@@ -8,7 +8,7 @@ __pycache__
 .env.example
 *.tar.gz
 *.zip
-data/
+/data/
 skills/
 *.md
 !README.md
