@@ -5,6 +5,7 @@ __pycache__
 .gitignore
 .env
 .env.local
+.env.example
 *.tar.gz
 *.zip
 data/
@@ -12,3 +13,9 @@ skills/
 *.md
 !README.md
 deploy.sh
+frontend/
+node_modules/
+.vscode/
+.idea/
+tests/
+*.log
