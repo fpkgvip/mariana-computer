@@ -27,7 +27,7 @@ Optional but rendered when present:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -88,7 +88,9 @@ def _prepare_context(report_data: dict[str, Any]) -> dict[str, Any]:
     elif isinstance(raw_dt, str):
         ctx["generated_at_str"] = raw_dt
     else:
-        ctx["generated_at_str"] = _format_datetime(datetime.now())
+        # BUG-027 fix: use datetime.now(timezone.utc) to produce a timezone-aware
+        # datetime, consistent with the rest of the codebase.
+        ctx["generated_at_str"] = _format_datetime(datetime.now(timezone.utc))
 
     # Format cost to 4 decimal places.
     ctx["total_cost_usd_str"] = f"${ctx.get('total_cost_usd', 0.0):.4f}"

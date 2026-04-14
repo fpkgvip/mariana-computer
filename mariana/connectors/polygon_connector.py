@@ -215,8 +215,11 @@ class PolygonConnector(BaseConnector):
         ticker = ticker.upper().strip()
         self._log.info("get_ticker_news", ticker=ticker, limit=limit)
         try:
+            # BUG-012 fix: use /v2/reference/news (v2 endpoint) as documented in
+            # the docstring.  /v3/reference/news is a different paginated endpoint
+            # with a different response structure and would silently break parsing.
             return await self._get(
-                "/v3/reference/news",
+                "/v2/reference/news",
                 params={"ticker": ticker, "limit": limit},
                 ttl=_TTL_NEWS,
             )

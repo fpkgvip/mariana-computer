@@ -45,8 +45,9 @@ _USER_AGENT = os.getenv("EDGAR_USER_AGENT", "Mariana Research mariana-research@l
 # How many concurrent EDGAR requests we allow (<=10 req/s safety net)
 _MAX_CONCURRENT = 5
 
-# Regex to extract likely ticker / company tokens from free-form text
-_TICKER_RE = re.compile(r"\b([A-Z]{1,5})\b")
+# BUG-014 fix: require at least 2 uppercase letters (matching polygon_connector)
+# to avoid spurious CIK lookups for single-letter words like "I", "A", "S".
+_TICKER_RE = re.compile(r"\b([A-Z]{2,5})\b")
 _WORD_RE = re.compile(r"[A-Za-z]{3,}")
 
 

@@ -66,8 +66,11 @@ _STOPWORDS: frozenset[str] = frozenset(
 )
 
 # Minimum keyword overlap between a question and a finding to count as resolved.
-# Set to 5 to reduce false-positive RESOLVED classifications from casual word overlap.
-_MIN_KEYWORD_MATCH: int = 5
+# BUG-036 fix: lowered from 5 to 3 so that short-but-legitimate questions
+# (e.g. "Is cash pledged?" — 3 keywords after stopword removal) are not
+# unconditionally blocked from being classified as RESOLVED when findings
+# clearly address them.  3 is still high enough to avoid trivial false positives.
+_MIN_KEYWORD_MATCH: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -315,9 +318,11 @@ async def run_skeptic(
     classified_questions = classify_questions(skeptic_output.questions, corpus)
 
     # Tally for logging.
+    # BUG-035 fix: the dict comprehension already initialises every enum key to 0;
+    # using .get(q.classification, 0) + 1 is redundant and dead code.
     counts = {cls: 0 for cls in QuestionClassification}
     for q in classified_questions:
-        counts[q.classification] = counts.get(q.classification, 0) + 1
+        counts[q.classification] += 1
 
     log.info(
         "skeptic_classification_done",

@@ -54,7 +54,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-mariana}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env or environment}
       POSTGRES_DB: ${POSTGRES_DB:-mariana}
     volumes:
       - postgres-data:/var/lib/postgresql/data

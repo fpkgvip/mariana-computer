@@ -237,9 +237,11 @@ class SkillSelector:
         for sid, boost in intent_boosts.items():
             scored[sid] = scored.get(sid, 0.0) + boost * 0.30
 
-        # Always include web_research as a baseline capability.
-        if "web_research" not in scored:
-            scored["web_research"] = 0.20
+        # BUG-031 fix: always ensure web_research is present at a minimum score
+        # of 0.20 — but only raise its score if it isn't already higher.
+        # Previously the check was "not in scored" which meant a registry-matched
+        # web_research with score 0.0 (unlikely) would not get the 0.20 floor.
+        scored["web_research"] = max(scored.get("web_research", 0.0), 0.20)
 
         # Step 2: rank and cap.
         ranked_ids = sorted(scored, key=lambda sid: scored[sid], reverse=True)

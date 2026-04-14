@@ -35,8 +35,10 @@ interface AuthContextType {
   /** No-op stub kept for backward compatibility — guest access removed */
   skip: () => void;
   addTokens: (amount: number) => void;
-  /** Purchase credits — adds tokens equivalent to dollar amount × 10 */
+  /** Purchase credits — credits coming soon (real payment not yet wired) */
   buyCredits: (dollars: number) => void;
+  /** Re-fetch the user profile from Supabase to pick up server-side balance changes */
+  refreshUser: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | null>(null);
@@ -81,33 +83,41 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   /**
    * Given a session (or null), load the profile and update state.
-   * Called both on initial mount and on every auth state change.
+   * BUG-023: Wrapped in try/catch so network errors don't become unhandled
+   * promise rejections in the onAuthStateChange listener.
    */
   const syncSession = useCallback(async (session: Session | null) => {
     if (!session) {
       setUser(null);
       return;
     }
-    const profile = await fetchProfile(session.user.id);
-    setUser(buildUser(session, profile));
+    try {
+      const profile = await fetchProfile(session.user.id);
+      setUser(buildUser(session, profile));
+    } catch (err) {
+      console.error("[AuthContext] syncSession error:", err);
+      // Still set user with just session data so the app remains usable
+      setUser(buildUser(session, null));
+    }
   }, []);
 
-  /** Bootstrap: get the current session from Supabase storage */
+  /**
+   * BUG-008: Remove explicit getSession() call.
+   * Supabase fires onAuthStateChange with INITIAL_SESSION on subscription,
+   * so calling getSession() separately causes a double fetchProfile on mount.
+   * Rely solely on onAuthStateChange for both initial and subsequent events.
+   */
   useEffect(() => {
     let mounted = true;
 
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    // Listen for all auth events including INITIAL_SESSION
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
       if (!mounted) return;
       syncSession(session).finally(() => {
         if (mounted) setLoading(false);
       });
-    });
-
-    // Listen for future auth events (login, logout, token refresh, etc.)
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
-      syncSession(session);
     });
 
     return () => {
@@ -194,12 +204,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     addTokens(dollars * 10);
   };
 
-  // Don't render children until the session check completes
-  if (loading) return null;
+  /**
+   * BUG-018: Re-fetch the user profile from Supabase.
+   * Call after an investigation completes to pick up server-side token balance changes.
+   */
+  const refreshUser = useCallback(async (): Promise<void> => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (session) {
+      await syncSession(session);
+    }
+  }, [syncSession]);
+
+  // BUG-015: Show a loading spinner instead of a blank screen while session loads
+  if (loading) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-background">
+        <div className="h-5 w-5 animate-spin rounded-full border-2 border-border border-t-primary" />
+      </div>
+    );
+  }
 
   return (
     <AuthContext.Provider
-      value={{ user, login, signup, logout, skip, addTokens, buyCredits }}
+      value={{ user, login, signup, logout, skip, addTokens, buyCredits, refreshUser }}
     >
       {children}
     </AuthContext.Provider>

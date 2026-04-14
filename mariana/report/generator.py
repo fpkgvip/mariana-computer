@@ -234,7 +234,9 @@ async def generate_report(
         "disclaimer_zh": final_output.disclaimer_zh,
         "generated_at": datetime.now(timezone.utc),
         "task_topic": task.topic,
-        "total_cost_usd": cost_tracker.total_spent,
+        # BUG-019 fix: guard against cost_tracker being None before accessing
+        # .total_spent — the parameter is typed Any and may be None.
+        "total_cost_usd": cost_tracker.total_spent if cost_tracker is not None else 0.0,
         "total_sources": len(all_sources),
         "total_findings": len(confirmed_findings),
     }
@@ -252,15 +254,25 @@ async def generate_report(
 
     import asyncio as _asyncio  # noqa: PLC0415
     try:
-        await _asyncio.get_event_loop().run_in_executor(
+        # BUG-004 fix: use get_running_loop() instead of deprecated get_event_loop().
+        await _asyncio.get_running_loop().run_in_executor(
             None, render_pdf, report_data, template_dir, pdf_path
         )
     except Exception as exc:
         log.error("report_render_failed", pdf_path=pdf_path, error=str(exc))
-        async with db.acquire() as _conn:
-            await _conn.execute(
-                "UPDATE research_tasks SET status = 'FAILED' WHERE id = $1",
-                task.id,
+        # BUG-023 fix: wrap the DB status update in its own try/except so that
+        # a DB failure does not replace the original render exception.
+        try:
+            async with db.acquire() as _conn:
+                await _conn.execute(
+                    "UPDATE research_tasks SET status = 'FAILED' WHERE id = $1",
+                    task.id,
+                )
+        except Exception as db_exc:
+            log.error(
+                "report_render_db_update_failed",
+                pdf_path=pdf_path,
+                db_error=str(db_exc),
             )
         raise
 
@@ -313,12 +325,15 @@ async def _persist_report_path(
                 task_id,
             )
 
+            # BUG-026 fix: specify the conflict column so PostgreSQL knows which
+            # unique constraint to check.  ON CONFLICT DO NOTHING without a target
+            # column is only valid when there is exactly one unique constraint.
             await conn.execute(
                 """
                 INSERT INTO report_generations (
                     task_id, pdf_path, report_cost_usd, generated_at
                 ) VALUES ($1, $2, $3, NOW())
-                ON CONFLICT DO NOTHING
+                ON CONFLICT (task_id) DO NOTHING
                 """,
                 task_id,
                 pdf_path,

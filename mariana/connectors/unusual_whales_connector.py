@@ -9,6 +9,7 @@ Cache policy:
 
 from __future__ import annotations
 
+import asyncio  # BUG-021 fix: moved from inline import inside method body to top-level
 import re
 from typing import Any
 
@@ -101,7 +102,10 @@ class UnusualWhalesConnector(BaseConnector):
         try:
             if ticker:
                 ticker = ticker.upper().strip()
-                return await self._get(f"/stock/{ticker}/flow/options", ttl=_TTL_FLOW)
+                # BUG-016 fix: use /stock/{ticker}/options-volume as documented
+                # in the docstring.  /stock/{ticker}/flow/options does not match
+                # the documented UW API endpoint.
+                return await self._get(f"/stock/{ticker}/options-volume", ttl=_TTL_FLOW)
             return await self._get("/options/flow", ttl=_TTL_FLOW)
         except Exception as exc:
             self._log.error("get_options_flow_failed", ticker=ticker, error=str(exc))
@@ -125,8 +129,12 @@ class UnusualWhalesConnector(BaseConnector):
         try:
             if ticker:
                 ticker = ticker.upper().strip()
-                return await self._get("/darkpool/recent", params={"ticker": ticker}, ttl=_TTL_FLOW)
-            return await self._get("/darkpool/recent", ttl=_TTL_FLOW)
+                # BUG-017 fix: use /darkpool/{ticker} as documented in the docstring.
+                # /darkpool/recent with a ticker query param is inconsistent with
+                # the documented UW endpoint; the per-ticker dark pool endpoint is
+                # /darkpool/{ticker} and the market-wide feed is /darkpool/flow.
+                return await self._get(f"/darkpool/{ticker}", ttl=_TTL_FLOW)
+            return await self._get("/darkpool/flow", ttl=_TTL_FLOW)
         except Exception as exc:
             self._log.error("get_dark_pool_flow_failed", ticker=ticker, error=str(exc))
             raise ConnectorError(f"Failed to get dark pool flow for {ticker!r}") from exc
@@ -250,8 +258,6 @@ class UnusualWhalesConnector(BaseConnector):
             except ConnectorError as exc:
                 self._log.warning("market_overview_failed", error=str(exc))
             return findings
-
-        import asyncio  # noqa: PLC0415
 
         for ticker in candidate_tickers:
             finding: dict = {"source": "unusual_whales", "ticker": ticker, "topic": topic}

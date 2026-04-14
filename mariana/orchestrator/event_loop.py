@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import traceback
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -38,12 +38,15 @@ from mariana.data.models import (
     Branch,
     BranchStatus,
     EvidenceExtractionOutput,
+    EvidenceType,
     EvaluationOutput,
     Finding,
     HypothesisGenerationOutput,
     ReportDraftOutput,
     ResearchTask,
     SkepticQuestionsOutput,
+    Source,
+    SourceType,
     State,
     TaskStatus,
     TaskType,
@@ -53,6 +56,7 @@ from mariana.data.models import (
     QuestionClassification,
     QuestionSeverity,
 )
+from mariana.data.db import _row_to_dict
 from mariana.orchestrator import checkpoint as checkpoint_module
 from mariana.orchestrator.branch_manager import (
     create_branch,
@@ -86,8 +90,8 @@ _MAX_ITERATIONS: int = 500
 _STRONG_FINDINGS_CONFIDENCE: float = 0.75
 _STRONG_FINDINGS_MIN_COUNT: int = 3
 
-_SCORE_HIGH_THRESHOLD: float = 7.0   # maps to BRANCH_SCORE_HIGH trigger
-_SCORE_MED_THRESHOLD: float = 4.0    # maps to BRANCH_SCORE_MEDIUM trigger
+_SCORE_HIGH_THRESHOLD: float = 0.7   # maps to BRANCH_SCORE_HIGH trigger (0–1 scale)
+_SCORE_MED_THRESHOLD: float = 0.4    # maps to BRANCH_SCORE_MEDIUM trigger (0–1 scale)
 # Below SCORE_MED_THRESHOLD → BRANCH_SCORE_LOW
 
 
@@ -134,7 +138,7 @@ async def run(
     # Mark task as RUNNING
     # ------------------------------------------------------------------
     task.status = TaskStatus.RUNNING
-    task.started_at = datetime.utcnow()
+    task.started_at = datetime.now(timezone.utc)
     await _persist_task(task, db)
 
     log.info("event_loop_started", budget=task.budget_usd)
@@ -157,6 +161,20 @@ async def run(
         task.ai_call_counter = latest_cp.ai_call_counter
         # Restore cost tracker totals from checkpoint
         cost_tracker.total_spent = latest_cp.total_spent
+        # Restore per-branch breakdown from DB (BUG-017)
+        branch_rows = await db.fetch(
+            "SELECT branch_id, SUM(cost_usd) as total FROM ai_sessions "
+            "WHERE task_id = $1 GROUP BY branch_id",
+            task.id,
+        )
+        for _br in branch_rows:
+            if _br["branch_id"]:
+                cost_tracker.per_branch[_br["branch_id"]] = float(_br["total"] or 0)
+        # Restore call count
+        _call_count = await db.fetchval(
+            "SELECT COUNT(*) FROM ai_sessions WHERE task_id = $1", task.id
+        )
+        cost_tracker.call_count = int(_call_count or 0)
 
     # ------------------------------------------------------------------
     # Main loop
@@ -206,7 +224,7 @@ async def run(
             # 3. Advance state machine
             # --------------------------------------------------------- #
             try:
-                next_state, actions = await transition(
+                next_state, actions = transition(
                     current_state=task.current_state,
                     trigger=trigger,
                     session_data=session_data,
@@ -252,13 +270,14 @@ async def run(
         # -------------------------------------------------------------- #
         # Loop exit
         # -------------------------------------------------------------- #
-        if iteration >= _MAX_ITERATIONS:
+        # Check HALT state before iteration limit (BUG-004)
+        if task.current_state == State.HALT:
+            task.status = TaskStatus.COMPLETED
+        elif iteration >= _MAX_ITERATIONS:
             log.error("max_iterations_reached", iterations=_MAX_ITERATIONS)
             task.status = TaskStatus.HALTED
-        elif task.current_state == State.HALT:
-            task.status = TaskStatus.COMPLETED
-        
-        task.completed_at = datetime.utcnow()
+
+        task.completed_at = datetime.now(timezone.utc)
         await _persist_task(task, db)
         log.info(
             "event_loop_finished",
@@ -277,7 +296,7 @@ async def run(
         await _emergency_checkpoint(task, cost_tracker, db, data_root)
         task.status = TaskStatus.HALTED
         task.error_message = str(exc)
-        task.completed_at = datetime.utcnow()
+        task.completed_at = datetime.now(timezone.utc)
         await _persist_task(task, db)
 
     except Exception as exc:  # noqa: BLE001
@@ -292,7 +311,7 @@ async def run(
             log.error("emergency_checkpoint_failed")
         task.status = TaskStatus.FAILED
         task.error_message = str(exc)
-        task.completed_at = datetime.utcnow()
+        task.completed_at = datetime.now(timezone.utc)
         await _persist_task(task, db)
         raise
 
@@ -473,7 +492,8 @@ async def _trigger_for_checkpoint(
     if task.diminishing_flags in (1, 2):
         return TransitionTrigger.DIMINISHING_RETURNS
 
-    return TransitionTrigger.STRONG_FINDINGS_EXIST
+    # BUG-026: Default fallthrough → continue normal research loop, not STRONG_FINDINGS_EXIST
+    return TransitionTrigger.BATCH_COMPLETE
 
 
 async def _trigger_for_tribunal(
@@ -575,32 +595,56 @@ async def handle_init(
     from mariana.data.models import Hypothesis, HypothesisStatus  # noqa: PLC0415
     import uuid as _uuid  # noqa: PLC0415
     created_hypotheses = []
-    for gen_hyp in hypothesis_output.hypotheses:
-        hyp = Hypothesis(
-            id=str(_uuid.uuid4()),
-            task_id=task.id,
-            statement=gen_hyp.statement,
-            statement_zh=gen_hyp.statement_zh,
-            rationale=gen_hyp.rationale,
-            status=HypothesisStatus.ACTIVE,
-        )
-        await db.execute(
-            """
-            INSERT INTO hypotheses (
-                id, task_id, parent_id, depth, statement, statement_zh,
-                status, score, momentum_note, rationale, created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
-            """,
-            hyp.id, hyp.task_id, None, 0,
-            hyp.statement, hyp.statement_zh,
-            hyp.status.value, None, None, hyp.rationale,
-        )
-        await create_branch(
-            hypothesis_id=hyp.id,
-            task_id=task.id,
-            db=db,
-        )
-        created_hypotheses.append(hyp)
+    # BUG-023: Wrap hypothesis + branch insertion in a transaction to avoid partial state
+    async with db.acquire() as _conn:
+        async with _conn.transaction():
+            for gen_hyp in hypothesis_output.hypotheses:
+                hyp = Hypothesis(
+                    id=str(_uuid.uuid4()),
+                    task_id=task.id,
+                    statement=gen_hyp.statement,
+                    statement_zh=gen_hyp.statement_zh,
+                    rationale=gen_hyp.rationale,
+                    status=HypothesisStatus.ACTIVE,
+                )
+                await _conn.execute(
+                    """
+                    INSERT INTO hypotheses (
+                        id, task_id, parent_id, depth, statement, statement_zh,
+                        status, score, momentum_note, rationale, created_at, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+                    """,
+                    hyp.id, hyp.task_id, None, 0,
+                    hyp.statement, hyp.statement_zh,
+                    hyp.status.value, None, None, hyp.rationale,
+                )
+                await _conn.execute(
+                    """
+                    INSERT INTO branches (
+                        id, hypothesis_id, task_id, status,
+                        score_history, budget_allocated, budget_spent,
+                        grants_log, cycles_completed, kill_reason,
+                        sources_searched, created_at, updated_at
+                    ) VALUES (
+                        $1, $2, $3, $4,
+                        $5, $6, $7,
+                        $8, $9, $10,
+                        $11, NOW(), NOW()
+                    )
+                    """,
+                    str(_uuid.uuid4()),
+                    hyp.id,
+                    hyp.task_id,
+                    BranchStatus.ACTIVE.value,
+                    "[]",  # score_history
+                    5.0,   # budget_allocated = BUDGET_INITIAL
+                    0.0,   # budget_spent
+                    "[]",  # grants_log
+                    0,     # cycles_completed
+                    None,  # kill_reason
+                    "[]",  # sources_searched
+                )
+                created_hypotheses.append(hyp)
 
     log.info("hypotheses_ready", count=len(created_hypotheses))
 
@@ -628,12 +672,19 @@ async def handle_search(
             continue
 
         try:
+            # BUG-002: Fetch actual hypothesis statement instead of using the UUID
+            _hyp_row = await db.fetchrow(
+                "SELECT statement FROM hypotheses WHERE id = $1",
+                branch.hypothesis_id,
+            )
+            _hyp_statement = _hyp_row["statement"] if _hyp_row else ""
+
             _, ai_session = await spawn_model(
                 task_type=TaskType.EVIDENCE_EXTRACTION,
                 context={
                     "task_id": task.id,
                     "hypothesis_id": branch.hypothesis_id,
-                    "hypothesis_statement": branch.hypothesis_id,  # fetched by prompt_builder
+                    "hypothesis_statement": _hyp_statement,
                     "page_content": "",
                     "source_url": "",
                     "sources_already_searched": branch.sources_searched,
@@ -756,12 +807,19 @@ async def handle_deepen(
             continue
 
         try:
+            # BUG-002: Fetch actual hypothesis statement instead of using the UUID
+            _hyp_row_d = await db.fetchrow(
+                "SELECT statement FROM hypotheses WHERE id = $1",
+                branch.hypothesis_id,
+            )
+            _hyp_statement_d = _hyp_row_d["statement"] if _hyp_row_d else ""
+
             _, ai_session = await spawn_model(
                 task_type=TaskType.EVIDENCE_EXTRACTION,
                 context={
                     "task_id": task.id,
                     "hypothesis_id": branch.hypothesis_id,
-                    "hypothesis_statement": branch.hypothesis_id,
+                    "hypothesis_statement": _hyp_statement_d,
                     "page_content": "",
                     "source_url": "",
                     "mode": "DEEPEN",
@@ -803,7 +861,11 @@ async def handle_checkpoint(
         "is_compressed, content, created_at FROM findings WHERE task_id = $1",
         task.id,
     )
-    findings = [Finding.model_validate(dict(r)) for r in finding_rows]
+    # BUG-013: Use _row_to_dict() to decode JSONB/enum fields before model_validate
+    findings = [
+        Finding.model_validate({**_row_to_dict(r), "evidence_type": EvidenceType(r["evidence_type"])})
+        for r in finding_rows
+    ]
 
     # Count sources for DR analysis
     source_count = await db.fetchval(
@@ -820,7 +882,8 @@ async def handle_checkpoint(
         prev_finding_count = max(0, len(findings) - len(session_data.recent_findings))
         prev_source_count = max(0, int(source_count) - len(session_data.all_source_ids))
 
-        check_diminishing_returns(
+        # BUG-003: Capture and log the return value of check_diminishing_returns
+        dr_result = check_diminishing_returns(
             branch=best_branch,
             findings_before=prev_finding_count,
             findings_after=len(findings),
@@ -828,6 +891,14 @@ async def handle_checkpoint(
             sources_after=int(source_count),
             task=task,
             config=config,
+        )
+        log.info(
+            "diminishing_returns_result",
+            recommendation=dr_result.recommendation.value,
+            novelty=dr_result.novelty,
+            new_sources=dr_result.new_sources,
+            score_delta=dr_result.score_delta,
+            flag_triggered=dr_result.flag_triggered,
         )
 
     killed_rows = await db.fetch(
@@ -837,7 +908,11 @@ async def handle_checkpoint(
         "FROM branches WHERE task_id = $1 AND status = 'KILLED'",
         task.id,
     )
-    killed_branches = [Branch.model_validate(dict(r)) for r in killed_rows]
+    # BUG-013: Use _row_to_dict() to decode JSONB/enum fields before model_validate
+    killed_branches = [
+        Branch.model_validate({**_row_to_dict(r), "status": BranchStatus(r["status"])})
+        for r in killed_rows
+    ]
 
     checkpoint_id = await checkpoint_module.save_checkpoint(
         task=task,
@@ -984,33 +1059,42 @@ async def handle_report(
     log = logger.bind(task_id=task.id, handler="report")
 
     # Fetch confirmed / high-confidence findings for the report
+    # BUG-047: include metadata column
     finding_rows = await db.fetch(
         """
         SELECT id, task_id, hypothesis_id, content, content_en, content_language,
                source_ids, confidence, evidence_type, is_compressed,
-               raw_content_path, created_at
+               raw_content_path, created_at, metadata
         FROM findings
         WHERE task_id = $1
         ORDER BY confidence DESC
         """,
         task.id,
     )
-    confirmed_findings = [Finding.model_validate(dict(r)) for r in finding_rows]
+    # BUG-014: Use _row_to_dict() to decode JSONB/enum fields before model_validate
+    confirmed_findings = [
+        Finding.model_validate({**_row_to_dict(r), "evidence_type": EvidenceType(r["evidence_type"])})
+        for r in finding_rows
+    ]
 
     # Fetch all sources collected during the investigation
-    from mariana.data.models import Source  # noqa: PLC0415
+    # BUG-046: include metadata column
     source_rows = await db.fetch(
         """
         SELECT id, task_id, url, url_hash, title, title_en, content_hash,
                fetched_at, cache_expiry, source_type, language, adapter_name,
-               is_paywalled
+               is_paywalled, metadata
         FROM sources
         WHERE task_id = $1
         ORDER BY fetched_at ASC
         """,
         task.id,
     )
-    all_sources = [Source.model_validate(dict(r)) for r in source_rows]
+    # BUG-014: Use _row_to_dict() to decode JSONB/enum fields before model_validate
+    all_sources = [
+        Source.model_validate({**_row_to_dict(r), "source_type": SourceType(r["source_type"])})
+        for r in source_rows
+    ]
 
     # Fetch killed/exhausted hypothesis statements for context
     hyp_rows = await db.fetch(
@@ -1039,7 +1123,10 @@ async def handle_report(
         task.ai_call_counter += 2
         log.info("report_compiled", pdf=pdf_path, docx=docx_path)
     except Exception as exc:  # noqa: BLE001
-        log.error("report_compile_failed", error=str(exc))
+        # BUG-005: Re-raise so the outer handler marks task FAILED
+        log.error("report_compile_failed", error=str(exc), exc_info=True)
+        task.error_message = f"Report generation failed: {exc}"
+        raise
 
     log.info("report_complete")
 
@@ -1113,8 +1200,9 @@ async def _execute_action(
                 log.info("kill_branch_action", branch_id=worst.id, reason=reason)
 
         case "GRANT_BUDGET":
-            score_band = action.params.get("score_band", "high")
-            amount = 20.0 if score_band == "high" else 50.0
+            score_band = action.params.get("score_band", "score7")
+            # BUG-020: score8 → $50 grant, score7 → $20 grant
+            amount = 50.0 if score_band == "score8" else 20.0
             active = session_data.active_branches
             if active:
                 best = max(
@@ -1172,7 +1260,11 @@ async def _build_session_data(
         """,
         task.id,
     )
-    active_branches = [Branch.model_validate(dict(r)) for r in active_rows]
+    # BUG-012: Use _row_to_dict() to decode JSONB/enum fields before model_validate
+    active_branches = [
+        Branch.model_validate({**_row_to_dict(r), "status": BranchStatus(r["status"])})
+        for r in active_rows
+    ]
 
     dead_rows = await db.fetch(
         """
@@ -1184,7 +1276,11 @@ async def _build_session_data(
         """,
         task.id,
     )
-    dead_branches = [Branch.model_validate(dict(r)) for r in dead_rows]
+    # BUG-012: Use _row_to_dict() to decode JSONB/enum fields before model_validate
+    dead_branches = [
+        Branch.model_validate({**_row_to_dict(r), "status": BranchStatus(r["status"])})
+        for r in dead_rows
+    ]
 
     # "Recent" findings = last 50 findings for the task
     finding_rows = await db.fetch(
@@ -1197,7 +1293,11 @@ async def _build_session_data(
         """,
         task.id,
     )
-    recent_findings = [Finding.model_validate(dict(r)) for r in finding_rows]
+    # BUG-012: Use _row_to_dict() to decode JSONB/enum fields before model_validate
+    recent_findings = [
+        Finding.model_validate({**_row_to_dict(r), "evidence_type": EvidenceType(r["evidence_type"])})
+        for r in finding_rows
+    ]
 
     source_rows = await db.fetch(
         "SELECT id FROM sources WHERE task_id = $1",
@@ -1270,7 +1370,10 @@ async def _emergency_checkpoint(
             "FROM branches WHERE task_id = $1 AND status != 'ACTIVE'",
             task.id,
         )
-        dead = [Branch.model_validate(dict(r)) for r in dead_rows]
+        dead = [
+            Branch.model_validate({**_row_to_dict(r), "status": BranchStatus(r["status"])})
+            for r in dead_rows
+        ]
     except Exception:  # noqa: BLE001
         dead = []
 

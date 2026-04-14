@@ -50,18 +50,27 @@ class OutputParseError(Exception):
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
 
+# BUG-008 fix: use \r?\n so Windows-style CRLF endings are also matched.
+# Also allow optional trailing whitespace before the closing fence.
 # Matches ```json … ``` blocks only (language tag is required).
 # Using a strict match ensures bare ``` … ``` fences fall through to _BARE_FENCE_RE.
 _JSON_FENCE_RE = re.compile(
-    r"```json\s*\n(.*?)\n```",
+    r"```json\s*\r?\n(.*?)\r?\n\s*```",
     re.DOTALL | re.IGNORECASE,
 )
 
 # Matches bare ``` … ``` fences (no language tag).
 # Only reached when _JSON_FENCE_RE does not match.
 _BARE_FENCE_RE = re.compile(
-    r"```\s*\n(.*?)\n```",
+    r"```\s*\r?\n(.*?)\r?\n\s*```",
     re.DOTALL,
+)
+
+# Additional fallback: strip ```json...``` markers even when no newline separates
+# the fence from the JSON body (e.g. ```json{...}``` on a single line).
+_INLINE_JSON_FENCE_RE = re.compile(
+    r"```(?:json)?\s*(.*?)\s*```",
+    re.DOTALL | re.IGNORECASE,
 )
 
 
@@ -83,6 +92,14 @@ def _extract_json_text(text: str) -> str:
     m = _BARE_FENCE_RE.search(text)
     if m:
         return m.group(1).strip()
+
+    # BUG-008 fix: handle inline fences like ```json{...}``` with no newlines.
+    m = _INLINE_JSON_FENCE_RE.search(text)
+    if m:
+        candidate = m.group(1).strip()
+        # Only use the inline match if it looks like JSON (starts with { or [).
+        if candidate.startswith("{") or candidate.startswith("["):
+            return candidate
 
     return text.strip()
 

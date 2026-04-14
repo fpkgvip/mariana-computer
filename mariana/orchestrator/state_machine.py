@@ -199,6 +199,8 @@ TRANSITION_TABLE: dict[tuple[State, TransitionTrigger], State] = {
     (State.EVALUATE, TransitionTrigger.BRANCH_SCORE_LOW): State.CHECKPOINT,  # after kill
     (State.EVALUATE, TransitionTrigger.STRONG_FINDINGS_EXIST): State.CHECKPOINT,
     (State.EVALUATE, TransitionTrigger.ALL_BRANCHES_EXHAUSTED): State.CHECKPOINT,
+    # BUG-040: No scores yet — do another search cycle
+    (State.EVALUATE, TransitionTrigger.BATCH_COMPLETE): State.SEARCH,
     (State.EVALUATE, TransitionTrigger.BUDGET_HARD_CAP): State.HALT,
 
     # ------------------------------------------------------------------
@@ -217,6 +219,8 @@ TRANSITION_TABLE: dict[tuple[State, TransitionTrigger], State] = {
     (State.CHECKPOINT, TransitionTrigger.ALL_BRANCHES_EXHAUSTED): State.PIVOT,  # if budget
     (State.CHECKPOINT, TransitionTrigger.CONSECUTIVE_DR_FLAGS_3): State.HALT,
     (State.CHECKPOINT, TransitionTrigger.DIMINISHING_RETURNS): State.PIVOT,  # flags==2 (guard handles flags==1 → SEARCH)
+    # BUG-026: BATCH_COMPLETE fallthrough → continue normal research loop
+    (State.CHECKPOINT, TransitionTrigger.BATCH_COMPLETE): State.SEARCH,
     (State.CHECKPOINT, TransitionTrigger.BUDGET_HARD_CAP): State.HALT,
 
     # ------------------------------------------------------------------
@@ -298,7 +302,7 @@ def _budget_is_available(cost_tracker: CostTracker, minimum: float) -> bool:
 # ===========================================================================
 
 
-async def transition(
+def transition(
     current_state: State,
     trigger: TransitionTrigger,
     session_data: ResearchSessionData,
@@ -433,10 +437,17 @@ def _apply_guards(
     # EVALUATE
     # ------------------------------------------------------------------
     if current_state == State.EVALUATE:
+        if trigger == TransitionTrigger.BATCH_COMPLETE:
+            # BUG-040: No scores yet — do another search cycle
+            actions.append(Action("SPAWN_AI", {"task_type": "EVIDENCE_EXTRACTION"}))
+            return State.SEARCH, actions
+
         if trigger == TransitionTrigger.BRANCH_SCORE_LOW:
             # Kill the lowest-scoring branch first
             actions.append(Action("KILL_BRANCH", {"reason": "low_score"}))
-            if _all_branches_exhausted(active, session_data.dead_branches):
+            # BUG-015: Account for the branch about to be killed when checking exhaustion
+            remaining_active = len(active) - 1
+            if remaining_active <= 0:
                 actions.append(Action("SAVE_CHECKPOINT", {"reason": "all_branches_dead"}))
                 return State.CHECKPOINT, actions
             # Still branches left → loop back to search
@@ -451,7 +462,13 @@ def _apply_guards(
             return State.CHECKPOINT, actions
 
         if trigger == TransitionTrigger.BRANCH_SCORE_HIGH:
-            actions.append(Action("GRANT_BUDGET", {"score_band": "high"}))
+            # BUG-020: differentiate score7 ($20 grant) vs score8 ($50 grant)
+            _best_score = max(
+                (b.latest_score for b in active if b.latest_score is not None),
+                default=0.0,
+            )
+            _score_band = "score8" if _best_score >= 0.8 else "score7"
+            actions.append(Action("GRANT_BUDGET", {"score_band": _score_band}))
             return State.DEEPEN, actions
 
         if trigger == TransitionTrigger.BRANCH_SCORE_MEDIUM:
@@ -462,7 +479,13 @@ def _apply_guards(
     # ------------------------------------------------------------------
     if current_state == State.DEEPEN:
         if trigger == TransitionTrigger.BRANCH_SCORE_HIGH:
-            actions.append(Action("GRANT_BUDGET", {"score_band": "high"}))
+            # BUG-020: differentiate score7 vs score8
+            _best_score_d = max(
+                (b.latest_score for b in active if b.latest_score is not None),
+                default=0.0,
+            )
+            _score_band_d = "score8" if _best_score_d >= 0.8 else "score7"
+            actions.append(Action("GRANT_BUDGET", {"score_band": _score_band_d}))
             return State.DEEPEN, actions
 
         if trigger == TransitionTrigger.BRANCH_SCORE_MEDIUM:
@@ -470,7 +493,9 @@ def _apply_guards(
 
         if trigger == TransitionTrigger.BRANCH_SCORE_LOW:
             actions.append(Action("KILL_BRANCH", {"reason": "low_score_in_deepen"}))
-            if _all_branches_exhausted(active, session_data.dead_branches):
+            # BUG-015: Account for the branch about to be killed when checking exhaustion
+            remaining_active = len(active) - 1
+            if remaining_active <= 0:
                 actions.append(Action("SAVE_CHECKPOINT", {"reason": "all_branches_dead"}))
                 return State.CHECKPOINT, actions
             return State.SEARCH, actions
@@ -486,6 +511,10 @@ def _apply_guards(
         # Always save on entry to CHECKPOINT state
         actions.append(Action("SAVE_CHECKPOINT", {"reason": trigger.value}))
 
+        if trigger == TransitionTrigger.BATCH_COMPLETE:
+            # BUG-026: Normal fallthrough — continue research loop
+            return State.SEARCH, actions
+
         if trigger == TransitionTrigger.STRONG_FINDINGS_EXIST:
             return State.TRIBUNAL, actions
 
@@ -495,6 +524,9 @@ def _apply_guards(
 
         if trigger == TransitionTrigger.DIMINISHING_RETURNS:
             flags = task.diminishing_flags
+            # BUG-016: flags >= 3 should have triggered CONSECUTIVE_DR_FLAGS_3 instead;
+            # this path is defensive only.
+            assert flags > 0, "DIMINISHING_RETURNS trigger should only fire with flags > 0"
             if flags >= 3:
                 actions.append(Action("HALT", {"reason": "dr_flags_ge_3"}))
                 return State.HALT, actions

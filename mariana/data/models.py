@@ -489,6 +489,12 @@ class SkepticResult(BaseModel):
         default=False,
         description="True when no CRITICAL open questions remain",
     )
+    # BUG-029: Make max_open_questions a proper field instead of using getattr
+    max_open_questions: int = Field(
+        default=2,
+        description="Maximum open questions allowed to pass publishing threshold",
+        exclude=True,  # Not persisted to DB
+    )
     cost_usd: float = Field(default=0.0, ge=0.0)
     created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
 
@@ -506,11 +512,10 @@ class SkepticResult(BaseModel):
         self.critical_open_count = sum(
             1 for q in open_qs if q.severity == QuestionSeverity.CRITICAL
         )
-        # Also check total open question count (config default: max 2 open questions allowed)
-        _max_open = getattr(self, "_max_open_questions", 2)
+        # BUG-029: Use the proper field instead of getattr fallback
         self.passes_publishing_threshold = (
             self.critical_open_count == 0
-            and self.open_count <= _max_open
+            and self.open_count <= self.max_open_questions
         )
         return self
 
@@ -638,6 +643,8 @@ class EvaluationOutput(BaseModel):
 
     model_config = _COMMON_CONFIG
 
+    # BUG-010/BUG-030: Score is on 0–1 scale; thresholds in event_loop.py and
+    # branch_manager.py have been updated to match (0.7 high, 0.4 medium/kill).
     score: float = Field(..., ge=0.0, le=1.0, description="Overall hypothesis score [0, 1]")
     score_rationale: str = Field(..., min_length=10, max_length=4096)
     momentum_note: str = Field(

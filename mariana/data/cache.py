@@ -355,6 +355,8 @@ class QueryDedup:
         """
         key = _query_dedup_key(task_id)
         members: list[bytes] = await self._redis.zrange(key, 0, -1)
+        # BUG-024: With decode_responses=True, members are already str; the
+        # isinstance guard handles both modes for backward compatibility.
         return {m.decode("utf-8") if isinstance(m, bytes) else m for m in members}
 
     async def clear(self, task_id: str) -> None:
@@ -394,9 +396,14 @@ async def create_redis_client(
         redis_url,
         max_connections=max_connections,
         socket_timeout=socket_timeout,
-        decode_responses=False,  # We handle encoding/decoding explicitly
+        # BUG-024: Use decode_responses=True for consistency with the API's Redis client
+        decode_responses=True,
     )
-    # Verify connectivity
-    await client.ping()
+    # Verify connectivity; clean up on failure to avoid connection pool leak (BUG-055)
+    try:
+        await client.ping()
+    except Exception:
+        await client.aclose()
+        raise
     logger.info("Redis client connected to %s", redis_url)
     return client

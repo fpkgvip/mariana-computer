@@ -127,7 +127,9 @@ class CostTracker:
         self.call_count += 1
 
         # Branch-level accounting + cap check
-        if branch_id:
+        # BUG-053: Use `is not None` instead of truthiness check to allow empty-string
+        # branch_id (though in practice all IDs are UUIDs or None)
+        if branch_id is not None:
             self.per_branch[branch_id] = (
                 self.per_branch.get(branch_id, 0.0) + cost
             )

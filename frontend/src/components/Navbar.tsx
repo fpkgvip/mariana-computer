@@ -1,4 +1,4 @@
-import { Link, useLocation } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useState, useEffect, useRef } from "react";
 import { Menu, X, User, LogOut, CreditCard, Settings } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
@@ -12,6 +12,7 @@ const navLinks = [
 
 export function Navbar() {
   const location = useLocation();
+  const navigate = useNavigate();
   const { user, logout } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [scrolled, setScrolled] = useState(false);
@@ -40,6 +41,12 @@ export function Navbar() {
     setMobileOpen(false);
     setUserMenuOpen(false);
   }, [location.pathname]);
+
+  // BUG-014: Navigate to / after logout for consistency with Account.tsx
+  const handleLogout = async () => {
+    await logout();
+    navigate("/");
+  };
 
   return (
     <nav
@@ -99,7 +106,7 @@ export function Navbar() {
                     </p>
                   </div>
                   <button
-                    onClick={logout}
+                    onClick={handleLogout}
                     className="flex w-full items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground"
                   >
                     <LogOut size={13} /> Sign out
@@ -169,7 +176,7 @@ export function Navbar() {
                   {user.name} · ${(user.tokens / 10).toFixed(2)} credit
                 </p>
                 <button
-                  onClick={logout}
+                  onClick={handleLogout}
                   className="py-1 text-left text-sm text-muted-foreground"
                 >
                   Sign out

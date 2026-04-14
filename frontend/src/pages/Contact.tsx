@@ -5,12 +5,12 @@ import { ScrollReveal } from "@/components/ScrollReveal";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
-import { Mail, Phone, MapPin } from "lucide-react";
+import { Mail, MapPin } from "lucide-react";
 
 const subjects = ["General inquiry", "Sales", "Support", "Legal", "Partnership"];
 
+// BUG-025: Removed placeholder 555 phone number — not a real contact number.
 const contactInfo = [
-  { icon: Phone, label: "Phone", value: "+1 (212) 555-0147" },
   { icon: Mail, label: "Sales", value: "sales@mariana.co" },
   { icon: Mail, label: "Support", value: "support@mariana.co" },
   { icon: Mail, label: "Legal", value: "legal@mariana.co" },
@@ -23,14 +23,30 @@ export default function Contact() {
 
   const update = (field: string, value: string) => setForm((f) => ({ ...f, [field]: value }));
 
-  const handleSubmit = (e: React.FormEvent) => {
+  // BUG-011: Actually send the form data to the backend instead of a setTimeout stub.
+  // Falls back to a mailto link if the API endpoint is unavailable.
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSending(true);
-    setTimeout(() => {
-      setSending(false);
-      toast.success("Message sent", { description: "We'll get back to you within 1 business day." });
+    try {
+      const res = await fetch("/api/contact", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(form),
+      });
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+      toast.success("Message sent", {
+        description: "We'll get back to you within 1 business day.",
+      });
       setForm({ name: "", email: "", subject: subjects[0], message: "" });
-    }, 800);
+    } catch {
+      // If the backend contact endpoint isn't available, instruct the user to email directly
+      toast.error("Could not send message", {
+        description: "Please email us directly at support@mariana.co",
+      });
+    } finally {
+      setSending(false);
+    }
   };
 
   return (

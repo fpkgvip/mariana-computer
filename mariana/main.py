@@ -202,8 +202,10 @@ class _ShutdownFlag:
 
     async def wait(self) -> None:
         # Poll in a non-blocking fashion to allow the event loop to yield.
+        # BUG-018: Use a timeout to prevent permanent thread leaks when
+        # shutdown is never signalled in long-running daemon mode.
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._flag.wait)
+        await loop.run_in_executor(None, lambda: self._flag.wait(timeout=10.0))
 
 
 _SHUTDOWN = _ShutdownFlag()
@@ -635,6 +637,10 @@ async def _async_main() -> int:  # noqa: PLR0912  (many branches by design)
         return await _run_dry_run(config)
 
     # ── Infrastructure for all other modes ────────────────────────────────────
+    # BUG-025: Initialize to None before try/finally to avoid UnboundLocalError
+    # if _create_db_pool raises before redis_client is assigned.
+    db = None
+    redis_client = None
     db = await _create_db_pool(config)
     await _ensure_db_modules(db, config)
     redis_client = await _create_redis(config)
@@ -674,14 +680,17 @@ async def _async_main() -> int:  # noqa: PLR0912  (many branches by design)
 
     finally:
         # Always clean up connections.
-        try:
-            await redis_client.aclose()
-        except Exception as exc:
-            log.warning("cleanup_error", component="redis", error=str(exc))
-        try:
-            await db.close()
-        except Exception as exc:
-            log.warning("cleanup_error", component="db", error=str(exc))
+        # BUG-025: Guard with is not None to handle partial initialization
+        if redis_client is not None:
+            try:
+                await redis_client.aclose()
+            except Exception as exc:
+                log.warning("cleanup_error", component="redis", error=str(exc))
+        if db is not None:
+            try:
+                await db.close()
+            except Exception as exc:
+                log.warning("cleanup_error", component="db", error=str(exc))
         log.info("mariana_shutdown", exit_code=exit_code)
 
     return exit_code

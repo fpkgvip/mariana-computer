@@ -68,10 +68,25 @@ class BaseConnector(ABC):
     # HTTP helpers
     # ------------------------------------------------------------------
 
+    def __del__(self) -> None:
+        # BUG-011 fix: warn if the connector was garbage-collected without being
+        # properly closed, which would silently leak the httpx connection pool.
+        if not self._closed:
+            import warnings
+            warnings.warn(
+                f"{self.__class__.__name__} was not properly closed. "
+                "Use 'async with' or call 'await connector.close()'.",
+                ResourceWarning,
+                stacklevel=2,
+            )
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=16),
-        retry=retry_if_exception_type((httpx.HTTPStatusError, RateLimitError)),
+        # BUG-010 fix: add ConnectorError to the retry list so transient network
+        # errors (timeouts, TCP resets) that are wrapped as ConnectorError are also
+        # retried — not just HTTP status errors and explicit rate-limit responses.
+        retry=retry_if_exception_type((httpx.HTTPStatusError, RateLimitError, ConnectorError)),
         reraise=True,
     )
     async def _request(self, method: str, url: str, **kwargs: Any) -> dict:
@@ -123,7 +138,9 @@ class BaseConnector(ABC):
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=16),
-        retry=retry_if_exception_type((httpx.HTTPStatusError, RateLimitError)),
+        # BUG-010 fix (same as _request): add ConnectorError so network/timeout
+        # errors are retried consistently across both HTTP helper methods.
+        retry=retry_if_exception_type((httpx.HTTPStatusError, RateLimitError, ConnectorError)),
         reraise=True,
     )
     async def _request_text(self, method: str, url: str, **kwargs: Any) -> str:

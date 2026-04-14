@@ -45,7 +45,8 @@ _NOVELTY_THRESHOLD: float = 0.10
 _NEW_SOURCES_THRESHOLD: int = 3
 """Fewer new sources than this across a cycle signals staleness."""
 
-_SCORE_DELTA_THRESHOLD: float = 1.0
+# BUG-010: On 0–1 scale, a delta of 0.1 (10% change) is the plateau threshold
+_SCORE_DELTA_THRESHOLD: float = 0.1
 """Score improvement below this value signals stagnation."""
 
 _FLAG_PIVOT_THRESHOLD: int = 2
@@ -135,13 +136,15 @@ def check_diminishing_returns(
     # 1. Compute novelty
     # ------------------------------------------------------------------
     # novelty = new findings / total findings (avoids ZeroDivisionError)
-    new_findings = findings_after - findings_before
+    # BUG-036: Clamp to 0 to avoid negative novelty if findings were somehow deleted
+    new_findings = max(0, findings_after - findings_before)
     novelty: float = new_findings / max(findings_after, 1)
 
     # ------------------------------------------------------------------
     # 2. New sources
     # ------------------------------------------------------------------
-    new_sources: int = sources_after - sources_before
+    # BUG-036: Clamp to 0 to avoid negative new_sources
+    new_sources: int = max(0, sources_after - sources_before)
 
     # ------------------------------------------------------------------
     # 3. Score delta
@@ -150,7 +153,8 @@ def check_diminishing_returns(
         score_delta = abs(branch.score_history[-1] - branch.score_history[-2])
     else:
         # Not enough history — never trip the flag on the first cycle
-        score_delta = 10.0
+        # BUG-010: Use large value on 0–1 scale to prevent premature plateau detection
+        score_delta = 2.0
 
     # ------------------------------------------------------------------
     # 4. Flag logic

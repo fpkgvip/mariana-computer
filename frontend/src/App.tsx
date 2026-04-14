@@ -15,17 +15,25 @@ import BuyCredits from "./pages/BuyCredits";
 import Account from "./pages/Account";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
+import ResetPassword from "./pages/ResetPassword";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
 
+/**
+ * BUG-029: BrowserRouter now wraps AuthProvider so AuthProvider (and any
+ * future consumers within it) can use React Router hooks (useNavigate etc.).
+ *
+ * BUG-010: Added /reset-password route so the password-reset email link
+ * from Login.tsx actually lands on a page instead of the 404.
+ */
 const App = () => (
   <QueryClientProvider client={queryClient}>
     <TooltipProvider>
       <Toaster />
       <Sonner />
-      <AuthProvider>
-        <BrowserRouter>
+      <BrowserRouter>
+        <AuthProvider>
           <Routes>
             <Route path="/" element={<Index />} />
             <Route path="/research" element={<Research />} />
@@ -37,10 +45,11 @@ const App = () => (
             <Route path="/account" element={<Account />} />
             <Route path="/login" element={<Login />} />
             <Route path="/signup" element={<Signup />} />
+            <Route path="/reset-password" element={<ResetPassword />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
-        </BrowserRouter>
-      </AuthProvider>
+        </AuthProvider>
+      </BrowserRouter>
     </TooltipProvider>
   </QueryClientProvider>
 );

@@ -23,6 +23,7 @@ Usage::
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Sequence
@@ -269,30 +270,41 @@ def _compute_relevance(topic_normalised: str, skill: Skill) -> float:
 # ---------------------------------------------------------------------------
 
 _GLOBAL_REGISTRY: SkillRegistry | None = None
+# BUG-024 fix: guard singleton initialisation with a threading.Lock so that
+# concurrent callers (e.g. from a thread pool) don't create multiple registries
+# and run the skill-registration side-effects more than once.
+_GLOBAL_REGISTRY_LOCK: threading.Lock = threading.Lock()
 
 
 def get_registry() -> SkillRegistry:
     """Return (and lazily create) the process-wide :class:`SkillRegistry`.
 
     On first call this imports the built-in skill modules which register
-    their skills as a side-effect.
+    their skills as a side-effect.  Thread-safe via double-checked locking.
     """
     global _GLOBAL_REGISTRY
 
+    # Fast path: no lock needed once the registry is already built.
     if _GLOBAL_REGISTRY is not None:
         return _GLOBAL_REGISTRY
 
-    _GLOBAL_REGISTRY = SkillRegistry()
+    with _GLOBAL_REGISTRY_LOCK:
+        # Re-check under the lock in case another thread initialised first.
+        if _GLOBAL_REGISTRY is not None:
+            return _GLOBAL_REGISTRY
 
-    # Import skill definition modules — they call register_many() on import.
-    from mariana.skills.finance_skills import register_finance_skills  # noqa: F811
-    from mariana.skills.general_skills import register_general_skills  # noqa: F811
+        _GLOBAL_REGISTRY = SkillRegistry()
 
-    register_finance_skills(_GLOBAL_REGISTRY)
-    register_general_skills(_GLOBAL_REGISTRY)
+        # Import skill definition modules — they call register_many() on import.
+        from mariana.skills.finance_skills import register_finance_skills  # noqa: F811
+        from mariana.skills.general_skills import register_general_skills  # noqa: F811
 
-    logger.info(
-        "skill_registry.loaded",
-        total_skills=len(_GLOBAL_REGISTRY._skills),
-    )
+        register_finance_skills(_GLOBAL_REGISTRY)
+        register_general_skills(_GLOBAL_REGISTRY)
+
+        logger.info(
+            "skill_registry.loaded",
+            total_skills=len(_GLOBAL_REGISTRY._skills),
+        )
+
     return _GLOBAL_REGISTRY

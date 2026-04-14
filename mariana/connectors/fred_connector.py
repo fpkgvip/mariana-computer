@@ -159,8 +159,10 @@ class FredConnector(BaseConnector):
         Returns:
             FRED category-series payload.
         """
+        # BUG-013 fix: raise ConnectorError (not ValueError) so callers that
+        # catch ConnectorError (as all connector callers do) handle this correctly.
         if category_id <= 0:
-            raise ValueError(f"category_id must be a positive integer, got {category_id}")
+            raise ConnectorError(f"category_id must be a positive integer, got {category_id}")
         self._log.info("get_category_series", category_id=category_id)
         try:
             return await self._get("/category/series", params={"category_id": category_id})

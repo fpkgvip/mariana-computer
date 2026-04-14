@@ -1,48 +1,27 @@
-import { useState, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
+import { useEffect } from "react";
+import { useNavigate, Link } from "react-router-dom";
 import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
 import { ScrollReveal } from "@/components/ScrollReveal";
-import { Input } from "@/components/ui/input";
-import { Button } from "@/components/ui/button";
 import { useAuth } from "@/contexts/AuthContext";
-import { toast } from "sonner";
+import { Mail } from "lucide-react";
 
-const presets = [10, 25, 50, 100];
-
+/**
+ * BUG-026 / BUG-030: The previous implementation collected card details
+ * (card number, expiry, CVC) that were never validated or transmitted —
+ * a fake payment flow using a setTimeout + local state update only.
+ *
+ * Replaced with a "contact us" page to request credits. Real payment
+ * integration (Stripe etc.) must be wired on the backend before a payment
+ * form should be re-introduced.
+ */
 export default function BuyCredits() {
-  const { user, buyCredits } = useAuth();
+  const { user } = useAuth();
   const navigate = useNavigate();
-  const [amount, setAmount] = useState(25);
-  const [custom, setCustom] = useState("");
-  const [useCustom, setUseCustom] = useState(false);
-  const [processing, setProcessing] = useState(false);
-
-  // Card form (visual only)
-  const [card, setCard] = useState({ number: "", expiry: "", cvc: "" });
 
   useEffect(() => {
     if (!user) navigate("/login", { replace: true });
   }, [user, navigate]);
-
-  const finalAmount = useCustom ? Number(custom) || 0 : amount;
-
-  const handlePurchase = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (finalAmount < 1) {
-      toast.error("Minimum purchase is $1");
-      return;
-    }
-    setProcessing(true);
-    setTimeout(() => {
-      buyCredits(finalAmount);
-      setProcessing(false);
-      toast.success(`$${finalAmount} in credits added`, {
-        description: `${finalAmount * 10} tokens added to your account.`,
-      });
-      setCard({ number: "", expiry: "", cvc: "" });
-    }, 1200);
-  };
 
   if (!user) return null;
 
@@ -54,108 +33,34 @@ export default function BuyCredits() {
         <div className="mx-auto max-w-lg">
           <ScrollReveal>
             <h1 className="font-serif text-2xl font-semibold text-foreground sm:text-3xl">
-              Buy credits
+              Get credits
             </h1>
             <p className="mt-2 text-sm text-muted-foreground">
-              Current balance: <span className="font-medium text-foreground">${(user.tokens / 10).toFixed(2)}</span>
+              Current balance:{" "}
+              <span className="font-medium text-foreground">
+                ${(user.tokens / 10).toFixed(2)}
+              </span>
             </p>
           </ScrollReveal>
 
-          <form onSubmit={handlePurchase} className="mt-10 space-y-8">
-            {/* Amount selector */}
-            <ScrollReveal>
-              <div>
-                <label className="mb-3 block text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                  Amount
-                </label>
-                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-                  {presets.map((p) => (
-                    <button
-                      key={p}
-                      type="button"
-                      onClick={() => { setAmount(p); setUseCustom(false); }}
-                      className={`rounded-md border px-4 py-3 text-sm font-medium transition-colors ${
-                        !useCustom && amount === p
-                          ? "border-primary bg-primary/5 text-primary"
-                          : "border-border text-muted-foreground hover:border-foreground/20 hover:text-foreground"
-                      }`}
-                    >
-                      ${p}
-                    </button>
-                  ))}
-                </div>
-                <div className="mt-3 flex items-center gap-3">
-                  <button
-                    type="button"
-                    onClick={() => setUseCustom(true)}
-                    className={`text-xs font-medium transition-colors ${useCustom ? "text-primary" : "text-muted-foreground hover:text-foreground"}`}
-                  >
-                    Custom amount
-                  </button>
-                  {useCustom && (
-                    <Input
-                      type="number"
-                      min={1}
-                      value={custom}
-                      onChange={(e) => setCustom(e.target.value)}
-                      placeholder="Enter amount"
-                      className="w-32"
-                    />
-                  )}
-                </div>
-              </div>
-            </ScrollReveal>
-
-            {/* Card details (fake) */}
-            <ScrollReveal>
-              <div className="space-y-4">
-                <label className="mb-1 block text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                  Payment details
-                </label>
-                <Input
-                  value={card.number}
-                  onChange={(e) => setCard({ ...card, number: e.target.value })}
-                  placeholder="4242 4242 4242 4242"
-                  maxLength={19}
-                  required
-                />
-                <div className="grid grid-cols-2 gap-3">
-                  <Input
-                    value={card.expiry}
-                    onChange={(e) => setCard({ ...card, expiry: e.target.value })}
-                    placeholder="MM / YY"
-                    maxLength={7}
-                    required
-                  />
-                  <Input
-                    value={card.cvc}
-                    onChange={(e) => setCard({ ...card, cvc: e.target.value })}
-                    placeholder="CVC"
-                    maxLength={4}
-                    required
-                  />
-                </div>
-              </div>
-            </ScrollReveal>
-
-            {/* Summary */}
-            <ScrollReveal>
-              <div className="rounded-lg border border-border bg-card p-4">
-                <div className="flex items-center justify-between text-sm">
-                  <span className="text-muted-foreground">Credits</span>
-                  <span className="font-medium text-foreground">{finalAmount * 10} tokens</span>
-                </div>
-                <div className="mt-2 flex items-center justify-between text-sm">
-                  <span className="text-muted-foreground">Total</span>
-                  <span className="font-semibold text-foreground">${finalAmount.toFixed(2)}</span>
-                </div>
-              </div>
-
-              <Button type="submit" disabled={processing || finalAmount < 1} className="mt-4 w-full">
-                {processing ? "Processing…" : `Purchase $${finalAmount.toFixed(2)}`}
-              </Button>
-            </ScrollReveal>
-          </form>
+          <ScrollReveal>
+            <div className="mt-10 rounded-lg border border-border bg-card p-6 space-y-4">
+              <p className="text-sm text-foreground font-medium">
+                Credits &mdash; coming soon
+              </p>
+              <p className="text-sm text-muted-foreground leading-relaxed">
+                Automated credit purchasing is not yet available. To top up your
+                account, please contact us and we will add credits manually.
+              </p>
+              <Link
+                to="/contact"
+                className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+              >
+                <Mail size={14} />
+                Contact us for credits
+              </Link>
+            </div>
+          </ScrollReveal>
         </div>
       </section>
 

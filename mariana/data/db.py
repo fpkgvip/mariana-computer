@@ -23,17 +23,38 @@ from mariana.data.models import (
     Branch,
     BranchStatus,
     Checkpoint,
+    EvidenceType,
     Finding,
     Hypothesis,
+    HypothesisStatus,
     ResearchTask,
     SkepticResult,
     Source,
+    SourceType,
     State,
     TaskStatus,
     TribunalSession,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# BUG-007: Column allowlists at module level so they cannot be accidentally
+# shadow-overridden by local variables inside function bodies.
+# ---------------------------------------------------------------------------
+
+_ALLOWED_TASK_COLUMNS: frozenset[str] = frozenset({
+    "topic", "budget_usd", "status", "current_state", "total_spent_usd",
+    "diminishing_flags", "ai_call_counter", "started_at", "completed_at",
+    "error_message", "output_pdf_path", "output_docx_path", "metadata",
+})
+
+_ALLOWED_BRANCH_COLUMNS: frozenset[str] = frozenset({
+    "hypothesis_id", "task_id", "status", "score_history", "budget_allocated",
+    "budget_spent", "grants_log", "cycles_completed", "kill_reason",
+    "sources_searched", "updated_at",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -420,15 +441,11 @@ async def update_research_task(
         else:
             serialised[k] = v
 
-    # Column-name whitelist to prevent SQL injection
-    _ALLOWED_TASK_COLUMNS: frozenset[str] = frozenset({
-        "topic", "budget_usd", "status", "current_state", "total_spent_usd",
-        "diminishing_flags", "ai_call_counter", "started_at", "completed_at",
-        "error_message", "output_pdf_path", "output_docx_path", "metadata",
-    })
+    # BUG-007: Use module-level constant; add assertion as defence-in-depth
     unknown = set(serialised.keys()) - _ALLOWED_TASK_COLUMNS
     if unknown:
         raise ValueError(f"update_research_task: unknown column(s): {unknown!r}")
+    assert all(col in _ALLOWED_TASK_COLUMNS for col in serialised), "Allowlist bypass detected"
 
     set_clauses = ", ".join(f"{col} = ${i + 2}" for i, col in enumerate(serialised))
     values = list(serialised.values())
@@ -505,7 +522,7 @@ async def get_hypotheses_for_task(
     results: list[Hypothesis] = []
     for row in rows:
         data = _row_to_dict(row)
-        from mariana.data.models import HypothesisStatus
+        # BUG-045: HypothesisStatus now imported at module level
         data["status"] = HypothesisStatus(data["status"])
         results.append(Hypothesis.model_validate(data))
     return results
@@ -565,7 +582,7 @@ async def get_findings_for_hypothesis(
     results: list[Finding] = []
     for row in rows:
         data = _row_to_dict(row)
-        from mariana.data.models import EvidenceType
+        # BUG-045: EvidenceType now imported at module level
         data["evidence_type"] = EvidenceType(data["evidence_type"])
         results.append(Finding.model_validate(data))
     return results
@@ -638,17 +655,23 @@ async def insert_source(pool: asyncpg.Pool, source: Source) -> None:
 async def get_source_by_url_hash(
     pool: asyncpg.Pool,
     url_hash: str,
+    task_id: str,  # BUG-019: Required to avoid cross-task contamination
 ) -> Source | None:
-    """Retrieve a Source by its URL hash.  Returns *None* if not found."""
+    """Retrieve a Source by its URL hash within a specific task.
+
+    The UNIQUE constraint is on (task_id, url_hash), not url_hash alone,
+    so task_id must always be specified to avoid returning sources from
+    other tasks that happen to share the same URL.
+    """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM sources WHERE url_hash = $1",
+            "SELECT * FROM sources WHERE url_hash = $1 AND task_id = $2",
             url_hash,
+            task_id,
         )
     if row is None:
         return None
     data = _row_to_dict(row)
-    from mariana.data.models import SourceType
     data["source_type"] = SourceType(data["source_type"])
     return Source.model_validate(data)
 
@@ -776,15 +799,11 @@ async def update_branch(
         else:
             serialised[k] = v
 
-    # Column-name whitelist to prevent SQL injection
-    _ALLOWED_BRANCH_COLUMNS: frozenset[str] = frozenset({
-        "hypothesis_id", "task_id", "status", "score_history", "budget_allocated",
-        "budget_spent", "grants_log", "cycles_completed", "kill_reason",
-        "sources_searched", "updated_at",
-    })
+    # BUG-007: Use module-level constant; add assertion as defence-in-depth
     unknown = set(serialised.keys()) - _ALLOWED_BRANCH_COLUMNS
     if unknown:
         raise ValueError(f"update_branch: unknown column(s): {unknown!r}")
+    assert all(col in _ALLOWED_BRANCH_COLUMNS for col in serialised), "Allowlist bypass detected"
 
     set_clauses = ", ".join(f"{col} = ${i + 2}" for i, col in enumerate(serialised))
     values = list(serialised.values())

@@ -364,30 +364,34 @@ async def _call_gateway(
     }
     body = _build_request_body(messages, model_config, max_tokens)
 
+    # BUG-006 fix: keep all response inspection INSIDE the async-with block so
+    # the connection is still live if future refactors need to stream the body.
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
         response = await client.post(url, json=body, headers=headers)
 
-    if response.status_code in _RETRYABLE_STATUS_CODES:
-        raise ModelCallError(
-            f"LLM Gateway transient error: HTTP {response.status_code}",
-            status_code=response.status_code,
-            response_body=response.text,
-        )
-    if response.status_code >= 400:
-        raise ModelCallError(
-            f"LLM Gateway non-retryable error: HTTP {response.status_code}",
-            status_code=response.status_code,
-            response_body=response.text,
-        )
+        if response.status_code in _RETRYABLE_STATUS_CODES:
+            raise ModelCallError(
+                f"LLM Gateway transient error: HTTP {response.status_code}",
+                status_code=response.status_code,
+                response_body=response.text,
+            )
+        if response.status_code >= 400:
+            raise ModelCallError(
+                f"LLM Gateway non-retryable error: HTTP {response.status_code}",
+                status_code=response.status_code,
+                response_body=response.text,
+            )
 
-    try:
-        return response.json()
-    except Exception as exc:
-        raise ModelCallError(
-            f"LLM Gateway returned non-JSON response: {exc}",
-            status_code=response.status_code,
-            response_body=response.text[:500],
-        ) from exc
+        # BUG-007 fix: catch only json.JSONDecodeError (a ValueError subclass),
+        # not bare Exception which would swallow programming errors.
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise ModelCallError(
+                f"LLM Gateway returned non-JSON response: {exc}",
+                status_code=response.status_code,
+                response_body=response.text[:500],
+            ) from exc
 
 
 async def _call_gateway_with_retry(
@@ -593,7 +597,7 @@ async def spawn_model(
     task_type: TaskType,
     context: dict[str, Any],
     output_schema: type[BaseModel],
-    max_tokens: int = 4096,
+    max_tokens: int | None = None,  # BUG-005 fix: None sentinel replaces fragile 4096 magic value
     use_batch: bool = False,
     branch_id: str | None = None,
     db: Any = None,  # asyncpg.Pool
@@ -613,8 +617,9 @@ async def spawn_model(
             see ``prompt_builder`` module documentation.
         output_schema: Pydantic ``BaseModel`` subclass.  The model's response
             will be validated against this schema.
-        max_tokens: Override the default output token limit.  The routing
-            table default is used if this matches the schema default (4096).
+        max_tokens: Override the default output token limit.  Pass None (default)
+            to use the routing table default.  Any explicit integer is honoured
+            (capped at 2× the routing table value).
         use_batch: Ignored in this implementation (batch path not yet wired).
             Kept for API compatibility.
         branch_id: Optional branch identifier for per-branch cost accounting.
@@ -648,14 +653,12 @@ async def spawn_model(
     # ── Step 1: model routing ─────────────────────────────────────────────────
     model_cfg: ModelConfig = await get_model_config(task_type, config)
 
-    # Caller can override max_tokens; but routing table defaults take priority
-    # only if the caller passed the function's own default.  We resolve here
-    # by taking the maximum of what the routing table says and what the caller
-    # requested (with the caller's value capped at the routing table value if
-    # the caller passed the generic default of 4096).
+    # BUG-005 fix: use None as sentinel instead of the magic value 4096.
+    # A caller that genuinely wants 4096 tokens for a task whose routing table
+    # default is 2048 would previously have their override silently discarded.
     effective_max_tokens = (
         model_cfg.max_tokens
-        if max_tokens == 4096
+        if max_tokens is None
         else min(max_tokens, model_cfg.max_tokens * 2)  # allow double, but cap
     )
 

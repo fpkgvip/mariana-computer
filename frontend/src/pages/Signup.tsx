@@ -3,23 +3,39 @@ import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { toast } from "sonner";
 
 export default function Signup() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const { signup } = useAuth();
+  const { signup, user } = useAuth();
   const navigate = useNavigate();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    // BUG-022: Client-side password length validation
+    if (password.length < 8) {
+      toast.error("Password too short", {
+        description: "Password must be at least 8 characters.",
+      });
+      return;
+    }
+
     setIsLoading(true);
     try {
       await signup(email, name, password);
-      // If email confirmation is required, Supabase shows a toast and we stay
-      // on this page. If confirmation is disabled, navigate to chat directly.
-      navigate("/chat");
+      // BUG-012: Only navigate to /chat if a session was established.
+      // If email confirmation is required, AuthContext shows a "Check your email"
+      // toast and returns without setting user — we stay on this page.
+      // We read user from context post-signup to check session state.
+      if (user) {
+        navigate("/chat");
+      }
+      // If user is null, email confirmation is required — the toast from
+      // AuthContext.signup() is sufficient feedback.
     } catch {
       // Error toast already shown by AuthContext.signup()
     } finally {

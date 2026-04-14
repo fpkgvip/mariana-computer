@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -318,6 +319,10 @@ budget. Prioritise correctness of structure over completeness of content.
 # Maps task_type.value.lower() → file content (or empty string if not found)
 _TASK_FRAMEWORK_CACHE: dict[str, str] = {}
 _FRAMEWORK_CACHE_LOADED: bool = False
+# BUG-010 fix: protect cache initialisation with a threading.Lock so concurrent
+# calls from multiple threads (e.g. via run_in_executor) don't trigger multiple
+# simultaneous file reads and non-atomic writes to _FRAMEWORK_CACHE_LOADED.
+_FRAMEWORK_CACHE_LOCK: threading.Lock = threading.Lock()
 
 
 def _load_task_frameworks() -> None:
@@ -349,8 +354,11 @@ def _load_task_frameworks() -> None:
 
 def _get_task_framework(task_type: TaskType) -> str:
     """Return the cached task-specific framework text for *task_type*."""
+    # BUG-010 fix: double-checked locking pattern for thread-safe lazy init.
     if not _FRAMEWORK_CACHE_LOADED:
-        _load_task_frameworks()
+        with _FRAMEWORK_CACHE_LOCK:
+            if not _FRAMEWORK_CACHE_LOADED:  # re-check under the lock
+                _load_task_frameworks()
     return _TASK_FRAMEWORK_CACHE.get(task_type.value.lower(), "")
 
 
@@ -751,8 +759,12 @@ def build_messages(
     )
 
     if use_cache_control:
-        # Anthropic multi-block content format with explicit cache_control.
-        content_blocks: list[dict[str, Any]] = [
+        # BUG-009 fix: Claude via an OpenAI-compatible gateway expects a separate
+        # system message (role="system") for the static identity/mission content,
+        # not everything bundled into a single "user" message.  The system blocks
+        # carry cache_control markers so the gateway can pass them to Anthropic's
+        # prompt-caching layer.  The dynamic context goes in the "user" message.
+        system_blocks: list[dict[str, Any]] = [
             {
                 "type": "text",
                 "text": block1_text,
@@ -760,21 +772,17 @@ def build_messages(
             },
         ]
         if block2_text:
-            content_blocks.append(
+            system_blocks.append(
                 {
                     "type": "text",
                     "text": block2_text,
                     "cache_control": {"type": "ephemeral"},
                 }
             )
-        content_blocks.append(
-            {
-                "type": "text",
-                "text": block3_text,
-                # No cache_control — dynamic block must not be cached.
-            }
-        )
-        return [{"role": "user", "content": content_blocks}]
+        return [
+            {"role": "system", "content": system_blocks},
+            {"role": "user", "content": block3_text},
+        ]
 
     else:
         # Standard OpenAI / DeepSeek format: system + user messages.

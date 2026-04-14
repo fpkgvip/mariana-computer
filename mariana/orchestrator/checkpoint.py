@@ -18,12 +18,13 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import structlog
 
+from mariana.data.db import _row_to_dict
 from mariana.data.models import (
     Branch,
     Checkpoint,
@@ -115,7 +116,7 @@ async def save_checkpoint(
         The UUID of the newly created checkpoint.
     """
     checkpoint_id = str(uuid.uuid4())
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)  # BUG-001
     timestamp_str = now.strftime("%Y%m%dT%H%M%S")
 
     # ------------------------------------------------------------------ #
@@ -211,9 +212,10 @@ async def save_checkpoint(
             checkpoint.task_id,
             checkpoint.timestamp,
             checkpoint.state_machine_state.value,
-            checkpoint.active_branch_ids,
-            checkpoint.killed_branch_ids,
-            checkpoint.compressed_findings,
+            # BUG-008: json.dumps() required for JSONB columns in asyncpg
+            json.dumps(checkpoint.active_branch_ids),
+            json.dumps(checkpoint.killed_branch_ids),
+            json.dumps(checkpoint.compressed_findings),
             checkpoint.budget_remaining,
             checkpoint.total_spent,
             checkpoint.diminishing_flags,
@@ -238,6 +240,21 @@ async def save_checkpoint(
             final_path=str(snapshot_path),
             error=str(exc),
         )
+        # BUG-038: Clean up orphaned temp file and clear invalid snapshot_path
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            import asyncio  # noqa: PLC0415
+            asyncio.get_event_loop().run_until_complete(
+                db.execute(
+                    "UPDATE checkpoints SET snapshot_path = NULL WHERE id = $1",
+                    checkpoint_id,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
         raise
 
     logger.info(
@@ -304,7 +321,14 @@ async def load_latest_checkpoint(
         logger.info("no_checkpoint_found", task_id=task_id)
         return None
 
-    checkpoint = Checkpoint.model_validate(dict(row))
+    # BUG-022: Decode JSONB columns and convert enum before model_validate
+    data = _row_to_dict(row)
+    # Decode JSONB list fields if they came back as strings
+    for _col in ("active_branch_ids", "killed_branch_ids", "compressed_findings"):
+        if isinstance(data.get(_col), str):
+            data[_col] = json.loads(data[_col])
+    data["state_machine_state"] = State(data["state_machine_state"])
+    checkpoint = Checkpoint.model_validate(data)
 
     # Warn if the snapshot file is missing (DB record exists but disk file
     # was deleted — e.g. container volume was remounted).

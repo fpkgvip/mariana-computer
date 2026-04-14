@@ -157,7 +157,16 @@ class _HealthState:
 
     healthy: bool = True
     last_checked_at: float = 0.0  # epoch seconds
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, compare=False, repr=False)
+    # BUG-001 fix: do NOT create asyncio.Lock at dataclass/module-import time.
+    # A Lock created before an event loop is running can bind to the wrong loop.
+    # Use lazy initialisation via get_lock() instead.
+    _lock: asyncio.Lock | None = field(default=None, compare=False, repr=False)
+
+    def get_lock(self) -> asyncio.Lock:
+        """Return the asyncio.Lock, creating it lazily inside the running loop."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
 
 class DeepSeekHealthCache:
@@ -187,7 +196,7 @@ class DeepSeekHealthCache:
         Performs a minimal single-token ping no more than once every 5 minutes.
         The lock prevents duplicate concurrent pings.
         """
-        async with self._state._lock:
+        async with self._state.get_lock():
             now = time.monotonic()
             age = now - self._state.last_checked_at
 
@@ -223,19 +232,21 @@ class DeepSeekHealthCache:
             "Content-Type": "application/json",
         }
         try:
+            # BUG-002 fix: check response.status_code INSIDE the async-with block
+            # so any future streaming/body access is still valid.
             async with httpx.AsyncClient(timeout=self._PING_TIMEOUT_SECONDS) as client:
                 response = await client.post(
                     self._PING_URL,
                     json=payload,
                     headers=headers,
                 )
-            if 200 <= response.status_code < 300:
-                return True
-            logger.warning(
-                "DeepSeek health ping returned HTTP %s (not 2xx — treating as unhealthy)",
-                response.status_code,
-            )
-            return False
+                if 200 <= response.status_code < 300:
+                    return True
+                logger.warning(
+                    "DeepSeek health ping returned HTTP %s (not 2xx — treating as unhealthy)",
+                    response.status_code,
+                )
+                return False
         except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
             logger.warning("DeepSeek health ping failed: %s", exc)
             return False
@@ -268,7 +279,9 @@ async def get_model_config(
         A frozen :class:`ModelConfig` ready for use by ``session.spawn_model()``.
     """
     # ── Step 1: check runtime override ────────────────────────────────────────
-    override_attr = f"MODEL_OVERRIDE_{task_type.value}"
+    # BUG-003 fix: use .upper() so the attr name matches conventional uppercase
+    # env-var naming (e.g. MODEL_OVERRIDE_EVIDENCE_EXTRACTION, not _evidence_extraction).
+    override_attr = f"MODEL_OVERRIDE_{task_type.value.upper()}"
     override_value: str | None = getattr(config, override_attr, None)
 
     if override_value:

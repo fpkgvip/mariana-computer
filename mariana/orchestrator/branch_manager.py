@@ -17,11 +17,12 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from mariana.data.db import _row_to_dict
 from mariana.data.models import Branch, BranchStatus
 
 if TYPE_CHECKING:
@@ -34,14 +35,14 @@ logger = structlog.get_logger(__name__)
 # Budget / scoring constants  (mirrors AppConfig defaults)
 # ---------------------------------------------------------------------------
 
-SCORE_KILL_THRESHOLD: float = 4.0
-"""Branches with a score strictly below this are killed immediately."""
+SCORE_KILL_THRESHOLD: float = 0.4
+"""Branches with a score strictly below this are killed immediately (0–1 scale)."""
 
-SCORE_DEEPEN_THRESHOLD: float = 7.0
-"""Branches at or above this score qualify for the first budget grant."""
+SCORE_DEEPEN_THRESHOLD: float = 0.7
+"""Branches at or above this score qualify for the first budget grant (0–1 scale)."""
 
-SCORE_TRIBUNAL_THRESHOLD: float = 8.0
-"""Branches at or above this score qualify for the larger $50 grant."""
+SCORE_TRIBUNAL_THRESHOLD: float = 0.8
+"""Branches at or above this score qualify for the larger $50 grant (0–1 scale)."""
 
 BUDGET_INITIAL: float = 5.00
 """Starting budget allocated to every new branch (USD)."""
@@ -56,9 +57,10 @@ first grant has already been issued."""
 BUDGET_HARD_CAP: float = 75.00
 """Absolute per-branch ceiling in USD; enforced by CostTracker."""
 
-_PLATEAU_DELTA_THRESHOLD: float = 1.0
+# BUG-010: On 0–1 scale, plateau delta of 0.1 (10% change) is appropriate
+_PLATEAU_DELTA_THRESHOLD: float = 0.1
 """Score improvement below this value across the last two cycles is
-considered a plateau (when in the 4–6 score band)."""
+considered a plateau (when in the mid-score band, 0–1 scale)."""
 
 _PLATEAU_MIN_CYCLES: int = 2
 """Minimum number of completed cycles before a plateau check fires."""
@@ -225,7 +227,8 @@ async def score_branch(
     if row is None:
         raise ValueError(f"Branch {branch_id!r} not found in database")
 
-    branch = Branch.model_validate(dict(row))
+    # BUG-011: Use _row_to_dict() to decode JSONB columns before model_validate
+    branch = Branch.model_validate({**_row_to_dict(row), "status": BranchStatus(row["status"])})
 
     # ------------------------------------------------------------------ #
     # Step 1: Record new score and update spend
@@ -233,7 +236,7 @@ async def score_branch(
     branch.score_history.append(new_score)
     branch.budget_spent += cost_spent_this_cycle
     branch.cycles_completed += 1
-    branch.updated_at = datetime.utcnow()
+    branch.updated_at = datetime.now(timezone.utc)  # BUG-001
 
     # Sync the per-branch ledger in the live cost tracker
     cost_tracker.record_branch_spend(branch_id, cost_spent_this_cycle)
@@ -382,7 +385,7 @@ async def kill_branch(
     db:
         asyncpg connection pool.
     """
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)  # BUG-001
     await db.execute(
         """
         UPDATE branches
@@ -426,7 +429,7 @@ async def grant_budget(
     if amount <= 0:
         raise ValueError(f"Grant amount must be positive, got {amount!r}")
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)  # BUG-001/056: timezone-aware datetime
     grant_record = {"reason": "score_grant", "amount": amount, "timestamp": now.isoformat()}
 
     # Fetch current grants_log and budget_allocated
@@ -503,7 +506,11 @@ async def get_active_branches(
         task_id,
         BranchStatus.ACTIVE.value,
     )
-    return [Branch.model_validate(dict(row)) for row in rows]
+    # BUG-011: Use _row_to_dict() to decode JSONB columns before model_validate
+    return [
+        Branch.model_validate({**_row_to_dict(row), "status": BranchStatus(row["status"])})
+        for row in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

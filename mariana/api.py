@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -41,7 +42,8 @@ from typing import Any, AsyncIterator
 
 import asyncpg
 import structlog
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -95,6 +97,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:  # noqa: BLE001
         log.error("db_pool_failed", error=str(exc))
         _db_pool = None
+        # BUG-054: Clarify degraded mode for operators
+        log.info("api_running_degraded_mode", missing="database",
+                 message="API started without database; most endpoints will return 503")
 
     # ── Redis ───────────────────────────────────────────────────────────────
     try:
@@ -141,13 +146,26 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# BUG-027: CORS origins read from config so the hardcoded Vercel URL can be
+# updated via environment variable without a code change.
+_DEFAULT_CORS_ORIGINS = [
+    "https://frontend-tau-navy-80.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+
+def _get_cors_origins() -> list[str]:
+    """Return CORS allowed origins from config, falling back to defaults."""
+    if _config is not None and hasattr(_config, "CORS_ALLOWED_ORIGINS"):
+        return _config.CORS_ALLOWED_ORIGINS
+    extra = os.environ.get("CORS_ALLOWED_ORIGINS", "")
+    if extra:
+        return [o.strip() for o in extra.split(",") if o.strip()]
+    return _DEFAULT_CORS_ORIGINS
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://frontend-tau-navy-80.vercel.app",
-        "http://localhost:5173",
-        "http://localhost:3000",
-    ],
+    allow_origins=_get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -513,23 +531,18 @@ async def kill_investigation(task_id: str) -> KillTaskResponse:
     """
     db = _get_db()
 
-    row = await db.fetchrow(
-        "SELECT id, status FROM research_tasks WHERE id = $1",
+    # BUG-021: Atomic conditional UPDATE to avoid race condition
+    result = await db.execute(
+        "UPDATE research_tasks SET status = 'HALTED', completed_at = NOW() "
+        "WHERE id = $1 AND status IN ('RUNNING', 'PENDING')",
         task_id,
     )
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
-
-    if row["status"] not in ("RUNNING", "PENDING"):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Task is already in terminal state: {row['status']}",
-        )
-
-    await db.execute(
-        "UPDATE research_tasks SET status = 'HALTED', completed_at = NOW() WHERE id = $1",
-        task_id,
-    )
+    rows_affected = int(result.split()[-1])
+    if rows_affected == 0:
+        exists = await db.fetchval("SELECT 1 FROM research_tasks WHERE id = $1", task_id)
+        if not exists:
+            raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        raise HTTPException(status_code=409, detail="Task is already in terminal state")
 
     if _redis is not None:
         try:
@@ -725,9 +738,12 @@ async def stream_logs(request: Request, task_id: str) -> EventSourceResponse:
                     if message is not None:
                         yield {"data": message.get("data", ""), "event": "log"}
                     else:
+                        # BUG-006: Use _db_pool directly to avoid HTTPException inside generator
+                        if _db_pool is None:
+                            yield {"data": json.dumps({"error": "database_unavailable"}), "event": "error"}
+                            break
                         # Periodically check if the task has reached a terminal state.
-                        db = _get_db()
-                        status_row = await db.fetchrow(
+                        status_row = await _db_pool.fetchrow(
                             "SELECT status FROM research_tasks WHERE id = $1",
                             task_id,
                         )
@@ -746,7 +762,11 @@ async def stream_logs(request: Request, task_id: str) -> EventSourceResponse:
                 await pubsub.aclose()
         else:
             # ── DB fallback: poll task status changes ───────────────────
-            db = _get_db()
+            # BUG-006: Use _db_pool directly to avoid HTTPException inside generator
+            if _db_pool is None:
+                yield {"data": json.dumps({"error": "database_unavailable"}), "event": "error"}
+                return
+            db = _db_pool
             last_state: str | None = None
             while True:
                 if await request.is_disconnected():
@@ -976,13 +996,21 @@ async def list_connectors() -> list[ConnectorStatus]:
     tags=["Admin"],
     summary="Gracefully shut down the API server",
 )
-async def graceful_shutdown() -> ShutdownResponse:
+async def graceful_shutdown(
+    x_admin_key: str | None = Header(None),
+) -> ShutdownResponse:
     """
     Initiate a graceful server shutdown.
 
     Marks all RUNNING tasks as HALTED in the DB and schedules process
-    termination via ``asyncio``.  Use with care in production.
+    termination via ``asyncio``.  Requires X-Admin-Key header matching
+    ADMIN_SECRET_KEY config value.  Use with care in production.
     """
+    # BUG-009: Require admin key to prevent unauthenticated shutdown
+    cfg = _get_config()
+    admin_key = getattr(cfg, "ADMIN_SECRET_KEY", "")
+    if admin_key and x_admin_key != admin_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
     db: asyncpg.Pool | None = _db_pool
     if db is not None:
         try:
@@ -999,11 +1027,13 @@ async def graceful_shutdown() -> ShutdownResponse:
 
 
 def _exit_process() -> None:
-    """Force-exit the process. Called from the event loop after shutdown."""
-    import sys  # noqa: PLC0415
+    """Force-exit the process. Called from the event loop after shutdown.
 
+    Uses os._exit to avoid SystemExit propagation through asyncio tasks
+    (BUG-044). sys is imported at module level (BUG-060).
+    """
     logger.info("api_process_exit")
-    sys.exit(0)
+    os._exit(0)  # noqa: SLF001
 
 
 # ---------------------------------------------------------------------------
@@ -1013,6 +1043,9 @@ def _exit_process() -> None:
 
 # ---------------------------------------------------------------------------
 # SQL injection protection — column-name allowlists
+# BUG-039: These API-layer allowlists overlap with _ALLOWED_TASK_COLUMNS and
+# _ALLOWED_BRANCH_COLUMNS in data/db.py. The canonical source of truth is db.py;
+# these API-layer sets are kept for the api.py update paths specifically.
 # ---------------------------------------------------------------------------
 
 #: Columns that may legally appear in UPDATE research_tasks SET ... queries.
@@ -1068,10 +1101,14 @@ def _ensure_task_exists(row: asyncpg.Record | None, task_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@app.exception_handler(422)
-async def validation_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+# BUG-037: Register on RequestValidationError (not integer 422) and return
+# structured field-level errors via exc.errors() instead of str(exc).
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
     """Return a structured JSON body for Pydantic validation errors."""
     return JSONResponse(
         status_code=422,
-        content={"detail": str(exc), "type": "validation_error"},
+        content={"detail": exc.errors(), "type": "validation_error"},
     )

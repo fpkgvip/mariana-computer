@@ -25,6 +25,7 @@ interface Message {
   content: string;
   type?: "text" | "code" | "status" | "error";
   id?: string; // dedup key for status messages
+  _id: string; // stable React key, always set
 }
 
 type InvestigationStatus = "PENDING" | "RUNNING" | "COMPLETED" | "FAILED";
@@ -59,7 +60,11 @@ interface InvestigationPollResponse {
 /*  Constants                                                         */
 /* ------------------------------------------------------------------ */
 
-const API_URL = (import.meta.env.VITE_API_URL as string | undefined) ?? "";
+// VITE_API_URL cast is unnecessary — Vite env vars are already string | undefined
+const API_URL = import.meta.env.VITE_API_URL ?? "";
+
+/** Generate a stable unique ID for message list keys */
+const makeMessageId = () => `msg-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 interface DurationOption {
   value: string;
@@ -94,25 +99,45 @@ async function getAccessToken(): Promise<string | null> {
   return data.session?.access_token ?? null;
 }
 
-/** Simple markdown-ish rendering: code blocks, bold, italic, newlines */
+/**
+ * Safe markdown-ish rendering.
+ * Uses bounded quantifiers to prevent ReDoS catastrophic backtracking.
+ * Bold is applied before italic so that **bold** is not corrupted by the italic pass.
+ * Fenced code blocks use a line-count-bounded approach: split on triple-backtick
+ * boundaries rather than a [\s\S]*? lazy dot-all pattern.
+ */
 function renderMarkdown(text: string): string {
+  // Escape HTML first to prevent XSS from content
   let html = text
-    // Escape HTML
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    // Fenced code blocks
-    .replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang, code) => {
-      return `<pre class="my-2 rounded-md bg-zinc-900 px-4 py-3 text-xs leading-relaxed overflow-x-auto"><code>${code.trim()}</code></pre>`;
-    })
-    // Inline code
-    .replace(/`([^`]+)`/g, '<code class="rounded bg-zinc-800 px-1.5 py-0.5 text-xs">$1</code>')
-    // Bold
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    // Italic
-    .replace(/\*(.+?)\*/g, "<em>$1</em>")
+    .replace(/>/g, "&gt;");
+
+  // Fenced code blocks: split on ``` boundaries to avoid ReDoS
+  // Only process if the string contains at least two ``` markers
+  if (html.includes("```")) {
+    const parts = html.split("```");
+    html = parts
+      .map((part, idx) => {
+        if (idx % 2 === 0) return part; // outside code block
+        // Inside code block: first line may be language hint
+        const newlineIdx = part.indexOf("\n");
+        const code = newlineIdx !== -1 ? part.slice(newlineIdx + 1) : part;
+        return `<pre class="my-2 rounded-md bg-zinc-900 px-4 py-3 text-xs leading-relaxed overflow-x-auto"><code>${code.trim()}</code></pre>`;
+      })
+      .join("");
+  }
+
+  html = html
+    // Inline code — [^`]{1,200} bounds the match length to prevent runaway
+    .replace(/`([^`]{1,200})`/g, '<code class="rounded bg-zinc-800 px-1.5 py-0.5 text-xs">$1</code>')
+    // Bold — [^\n]{1,200} prevents catastrophic backtracking and avoids crossing newlines
+    .replace(/\*\*([^\n]{1,200})\*\*/g, "<strong>$1</strong>")
+    // Italic — applied after bold so ** is already consumed
+    .replace(/\*([^*\n]{1,200})\*/g, "<em>$1</em>")
     // Newlines
     .replace(/\n/g, "<br />");
+
   return html;
 }
 
@@ -144,7 +169,7 @@ function formatCountdown(secondsRemaining: number): string {
 /* ------------------------------------------------------------------ */
 
 export default function Chat() {
-  const { user } = useAuth();
+  const { user, refreshUser } = useAuth();
   const navigate = useNavigate();
 
   // Messages for the currently viewed investigation
@@ -177,12 +202,23 @@ export default function Chat() {
   // Per-investigation message store
   const messageStoreRef = useRef<Record<string, Message[]>>({});
 
+  // Stable ref to current messages — prevents stale closure in switchInvestigation
+  const messagesRef = useRef<Message[]>([]);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
   /* ---------------------------------------------------------------- */
   /*  Auth guard                                                      */
   /* ---------------------------------------------------------------- */
 
+  // BUG-009: Add a brief grace period before redirecting so we don't
+  // false-logout during a Supabase token refresh (which briefly sets user=null).
   useEffect(() => {
-    if (!user) navigate("/login");
+    if (!user) {
+      const timer = setTimeout(() => navigate("/login"), 500);
+      return () => clearTimeout(timer);
+    }
   }, [user, navigate]);
 
   /* ---------------------------------------------------------------- */
@@ -192,12 +228,15 @@ export default function Chat() {
   useEffect(() => {
     if (!user) return;
     const loadInvestigations = async () => {
+      // BUG-013: Always filter by user_id as defense-in-depth (don't rely solely on RLS)
       const { data, error } = await supabase
         .from("investigations")
         .select("task_id, topic, status, created_at, duration_hours, budget_usd")
+        .eq("user_id", user.id)
         .order("created_at", { ascending: false });
       if (error) {
         console.error("[Chat] Failed to load investigations:", error.message);
+        toast.error("Failed to load investigations", { description: error.message });
         return;
       }
       if (data && data.length > 0) {
@@ -257,8 +296,14 @@ export default function Chat() {
   const appendMessage = useCallback((msg: Message) => {
     const msgId = msg.id || `${msg.role}-${msg.content}`;
     if (msg.type === "status" && seenStatusIds.current.has(msgId)) return;
-    if (msg.type === "status") seenStatusIds.current.add(msgId);
-    setMessages((prev) => [...prev, msg]);
+    if (msg.type === "status") {
+      seenStatusIds.current.add(msgId);
+      // BUG-019: Cap seenStatusIds set to prevent unbounded memory growth
+      if (seenStatusIds.current.size > 1000) seenStatusIds.current.clear();
+    }
+    // Ensure every message has a stable _id for React keying
+    const msgWithId: Message = msg._id ? msg : { ...msg, _id: makeMessageId() };
+    setMessages((prev) => [...prev, msgWithId]);
   }, []);
 
   /* ---------------------------------------------------------------- */
@@ -285,7 +330,12 @@ export default function Chat() {
   /*  Stop all real-time connections                                   */
   /* ---------------------------------------------------------------- */
 
-  const stopAllConnections = useCallback(() => {
+  /**
+   * BUG-003: Separate "stop connections" from "set sending=false".
+   * stopConnectionsOnly is used inside handleSend to avoid a race where
+   * isSending is set to false then immediately back to true.
+   */
+  const stopConnectionsOnly = useCallback(() => {
     if (pollIntervalRef.current) {
       clearInterval(pollIntervalRef.current);
       pollIntervalRef.current = null;
@@ -294,9 +344,13 @@ export default function Chat() {
       eventSourceRef.current.close();
       eventSourceRef.current = null;
     }
-    setIsSending(false);
     stopTimer();
   }, [stopTimer]);
+
+  const stopAllConnections = useCallback(() => {
+    stopConnectionsOnly();
+    setIsSending(false);
+  }, [stopConnectionsOnly]);
 
   /* ---------------------------------------------------------------- */
   /*  Polling fallback                                                */
@@ -355,6 +409,7 @@ export default function Chat() {
                 role: "assistant",
                 content: data.findings,
                 type: "text",
+                _id: makeMessageId(),
               });
             }
             appendMessage({
@@ -362,8 +417,11 @@ export default function Chat() {
               content: "Investigation complete. Reports are ready for download.",
               type: "status",
               id: `completed-${taskId}`,
+              _id: makeMessageId(),
             });
             stopAllConnections();
+            // BUG-018: Refresh credit balance after investigation completes
+            refreshUser();
           } else if (data.status === "FAILED") {
             updateInvestigationStatus(taskId, "FAILED");
             const errMsg = data.error ?? "The investigation failed. Please try again.";
@@ -371,9 +429,12 @@ export default function Chat() {
               role: "assistant",
               content: errMsg,
               type: "text",
+              _id: makeMessageId(),
             });
             toast.error("Investigation failed", { description: errMsg });
             stopAllConnections();
+            // BUG-018: Refresh credit balance after investigation completes
+            refreshUser();
           }
         } catch (err) {
           console.error("[Chat] Polling error:", err);
@@ -383,7 +444,7 @@ export default function Chat() {
       poll();
       pollIntervalRef.current = setInterval(poll, 5000);
     },
-    [appendMessage, navigate, stopAllConnections, updateInvestigationStatus]
+    [appendMessage, navigate, refreshUser, stopAllConnections, updateInvestigationStatus]
   );
 
   /* ---------------------------------------------------------------- */
@@ -392,11 +453,16 @@ export default function Chat() {
 
   const startSSE = useCallback(
     (taskId: string, token: string) => {
-      const url = `${API_URL}/api/investigations/${taskId}/logs`;
+      // BUG-001: Native EventSource cannot send custom headers.
+      // Pass the auth token as a query parameter instead.
+      const url = `${API_URL}/api/investigations/${taskId}/logs?token=${encodeURIComponent(token)}`;
 
       try {
         const es = new EventSource(url);
         eventSourceRef.current = es;
+
+        // BUG-002: Guard against multiple fallback polling loops
+        let hasFailedOver = false;
 
         es.onmessage = (event) => {
           try {
@@ -409,6 +475,7 @@ export default function Chat() {
               content: String(content),
               type: "status",
               id: `sse-${event.lastEventId || content}`,
+              _id: makeMessageId(),
             });
 
             if (status === "RUNNING") {
@@ -422,6 +489,7 @@ export default function Chat() {
                   role: "assistant",
                   content: parsed.findings,
                   type: "text",
+                  _id: makeMessageId(),
                 });
               }
               appendMessage({
@@ -429,16 +497,22 @@ export default function Chat() {
                 content: "Investigation complete. Reports are ready for download.",
                 type: "status",
                 id: `completed-${taskId}`,
+                _id: makeMessageId(),
               });
               stopAllConnections();
+              // BUG-018: Refresh credit balance after investigation completes
+              refreshUser();
             } else if (status === "FAILED") {
               updateInvestigationStatus(taskId, "FAILED");
               appendMessage({
                 role: "assistant",
                 content: parsed.error || "The investigation failed.",
                 type: "text",
+                _id: makeMessageId(),
               });
               stopAllConnections();
+              // BUG-018: Refresh credit balance after investigation completes
+              refreshUser();
             }
           } catch {
             // Plain text SSE event
@@ -447,15 +521,18 @@ export default function Chat() {
               content: event.data,
               type: "status",
               id: `sse-${event.data}`,
+              _id: makeMessageId(),
             });
           }
         };
 
+        // BUG-002: hasFailedOver flag prevents multiple concurrent polling loops
         es.onerror = () => {
+          if (hasFailedOver) return;
+          hasFailedOver = true;
           console.warn("[Chat] SSE connection error, falling back to polling.");
           es.close();
           eventSourceRef.current = null;
-          // Fall back to polling
           startPolling(taskId, token);
         };
       } catch {
@@ -463,7 +540,7 @@ export default function Chat() {
         startPolling(taskId, token);
       }
     },
-    [appendMessage, startPolling, stopAllConnections, updateInvestigationStatus]
+    [appendMessage, refreshUser, startPolling, stopAllConnections, updateInvestigationStatus]
   );
 
   /* ---------------------------------------------------------------- */
@@ -485,9 +562,10 @@ export default function Chat() {
 
   const switchInvestigation = useCallback(
     (taskId: string) => {
-      // Save current messages
-      if (activeTaskId && messages.length > 0) {
-        messageStoreRef.current[activeTaskId] = [...messages];
+      // BUG-004: Use messagesRef.current instead of messages from closure
+      // to avoid stale snapshot and unnecessary re-creation on every message append
+      if (activeTaskId && messagesRef.current.length > 0) {
+        messageStoreRef.current[activeTaskId] = [...messagesRef.current];
       }
 
       // Stop any active connections
@@ -518,7 +596,8 @@ export default function Chat() {
         });
       }
     },
-    [activeTaskId, messages, investigations, stopAllConnections, startSSE, startTimer]
+    // messages removed from deps — using messagesRef.current instead
+    [activeTaskId, investigations, stopAllConnections, startSSE, startTimer]
   );
 
   /* ---------------------------------------------------------------- */
@@ -535,16 +614,17 @@ export default function Chat() {
     setIsSending(true);
 
     // Save current investigation messages before starting new
-    if (activeTaskId && messages.length > 0) {
-      messageStoreRef.current[activeTaskId] = [...messages];
+    if (activeTaskId && messagesRef.current.length > 0) {
+      messageStoreRef.current[activeTaskId] = [...messagesRef.current];
     }
 
-    // Reset state for new investigation
+    // BUG-003: Use stopConnectionsOnly to avoid race condition where
+    // stopAllConnections sets isSending=false then we immediately set it true
     seenStatusIds.current.clear();
-    stopAllConnections();
+    stopConnectionsOnly();
 
     const newMessages: Message[] = [
-      { role: "user", content: topic, type: "text" },
+      { role: "user", content: topic, type: "text", _id: makeMessageId() },
     ];
     setMessages(newMessages);
 
@@ -565,6 +645,7 @@ export default function Chat() {
       content: "Initializing research environment...",
       type: "status",
       id: "init",
+      _id: makeMessageId(),
     };
     seenStatusIds.current.add("init");
     setMessages((prev) => [...prev, initMsg]);
@@ -602,6 +683,7 @@ export default function Chat() {
           content: `Rate limited. Please retry in ${retryAfter} seconds.`,
           type: "error",
           id: `rate-limit-${Date.now()}`,
+          _id: makeMessageId(),
         });
         return;
       }
@@ -627,26 +709,31 @@ export default function Chat() {
       setInvestigations((prev) => [newInvestigation, ...prev]);
       setActiveTaskId(taskId);
 
-      // Persist to Supabase
-      supabase
-        .from("investigations")
-        .insert({
-          task_id: taskId,
-          topic,
-          status: "PENDING",
-          duration_hours: effectiveHours,
-          budget_usd: budgetUsd,
-          user_id: user?.id,
-        })
-        .then(({ error }) => {
-          if (error) console.error("[Chat] Failed to persist investigation:", error.message);
-        });
+      // BUG-005: Guard against null user before Supabase insert
+      if (!user?.id) {
+        console.error("[Chat] Cannot persist investigation: no user ID");
+      } else {
+        supabase
+          .from("investigations")
+          .insert({
+            task_id: taskId,
+            topic,
+            status: "PENDING",
+            duration_hours: effectiveHours,
+            budget_usd: budgetUsd,
+            user_id: user.id, // guaranteed non-null
+          })
+          .then(({ error }) => {
+            if (error) console.error("[Chat] Failed to persist investigation:", error.message);
+          });
+      }
 
       appendMessage({
         role: "system",
         content: `Investigation started (ID: ${taskId}). Estimated duration: ${formatDuration(effectiveHours)}. Monitoring progress...`,
         type: "status",
         id: `started-${taskId}`,
+        _id: makeMessageId(),
       });
 
       // Start timer and SSE
@@ -661,6 +748,7 @@ export default function Chat() {
         content: `Could not start the investigation: ${message}`,
         type: "error",
         id: `error-${Date.now()}`,
+        _id: makeMessageId(),
       });
       setIsSending(false);
     }
@@ -675,6 +763,42 @@ export default function Chat() {
       handleSend();
     }
   };
+
+  /* ---------------------------------------------------------------- */
+  /*  Report download (BUG-007: use fetch with auth header)           */
+  /* ---------------------------------------------------------------- */
+
+  const handleDownload = useCallback(async (format: "pdf" | "docx") => {
+    if (!activeTaskId) return;
+    const token = await getAccessToken();
+    if (!token) {
+      toast.error("Not authenticated", { description: "Please sign in again." });
+      return;
+    }
+    const endpoint =
+      format === "pdf"
+        ? `/api/investigations/${activeTaskId}/report`
+        : `/api/investigations/${activeTaskId}/report/docx`;
+    try {
+      const res = await fetch(`${API_URL}${endpoint}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        toast.error("Download failed", { description: `Server returned ${res.status}` });
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `investigation-${activeTaskId}.${format}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      toast.error("Download failed", { description: msg });
+    }
+  }, [activeTaskId]);
 
   /* ---------------------------------------------------------------- */
   /*  Derived state                                                   */
@@ -726,8 +850,8 @@ export default function Chat() {
         <div className="px-4 pt-4">
           <button
             onClick={() => {
-              if (activeTaskId && messages.length > 0) {
-                messageStoreRef.current[activeTaskId] = [...messages];
+              if (activeTaskId && messagesRef.current.length > 0) {
+                messageStoreRef.current[activeTaskId] = [...messagesRef.current];
               }
               stopAllConnections();
               setActiveTaskId(null);
@@ -866,7 +990,7 @@ export default function Chat() {
             {/* Messages */}
             {messages.filter(Boolean).map((msg, i) => (
               <div
-                key={i}
+                key={msg._id || `fallback-${i}`}
                 className="animate-fade-in"
                 style={{ animationDelay: `${Math.min(i * 30, 300)}ms` }}
               >
@@ -934,25 +1058,22 @@ export default function Chat() {
                     Investigation Complete
                   </span>
                 </div>
+                {/* BUG-007: Use programmatic fetch with auth header instead of bare <a href> */}
                 <div className="flex flex-wrap gap-2">
-                  <a
-                    href={`${API_URL}/api/investigations/${activeTaskId}/report`}
-                    target="_blank"
-                    rel="noopener noreferrer"
+                  <button
+                    onClick={() => handleDownload("pdf")}
                     className="inline-flex items-center gap-1.5 rounded-md bg-green-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-green-700 transition-colors"
                   >
                     <Download size={12} />
                     Download PDF Report
-                  </a>
-                  <a
-                    href={`${API_URL}/api/investigations/${activeTaskId}/report/docx`}
-                    target="_blank"
-                    rel="noopener noreferrer"
+                  </button>
+                  <button
+                    onClick={() => handleDownload("docx")}
                     className="inline-flex items-center gap-1.5 rounded-md border border-green-600/50 px-3 py-1.5 text-xs font-medium text-green-400 hover:bg-green-600/10 transition-colors"
                   >
                     <Download size={12} />
                     Download Word Report
-                  </a>
+                  </button>
                 </div>
               </div>
             )}

@@ -127,7 +127,10 @@ export default function Research() {
         <div className="mt-8 divide-y divide-border">
           {filtered.map((report, i) => (
             <ScrollReveal key={i} delay={i * 60}>
-              <article className="group relative cursor-pointer py-8 transition-colors">
+              {/* BUG-021: Articles are not clickable — removed cursor-pointer and hover arrow
+                  to avoid implying navigation that doesn't exist yet.
+                  TODO: wrap in <Link> once report detail pages are added. */}
+              <article className="group relative py-8 transition-colors">
                 <div className="flex items-start justify-between gap-4">
                   <div className="flex-1">
                     <div className="mb-2.5 flex flex-wrap items-center gap-3">
@@ -155,10 +158,7 @@ export default function Research() {
                       {report.abstract}
                     </p>
                   </div>
-                  <ArrowRight
-                    size={16}
-                    className="mt-6 shrink-0 text-muted-foreground/20 transition-all group-hover:text-accent group-hover:translate-x-1"
-                  />
+                  {/* ArrowRight removed — articles not yet clickable */}
                 </div>
 
                 {/* Paywall overlay */}

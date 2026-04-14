@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path  # BUG-028: Required for load_config type annotation
 
 from dotenv import load_dotenv
 
@@ -44,12 +45,12 @@ class AppConfig:
 
     # ------------------------------------------------------------------
     # Branch scoring thresholds — architecture spec §6.3
-    # Score is on 0-10 scale.
+    # BUG-010: Score is on 0-1 scale (matching EvaluationOutput.score constraint).
     # ------------------------------------------------------------------
-    SCORE_KILL_THRESHOLD: float = 4.0
-    SCORE_DEEPEN_THRESHOLD: float = 7.0
-    SCORE_TRIBUNAL_THRESHOLD: float = 8.0
-    SCORE_PIVOT_AFTER_TWO_CYCLES: float = 4.0
+    SCORE_KILL_THRESHOLD: float = 0.4
+    SCORE_DEEPEN_THRESHOLD: float = 0.7
+    SCORE_TRIBUNAL_THRESHOLD: float = 0.8
+    SCORE_PIVOT_AFTER_TWO_CYCLES: float = 0.4
 
     # ------------------------------------------------------------------
     # Cache TTLs (seconds) — architecture spec §6.4
@@ -173,6 +174,11 @@ class AppConfig:
     LOG_LEVEL: str = "INFO"
     LOG_JSON: bool = True
 
+    # ------------------------------------------------------------------
+    # Security
+    # ------------------------------------------------------------------
+    ADMIN_SECRET_KEY: str = ""  # Set in env to enable /api/shutdown auth (BUG-009)
+
 
 # Alias for backward compat
 Config = AppConfig
@@ -228,7 +234,12 @@ def load_config(env_file: str | Path | None = None) -> AppConfig:
                 "POSTGRES_PASSWORD environment variable is required when POSTGRES_DSN is not set. "
                 "Set POSTGRES_DSN or POSTGRES_PASSWORD in your environment or .env file."
             )
-        postgres_dsn = f"postgresql://mariana:{pg_password}@postgresql:5432/mariana"
+        # BUG-051: Make host, port, user, and db configurable via env vars
+        pg_user = os.environ.get("POSTGRES_USER", "mariana")
+        pg_host = os.environ.get("POSTGRES_HOST", "postgresql")
+        pg_port = os.environ.get("POSTGRES_PORT", "5432")
+        pg_db = os.environ.get("POSTGRES_DB", "mariana")
+        postgres_dsn = f"postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_db}"
 
     return AppConfig(
         # Model tiers
@@ -243,10 +254,11 @@ def load_config(env_file: str | Path | None = None) -> AppConfig:
         BUDGET_BRANCH_HARD_CAP=_float("BUDGET_BRANCH_HARD_CAP", 75.00),
         BUDGET_TASK_HARD_CAP=_float("BUDGET_TASK_HARD_CAP", 400.00),
         # Scoring
-        SCORE_KILL_THRESHOLD=_float("SCORE_KILL_THRESHOLD", 4.0),
-        SCORE_DEEPEN_THRESHOLD=_float("SCORE_DEEPEN_THRESHOLD", 7.0),
-        SCORE_TRIBUNAL_THRESHOLD=_float("SCORE_TRIBUNAL_THRESHOLD", 8.0),
-        SCORE_PIVOT_AFTER_TWO_CYCLES=_float("SCORE_PIVOT_AFTER_TWO_CYCLES", 4.0),
+        # BUG-010: 0–1 scale thresholds
+        SCORE_KILL_THRESHOLD=_float("SCORE_KILL_THRESHOLD", 0.4),
+        SCORE_DEEPEN_THRESHOLD=_float("SCORE_DEEPEN_THRESHOLD", 0.7),
+        SCORE_TRIBUNAL_THRESHOLD=_float("SCORE_TRIBUNAL_THRESHOLD", 0.8),
+        SCORE_PIVOT_AFTER_TWO_CYCLES=_float("SCORE_PIVOT_AFTER_TWO_CYCLES", 0.4),
         # Cache TTLs
         CACHE_TTL_NEWS=_int("CACHE_TTL_NEWS", 86_400),
         CACHE_TTL_FILINGS=_int("CACHE_TTL_FILINGS", 604_800),
@@ -299,4 +311,5 @@ def load_config(env_file: str | Path | None = None) -> AppConfig:
         # Logging
         LOG_LEVEL=_str("LOG_LEVEL", "INFO"),
         LOG_JSON=_bool("LOG_JSON", True),
+        ADMIN_SECRET_KEY=_str("ADMIN_SECRET_KEY", ""),
     )

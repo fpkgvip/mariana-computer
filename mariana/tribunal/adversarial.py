@@ -375,7 +375,17 @@ async def run_tribunal(
     )
 
     # ── Persist to database ──────────────────────────────────────────────────
-    await _persist_tribunal_session(db, tribunal_session, verdict_output)
+    # BUG-025 fix: swallow DB persistence errors like ai/session.py does in
+    # _persist_session — a DB outage should not abort the tribunal result.
+    try:
+        await _persist_tribunal_session(db, tribunal_session, verdict_output)
+    except Exception as exc:
+        log.error(
+            "tribunal_persist_failed",
+            tribunal_id=session_id,
+            error=str(exc),
+            msg="DB persistence failed but tribunal result is still returned",
+        )
 
     log.info(
         "tribunal_complete",

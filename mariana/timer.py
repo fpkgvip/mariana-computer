@@ -57,7 +57,9 @@ _PHASE_BOUNDARIES: list[tuple[float, float, ResearchPhase]] = [
     (0.40, 0.65, "synthesis"),
     (0.65, 0.80, "verification"),
     (0.80, 0.90, "report_writing"),
-    (0.90, 1.00, "finalization"),
+    # BUG-050: Use 1.01 upper bound so pct==1.0 (exactly 100%) matches this boundary
+    # and doesn't fall through to the fallback return.
+    (0.90, 1.01, "finalization"),
 ]
 
 _PHASE_LABELS: dict[ResearchPhase, str] = {
