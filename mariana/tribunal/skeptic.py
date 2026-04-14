@@ -289,6 +289,7 @@ async def run_skeptic(
     skeptic_parsed, skeptic_session = await spawn_model(
         task_type=TaskType.SKEPTIC_QUESTIONS,
         context={
+            "task_id": task_id,
             "finding_summary": finding_summary,
             "confidence_score": f"{finding.confidence:.2f}",
             "tribunal_verdict": (
@@ -349,9 +350,21 @@ async def run_skeptic(
     )
 
     # ── Persist ──────────────────────────────────────────────────────────────
-    await _persist_skeptic_result(
-        db, skeptic_result, skeptic_output.overall_skeptic_assessment
-    )
+    # BUG-A02 fix: wrap DB persistence in try/except so that a database failure
+    # (network drop, pool exhaustion, constraint violation) does not abort the
+    # skeptic result.  The AI computation already completed successfully; the
+    # result is still returned to the caller even if persistence fails.
+    try:
+        await _persist_skeptic_result(
+            db, skeptic_result, skeptic_output.overall_skeptic_assessment
+        )
+    except Exception as exc:
+        log.error(
+            "skeptic_persist_failed",
+            skeptic_id=result_id,
+            error=str(exc),
+            msg="DB persistence failed but skeptic result is still returned",
+        )
 
     return skeptic_result
 
@@ -395,13 +408,13 @@ async def _persist_skeptic_result(
                     questions,
                     open_count, researchable_count, resolved_count,
                     critical_open_count, passes_publishing_threshold,
-                    overall_assessment, cost_usd, created_at
+                    cost_usd, created_at
                 ) VALUES (
                     $1, $2, $3, $4,
                     $5::jsonb,
                     $6, $7, $8,
                     $9, $10,
-                    $11, $12, NOW()
+                    $11, NOW()
                 )
                 ON CONFLICT (id) DO NOTHING
                 """,
@@ -415,6 +428,5 @@ async def _persist_skeptic_result(
                 result.resolved_count,
                 result.critical_open_count,
                 result.passes_publishing_threshold,
-                overall_assessment,
                 result.cost_usd,
             )

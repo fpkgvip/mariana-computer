@@ -83,20 +83,23 @@ export function Navbar() {
             <div className="relative" ref={menuRef}>
               <button
                 onClick={() => setUserMenuOpen(!userMenuOpen)}
+                aria-expanded={userMenuOpen}
+                aria-haspopup="menu"
+                onKeyDown={(e) => e.key === "Escape" && setUserMenuOpen(false)}
                 className="flex items-center gap-2 text-[13px] font-medium text-muted-foreground transition-colors hover:text-foreground"
               >
                 <User size={15} />
                 <span>{user.name}</span>
               </button>
               {userMenuOpen && (
-                <div className="absolute right-0 top-full mt-2 w-52 rounded-lg border border-border bg-card py-1 shadow-lg">
-                  <Link to="/chat" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
+                <div role="menu" className="absolute right-0 top-full mt-2 w-52 rounded-lg border border-border bg-card py-1 shadow-lg">
+                  <Link role="menuitem" to="/chat" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
                     Mariana Computer
                   </Link>
-                  <Link to="/account" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
+                  <Link role="menuitem" to="/account" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
                     <Settings size={13} /> Account
                   </Link>
-                  <Link to="/buy-credits" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
+                  <Link role="menuitem" to="/buy-credits" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
                     <CreditCard size={13} /> Buy credits
                   </Link>
                   <div className="mx-4 my-1 border-t border-border" />
@@ -106,6 +109,7 @@ export function Navbar() {
                     </p>
                   </div>
                   <button
+                    role="menuitem"
                     onClick={handleLogout}
                     className="flex w-full items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground"
                   >

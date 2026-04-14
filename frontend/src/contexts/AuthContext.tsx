@@ -73,7 +73,7 @@ function buildUser(session: Session, profile: ProfileRow | null): User {
     id: session.user.id,
     email,
     name: profile?.full_name ?? (metaName || email.split("@")[0]),
-    tokens: profile?.tokens ?? 500,
+    tokens: profile?.tokens ?? 0,
   };
 }
 
@@ -129,9 +129,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   /**
    * Sign in with email + password.
    * Throws on failure so the caller (Login.tsx) can catch and display errors.
+   *
+   * BUG-R2-07: Do NOT call fetchProfile or setUser here.
+   * supabase.auth.signInWithPassword() triggers the SIGNED_IN event on the
+   * onAuthStateChange listener, which calls syncSession() — and therefore
+   * fetchProfile — automatically. Calling it here too results in two
+   * concurrent DB reads with a non-deterministic setUser race.
    */
   const login = async (email: string, password: string): Promise<void> => {
-    const { data, error } = await supabase.auth.signInWithPassword({
+    const { error } = await supabase.auth.signInWithPassword({
       email,
       password,
     });
@@ -139,10 +145,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       toast.error("Sign in failed", { description: error.message });
       throw error;
     }
-    if (data.session) {
-      const profile = await fetchProfile(data.session.user.id);
-      setUser(buildUser(data.session, profile));
-    }
+    // onAuthStateChange handles SIGNED_IN — no manual fetchProfile/setUser needed
   };
 
   /**
@@ -183,8 +186,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  // BUG-R2-12: Destructure the signOut result to log errors.
+  // A failed signOut (network error, Supabase outage) was silently swallowed,
+  // leaving the server session alive while the client believed it was logged out.
+  // We still clear local user state regardless — don't leave the user stuck.
   const logout = async (): Promise<void> => {
-    await supabase.auth.signOut();
+    const { error } = await supabase.auth.signOut();
+    if (error) {
+      console.error("[AuthContext] signOut error:", error.message);
+      // Clear local state anyway — better to be logged out locally than stuck
+    }
     setUser(null);
   };
 

@@ -129,12 +129,27 @@ class AppConfig:
     DATA_ROOT: str = "/data/mariana"
 
     def __post_init__(self) -> None:
-        """Validate budget ordering invariant at startup."""
+        """Validate budget ordering invariants at startup."""
         if not (self.BUDGET_BRANCH_INITIAL <= self.BUDGET_BRANCH_HARD_CAP <= self.BUDGET_TASK_HARD_CAP):
             raise RuntimeError(
                 f"Budget validation failed: BUDGET_BRANCH_INITIAL ({self.BUDGET_BRANCH_INITIAL}) "
                 f"<= BUDGET_BRANCH_HARD_CAP ({self.BUDGET_BRANCH_HARD_CAP}) "
                 f"<= BUDGET_TASK_HARD_CAP ({self.BUDGET_TASK_HARD_CAP}) must hold."
+            )
+        # BUG-NEW-13 fix: validate that grant amounts are below the hard cap
+        # so the hardcoded constants in branch_manager.py stay consistent with
+        # whatever values the operator configures via environment variables.
+        if not (self.BUDGET_BRANCH_GRANT_SCORE7 < self.BUDGET_BRANCH_HARD_CAP):
+            raise RuntimeError(
+                f"Budget validation failed: BUDGET_BRANCH_GRANT_SCORE7 "
+                f"({self.BUDGET_BRANCH_GRANT_SCORE7}) must be less than "
+                f"BUDGET_BRANCH_HARD_CAP ({self.BUDGET_BRANCH_HARD_CAP})."
+            )
+        if not (self.BUDGET_BRANCH_GRANT_SCORE8 < self.BUDGET_BRANCH_HARD_CAP):
+            raise RuntimeError(
+                f"Budget validation failed: BUDGET_BRANCH_GRANT_SCORE8 "
+                f"({self.BUDGET_BRANCH_GRANT_SCORE8}) must be less than "
+                f"BUDGET_BRANCH_HARD_CAP ({self.BUDGET_BRANCH_HARD_CAP})."
             )
 
     @property
@@ -178,6 +193,15 @@ class AppConfig:
     # Security
     # ------------------------------------------------------------------
     ADMIN_SECRET_KEY: str = ""  # Set in env to enable /api/shutdown auth (BUG-009)
+
+    # ------------------------------------------------------------------
+    # CORS — BUG-NEW-06: field added so _get_cors_origins() in api.py can
+    # read origins from config rather than the dead-code branch being
+    # permanently unreachable.
+    # Value is a comma-separated string; api.py splits it into a list.
+    # An empty string means "use the hardcoded _DEFAULT_CORS_ORIGINS".
+    # ------------------------------------------------------------------
+    CORS_ALLOWED_ORIGINS: str = ""
 
 
 # Alias for backward compat
@@ -312,4 +336,5 @@ def load_config(env_file: str | Path | None = None) -> AppConfig:
         LOG_LEVEL=_str("LOG_LEVEL", "INFO"),
         LOG_JSON=_bool("LOG_JSON", True),
         ADMIN_SECRET_KEY=_str("ADMIN_SECRET_KEY", ""),
+        CORS_ALLOWED_ORIGINS=_str("CORS_ALLOWED_ORIGINS", ""),
     )

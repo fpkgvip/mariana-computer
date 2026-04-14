@@ -10,56 +10,18 @@ type AccessLevel = "all" | "free" | "premium";
 
 const sectors = ["All", "Macro", "Equities", "Fixed Income", "Commodities", "Crypto"];
 
-const reports = [
-  {
-    title: "The Semiconductor Supercycle: A 10-Year DCF Framework",
-    abstract: "A comprehensive discounted cash flow analysis across 23 semiconductor firms, modeling capex cycles, geopolitical risk premia, and demand elasticity under three macro scenarios.",
-    date: "2026-04-08",
-    readTime: "42 min",
-    sector: "Equities",
-    access: "premium" as const,
-  },
-  {
-    title: "US Treasury Yield Curve Dynamics Under QT",
-    abstract: "Quantitative analysis of yield curve shape evolution during the current quantitative tightening cycle, with comparisons to 2018-2019 and historical precedents.",
-    date: "2026-04-05",
-    readTime: "28 min",
-    sector: "Fixed Income",
-    access: "free" as const,
-  },
-  {
-    title: "Global Macro Outlook: Q2 2026",
-    abstract: "Cross-asset macro framework incorporating monetary policy divergence, fiscal trajectories, and geopolitical risk premia across G10 and major EM economies.",
-    date: "2026-04-01",
-    readTime: "35 min",
-    sector: "Macro",
-    access: "free" as const,
-  },
-  {
-    title: "Crude Oil: Monte Carlo Supply Disruption Modeling",
-    abstract: "50,000-iteration Monte Carlo simulation modeling OPEC+ compliance variance, Strait of Hormuz disruption probability, and US shale production elasticity on WTI forward curves.",
-    date: "2026-03-28",
-    readTime: "55 min",
-    sector: "Commodities",
-    access: "premium" as const,
-  },
-  {
-    title: "Ethereum Post-Dencun: Protocol Revenue & Valuation",
-    abstract: "On-chain data analysis of Ethereum's fee market post-Dencun upgrade, modeling L2 settlement revenue, blob fee economics, and ETH as a productive asset.",
-    date: "2026-03-22",
-    readTime: "30 min",
-    sector: "Crypto",
-    access: "premium" as const,
-  },
-  {
-    title: "Japanese Yen Carry Trade: Unwind Risk Assessment",
-    abstract: "Sizing the global yen carry trade using BIS data, modeling unwind scenarios triggered by BOJ policy normalization, and second-order effects on US credit markets.",
-    date: "2026-03-18",
-    readTime: "24 min",
-    sector: "Macro",
-    access: "free" as const,
-  },
-];
+// BUG-R1-13: Removed hardcoded placeholder report data that had future dates
+// and no real content behind any report link. Reports will be fetched from
+// /api/research once that endpoint is implemented. Until then the page shows
+// a Coming Soon empty state.
+const reports: {
+  title: string;
+  abstract: string;
+  date: string;
+  readTime: string;
+  sector: string;
+  access: "free" | "premium";
+}[] = [];
 
 export default function Research() {
   const { user } = useAuth();
@@ -72,6 +34,9 @@ export default function Research() {
     return true;
   });
 
+  // BUG-R2-19: canAccessPremium is intentionally preserved even though `reports` is currently
+  // an empty array (making this dead code). Once the /api/research endpoint is implemented
+  // and reports are populated, this gate will be used by the paywall overlay below.
   const canAccessPremium = user && user.tokens > 0;
 
   return (
@@ -126,11 +91,15 @@ export default function Research() {
         {/* Reports */}
         <div className="mt-8 divide-y divide-border">
           {filtered.map((report, i) => (
-            <ScrollReveal key={i} delay={i * 60}>
-              {/* BUG-021: Articles are not clickable — removed cursor-pointer and hover arrow
-                  to avoid implying navigation that doesn't exist yet.
+            // BUG-R1-18: Use stable key (report.title) instead of array index.
+            // Index keys cause React to associate ScrollReveal animation state
+            // with the wrong report when filters change and array order shifts.
+            <ScrollReveal key={report.title} delay={i * 60}>
+              {/* BUG-021 / BUG-R1-12: Articles are not clickable — removed
+                  group/hover affordance to avoid implying navigation that
+                  doesn't exist yet.
                   TODO: wrap in <Link> once report detail pages are added. */}
-              <article className="group relative py-8 transition-colors">
+              <article className="relative py-8 transition-colors">
                 <div className="flex items-start justify-between gap-4">
                   <div className="flex-1">
                     <div className="mb-2.5 flex flex-wrap items-center gap-3">
@@ -151,7 +120,7 @@ export default function Research() {
                         <span className="text-[11px] text-muted-foreground">Free</span>
                       )}
                     </div>
-                    <h2 className="font-serif text-xl font-semibold text-foreground transition-colors group-hover:text-accent">
+                    <h2 className="font-serif text-xl font-semibold text-foreground transition-colors">
                       {report.title}
                     </h2>
                     <p className="mt-2 max-w-2xl text-sm leading-[1.7] text-muted-foreground">
@@ -184,11 +153,19 @@ export default function Research() {
           ))}
         </div>
 
-        {filtered.length === 0 && (
+        {reports.length === 0 ? (
+          // BUG-R1-13: No published reports yet — show honest empty state
+          <div className="py-20 text-center">
+            <p className="text-lg font-medium text-foreground">Coming soon</p>
+            <p className="mt-2 text-sm text-muted-foreground max-w-sm mx-auto">
+              Published research reports are in preparation. Check back soon.
+            </p>
+          </div>
+        ) : filtered.length === 0 ? (
           <p className="py-12 text-center text-muted-foreground">
             No reports match the current filters.
           </p>
-        )}
+        ) : null}
       </div>
       <Footer />
     </div>

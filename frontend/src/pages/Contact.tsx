@@ -17,6 +17,8 @@ const contactInfo = [
   { icon: MapPin, label: "Office", value: "140 Broadway, 46th Floor\nNew York, NY 10005" },
 ];
 
+const API_URL = import.meta.env.VITE_API_URL ?? "";
+
 export default function Contact() {
   const [form, setForm] = useState({ name: "", email: "", subject: subjects[0], message: "" });
   const [sending, setSending] = useState(false);
@@ -29,7 +31,7 @@ export default function Contact() {
     e.preventDefault();
     setSending(true);
     try {
-      const res = await fetch("/api/contact", {
+      const res = await fetch(`${API_URL}/api/contact`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(form),
@@ -87,18 +89,19 @@ export default function Contact() {
               <form onSubmit={handleSubmit} className="space-y-5">
                 <div className="grid gap-5 sm:grid-cols-2">
                   <div>
-                    <label className="mb-1.5 block text-xs font-medium text-muted-foreground">Name</label>
-                    <Input value={form.name} onChange={(e) => update("name", e.target.value)} required placeholder="Your name" />
+                    <label htmlFor="contact-name" className="mb-1.5 block text-xs font-medium text-muted-foreground">Name</label>
+                    <Input id="contact-name" value={form.name} onChange={(e) => update("name", e.target.value)} required placeholder="Your name" />
                   </div>
                   <div>
-                    <label className="mb-1.5 block text-xs font-medium text-muted-foreground">Email</label>
-                    <Input type="email" value={form.email} onChange={(e) => update("email", e.target.value)} required placeholder="you@firm.com" />
+                    <label htmlFor="contact-email" className="mb-1.5 block text-xs font-medium text-muted-foreground">Email</label>
+                    <Input id="contact-email" type="email" value={form.email} onChange={(e) => update("email", e.target.value)} required placeholder="you@firm.com" />
                   </div>
                 </div>
 
                 <div>
-                  <label className="mb-1.5 block text-xs font-medium text-muted-foreground">Subject</label>
+                  <label htmlFor="contact-subject" className="mb-1.5 block text-xs font-medium text-muted-foreground">Subject</label>
                   <select
+                    id="contact-subject"
                     value={form.subject}
                     onChange={(e) => update("subject", e.target.value)}
                     className="w-full rounded-md border border-input bg-background px-3 py-2.5 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
@@ -110,8 +113,9 @@ export default function Contact() {
                 </div>
 
                 <div>
-                  <label className="mb-1.5 block text-xs font-medium text-muted-foreground">Message</label>
+                  <label htmlFor="contact-message" className="mb-1.5 block text-xs font-medium text-muted-foreground">Message</label>
                   <textarea
+                    id="contact-message"
                     value={form.message}
                     onChange={(e) => update("message", e.target.value)}
                     required

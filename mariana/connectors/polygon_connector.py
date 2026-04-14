@@ -203,24 +203,25 @@ class PolygonConnector(BaseConnector):
         """
         Fetch recent news articles mentioning a ticker.
 
-        Endpoint: GET /v2/reference/news
+        Endpoint: GET /v3/reference/news
 
         Args:
             ticker: Uppercase ticker symbol.
             limit:  Maximum number of articles to return (default 20).
 
         Returns:
-            Polygon news payload.
+            Polygon v3 news payload: ``{"results": [...], "next_url": "..."}``.
         """
         ticker = ticker.upper().strip()
         self._log.info("get_ticker_news", ticker=ticker, limit=limit)
         try:
-            # BUG-012 fix: use /v2/reference/news (v2 endpoint) as documented in
-            # the docstring.  /v3/reference/news is a different paginated endpoint
-            # with a different response structure and would silently break parsing.
+            # BUG-A06 fix: use /v3/reference/news (the current active endpoint).
+            # The v2 endpoint (/v2/reference/news) is deprecated.  The v3 endpoint
+            # uses "ticker.any_of" as the query param (not plain "ticker") and
+            # returns a paginated response: {"results": [...], "next_url": "..."}.
             return await self._get(
-                "/v2/reference/news",
-                params={"ticker": ticker, "limit": limit},
+                "/v3/reference/news",
+                params={"ticker.any_of": ticker, "limit": limit},
                 ttl=_TTL_NEWS,
             )
         except Exception as exc:

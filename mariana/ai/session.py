@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -745,6 +746,7 @@ async def spawn_model(
     duration_ms = int((time.monotonic() - start_mono) * 1000)
 
     session = AISession(
+        id=str(uuid.uuid4()),
         task_id=context.get("task_id", "unknown"),
         branch_id=branch_id,
         task_type=task_type,

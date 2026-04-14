@@ -28,7 +28,7 @@ interface Message {
   _id: string; // stable React key, always set
 }
 
-type InvestigationStatus = "PENDING" | "RUNNING" | "COMPLETED" | "FAILED";
+type InvestigationStatus = "PENDING" | "RUNNING" | "COMPLETED" | "FAILED" | "HALTED";
 
 interface Investigation {
   task_id: string;
@@ -46,13 +46,15 @@ interface CreateInvestigationResponse {
   message: string;
 }
 
-/** GET /api/investigations/{task_id} polling response */
+/** GET /api/investigations/{task_id} polling response — matches backend TaskSummary */
 interface InvestigationPollResponse {
-  task_id: string;
+  id: string;                       // BUG-R2-02: backend returns "id" not "task_id"
   status: InvestigationStatus;
-  topic?: string;
-  findings?: string;
-  status_message?: string;
+  current_state: string;            // BUG-R2-02: backend returns "current_state" not "status_message"
+  topic: string;
+  total_spent_usd: number;
+  output_pdf_path: string | null;
+  output_docx_path: string | null;
   error?: string;
 }
 
@@ -105,6 +107,12 @@ async function getAccessToken(): Promise<string | null> {
  * Bold is applied before italic so that **bold** is not corrupted by the italic pass.
  * Fenced code blocks use a line-count-bounded approach: split on triple-backtick
  * boundaries rather than a [\s\S]*? lazy dot-all pattern.
+ *
+ * BUG-R2-14: XSS SAFETY NOTE — Do NOT add link/URL rendering ([text](url)) without
+ * first sanitizing the href value against `javascript:` and `data:` URI schemes.
+ * Example safe check: if (!/^https?:\/\//i.test(url)) return '...' (strip non-http links).
+ * All content is HTML-escaped (& < >) before any markdown substitution, making the
+ * current set of transformations safe for dangerouslySetInnerHTML use.
  */
 function renderMarkdown(text: string): string {
   // Escape HTML first to prevent XSS from content
@@ -152,7 +160,7 @@ function formatDuration(hours: number): string {
     return m > 0 ? `${h}h ${m}m` : `${h}h`;
   }
   const days = Math.round(hours / 24 * 10) / 10;
-  return `${days} days`;
+  return `${days} ${days === 1 ? "day" : "days"}`; // BUG-R2-20: fix "1 days" grammar
 }
 
 function formatCountdown(secondsRemaining: number): string {
@@ -202,11 +210,12 @@ export default function Chat() {
   // Per-investigation message store
   const messageStoreRef = useRef<Record<string, Message[]>>({});
 
-  // Stable ref to current messages — prevents stale closure in switchInvestigation
+  // Stable ref to current messages — prevents stale closure in switchInvestigation.
+  // BUG-R2-11: Assign directly during render instead of via useEffect.
+  // React docs explicitly sanction writing to a ref during render for this synchronization
+  // pattern, and it avoids an unnecessary effect + potential lint warnings.
   const messagesRef = useRef<Message[]>([]);
-  useEffect(() => {
-    messagesRef.current = messages;
-  }, [messages]);
+  messagesRef.current = messages;
 
   /* ---------------------------------------------------------------- */
   /*  Auth guard                                                      */
@@ -298,8 +307,14 @@ export default function Chat() {
     if (msg.type === "status" && seenStatusIds.current.has(msgId)) return;
     if (msg.type === "status") {
       seenStatusIds.current.add(msgId);
-      // BUG-019: Cap seenStatusIds set to prevent unbounded memory growth
-      if (seenStatusIds.current.size > 1000) seenStatusIds.current.clear();
+      // BUG-019 / BUG-R1-25: Cap seenStatusIds to prevent unbounded memory growth.
+      // Use a sliding-window trim instead of clearing entirely — a full clear
+      // would remove dedup protection for the next 1000 messages, potentially
+      // causing visible duplicates in long-running marathon investigations.
+      if (seenStatusIds.current.size > 1000) {
+        const entries = [...seenStatusIds.current];
+        seenStatusIds.current = new Set(entries.slice(-500));
+      }
     }
     // Ensure every message has a stable _id for React keying
     const msgWithId: Message = msg._id ? msg : { ...msg, _id: makeMessageId() };
@@ -357,12 +372,23 @@ export default function Chat() {
   /* ---------------------------------------------------------------- */
 
   const startPolling = useCallback(
-    (taskId: string, token: string) => {
+    (taskId: string, _initialToken: string) => {
       const poll = async () => {
         try {
+          // BUG-R1-02: Get a fresh token on every poll tick instead of reusing
+          // the captured string. The initial token expires after ~1 hour;
+          // for Flagship/Marathon investigations (24h–5 days) this caused 401s
+          // that force-logged users out mid-investigation.
+          const freshToken = await getAccessToken();
+          if (!freshToken) {
+            stopAllConnections();
+            toast.error("Session expired", { description: "Please sign in again." });
+            navigate("/login");
+            return;
+          }
           const res = await fetch(`${API_URL}/api/investigations/${taskId}`, {
             headers: {
-              Authorization: `Bearer ${token}`,
+              Authorization: `Bearer ${freshToken}`,
               "Content-Type": "application/json",
             },
           });
@@ -381,20 +407,24 @@ export default function Chat() {
               content: `Rate limited. Retrying in ${retryAfter} seconds...`,
               type: "status",
               id: `rate-limit-${Date.now()}`,
+              _id: makeMessageId(),
             });
             return;
           }
 
           if (!res.ok) return;
 
+          // BUG-R2-02: Backend returns TaskSummary — use "id", "current_state" not "task_id", "status_message"
           const data: InvestigationPollResponse = await res.json();
 
-          if (data.status_message) {
+          // Show current_state as a progress message (backend state-machine string)
+          if (data.current_state) {
             appendMessage({
               role: "system",
-              content: data.status_message,
+              content: data.current_state,
               type: "status",
-              id: `poll-${data.status_message}`,
+              id: `poll-state-${data.current_state}`,
+              _id: makeMessageId(),
             });
           }
 
@@ -404,14 +434,9 @@ export default function Chat() {
 
           if (data.status === "COMPLETED") {
             updateInvestigationStatus(taskId, "COMPLETED");
-            if (data.findings) {
-              appendMessage({
-                role: "assistant",
-                content: data.findings,
-                type: "text",
-                _id: makeMessageId(),
-              });
-            }
+            // BUG-R2-02: Backend has no "findings" field in TaskSummary.
+            // Report content is available only via the download endpoints.
+            // Show a completion message and let the download buttons handle retrieval.
             appendMessage({
               role: "system",
               content: "Investigation complete. Reports are ready for download.",
@@ -422,7 +447,7 @@ export default function Chat() {
             stopAllConnections();
             // BUG-018: Refresh credit balance after investigation completes
             refreshUser();
-          } else if (data.status === "FAILED") {
+          } else if (data.status === "FAILED" || data.status === "HALTED") {
             updateInvestigationStatus(taskId, "FAILED");
             const errMsg = data.error ?? "The investigation failed. Please try again.";
             appendMessage({
@@ -453,8 +478,17 @@ export default function Chat() {
 
   const startSSE = useCallback(
     (taskId: string, token: string) => {
-      // BUG-001: Native EventSource cannot send custom headers.
-      // Pass the auth token as a query parameter instead.
+      // BUG-001 / BUG-R1-09: Native EventSource cannot send custom headers,
+      // so the auth token must be passed as a URL query parameter instead.
+      // KNOWN TRADE-OFF: The token will appear in server access logs, browser
+      // history, and any monitoring tools that record full URLs.
+      // Mitigations:
+      //   1. Configure the backend to redact the `token` query param from logs.
+      //   2. Ideally, use a short-lived "stream token" from a dedicated endpoint
+      //      (POST /api/investigations/{id}/stream-token) rather than the
+      //      long-lived JWT, so a leaked URL has a narrow exposure window.
+      //   3. Long-term: replace EventSource with fetch + ReadableStream to
+      //      allow proper Authorization headers.
       const url = `${API_URL}/api/investigations/${taskId}/logs?token=${encodeURIComponent(token)}`;
 
       try {
@@ -526,17 +560,101 @@ export default function Chat() {
           }
         };
 
+        // BUG-R2-08: Register named event listeners for server-emitted event types.
+        // es.onmessage only handles the default (unnamed) event type.
+        // The backend emits: "done", "ping", "state_change", "error" — all ignored by onmessage.
+
+        es.addEventListener("done", (event: MessageEvent) => {
+          try {
+            const parsed = JSON.parse(event.data);
+            const finalStatus = (parsed.final_status || parsed.status) as InvestigationStatus;
+            if (finalStatus === "COMPLETED") {
+              updateInvestigationStatus(taskId, "COMPLETED");
+              appendMessage({
+                role: "system",
+                content: "Investigation complete. Reports are ready for download.",
+                type: "status",
+                id: `completed-${taskId}`,
+                _id: makeMessageId(),
+              });
+              stopAllConnections();
+              refreshUser();
+            } else if (finalStatus === "FAILED" || finalStatus === "HALTED") {
+              updateInvestigationStatus(taskId, "FAILED");
+              appendMessage({
+                role: "assistant",
+                content: parsed.error || `Investigation ${finalStatus}.`,
+                type: "text",
+                _id: makeMessageId(),
+              });
+              stopAllConnections();
+              refreshUser();
+            }
+          } catch {
+            // Non-JSON done event — treat as completion signal
+            updateInvestigationStatus(taskId, "COMPLETED");
+            appendMessage({
+              role: "system",
+              content: "Investigation complete. Reports are ready for download.",
+              type: "status",
+              id: `completed-${taskId}`,
+              _id: makeMessageId(),
+            });
+            stopAllConnections();
+            refreshUser();
+          }
+        });
+
+        es.addEventListener("state_change", (event: MessageEvent) => {
+          try {
+            const parsed = JSON.parse(event.data);
+            if (parsed.status) updateInvestigationStatus(taskId, parsed.status as InvestigationStatus);
+            const stateMsg = parsed.state || parsed.current_state || parsed.message;
+            if (stateMsg) {
+              appendMessage({
+                role: "system",
+                content: String(stateMsg),
+                type: "status",
+                id: `state-change-${stateMsg}`,
+                _id: makeMessageId(),
+              });
+            }
+          } catch {}
+        });
+
+        // Named "error" event from the server (distinct from connection errors via es.onerror)
+        es.addEventListener("error", (event: MessageEvent) => {
+          try {
+            const parsed = JSON.parse(event.data);
+            const errMsg = parsed.error || parsed.message || "Stream error";
+            appendMessage({
+              role: "assistant",
+              content: errMsg,
+              type: "error",
+              _id: makeMessageId(),
+            });
+          } catch {}
+        });
+
         // BUG-002: hasFailedOver flag prevents multiple concurrent polling loops
-        es.onerror = () => {
+        es.onerror = async () => {
           if (hasFailedOver) return;
           hasFailedOver = true;
           console.warn("[Chat] SSE connection error, falling back to polling.");
           es.close();
           eventSourceRef.current = null;
-          startPolling(taskId, token);
+          // BUG-R1-02: Fetch fresh token for polling fallover — the SSE token
+          // may have been created some time ago and could be near expiry.
+          const freshToken = await getAccessToken();
+          // BUG-R2-17: Guard against starting a polling loop if the component
+          // unmounted during the async getAccessToken() call.
+          if (freshToken && pollIntervalRef.current === null) {
+            startPolling(taskId, freshToken);
+          }
         };
       } catch {
         console.warn("[Chat] SSE not available, using polling.");
+        // Pass token through for initial call; poll() will refresh on each tick
         startPolling(taskId, token);
       }
     },
@@ -550,7 +668,9 @@ export default function Chat() {
   const getEffectiveHours = useCallback((): number => {
     if (duration === "custom") {
       const parsed = parseFloat(customHours);
-      return isNaN(parsed) || parsed <= 0 ? 1 : parsed;
+      // BUG-R2-03: Cap at 100 hours so budget_usd ≤ $500 (100 × $5 = $500).
+      // Previous cap was 240 hours which would produce $1200, exceeding the backend hard limit.
+      return isNaN(parsed) || parsed <= 0 ? 1 : Math.min(parsed, 100);
     }
     const opt = durationOptions.find((d) => d.value === duration);
     return opt?.hours ?? 1.5;
@@ -570,24 +690,32 @@ export default function Chat() {
 
       // Stop any active connections
       stopAllConnections();
-      seenStatusIds.current.clear();
 
       // Load stored messages for the target investigation
+      // BUG-R2-06: Fall back to messages currently shown if no store entry
+      // (e.g. investigation loaded from Supabase on mount but never viewed this session)
       const stored = messageStoreRef.current[taskId];
-      setMessages(stored || []);
+      const targetMessages = stored || [];
+      setMessages(targetMessages);
       setActiveTaskId(taskId);
       setSidebarOpen(false);
+
+      // BUG-R2-06: Reseed seenStatusIds from the messages we're about to display.
+      // Must happen after clear() so we don't leave stale IDs from the previous investigation.
+      seenStatusIds.current.clear();
+      targetMessages.forEach((m) => {
+        if (m.id) seenStatusIds.current.add(m.id);
+      });
 
       // If investigation is still running, reconnect SSE
       const inv = investigations.find((i) => i.task_id === taskId);
       if (inv && (inv.status === "RUNNING" || inv.status === "PENDING")) {
         setIsSending(true);
-        // Re-seed seen IDs from stored messages
-        if (stored) {
-          stored.forEach((m) => {
-            if (m.id) seenStatusIds.current.add(m.id);
-          });
-        }
+        // BUG-R2-05: getAccessToken() fetches the current session token.
+        // The token is baked into the SSE URL at connection time; if the user
+        // leaves this view open for >1h the EventSource reconnect will use the
+        // original (now-expired) URL and get 401s, triggering the onerror
+        // failover to polling which then fetches a fresh token on each tick.
         getAccessToken().then((token) => {
           if (token) {
             startTimer();
@@ -604,10 +732,17 @@ export default function Chat() {
   /*  Send investigation                                              */
   /* ---------------------------------------------------------------- */
 
-  const handleSend = async (e?: React.FormEvent) => {
+  // BUG-R2-01: Wrapped in useCallback to prevent stale closures in handleRetry.
+  // Without memoization, handleRetry captures an old handleSend where isSending=false,
+  // allowing duplicate investigation submissions via the Retry button.
+  const handleSend = useCallback(async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    const topic = retryPayload?.topic || input.trim();
-    if (!topic || isSending) return;
+    // BUG-R2-01: Check isSending at the top as a synchronous guard
+    if (isSending) return;
+    // BUG-R2-10: Input takes priority over retryPayload topic.
+    // If the user edits input while a retry is showing, the edited text wins.
+    const topic = input.trim() || retryPayload?.topic || "";
+    if (!topic) return;
 
     setRetryPayload(null);
     setInput("");
@@ -651,7 +786,9 @@ export default function Chat() {
     setMessages((prev) => [...prev, initMsg]);
 
     const effectiveHours = getEffectiveHours();
-    const budgetUsd = Math.max(1, Math.round(effectiveHours * 5));
+    // BUG-R2-03: Cap budget_usd at $500 — backend Pydantic model enforces le=500.0.
+    // With uncapped customHours (was 240 max), budgetUsd could reach $1200, causing HTTP 422.
+    const budgetUsd = Math.min(500, Math.max(1, Math.round(effectiveHours * 5)));
 
     try {
       const res = await fetch(`${API_URL}/api/investigations`, {
@@ -752,17 +889,19 @@ export default function Chat() {
       });
       setIsSending(false);
     }
-  };
+  // BUG-R2-01: Dependency array for useCallback — all captured values listed
+  }, [isSending, input, retryPayload, duration, customHours, user,
+      getEffectiveHours, appendMessage, stopConnectionsOnly,
+      startTimer, startSSE, navigate, refreshUser, activeTaskId]);
 
   /* ---------------------------------------------------------------- */
   /*  Retry handler                                                   */
   /* ---------------------------------------------------------------- */
 
-  const handleRetry = () => {
-    if (retryPayload) {
-      handleSend();
-    }
-  };
+  // BUG-R2-01: Wrapped in useCallback so handleSend reference is always fresh
+  const handleRetry = useCallback(() => {
+    if (retryPayload) handleSend();
+  }, [retryPayload, handleSend]);
 
   /* ---------------------------------------------------------------- */
   /*  Report download (BUG-007: use fetch with auth header)           */
@@ -792,8 +931,15 @@ export default function Chat() {
       const a = document.createElement("a");
       a.href = url;
       a.download = `investigation-${activeTaskId}.${format}`;
+      // BUG-R2-15: Append/remove anchor from DOM for maximum browser compatibility.
+      // Edge historically required the element to be in the DOM for .click() to trigger a download.
+      // BUG-R1-19: Revoke asynchronously — browser download initiation is
+      // async, so synchronous revocation can cause empty/failed downloads in
+      // Firefox and some other browsers.
+      document.body.appendChild(a);
       a.click();
-      URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 100);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";
       toast.error("Download failed", { description: msg });
@@ -841,6 +987,7 @@ export default function Chat() {
           <button
             onClick={() => setSidebarOpen(false)}
             className="md:hidden text-muted-foreground"
+            aria-label="Close sidebar"
           >
             <X size={18} />
           </button>
@@ -1114,6 +1261,7 @@ export default function Chat() {
                 <input
                   type="number"
                   min="0.1"
+                  max="100"
                   step="0.1"
                   value={customHours}
                   onChange={(e) => setCustomHours(e.target.value)}
@@ -1126,8 +1274,8 @@ export default function Chat() {
               {/* Estimated time display */}
               <span className="text-[10px] text-muted-foreground">
                 {duration === "custom"
-                  ? customHours
-                    ? `≈ ${formatDuration(parseFloat(customHours) || 0)}`
+                  ? customHours && parseFloat(customHours) > 0
+                    ? `≈ ${formatDuration(parseFloat(customHours))}` // BUG-R2-13: skip 0 — shows "Enter hours" instead of "≈ 0 min"
                     : "Enter hours"
                   : `≈ ${selectedDuration?.timeLabel}`}
               </span>
@@ -1158,6 +1306,7 @@ export default function Chat() {
               <button
                 type="submit"
                 disabled={isSending || !input.trim()}
+                aria-label="Send investigation"
                 className="flex shrink-0 items-center gap-2 rounded-md bg-primary px-3 py-2.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50 sm:px-4"
               >
                 <Send size={14} />

@@ -88,10 +88,9 @@ _ERROR_COUNT: int = 0
 app = FastAPI(
     title="Mariana Browser Pool",
     description=(
-        "Manages Playwright/Chromium browser contexts for JavaScript-heavy pages. "
-        "This is the prototype placeholder — real browser automation is not yet active."
+        "Manages Playwright/Chromium browser contexts for JavaScript-heavy page rendering."
     ),
-    version="0.1.0-prototype",
+    version="0.1.0",
 )
 
 
@@ -134,13 +133,15 @@ async def health() -> JSONResponse:
 
 @app.post(
     "/dispatch",
+    response_model=DispatchResponse,
+    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
     summary="Dispatch a browser task",
     description=(
         "Browser pool is not yet configured. Returns HTTP 503 for every request. "
         "The orchestrator should fall back to the HTTP connectors for data retrieval."
     ),
 )
-async def dispatch_task(task: BrowserTask) -> JSONResponse:
+async def dispatch_task(task: BrowserTask) -> DispatchResponse:
     """
     Return HTTP 503 for every dispatch request — the browser pool is not active.
 
@@ -163,9 +164,9 @@ async def dispatch_task(task: BrowserTask) -> JSONResponse:
         task_id=task.task_id,
         skipped_total=_SKIPPED_COUNT,
     )
-    return JSONResponse(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        content={"error": "Browser pool not configured"},
+    return DispatchResponse(
+        status="unavailable",
+        error="Browser pool not configured",
     )
 
 
@@ -227,8 +228,13 @@ def main() -> None:
     port = int(os.getenv("BROWSER_POOL_PORT", "8888"))
     log_level = os.getenv("LOG_LEVEL", "info").lower()
 
-    print(f"Starting Mariana browser pool server (prototype): {host}:{port}")
+    logger.info("browser_pool_server_starting", host=host, port=port)
 
+    # BUG-A08 note: _SKIPPED_COUNT and _ERROR_COUNT are plain module-level ints
+    # mutated with += 1 in route handlers.  This is safe under the asyncio event
+    # loop (single-threaded), but becomes a read-modify-write race if uvicorn is
+    # ever started with workers > 1 (multi-process).  This server MUST be run
+    # with a single worker (the default below).  Do NOT set workers > 1.
     uvicorn.run(
         "mariana.browser.pool_server:app",
         host=host,

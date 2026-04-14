@@ -19,8 +19,14 @@ export default function BuyCredits() {
   const { user } = useAuth();
   const navigate = useNavigate();
 
+  // BUG-R1-10: Add a 500ms grace period before redirecting, matching Chat.tsx.
+  // Supabase token refresh briefly sets user=null; without the delay, users
+  // navigating to this page during a refresh cycle are incorrectly sent to /login.
   useEffect(() => {
-    if (!user) navigate("/login", { replace: true });
+    if (!user) {
+      const timer = setTimeout(() => navigate("/login", { replace: true }), 500);
+      return () => clearTimeout(timer);
+    }
   }, [user, navigate]);
 
   if (!user) return null;

@@ -37,9 +37,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -355,6 +353,14 @@ def _load_task_frameworks() -> None:
 def _get_task_framework(task_type: TaskType) -> str:
     """Return the cached task-specific framework text for *task_type*."""
     # BUG-010 fix: double-checked locking pattern for thread-safe lazy init.
+    # BUG-A09 note: the outer un-locked read of _FRAMEWORK_CACHE_LOADED is safe
+    # under CPython because the GIL serialises thread execution and
+    # threading.Lock acquire/release act as full memory barriers.  Under the
+    # free-threaded CPython build (PEP 703, --disable-gil, Python 3.13+) this
+    # double-checked locking is NOT safe — the outer read could observe a stale
+    # value.  If free-threaded support is ever needed, replace this with a
+    # single-check-under-lock pattern or use a threading.Event instead of a
+    # plain bool flag.
     if not _FRAMEWORK_CACHE_LOADED:
         with _FRAMEWORK_CACHE_LOCK:
             if not _FRAMEWORK_CACHE_LOADED:  # re-check under the lock
@@ -682,14 +688,17 @@ def _ctx_report_final_edit(ctx: dict[str, Any]) -> str:
 def _ctx_watchdog(ctx: dict[str, Any]) -> str:
     _require(ctx, "recent_action_summaries")
     branch_id = ctx.get("current_branch_id", "")
-    branch_block = f"\nCurrent branch ID: {branch_id}" if branch_id else ""
+    # BUG-A04 fix: branch_block must appear before the "Recent action summaries:"
+    # label so the branch ID is a standalone context field rather than making
+    # "Recent action summaries:" look like a header for the branch ID line.
+    branch_block = f"Current branch ID: {branch_id}\n\n" if branch_id else ""
     return (
         f"TASK: WATCHDOG\n\n"
         "You are a meta-supervisor monitoring a multi-step research process "
         "for signs of circular reasoning, repetitive actions, or diminishing "
         "returns.\n\n"
-        f"Recent action summaries:"
-        f"{branch_block}\n"
+        f"{branch_block}"
+        "Recent action summaries:\n"
         "---\n"
         f"{ctx.get('recent_action_summaries', '[missing]')}\n"
         "---\n\n"

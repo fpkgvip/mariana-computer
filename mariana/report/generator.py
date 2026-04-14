@@ -27,7 +27,6 @@ For the prototype DOCX generation is skipped; the function returns
 
 from __future__ import annotations
 
-import json
 import os
 import time
 import uuid
@@ -164,6 +163,7 @@ async def generate_report(
     draft_parsed, draft_session = await spawn_model(
         task_type=TaskType.REPORT_DRAFT,
         context={
+            "task_id": task.id,           # BUG-A03 fix: include task_id for AISession cost attribution
             "confirmed_findings": findings_block,
             "all_sources": sources_block,
             "task_topic": task.topic,
@@ -189,6 +189,7 @@ async def generate_report(
     final_parsed, edit_session = await spawn_model(
         task_type=TaskType.REPORT_FINAL_EDIT,
         context={
+            "task_id": task.id,           # BUG-A03 fix: include task_id for AISession cost attribution
             "draft": draft_output.model_dump_json(indent=2),
             "all_sources": sources_block,
         },

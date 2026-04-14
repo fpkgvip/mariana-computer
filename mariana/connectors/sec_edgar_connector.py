@@ -21,7 +21,6 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from typing import Any
-from urllib.parse import quote
 
 import structlog
 
@@ -119,6 +118,8 @@ class SecEdgarConnector(BaseConnector):
         query: str,
         date_range: str | None = None,
         form_type: str | None = None,
+        startdt: str | None = None,   # BUG-A05 fix: e.g. "2023-01-01"
+        enddt: str | None = None,     # BUG-A05 fix: e.g. "2023-12-31"
     ) -> dict:
         """
         Search SEC EDGAR full-text for filings matching a keyword query.
@@ -127,17 +128,34 @@ class SecEdgarConnector(BaseConnector):
 
         Args:
             query:      Search terms.
-            date_range: Optional date range filter, e.g. "custom" (EDGAR uses
-                        separate dateRange, startdt, enddt params; pass as-is).
+            date_range: Optional date range filter.  To filter by a specific
+                        date window, pass ``date_range="custom"`` together with
+                        ``startdt`` and ``enddt`` (the EFTS API requires all
+                        three parameters for bounded date filtering).
             form_type:  Optional form type filter, e.g. "10-K", "8-K".
+            startdt:    Start date for custom date range, format "YYYY-MM-DD".
+                        Only used when ``date_range="custom"``.
+            enddt:      End date for custom date range, format "YYYY-MM-DD".
+                        Only used when ``date_range="custom"``.
 
         Returns:
             EFTS search-index payload.
         """
-        self._log.info("search_filings", query=query, date_range=date_range, form_type=form_type)
+        self._log.info(
+            "search_filings",
+            query=query,
+            date_range=date_range,
+            form_type=form_type,
+            startdt=startdt,
+            enddt=enddt,
+        )
         params: dict = {"q": query}
         if date_range:
             params["dateRange"] = date_range
+        if startdt:
+            params["startdt"] = startdt
+        if enddt:
+            params["enddt"] = enddt
         if form_type:
             params["forms"] = form_type
         try:

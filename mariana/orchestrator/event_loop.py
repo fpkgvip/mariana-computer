@@ -139,6 +139,7 @@ async def run(
     # ------------------------------------------------------------------
     task.status = TaskStatus.RUNNING
     task.started_at = datetime.now(timezone.utc)
+    _sync_cost(task, cost_tracker)  # BUG-R3-01: sync cost fields before every persist
     await _persist_task(task, db)
 
     log.info("event_loop_started", budget=task.budget_usd)
@@ -260,6 +261,7 @@ async def run(
             # 5. Advance state + persist
             # --------------------------------------------------------- #
             task.current_state = next_state
+            _sync_cost(task, cost_tracker)  # BUG-R3-01: sync cost fields before every persist
             await _persist_task(task, db)
 
             log.info("state_advanced", new_state=next_state.value, iteration=iteration)
@@ -272,12 +274,18 @@ async def run(
         # -------------------------------------------------------------- #
         # Check HALT state before iteration limit (BUG-004)
         if task.current_state == State.HALT:
-            task.status = TaskStatus.COMPLETED
+            # Only mark COMPLETED if not already explicitly HALTED (e.g. by SIGTERM handler)
+            # BUG-NEW-02 fix: preserve HALTED status set by shutdown_flag handler
+            # BUG-NEW-12 fix: also preserve FAILED; only promote to COMPLETED if status
+            # is still RUNNING (i.e. a clean report_complete halt path)
+            if task.status not in (TaskStatus.HALTED, TaskStatus.FAILED):
+                task.status = TaskStatus.COMPLETED
         elif iteration >= _MAX_ITERATIONS:
             log.error("max_iterations_reached", iterations=_MAX_ITERATIONS)
             task.status = TaskStatus.HALTED
 
         task.completed_at = datetime.now(timezone.utc)
+        _sync_cost(task, cost_tracker)  # BUG-R3-01: sync cost fields before every persist
         await _persist_task(task, db)
         log.info(
             "event_loop_finished",
@@ -297,6 +305,7 @@ async def run(
         task.status = TaskStatus.HALTED
         task.error_message = str(exc)
         task.completed_at = datetime.now(timezone.utc)
+        _sync_cost(task, cost_tracker)  # BUG-R3-01: sync cost fields before every persist
         await _persist_task(task, db)
 
     except Exception as exc:  # noqa: BLE001
@@ -312,6 +321,7 @@ async def run(
         task.status = TaskStatus.FAILED
         task.error_message = str(exc)
         task.completed_at = datetime.now(timezone.utc)
+        _sync_cost(task, cost_tracker)  # BUG-R3-01: sync cost fields before every persist
         await _persist_task(task, db)
         raise
 
@@ -511,9 +521,13 @@ async def _trigger_for_tribunal(
         session_data.task.id,
     )
     if row is None:
-        # No tribunal result yet — re-run evaluation
+        # BUG-NEW-09 fix: returning TRIBUNAL_WEAKENED here would prematurely
+        # regress the investigation to SEARCH (or HALT) before the tribunal
+        # handler has written any result.  Return TRIBUNAL_CONFIRMED as the
+        # safest neutral fallback — it keeps the loop advancing instead of
+        # destroying the current branch on a race-condition miss.
         logger.warning("no_tribunal_result", task_id=session_data.task.id)
-        return TransitionTrigger.TRIBUNAL_WEAKENED
+        return TransitionTrigger.TRIBUNAL_CONFIRMED
 
     verdict_str: str = row["verdict"]
     if verdict_str == TribunalVerdict.CONFIRMED.value:
@@ -540,8 +554,12 @@ async def _trigger_for_skeptic(
         session_data.task.id,
     )
     if row is None:
+        # BUG-NEW-08 fix: returning SKEPTIC_CRITICAL_OPEN here would cause an
+        # immediate HALT on first entry into the SKEPTIC state before the
+        # handle_skeptic action has written any result.  Return a neutral
+        # trigger that keeps the loop progressing instead.
         logger.warning("no_skeptic_result", task_id=session_data.task.id)
-        return TransitionTrigger.SKEPTIC_CRITICAL_OPEN
+        return TransitionTrigger.SKEPTIC_RESEARCHABLE_EXIST
 
     if row["critical_open_count"] > 0:
         return TransitionTrigger.SKEPTIC_CRITICAL_OPEN
@@ -766,6 +784,10 @@ async def handle_evaluate(
             decision = await score_branch(
                 branch_id=branch.id,
                 new_score=new_score,
+                # BUG-NEW-07 fix: score_branch no longer calls
+                # cost_tracker.record_branch_spend() internally to avoid
+                # double-counting; it only updates branch.budget_spent in DB.
+                # The actual cost was already recorded by spawn_model.
                 cost_spent_this_cycle=ai_session.cost_usd,
                 db=db,
                 cost_tracker=cost_tracker,
@@ -857,8 +879,12 @@ async def handle_checkpoint(
 
     # Fetch all findings for DR analysis
     finding_rows = await db.fetch(
-        "SELECT id, hypothesis_id, confidence, evidence_type, source_ids, "
-        "is_compressed, content, created_at FROM findings WHERE task_id = $1",
+        """
+        SELECT id, task_id, hypothesis_id, content, content_en, content_language,
+               source_ids, confidence, evidence_type, is_compressed,
+               raw_content_path, created_at, metadata
+        FROM findings WHERE task_id = $1
+        """,
         task.id,
     )
     # BUG-013: Use _row_to_dict() to decode JSONB/enum fields before model_validate
@@ -874,6 +900,7 @@ async def handle_checkpoint(
 
     # Run DR check on the best active branch (if any)
     active = session_data.active_branches
+    dr_recommendation = None  # BUG-R3-05: track recommendation to pass to save_checkpoint
     if active:
         best_branch = max(
             active,
@@ -892,6 +919,7 @@ async def handle_checkpoint(
             task=task,
             config=config,
         )
+        dr_recommendation = dr_result.recommendation  # BUG-R3-05: capture for checkpoint
         log.info(
             "diminishing_returns_result",
             recommendation=dr_result.recommendation.value,
@@ -923,6 +951,7 @@ async def handle_checkpoint(
         cost_tracker=cost_tracker,
         db=db,
         data_root=data_root,
+        diminishing_result=dr_recommendation,  # BUG-R3-05
     )
     log.info("checkpoint_complete", checkpoint_id=checkpoint_id)
 
@@ -966,6 +995,7 @@ async def handle_tribunal(
         TaskType.TRIBUNAL_REBUTTAL,
         TaskType.TRIBUNAL_COUNTER,
     )
+    total_tribunal_cost: float = 0.0
     for task_type in argument_stages:
         _, ai_session = await spawn_model(
             task_type=task_type,
@@ -983,9 +1013,10 @@ async def handle_tribunal(
         )
         # spawn_model already records cost internally — do NOT double-count
         task.ai_call_counter += 1
+        total_tribunal_cost += ai_session.cost_usd
 
-    # Judge verdict
-    _, judge_session = await spawn_model(
+    # Judge verdict — capture parsed output so we can persist the verdict
+    judge_output, judge_session = await spawn_model(
         task_type=TaskType.TRIBUNAL_JUDGE,
         context={
             "task_id": task.id,
@@ -1001,8 +1032,86 @@ async def handle_tribunal(
     )
     # spawn_model already records cost internally — do NOT double-count
     task.ai_call_counter += 1
+    total_tribunal_cost += judge_session.cost_usd
 
-    log.info("tribunal_complete", tribunal_id=tribunal_id, finding_id=finding_id)
+    # BUG-R3-02: Persist the TribunalSession to the DB so that
+    # _trigger_for_tribunal() can read the verdict on the next iteration.
+    verdict_output: TribunalVerdictOutput = judge_output  # type: ignore[assignment]
+    from mariana.data.models import TribunalSession as _TribunalSession  # noqa: PLC0415
+    import json as _json  # noqa: PLC0415
+    tribunal_session_record = _TribunalSession(
+        id=tribunal_id,
+        task_id=task.id,
+        finding_id=finding_id,
+        verdict=verdict_output.verdict,
+        judge_plaintiff_score=verdict_output.plaintiff_score,
+        judge_defendant_score=verdict_output.defendant_score,
+        judge_reasoning=verdict_output.verdict_reasoning,
+        unanswered_questions=verdict_output.unanswered_questions,
+        total_cost_usd=total_tribunal_cost,
+    )
+    try:
+        async with db.acquire() as _tconn:
+            async with _tconn.transaction():
+                await _tconn.execute(
+                    """
+                    INSERT INTO tribunal_sessions (
+                        id, task_id, finding_id,
+                        verdict,
+                        judge_plaintiff_score, judge_defendant_score,
+                        judge_reasoning, unanswered_questions,
+                        total_cost_usd, created_at
+                    ) VALUES (
+                        $1, $2, $3,
+                        $4,
+                        $5, $6,
+                        $7, $8,
+                        $9, NOW()
+                    )
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    tribunal_session_record.id,
+                    tribunal_session_record.task_id,
+                    tribunal_session_record.finding_id,
+                    tribunal_session_record.verdict.value if tribunal_session_record.verdict else None,
+                    tribunal_session_record.judge_plaintiff_score,
+                    tribunal_session_record.judge_defendant_score,
+                    tribunal_session_record.judge_reasoning,
+                    _json.dumps(tribunal_session_record.unanswered_questions, default=str),
+                    tribunal_session_record.total_cost_usd,
+                )
+                # Update finding confidence based on tribunal outcome
+                await _tconn.execute(
+                    """
+                    UPDATE findings
+                       SET confidence = $1,
+                           metadata   = metadata || $2::jsonb
+                     WHERE id = $3
+                    """,
+                    verdict_output.finding_confidence_after_tribunal,
+                    _json.dumps({
+                        "tribunal_session_id": tribunal_id,
+                        "tribunal_verdict": (
+                            verdict_output.verdict.value
+                            if verdict_output.verdict else None
+                        ),
+                        "publication_risk": verdict_output.publication_risk_assessment,
+                    }),
+                    finding_id,
+                )
+    except Exception as _exc:  # noqa: BLE001
+        log.error(
+            "tribunal_persist_failed",
+            tribunal_id=tribunal_id,
+            error=str(_exc),
+        )
+
+    log.info(
+        "tribunal_complete",
+        tribunal_id=tribunal_id,
+        finding_id=finding_id,
+        verdict=verdict_output.verdict.value if verdict_output.verdict else None,
+    )
 
 
 async def handle_skeptic(
@@ -1020,7 +1129,31 @@ async def handle_skeptic(
     """
     log = logger.bind(task_id=task.id, handler="skeptic")
 
-    _, ai_session = await spawn_model(
+    # Fetch the top finding for context (same as tribunal uses)
+    _top_finding_row = await db.fetchrow(
+        """
+        SELECT id FROM findings
+        WHERE task_id = $1
+        ORDER BY confidence DESC
+        LIMIT 1
+        """,
+        task.id,
+    )
+    _finding_id: str | None = _top_finding_row["id"] if _top_finding_row else None
+
+    # Fetch the latest tribunal session for linking
+    _tribunal_row = await db.fetchrow(
+        """
+        SELECT id FROM tribunal_sessions
+        WHERE task_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        task.id,
+    )
+    _tribunal_session_id: str | None = _tribunal_row["id"] if _tribunal_row else None
+
+    skeptic_output, ai_session = await spawn_model(
         task_type=TaskType.SKEPTIC_QUESTIONS,
         context={
             "task_id": task.id,
@@ -1036,7 +1169,78 @@ async def handle_skeptic(
     # spawn_model already records cost internally — do NOT double-count
     task.ai_call_counter += 1
 
-    log.info("skeptic_complete")
+    # BUG-R3-03: Persist the SkepticResult so that _trigger_for_skeptic()
+    # can read the question counts on the next iteration.
+    if _finding_id is not None:
+        from mariana.data.models import SkepticResult as _SkepticResult  # noqa: PLC0415
+        import json as _json_s  # noqa: PLC0415
+        import uuid as _uuid_s  # noqa: PLC0415
+
+        _skeptic_output: SkepticQuestionsOutput = skeptic_output  # type: ignore[assignment]
+
+        # Build SkepticResult — model_validator computes aggregated counts
+        _skeptic_result = _SkepticResult(
+            id=str(_uuid_s.uuid4()),
+            task_id=task.id,
+            finding_id=_finding_id,
+            tribunal_session_id=_tribunal_session_id,
+            questions=_skeptic_output.questions,
+            cost_usd=ai_session.cost_usd,
+        )
+
+        _questions_json = _json_s.dumps(
+            [
+                {
+                    "number": q.number,
+                    "question": q.question,
+                    "category": q.category.value,
+                    "severity": q.severity.value,
+                    "classification": q.classification.value,
+                    "resolution_note": q.resolution_note,
+                }
+                for q in _skeptic_result.questions
+            ]
+        )
+
+        try:
+            async with db.acquire() as _sconn:
+                async with _sconn.transaction():
+                    await _sconn.execute(
+                        """
+                        INSERT INTO skeptic_results (
+                            id, task_id, finding_id, tribunal_session_id,
+                            questions,
+                            open_count, researchable_count, resolved_count,
+                            critical_open_count, passes_publishing_threshold,
+                            cost_usd, created_at
+                        ) VALUES (
+                            $1, $2, $3, $4,
+                            $5::jsonb,
+                            $6, $7, $8,
+                            $9, $10,
+                            $11, NOW()
+                        )
+                        ON CONFLICT (id) DO NOTHING
+                        """,
+                        _skeptic_result.id,
+                        _skeptic_result.task_id,
+                        _skeptic_result.finding_id,
+                        _skeptic_result.tribunal_session_id,
+                        _questions_json,
+                        _skeptic_result.open_count,
+                        _skeptic_result.researchable_count,
+                        _skeptic_result.resolved_count,
+                        _skeptic_result.critical_open_count,
+                        _skeptic_result.passes_publishing_threshold,
+                        _skeptic_result.cost_usd,
+                    )
+        except Exception as _exc:  # noqa: BLE001
+            log.error(
+                "skeptic_persist_failed",
+                error=str(_exc),
+            )
+
+    log.info("skeptic_complete", finding_id=_finding_id)
 
 
 async def handle_report(
@@ -1287,7 +1491,7 @@ async def _build_session_data(
         """
         SELECT id, task_id, hypothesis_id, content, content_en, content_language,
                source_ids, confidence, evidence_type, is_compressed,
-               raw_content_path, created_at
+               raw_content_path, created_at, metadata
         FROM findings WHERE task_id = $1
         ORDER BY created_at DESC LIMIT 50
         """,
@@ -1314,6 +1518,18 @@ async def _build_session_data(
         ai_call_counter=task.ai_call_counter,
         recent_action_summaries=[],
     )
+
+
+def _sync_cost(task: ResearchTask, cost_tracker: CostTracker) -> None:
+    """Sync live cost-tracker totals into the task model before persistence.
+
+    BUG-R3-01 fix: ``task.total_spent_usd`` was never updated from
+    ``cost_tracker.total_spent``, causing the DB to always record 0.0.
+    ``task.ai_call_counter`` is also synced from the tracker's call_count
+    so both fields reflect the latest values at every checkpoint.
+    """
+    task.total_spent_usd = cost_tracker.total_spent
+    task.ai_call_counter = cost_tracker.call_count
 
 
 async def _persist_task(task: ResearchTask, db: Any) -> None:

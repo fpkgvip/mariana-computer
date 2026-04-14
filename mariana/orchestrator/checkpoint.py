@@ -28,6 +28,7 @@ from mariana.data.db import _row_to_dict
 from mariana.data.models import (
     Branch,
     Checkpoint,
+    DiminishingRecommendation,
     Finding,
     ResearchTask,
     State,
@@ -79,6 +80,7 @@ async def save_checkpoint(
     cost_tracker: CostTracker,
     db: Any,  # asyncpg.Pool
     data_root: str,
+    diminishing_result: DiminishingRecommendation | None = None,  # BUG-R3-05
 ) -> str:
     """Serialise and persist the current orchestrator state.
 
@@ -140,6 +142,7 @@ async def save_checkpoint(
         total_spent=cost_tracker.total_spent,
         diminishing_flags=task.diminishing_flags,
         ai_call_counter=task.ai_call_counter,
+        diminishing_result=diminishing_result,  # BUG-R3-05
     )
 
     # ------------------------------------------------------------------ #
@@ -197,12 +200,12 @@ async def save_checkpoint(
                 id, task_id, timestamp, state_machine_state,
                 active_branch_ids, killed_branch_ids, compressed_findings,
                 budget_remaining, total_spent, diminishing_flags,
-                ai_call_counter, snapshot_path
+                ai_call_counter, snapshot_path, diminishing_result
             ) VALUES (
                 $1, $2, $3, $4,
                 $5, $6, $7,
                 $8, $9, $10,
-                $11, $12
+                $11, $12, $13
             )
             ON CONFLICT (id) DO UPDATE SET
                 snapshot_path = EXCLUDED.snapshot_path,
@@ -221,6 +224,8 @@ async def save_checkpoint(
             checkpoint.diminishing_flags,
             checkpoint.ai_call_counter,
             checkpoint.snapshot_path,
+            # BUG-R3-05: persist diminishing_result so crash recovery has it
+            checkpoint.diminishing_result.value if checkpoint.diminishing_result else None,
         )
     except Exception:
         # DB insert failed — remove the orphaned temp file and re-raise
@@ -246,12 +251,9 @@ async def save_checkpoint(
         except OSError:
             pass
         try:
-            import asyncio  # noqa: PLC0415
-            asyncio.get_event_loop().run_until_complete(
-                db.execute(
-                    "UPDATE checkpoints SET snapshot_path = NULL WHERE id = $1",
-                    checkpoint_id,
-                )
+            await db.execute(
+                "UPDATE checkpoints SET snapshot_path = NULL WHERE id = $1",
+                checkpoint_id,
             )
         except Exception:  # noqa: BLE001
             pass
@@ -308,7 +310,7 @@ async def load_latest_checkpoint(
         SELECT id, task_id, timestamp, state_machine_state,
                active_branch_ids, killed_branch_ids, compressed_findings,
                budget_remaining, total_spent, diminishing_flags,
-               ai_call_counter, snapshot_path
+               ai_call_counter, snapshot_path, diminishing_result
         FROM checkpoints
         WHERE task_id = $1
         ORDER BY timestamp DESC

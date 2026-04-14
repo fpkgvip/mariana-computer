@@ -3,7 +3,10 @@
   "outputDirectory": "dist",
   "framework": "vite",
   "rewrites": [
-    { "source": "/api/:path*", "destination": "http://77.42.3.206:8080/api/:path*" },
+    {
+      "source": "/api/:path*",
+      "destination": "http://77.42.3.206:8080/api/:path*"
+    },
     { "source": "/(.*)", "destination": "/index.html" }
   ]
 }

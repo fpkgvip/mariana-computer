@@ -116,7 +116,7 @@ class URLCache:
             The cached payload dict (keys: ``content``, ``metadata``,
             ``cached_at``, ``expires_at``), or *None* on a cache miss.
         """
-        raw: bytes | None = await self._redis.get(_url_cache_key(url_hash))
+        raw: str | None = await self._redis.get(_url_cache_key(url_hash))  # BUG-NEW-16 fix: decode_responses=True returns str, not bytes
         if raw is None:
             logger.debug("URL cache miss url_hash=%s", url_hash)
             return None

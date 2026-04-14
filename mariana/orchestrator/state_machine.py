@@ -526,7 +526,15 @@ def _apply_guards(
             flags = task.diminishing_flags
             # BUG-016: flags >= 3 should have triggered CONSECUTIVE_DR_FLAGS_3 instead;
             # this path is defensive only.
-            assert flags > 0, "DIMINISHING_RETURNS trigger should only fire with flags > 0"
+            # BUG-NEW-18 fix: replaced assert (disabled under python -O) with an
+            # explicit runtime guard that logs and falls back safely.
+            if flags <= 0:
+                logger.error(
+                    "diminishing_returns_trigger_with_zero_flags",
+                    flags=flags,
+                    task_id=getattr(task, "id", None),
+                )
+                return State.SEARCH, actions
             if flags >= 3:
                 actions.append(Action("HALT", {"reason": "dr_flags_ge_3"}))
                 return State.HALT, actions

@@ -10,7 +10,7 @@ export default function Signup() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const { signup, user } = useAuth();
+  const { signup } = useAuth();
   const navigate = useNavigate();
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -27,15 +27,12 @@ export default function Signup() {
     setIsLoading(true);
     try {
       await signup(email, name, password);
-      // BUG-012: Only navigate to /chat if a session was established.
-      // If email confirmation is required, AuthContext shows a "Check your email"
-      // toast and returns without setting user — we stay on this page.
-      // We read user from context post-signup to check session state.
-      if (user) {
-        navigate("/chat");
-      }
-      // If user is null, email confirmation is required — the toast from
-      // AuthContext.signup() is sufficient feedback.
+      // BUG-R1-01: Navigate unconditionally after a non-throwing signup().
+      // Checking the `user` context value here is wrong — React state updates
+      // from AuthContext.setUser() are batched and the closure still holds the
+      // old (null) reference. If email confirmation is required, AuthContext
+      // will have left user=null and Chat.tsx will redirect back to /login.
+      navigate("/chat");
     } catch {
       // Error toast already shown by AuthContext.signup()
     } finally {
@@ -57,8 +54,9 @@ export default function Signup() {
 
         <form onSubmit={handleSubmit} className="mt-8 space-y-4">
           <div>
-            <label className="mb-1.5 block text-xs font-medium text-muted-foreground">Name</label>
+            <label htmlFor="name" className="mb-1.5 block text-xs font-medium text-muted-foreground">Name</label>
             <Input
+              id="name"
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -68,8 +66,9 @@ export default function Signup() {
             />
           </div>
           <div>
-            <label className="mb-1.5 block text-xs font-medium text-muted-foreground">Email</label>
+            <label htmlFor="email" className="mb-1.5 block text-xs font-medium text-muted-foreground">Email</label>
             <Input
+              id="email"
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
@@ -79,15 +78,19 @@ export default function Signup() {
             />
           </div>
           <div>
-            <label className="mb-1.5 block text-xs font-medium text-muted-foreground">Password</label>
+            <label htmlFor="password" className="mb-1.5 block text-xs font-medium text-muted-foreground">Password</label>
             <Input
+              id="password"
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               required
+              minLength={8}
               placeholder="••••••••"
               disabled={isLoading}
             />
+            {/* BUG-R1-15: Show minimum length hint before submission */}
+            <p className="mt-1 text-xs text-muted-foreground">Minimum 8 characters</p>
           </div>
 
           <Button type="submit" className="w-full" disabled={isLoading}>

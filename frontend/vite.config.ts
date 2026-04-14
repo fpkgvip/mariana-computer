@@ -12,6 +12,12 @@ export default defineConfig(({ mode }) => ({
     },
   },
   plugins: [react()].filter(Boolean),
+  build: {
+    // BUG-R1-22: Explicitly disable source maps in production builds.
+    // Vite defaults to false anyway, but explicit is safer — prevents
+    // accidentally enabling them via a future config change.
+    sourcemap: false,
+  },
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

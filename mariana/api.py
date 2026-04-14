@@ -155,9 +155,15 @@ _DEFAULT_CORS_ORIGINS = [
 ]
 
 def _get_cors_origins() -> list[str]:
-    """Return CORS allowed origins from config, falling back to defaults."""
-    if _config is not None and hasattr(_config, "CORS_ALLOWED_ORIGINS"):
-        return _config.CORS_ALLOWED_ORIGINS
+    """Return CORS allowed origins from env var, falling back to defaults.
+
+    BUG-R3-04 fix: ``add_middleware`` is called at module load time, before
+    the FastAPI lifespan context runs, so ``_config`` is always ``None`` at
+    that point.  The ``_config.CORS_ALLOWED_ORIGINS`` branch was therefore
+    dead code that silently dropped operator-configured origins.  Now we read
+    directly from ``os.environ`` (which IS available at import time) so the
+    env var is always honoured.
+    """
     extra = os.environ.get("CORS_ALLOWED_ORIGINS", "")
     if extra:
         return [o.strip() for o in extra.split(",") if o.strip()]

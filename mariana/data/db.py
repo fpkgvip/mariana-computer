@@ -95,6 +95,10 @@ async def create_pool(
 # ---------------------------------------------------------------------------
 
 _SCHEMA_SQL = """
+-- BUG-NEW-10 fix: ensure pgcrypto extension is available for gen_random_uuid()
+-- used in report_generations and evaluation_results tables.
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
 CREATE TABLE IF NOT EXISTS research_tasks (
     id                  TEXT        PRIMARY KEY,
     topic               TEXT        NOT NULL,

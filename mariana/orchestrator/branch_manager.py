@@ -132,34 +132,35 @@ async def create_branch(
         cycles_completed=0,
     )
 
-    await db.execute(
-        """
-        INSERT INTO branches (
-            id, hypothesis_id, task_id, status,
-            score_history, budget_allocated, budget_spent,
-            grants_log, cycles_completed, kill_reason,
-            sources_searched, created_at, updated_at
-        ) VALUES (
-            $1, $2, $3, $4,
-            $5, $6, $7,
-            $8, $9, $10,
-            $11, $12, $13
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO branches (
+                id, hypothesis_id, task_id, status,
+                score_history, budget_allocated, budget_spent,
+                grants_log, cycles_completed, kill_reason,
+                sources_searched, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4,
+                $5, $6, $7,
+                $8, $9, $10,
+                $11, $12, $13
+            )
+            """,
+            branch.id,
+            branch.hypothesis_id,
+            branch.task_id,
+            branch.status.value,
+            json.dumps(branch.score_history),
+            branch.budget_allocated,
+            branch.budget_spent,
+            json.dumps(branch.grants_log),
+            branch.cycles_completed,
+            branch.kill_reason,
+            json.dumps(branch.sources_searched),
+            branch.created_at,
+            branch.updated_at,
         )
-        """,
-        branch.id,
-        branch.hypothesis_id,
-        branch.task_id,
-        branch.status.value,
-        json.dumps(branch.score_history),
-        branch.budget_allocated,
-        branch.budget_spent,
-        json.dumps(branch.grants_log),
-        branch.cycles_completed,
-        branch.kill_reason,
-        json.dumps(branch.sources_searched),
-        branch.created_at,
-        branch.updated_at,
-    )
 
     logger.info(
         "branch_created",
@@ -197,7 +198,7 @@ async def score_branch(
     branch_id:
         UUID of the branch to evaluate.
     new_score:
-        The latest evaluation score (0–10 scale).
+        The latest evaluation score (0–1 scale).
     cost_spent_this_cycle:
         USD spent during this cycle; used to update the branch's
         ``budget_spent`` field before running cap checks.
@@ -238,8 +239,13 @@ async def score_branch(
     branch.cycles_completed += 1
     branch.updated_at = datetime.now(timezone.utc)  # BUG-001
 
-    # Sync the per-branch ledger in the live cost tracker
-    cost_tracker.record_branch_spend(branch_id, cost_spent_this_cycle)
+    # BUG-NEW-07 fix: Do NOT call cost_tracker.record_branch_spend() here.
+    # spawn_model() already called cost_tracker.record_call() internally,
+    # which added cost_spent_this_cycle to total_spent (and optionally to
+    # per_branch if a branch_id was passed).  Calling record_branch_spend()
+    # again would double-count the cost in total_spent.  The per-branch
+    # budget_spent DB field is updated directly via branch.budget_spent above.
+    # (Intentionally no cost_tracker.record_branch_spend call here.)
 
     # ------------------------------------------------------------------ #
     # Step 2: Hard branch budget cap check

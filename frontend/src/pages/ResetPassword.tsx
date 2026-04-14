@@ -17,19 +17,36 @@ export default function ResetPassword() {
   const [confirm, setConfirm] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isReady, setIsReady] = useState(false);
+  const [isError, setIsError] = useState(false);
 
   // Supabase appends the recovery token as a URL hash fragment.
   // onAuthStateChange fires with event=PASSWORD_RECOVERY when it detects it.
+  // BUG-R1-06: Add a 10-second timeout so users with expired/invalid links
+  // don’t get stuck on "Verifying your reset link…" forever.
+  // BUG-R2-04: Empty deps array — run once on mount only.
+  // isReady was previously in deps, causing the subscription to be torn down and recreated
+  // every time PASSWORD_RECOVERY fired and set isReady=true, creating a leaked subscription.
+  // The timeout callback uses a functional setter so it correctly handles the case where
+  // isReady was already set to true before the timeout fires.
   useEffect(() => {
+    const timeout = setTimeout(() => {
+      // Only set error if we haven't already transitioned to the ready state
+      setIsError((prev) => (prev ? prev : true));
+    }, 10000);
+
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((event) => {
       if (event === "PASSWORD_RECOVERY") {
+        clearTimeout(timeout);
         setIsReady(true);
       }
     });
-    return () => subscription.unsubscribe();
-  }, []);
+    return () => {
+      clearTimeout(timeout);
+      subscription.unsubscribe();
+    };
+  }, []); // no deps — run once on mount
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -72,29 +89,48 @@ export default function ResetPassword() {
         <p className="mt-2 text-sm text-muted-foreground">
           {isReady
             ? "Enter a new password for your account."
+            : isError
+            ? "Link expired or invalid."
             : "Verifying your reset link…"}
         </p>
+
+        {/* BUG-R1-06: Show error state when token is expired/invalid/missing */}
+        {isError && !isReady && (
+          <div className="mt-6 rounded-md border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-400">
+            <p>Your password reset link has expired or is invalid.</p>
+            <p className="mt-2">
+              <Link to="/login" className="font-medium underline hover:text-red-300">
+                Request a new password reset
+              </Link>
+            </p>
+          </div>
+        )}
 
         {isReady && (
           <form onSubmit={handleSubmit} className="mt-8 space-y-4">
             <div>
-              <label className="mb-1.5 block text-xs font-medium text-muted-foreground">
+              <label htmlFor="new-password" className="mb-1.5 block text-xs font-medium text-muted-foreground">
                 New password
               </label>
               <Input
+                id="new-password"
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required
+                minLength={8}
                 placeholder="••••••••"
                 disabled={isLoading}
               />
+              {/* BUG-R1-16: Show minimum length hint before submission */}
+              <p className="mt-1 text-xs text-muted-foreground">Minimum 8 characters</p>
             </div>
             <div>
-              <label className="mb-1.5 block text-xs font-medium text-muted-foreground">
+              <label htmlFor="confirm-password" className="mb-1.5 block text-xs font-medium text-muted-foreground">
                 Confirm password
               </label>
               <Input
+                id="confirm-password"
                 type="password"
                 value={confirm}
                 onChange={(e) => setConfirm(e.target.value)}

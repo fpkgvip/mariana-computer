@@ -21,9 +21,12 @@ Cost from all five sessions is accumulated and recorded in the returned
 ``spawn_model`` signature (from ``mariana.ai.session``):
     async def spawn_model(
         task_type, context: dict, output_schema,
-        max_tokens=4096, use_batch=False, branch_id=None,
+        max_tokens=None, use_batch=False, branch_id=None,
         db=None, cost_tracker=None, config=None
     ) -> tuple[BaseModel, AISession]
+
+    Note: max_tokens defaults to None (model decides), not 4096.
+    BUG-A07 fix: updated from stale default value of 4096.
 
 Context keys required per task_type (from ``prompt_builder``):
     TRIBUNAL_PLAINTIFF : finding_summary, supporting_evidence, sources
@@ -216,6 +219,7 @@ async def run_tribunal(
     plaintiff_parsed, plaintiff_session = await spawn_model(
         task_type=TaskType.TRIBUNAL_PLAINTIFF,
         context={
+            "task_id": task_id,
             "finding_summary": finding_summary,
             "supporting_evidence": supporting_evidence_block,
             "sources": source_summary,
@@ -246,6 +250,7 @@ async def run_tribunal(
     defendant_parsed, defendant_session = await spawn_model(
         task_type=TaskType.TRIBUNAL_DEFENDANT,
         context={
+            "task_id": task_id,
             "finding_summary": finding_summary,
             "plaintiff_argument": plaintiff_arg_text,
         },
@@ -275,6 +280,7 @@ async def run_tribunal(
     rebuttal_parsed, rebuttal_session = await spawn_model(
         task_type=TaskType.TRIBUNAL_REBUTTAL,
         context={
+            "task_id": task_id,
             "finding_summary": finding_summary,
             "defendant_argument": defendant_arg_text,
             "plaintiff_original": plaintiff_arg_text,
@@ -305,6 +311,7 @@ async def run_tribunal(
     counter_parsed, counter_session = await spawn_model(
         task_type=TaskType.TRIBUNAL_COUNTER,
         context={
+            "task_id": task_id,
             "finding_summary": finding_summary,
             "plaintiff_rebuttal": rebuttal_arg_text,
             "defendant_original": defendant_arg_text,
@@ -335,6 +342,7 @@ async def run_tribunal(
     verdict_parsed, judge_session = await spawn_model(
         task_type=TaskType.TRIBUNAL_JUDGE,
         context={
+            "task_id": task_id,
             "finding_summary": finding_summary,
             "plaintiff_summary": plaintiff_summary,
             "defendant_summary": defendant_summary,
