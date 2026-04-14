@@ -1,0 +1,46 @@
+name: Deploy to Hetzner
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USER }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            cd /opt/mariana
+
+            # Pull latest code
+            git pull origin master
+
+            # Build and restart
+            docker compose build --no-cache
+            docker compose down
+            docker compose up -d
+
+            # Wait for health
+            for i in $(seq 1 12); do
+              if curl -sf http://localhost:8080/api/health >/dev/null 2>&1; then
+                echo "✓ API healthy"
+                exit 0
+              fi
+              echo "Waiting for API... ($i/12)"
+              sleep 5
+            done
+            echo "WARNING: API not responding after 60s"
+            docker compose logs --tail=50
+            exit 1
