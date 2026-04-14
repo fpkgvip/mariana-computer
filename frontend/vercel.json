@@ -2,7 +2,6 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "framework": "vite",
-  "_comment_backend_ip": "BUG-042: Backend IP is hardcoded here because Vercel rewrites do not currently support environment variable substitution in destination URLs for this project plan. Move to a domain name or upgrade Vercel plan to use $BACKEND_URL env var when available.",
   "rewrites": [
     { "source": "/api/:path*", "destination": "http://77.42.3.206:8080/api/:path*" },
     { "source": "/(.*)", "destination": "/index.html" }
