@@ -11,8 +11,9 @@ dist/
 build/
 .eggs/
 
-# Data (persisted on server, not in git)
-data/
+# Data (runtime artifacts persisted on server, not in git)
+/data/
+!mariana/data/
 *.pdf
 *.docx
 
