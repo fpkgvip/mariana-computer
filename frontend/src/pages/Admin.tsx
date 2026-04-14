@@ -212,12 +212,21 @@ export default function Admin() {
     }
   };
 
-  // While the useEffect redirect is in flight, show a brief loading indicator
-  // instead of a blank page.
+  // While the useEffect redirect is in flight, show a diagnostic view.
   if (!user || user.role !== "admin") {
     return (
-      <div className="flex h-screen items-center justify-center bg-background">
+      <div className="flex h-screen flex-col items-center justify-center gap-4 bg-background p-8">
         <Loader2 size={18} className="animate-spin text-muted-foreground" />
+        <p className="text-xs text-muted-foreground">Checking admin access...</p>
+        <pre className="mt-4 max-w-lg overflow-auto rounded bg-card p-4 text-xs text-foreground">
+          {JSON.stringify(
+            user
+              ? { id: user.id, role: user.role, email: user.email, name: user.name }
+              : { user: "null" },
+            null,
+            2
+          )}
+        </pre>
       </div>
     );
   }
