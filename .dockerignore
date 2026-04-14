@@ -8,7 +8,9 @@ __pycache__
 .env.example
 *.tar.gz
 *.zip
-/data/
+# Exclude top-level data dir (runtime artifacts) but keep mariana/data/ (Python module)
+data/
+!mariana/data/
 skills/
 *.md
 !README.md
