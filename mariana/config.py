@@ -205,6 +205,7 @@ class AppConfig:
     # Supabase — used by backend for REST API calls (webhooks, admin)
     # ------------------------------------------------------------------
     SUPABASE_URL: str = ""
+    SUPABASE_ANON_KEY: str = ""
     SUPABASE_SERVICE_KEY: str = ""
 
     # ------------------------------------------------------------------
@@ -356,5 +357,6 @@ def load_config(env_file: str | Path | None = None) -> AppConfig:
         STRIPE_WEBHOOK_SECRET=_str("STRIPE_WEBHOOK_SECRET", ""),
         # Supabase
         SUPABASE_URL=_str("SUPABASE_URL", ""),
+        SUPABASE_ANON_KEY=_str("SUPABASE_ANON_KEY", ""),
         SUPABASE_SERVICE_KEY=_str("SUPABASE_SERVICE_KEY", ""),
     )

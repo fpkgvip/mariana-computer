@@ -93,17 +93,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
    * promise rejections in the onAuthStateChange listener.
    */
   const syncSession = useCallback(async (session: Session | null) => {
-    console.log("[AuthContext] syncSession called, session:", session ? "exists" : "null");
     if (!session) {
       setUser(null);
       return;
     }
     try {
       const profile = await fetchProfile(session.user.id);
-      console.log("[AuthContext] profile fetched:", profile ? { role: profile.role, tokens: profile.tokens } : "null");
-      const u = buildUser(session, profile);
-      console.log("[AuthContext] buildUser result:", { role: u.role, name: u.name });
-      setUser(u);
+      setUser(buildUser(session, profile));
     } catch (err) {
       console.error("[AuthContext] syncSession error:", err);
       // Still set user with just session data so the app remains usable

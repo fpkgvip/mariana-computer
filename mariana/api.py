@@ -410,10 +410,12 @@ class AdminSetCreditsRequest(BaseModel):
 class AdminStatsResponse(BaseModel):
     """System-wide statistics for the admin dashboard."""
 
+    total_users: int
     total_investigations: int
     running_investigations: int
     completed_investigations: int
     failed_investigations: int
+    total_credits_consumed: int
     total_spent_usd: float
     active_users_30d: int
 
@@ -1838,30 +1840,31 @@ async def _get_stripe_customer_id(
     summary="List all users (admin only)",
 )
 async def admin_list_users(
+    request: Request,
     _: dict[str, str] = Depends(_require_admin),
 ) -> list[AdminUserSummary]:
     """
-    Return all user profiles from Supabase via the REST API.
-
-    Requires admin JWT.  Fetches from the Supabase ``profiles`` table.
+    Return all user profiles via the Supabase ``admin_list_profiles()``
+    SECURITY DEFINER function.  The function itself checks that the caller
+    has role='admin' in the profiles table, so it's double-gated.
     """
     cfg = _get_config()
-    if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
+    if not cfg.SUPABASE_URL:
         raise HTTPException(status_code=503, detail="Supabase not configured")
 
-    url = (
-        f"{cfg.SUPABASE_URL}/rest/v1/profiles"
-        "?select=id,email,role,tokens,stripe_customer_id,"
-        "subscription_plan,subscription_status,created_at"
-        "&order=created_at.desc"
-    )
+    # Forward the caller's JWT so the RPC function can verify admin role
+    auth_header = request.headers.get("authorization", "")
+    anon_key = cfg.SUPABASE_ANON_KEY or ""
+
+    url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/admin_list_profiles"
     headers = {
-        "apikey": cfg.SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+        "apikey": anon_key,
+        "Authorization": auth_header,
+        "Content-Type": "application/json",
     }
 
     async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(url, headers=headers)
+        resp = await client.post(url, headers=headers, json={})
 
     if resp.status_code != 200:
         logger.error("admin_list_users_failed", status=resp.status_code, body=resp.text[:200])
@@ -1870,7 +1873,7 @@ async def admin_list_users(
     rows: list[dict[str, Any]] = resp.json()
     return [
         AdminUserSummary(
-            user_id=r["id"],
+            user_id=str(r["id"]),
             email=r.get("email"),
             role=r.get("role") or "authenticated",
             credits=r.get("tokens") or 0,
@@ -1949,67 +1952,48 @@ async def admin_list_investigations(
 async def admin_set_credits(
     user_id: str,
     body: AdminSetCreditsRequest,
+    request: Request,
     _: dict[str, str] = Depends(_require_admin),
 ) -> JSONResponse:
     """
     Set the absolute credit balance for a user, or add/subtract a delta.
 
-    If ``body.delta`` is True, the ``credits`` value is treated as an
-    increment (positive to add, negative to deduct).  Otherwise it sets
-    the balance absolutely.
+    Uses the ``admin_set_credits`` SECURITY DEFINER function in Supabase
+    so no service-role key is needed.
     """
     cfg = _get_config()
-    if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
+    if not cfg.SUPABASE_URL:
         raise HTTPException(status_code=503, detail="Supabase not configured")
 
+    auth_header = request.headers.get("authorization", "")
+    anon_key = cfg.SUPABASE_ANON_KEY or ""
+
+    url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/admin_set_credits"
     headers = {
-        "apikey": cfg.SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+        "apikey": anon_key,
+        "Authorization": auth_header,
         "Content-Type": "application/json",
-        "Prefer": "return=minimal",
     }
-    profile_url = (
-        f"{cfg.SUPABASE_URL}/rest/v1/profiles"
-        f"?id=eq.{user_id}&select=tokens"
-    )
+    payload = {
+        "target_user_id": user_id,
+        "new_credits": body.credits,
+        "is_delta": body.delta,
+    }
 
     async with httpx.AsyncClient(timeout=15.0) as client:
-        if body.delta:
-            # Read current balance first
-            get_resp = await client.get(
-                profile_url,
-                headers={
-                    "apikey": cfg.SUPABASE_SERVICE_KEY,
-                    "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
-                },
-            )
-            if get_resp.status_code != 200:
-                raise HTTPException(
-                    status_code=502, detail="Failed to read user profile"
-                )
-            rows = get_resp.json()
-            if not rows:
-                raise HTTPException(status_code=404, detail=f"User {user_id!r} not found")
-            current: int = rows[0].get("tokens", 0) or 0
-            new_balance = max(0, current + body.credits)
-        else:
-            new_balance = body.credits
+        resp = await client.post(url, headers=headers, json=payload)
 
-        patch_url = f"{cfg.SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}"
-        patch_resp = await client.patch(
-            patch_url,
-            json={"tokens": new_balance},
-            headers=headers,
-        )
-
-    if patch_resp.status_code not in (200, 204):
+    if resp.status_code != 200:
+        detail = resp.text[:200] if resp.text else "Unknown error"
         logger.error(
             "admin_set_credits_failed",
             user_id=user_id,
-            status=patch_resp.status_code,
+            status=resp.status_code,
+            detail=detail,
         )
-        raise HTTPException(status_code=502, detail="Failed to update user credits")
+        raise HTTPException(status_code=502, detail=f"Failed to update credits: {detail}")
 
+    new_balance = resp.json()
     logger.info(
         "admin_credits_updated",
         user_id=user_id,
@@ -2026,10 +2010,34 @@ async def admin_set_credits(
     summary="System-wide statistics (admin only)",
 )
 async def admin_stats(
+    request: Request,
     _: dict[str, str] = Depends(_require_admin),
 ) -> AdminStatsResponse:
     """Return aggregated system stats for the admin overview."""
     db = _get_db()
+    cfg = _get_config()
+
+    # --- Total users via SECURITY DEFINER RPC (no service key needed) ---
+    total_users = 0
+    if cfg.SUPABASE_URL:
+        try:
+            auth_header = request.headers.get("authorization", "")
+            anon_key = cfg.SUPABASE_ANON_KEY or ""
+            headers = {
+                "apikey": anon_key,
+                "Authorization": auth_header,
+                "Content-Type": "application/json",
+            }
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    f"{cfg.SUPABASE_URL}/rest/v1/rpc/admin_count_profiles",
+                    headers=headers,
+                    json={},
+                )
+                if resp.status_code == 200:
+                    total_users = int(resp.json())
+        except Exception as e:
+            logger.warning("admin_stats_supabase_error", error=str(e))
 
     total_investigations: int = await db.fetchval("SELECT COUNT(*) FROM research_tasks") or 0
     running: int = await db.fetchval(
@@ -2046,6 +2054,8 @@ async def admin_stats(
             "SELECT COALESCE(SUM(total_spent_usd), 0.0) FROM research_tasks"
         ) or 0.0
     )
+    # Approximate credits consumed: $1 = 100 credits, round to integer
+    total_credits_consumed = int(total_spent * 100)
     active_users_30d: int = await db.fetchval(
         """
         SELECT COUNT(DISTINCT metadata->>'user_id')
@@ -2056,10 +2066,12 @@ async def admin_stats(
     ) or 0
 
     return AdminStatsResponse(
+        total_users=total_users,
         total_investigations=total_investigations,
         running_investigations=running,
         completed_investigations=completed,
         failed_investigations=failed,
+        total_credits_consumed=total_credits_consumed,
         total_spent_usd=total_spent,
         active_users_30d=active_users_30d,
     )

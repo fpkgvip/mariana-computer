@@ -32,26 +32,28 @@ interface AdminStats {
   completed_investigations: number;
   failed_investigations: number;
   total_credits_consumed: number;
+  total_spent_usd: number;
+  active_users_30d: number;
 }
 
 interface AdminUser {
-  id: string;
-  email: string;
-  full_name: string | null;
-  tokens: number;
+  user_id: string;
+  email: string | null;
   role: string;
+  credits: number;
+  stripe_customer_id: string | null;
   subscription_plan: string | null;
   subscription_status: string | null;
-  created_at: string;
+  created_at: string | null;
 }
 
 interface AdminInvestigation {
-  task_id: string;
+  id: string;
   topic: string;
   status: string;
   created_at: string;
-  user_id: string;
-  user_email?: string;
+  budget_usd: number;
+  total_spent_usd: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -94,16 +96,11 @@ export default function Admin() {
 
   /* Auth guard — redirect non-admins (including unauthenticated users) */
   useEffect(() => {
-    console.log("[Admin] auth guard — user:", user ? { id: user.id, role: user.role, email: user.email } : null);
-    // user is null = not logged in (AuthProvider's loading spinner already
-    // handled the "still loading" state).  Redirect to login.
     if (user === null) {
       navigate("/login", { replace: true });
       return;
     }
-    // Logged in but not admin — send to chat.
     if (user.role !== "admin") {
-      console.warn("[Admin] non-admin user, redirecting to /chat", user.role);
       navigate("/chat", { replace: true });
     }
   }, [user, navigate]);
@@ -155,8 +152,10 @@ export default function Admin() {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data: AdminInvestigation[] = await res.json();
-      setInvestigations(data);
+      const data = await res.json();
+      // Backend returns { items: [...], total, page, page_size }
+      const items: AdminInvestigation[] = Array.isArray(data) ? data : (data.items ?? []);
+      setInvestigations(items);
     } catch (err) {
       console.error("[Admin] Failed to fetch investigations:", err);
       toast.error("Could not load investigations");
@@ -191,7 +190,7 @@ export default function Admin() {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ amount }),
+        body: JSON.stringify({ credits: amount, delta: true }),
       });
 
       if (!res.ok) {
@@ -212,21 +211,11 @@ export default function Admin() {
     }
   };
 
-  // While the useEffect redirect is in flight, show a diagnostic view.
+  // Show loading spinner while redirect is in flight
   if (!user || user.role !== "admin") {
     return (
-      <div className="flex h-screen flex-col items-center justify-center gap-4 bg-background p-8">
+      <div className="flex h-screen items-center justify-center bg-background">
         <Loader2 size={18} className="animate-spin text-muted-foreground" />
-        <p className="text-xs text-muted-foreground">Checking admin access...</p>
-        <pre className="mt-4 max-w-lg overflow-auto rounded bg-card p-4 text-xs text-foreground">
-          {JSON.stringify(
-            user
-              ? { id: user.id, role: user.role, email: user.email, name: user.name }
-              : { user: "null" },
-            null,
-            2
-          )}
-        </pre>
       </div>
     );
   }
@@ -353,9 +342,9 @@ export default function Admin() {
                   </thead>
                   <tbody className="divide-y divide-border">
                     {users.map((u) => (
-                      <tr key={u.id} className="bg-card hover:bg-secondary/30 transition-colors">
-                        <td className="px-4 py-3 text-foreground">{u.full_name ?? "—"}</td>
-                        <td className="px-4 py-3 text-muted-foreground">{u.email}</td>
+                      <tr key={u.user_id} className="bg-card hover:bg-secondary/30 transition-colors">
+                        <td className="px-4 py-3 text-foreground">{u.email?.split("@")[0] ?? "—"}</td>
+                        <td className="px-4 py-3 text-muted-foreground">{u.email ?? "—"}</td>
                         <td className="px-4 py-3">
                           <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-medium ring-1 ring-inset ${
                             u.role === "admin"
@@ -369,10 +358,10 @@ export default function Admin() {
                           {u.subscription_plan ?? "none"}
                         </td>
                         <td className="px-4 py-3 text-right font-mono text-foreground">
-                          {u.tokens.toLocaleString()}
+                          {(u.credits ?? 0).toLocaleString()}
                         </td>
                         <td className="px-4 py-3 font-mono text-[10px] text-muted-foreground/60">
-                          {u.id}
+                          {u.user_id}
                         </td>
                       </tr>
                     ))}
@@ -417,14 +406,14 @@ export default function Admin() {
                     <tr className="border-b border-border bg-card/50">
                       <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">Topic</th>
                       <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">Status</th>
-                      <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">User</th>
+                      <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wider text-muted-foreground">Spent</th>
                       <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">Created</th>
-                      <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">Task ID</th>
+                      <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">ID</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border">
                     {investigations.map((inv) => (
-                      <tr key={inv.task_id} className="bg-card hover:bg-secondary/30 transition-colors">
+                      <tr key={inv.id} className="bg-card hover:bg-secondary/30 transition-colors">
                         <td className="max-w-xs px-4 py-3 text-foreground truncate">{inv.topic}</td>
                         <td className="px-4 py-3">
                           <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-medium ring-1 ring-inset ${
@@ -439,14 +428,14 @@ export default function Admin() {
                             {inv.status}
                           </span>
                         </td>
-                        <td className="px-4 py-3 font-mono text-[11px] text-muted-foreground">
-                          {inv.user_email ?? inv.user_id.slice(0, 8) + "…"}
+                        <td className="px-4 py-3 text-right font-mono text-xs text-muted-foreground">
+                          ${(inv.total_spent_usd ?? 0).toFixed(2)}
                         </td>
                         <td className="px-4 py-3 text-xs text-muted-foreground">
                           {new Date(inv.created_at).toLocaleString()}
                         </td>
                         <td className="px-4 py-3 font-mono text-[10px] text-muted-foreground/60">
-                          {inv.task_id}
+                          {inv.id}
                         </td>
                       </tr>
                     ))}
