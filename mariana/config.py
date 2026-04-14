@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -107,9 +106,14 @@ class AppConfig:
     CHECKPOINT_INTERVAL_CYCLES: int = 10
 
     # ------------------------------------------------------------------
+    # Timer system
+    # ------------------------------------------------------------------
+    duration_hours: float = 2.0
+
+    # ------------------------------------------------------------------
     # Infrastructure — Postgres
     # ------------------------------------------------------------------
-    POSTGRES_DSN: str = "postgresql://mariana:mariana@postgresql:5432/mariana"
+    POSTGRES_DSN: str = ""
     POSTGRES_POOL_MIN: int = 2
     POSTGRES_POOL_MAX: int = 10
 
@@ -122,6 +126,15 @@ class AppConfig:
     # Filesystem
     # ------------------------------------------------------------------
     DATA_ROOT: str = "/data/mariana"
+
+    def __post_init__(self) -> None:
+        """Validate budget ordering invariant at startup."""
+        if not (self.BUDGET_BRANCH_INITIAL <= self.BUDGET_BRANCH_HARD_CAP <= self.BUDGET_TASK_HARD_CAP):
+            raise RuntimeError(
+                f"Budget validation failed: BUDGET_BRANCH_INITIAL ({self.BUDGET_BRANCH_INITIAL}) "
+                f"<= BUDGET_BRANCH_HARD_CAP ({self.BUDGET_BRANCH_HARD_CAP}) "
+                f"<= BUDGET_TASK_HARD_CAP ({self.BUDGET_TASK_HARD_CAP}) must hold."
+            )
 
     @property
     def checkpoints_dir(self) -> str:
@@ -206,7 +219,16 @@ def load_config(env_file: str | Path | None = None) -> AppConfig:
             return default
         return raw.strip().lower() in {"1", "true", "yes", "on"}
 
-    pg_password = _str("POSTGRES_PASSWORD", "mariana")
+    # Require POSTGRES_PASSWORD if POSTGRES_DSN is not explicitly set.
+    postgres_dsn = os.environ.get("POSTGRES_DSN")
+    if not postgres_dsn:
+        pg_password = os.environ.get("POSTGRES_PASSWORD")
+        if not pg_password:
+            raise RuntimeError(
+                "POSTGRES_PASSWORD environment variable is required when POSTGRES_DSN is not set. "
+                "Set POSTGRES_DSN or POSTGRES_PASSWORD in your environment or .env file."
+            )
+        postgres_dsn = f"postgresql://mariana:{pg_password}@postgresql:5432/mariana"
 
     return AppConfig(
         # Model tiers
@@ -256,10 +278,7 @@ def load_config(env_file: str | Path | None = None) -> AppConfig:
         # Checkpoint
         CHECKPOINT_INTERVAL_CYCLES=_int("CHECKPOINT_INTERVAL_CYCLES", 10),
         # Postgres
-        POSTGRES_DSN=_str(
-            "POSTGRES_DSN",
-            f"postgresql://mariana:{pg_password}@postgresql:5432/mariana",
-        ),
+        POSTGRES_DSN=postgres_dsn,
         POSTGRES_POOL_MIN=_int("POSTGRES_POOL_MIN", 2),
         POSTGRES_POOL_MAX=_int("POSTGRES_POOL_MAX", 10),
         # Redis
@@ -275,6 +294,8 @@ def load_config(env_file: str | Path | None = None) -> AppConfig:
         DEEPSEEK_API_KEY=_str("DEEPSEEK_API_KEY", ""),
         # Batch
         BATCH_POLL_INTERVAL_SECONDS=_int("BATCH_POLL_INTERVAL_SECONDS", 300),
+        # Timer
+        duration_hours=_float("DURATION_HOURS", 2.0),
         # Logging
         LOG_LEVEL=_str("LOG_LEVEL", "INFO"),
         LOG_JSON=_bool("LOG_JSON", True),

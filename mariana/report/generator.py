@@ -31,7 +31,7 @@ import json
 import os
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -110,7 +110,7 @@ async def generate_report(
     db: Any,  # asyncpg.Pool
     cost_tracker: Any,  # mariana.orchestrator.cost_tracker.CostTracker
     report_dir: str,
-) -> tuple[str, None]:
+) -> tuple[str, str | None]:  # TODO: implement DOCX generation
     """
     Generate the full bilingual PDF research report.
 
@@ -208,7 +208,7 @@ async def generate_report(
 
     # ── Compute word counts ───────────────────────────────────────────────────
     for section in final_output.sections:
-        section.word_count_en = len(section.content_en.split())
+        section.word_count_en = len((section.content_en or "").split())
 
     # ── Build template data dict ──────────────────────────────────────────────
     report_data: dict[str, Any] = {
@@ -232,7 +232,7 @@ async def generate_report(
         "conclusion_zh": final_output.conclusion_zh,
         "disclaimer_en": final_output.disclaimer_en,
         "disclaimer_zh": final_output.disclaimer_zh,
-        "generated_at": datetime.utcnow(),
+        "generated_at": datetime.now(timezone.utc),
         "task_topic": task.topic,
         "total_cost_usd": cost_tracker.total_spent,
         "total_sources": len(all_sources),
@@ -250,11 +250,19 @@ async def generate_report(
     log.info("report_render_start", pdf_path=pdf_path)
     t0 = time.monotonic()
 
-    render_pdf(
-        report_data=report_data,
-        template_dir=template_dir,
-        output_path=pdf_path,
-    )
+    import asyncio as _asyncio  # noqa: PLC0415
+    try:
+        await _asyncio.get_event_loop().run_in_executor(
+            None, render_pdf, report_data, template_dir, pdf_path
+        )
+    except Exception as exc:
+        log.error("report_render_failed", pdf_path=pdf_path, error=str(exc))
+        async with db.acquire() as _conn:
+            await _conn.execute(
+                "UPDATE research_tasks SET status = 'FAILED' WHERE id = $1",
+                task.id,
+            )
+        raise
 
     log.info(
         "report_render_done",
@@ -272,6 +280,7 @@ async def generate_report(
         report_cost_usd=total_ai_cost,
     )
 
+    logger.warning("docx_generation_skipped_prototype")
     return pdf_path, None
 
 

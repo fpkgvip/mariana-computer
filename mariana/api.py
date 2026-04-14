@@ -35,7 +35,7 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -143,7 +143,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # Restrict to known origins in production
+    allow_origins=[
+        "https://frontend-tau-navy-80.vercel.app",
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -196,6 +200,7 @@ class ConfigResponse(BaseModel):
 class StartInvestigationRequest(BaseModel):
     topic: str = Field(..., min_length=3, max_length=1024, description="Research topic")
     budget_usd: float = Field(..., gt=0.0, le=500.0, description="Budget ceiling in USD")
+    duration_hours: float = Field(2.0, gt=0.0, description="Maximum investigation duration in hours")
 
 
 class StartInvestigationResponse(BaseModel):
@@ -383,12 +388,13 @@ async def start_investigation(body: StartInvestigationRequest) -> StartInvestiga
     """
     cfg = _get_config()
     task_id = str(uuid.uuid4())
-    created_at = datetime.utcnow().isoformat()
+    created_at = datetime.now(tz=timezone.utc).isoformat()
 
     task_payload: dict[str, Any] = {
         "id": task_id,
         "topic": body.topic,
         "budget_usd": body.budget_usd,
+        "duration_hours": body.duration_hours,
         "status": "PENDING",
         "created_at": created_at,
     }
@@ -521,7 +527,7 @@ async def kill_investigation(task_id: str) -> KillTaskResponse:
         )
 
     await db.execute(
-        "UPDATE research_tasks SET status = 'HALTED' WHERE id = $1",
+        "UPDATE research_tasks SET status = 'HALTED', completed_at = NOW() WHERE id = $1",
         task_id,
     )
 
@@ -719,6 +725,20 @@ async def stream_logs(request: Request, task_id: str) -> EventSourceResponse:
                     if message is not None:
                         yield {"data": message.get("data", ""), "event": "log"}
                     else:
+                        # Periodically check if the task has reached a terminal state.
+                        db = _get_db()
+                        status_row = await db.fetchrow(
+                            "SELECT status FROM research_tasks WHERE id = $1",
+                            task_id,
+                        )
+                        if status_row is not None and status_row["status"] in (
+                            "COMPLETED", "FAILED", "HALTED"
+                        ):
+                            yield {
+                                "data": json.dumps({"task_id": task_id, "final_status": status_row["status"]}),
+                                "event": "done",
+                            }
+                            break
                         yield {"data": json.dumps({"heartbeat": True}), "event": "ping"}
                     await asyncio.sleep(0.1)
             finally:
@@ -751,7 +771,7 @@ async def stream_logs(request: Request, task_id: str) -> EventSourceResponse:
                             "status": row["status"],
                             "state": current_state,
                             "total_spent_usd": float(row["total_spent_usd"] or 0.0),
-                            "ts": datetime.utcnow().isoformat(),
+                            "ts": datetime.now(tz=timezone.utc).isoformat(),
                         }),
                         "event": "state_change",
                     }
@@ -798,15 +818,25 @@ async def download_report_pdf(task_id: str) -> FileResponse:
             detail="PDF report has not been generated yet for this task",
         )
 
-    if not os.path.isfile(pdf_path):
+    # Protect against path traversal: ensure the resolved path is under DATA_ROOT.
+    cfg = _get_config()
+    resolved = Path(pdf_path).resolve()
+    data_root = Path(cfg.DATA_ROOT).resolve()
+    if not resolved.is_relative_to(data_root):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: report path is outside the data root",
+        )
+
+    if not resolved.is_file():
         raise HTTPException(
             status_code=404,
             detail=f"PDF file not found on disk: {pdf_path}",
         )
 
-    filename = Path(pdf_path).name
+    filename = resolved.name
     return FileResponse(
-        path=pdf_path,
+        path=str(resolved),
         media_type="application/pdf",
         filename=filename,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
@@ -841,15 +871,25 @@ async def download_report_docx(task_id: str) -> FileResponse:
             detail="DOCX report not available. The generator currently produces PDF only.",
         )
 
-    if not os.path.isfile(docx_path):
+    # Protect against path traversal: ensure the resolved path is under DATA_ROOT.
+    cfg = _get_config()
+    resolved = Path(docx_path).resolve()
+    data_root = Path(cfg.DATA_ROOT).resolve()
+    if not resolved.is_relative_to(data_root):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: report path is outside the data root",
+        )
+
+    if not resolved.is_file():
         raise HTTPException(
             status_code=404,
             detail=f"DOCX file not found on disk: {docx_path}",
         )
 
-    filename = Path(docx_path).name
+    filename = resolved.name
     return FileResponse(
-        path=docx_path,
+        path=str(resolved),
         media_type=(
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         ),
@@ -954,7 +994,7 @@ async def graceful_shutdown() -> ShutdownResponse:
             logger.error("shutdown_halt_failed", error=str(exc))
 
     # Schedule OS-level exit after a brief delay to let the response flush
-    asyncio.get_event_loop().call_later(1.0, _exit_process)
+    asyncio.get_running_loop().call_later(1.0, _exit_process)
     return ShutdownResponse(message="Graceful shutdown initiated")
 
 
@@ -969,6 +1009,52 @@ def _exit_process() -> None:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# SQL injection protection — column-name allowlists
+# ---------------------------------------------------------------------------
+
+#: Columns that may legally appear in UPDATE research_tasks SET ... queries.
+_RESEARCH_TASK_UPDATABLE_COLUMNS: frozenset[str] = frozenset({
+    "status",
+    "current_state",
+    "error_message",
+    "total_spent_usd",
+    "ai_call_counter",
+    "diminishing_flags",
+    "started_at",
+    "completed_at",
+    "output_pdf_path",
+    "output_docx_path",
+    "metadata",
+})
+
+#: Columns that may legally appear in UPDATE branches SET ... queries.
+_BRANCH_UPDATABLE_COLUMNS: frozenset[str] = frozenset({
+    "status",
+    "budget_allocated",
+    "budget_spent",
+    "cycles_completed",
+    "score_history",
+    "kill_reason",
+    "updated_at",
+})
+
+
+def _validate_update_columns(columns: set[str], allowlist: frozenset[str], table: str) -> None:
+    """
+    Raise ValueError if any column name is not in the allowlist.
+
+    This prevents SQL injection via dynamic column-name interpolation in
+    UPDATE queries built from **kwargs-style field mappings.
+    """
+    unknown = columns - allowlist
+    if unknown:
+        raise ValueError(
+            f"SQL injection protection: disallowed column(s) for table '{table}': "
+            + ", ".join(sorted(unknown))
+        )
 
 
 def _ensure_task_exists(row: asyncpg.Record | None, task_id: str) -> None:

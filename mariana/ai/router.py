@@ -229,10 +229,11 @@ class DeepSeekHealthCache:
                     json=payload,
                     headers=headers,
                 )
-            if response.status_code < 500:
+            if 200 <= response.status_code < 300:
                 return True
             logger.warning(
-                "DeepSeek health ping returned HTTP %s", response.status_code
+                "DeepSeek health ping returned HTTP %s (not 2xx — treating as unhealthy)",
+                response.status_code,
             )
             return False
         except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:

@@ -17,6 +17,7 @@ Cache policy:
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import xml.etree.ElementTree as ET
 from typing import Any
@@ -32,12 +33,14 @@ logger = structlog.get_logger(__name__)
 _TTL_FILINGS = 30 * 24 * 3600
 
 # Public EDGAR endpoints
+# EFTS full-text search: returns Elasticsearch-style {hits: {hits: [{_source: ...}]}}
 _EFTS_SEARCH = "https://efts.sec.gov/LATEST/search-index"
 _DATA_FACTS = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 _DATA_SUBMISSIONS = "https://data.sec.gov/submissions/CIK{cik}.json"
 _EDGAR_BROWSE = "https://www.sec.gov/cgi-bin/browse-edgar"
 
-_USER_AGENT = "Mariana Research research@mariana.ai"
+# SEC requires a real identifying User-Agent; configurable via EDGAR_USER_AGENT env var.
+_USER_AGENT = os.getenv("EDGAR_USER_AGENT", "Mariana Research mariana-research@localhost")
 
 # How many concurrent EDGAR requests we allow (<=10 req/s safety net)
 _MAX_CONCURRENT = 5
@@ -49,7 +52,10 @@ _WORD_RE = re.compile(r"[A-Za-z]{3,}")
 
 def _zero_pad_cik(cik: str) -> str:
     """Return a 10-digit zero-padded CIK string as expected by EDGAR data APIs."""
-    return cik.strip().lstrip("0").zfill(10)
+    stripped = cik.strip()
+    if not stripped.isdigit():
+        raise ConnectorError(f"Invalid CIK (must be numeric): {cik!r}")
+    return stripped.zfill(10)
 
 
 class SecEdgarConnector(BaseConnector):
@@ -336,6 +342,7 @@ class SecEdgarConnector(BaseConnector):
 
         # 3. Per-ticker lookups
         for ticker in tickers:
+            cik: str | None = None  # reset each iteration to avoid variable leak
             finding: dict = {"source": "sec_edgar", "ticker": ticker, "topic": topic}
 
             cik = await self.lookup_cik(ticker)

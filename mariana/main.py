@@ -42,9 +42,9 @@ import logging
 import os
 import signal
 import sys
-import time
+import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -180,14 +180,19 @@ async def _mark_task_failed(db: Any, task_id: str, error: str) -> None:
 
 class _ShutdownFlag:
     """
-    Simple, asyncio-safe shutdown sentinel.
+    Thread-safe shutdown sentinel using threading.Event.
+
+    Using threading.Event instead of asyncio.Event avoids the issue of
+    creating an asyncio.Event at module import time (outside any running
+    event loop), which raises DeprecationWarning in Python 3.10 and
+    RuntimeError in Python 3.12+.
 
     Set by the SIGINT / SIGTERM handler.  Long-running loops check
     ``flag.is_set()`` after each iteration.
     """
 
     def __init__(self) -> None:
-        self._flag = asyncio.Event()
+        self._flag = threading.Event()
 
     def set(self) -> None:
         self._flag.set()
@@ -196,7 +201,9 @@ class _ShutdownFlag:
         return self._flag.is_set()
 
     async def wait(self) -> None:
-        await self._flag.wait()
+        # Poll in a non-blocking fashion to allow the event loop to yield.
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._flag.wait)
 
 
 _SHUTDOWN = _ShutdownFlag()
@@ -415,7 +422,7 @@ async def _run_single(
         budget_usd=budget,
         status=TaskStatus.RUNNING,
         current_state=State.INIT,
-        started_at=datetime.utcnow(),
+        started_at=datetime.now(tz=timezone.utc),
     )
 
     await _insert_task(db, task)
@@ -473,8 +480,9 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
 
     File format:
     {
-        "topic":  "Research topic string",
-        "budget": 50.0
+        "topic":        "Research topic string",
+        "budget_usd":   50.0,
+        "duration_hours": 2.0
     }
 
     Processing:
@@ -507,7 +515,8 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
                 continue
 
             topic = task_data.get("topic", "").strip()
-            budget = float(task_data.get("budget", 50.0))
+            budget = float(task_data.get("budget_usd", task_data.get("budget", 50.0)))
+            duration_hours = float(task_data.get("duration_hours", 2.0))
 
             if not topic:
                 logger.warning(
@@ -524,6 +533,7 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
                 file=tf.name,
                 topic=topic[:60],
                 budget_usd=budget,
+                duration_hours=duration_hours,
             )
 
             exit_code = await _run_single(
@@ -666,12 +676,12 @@ async def _async_main() -> int:  # noqa: PLR0912  (many branches by design)
         # Always clean up connections.
         try:
             await redis_client.aclose()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("cleanup_error", component="redis", error=str(exc))
         try:
             await db.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("cleanup_error", component="db", error=str(exc))
         log.info("mariana_shutdown", exit_code=exit_code)
 
     return exit_code

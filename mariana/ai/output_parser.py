@@ -50,13 +50,15 @@ class OutputParseError(Exception):
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
 
-# Matches the first ```json … ``` block, non-greedy, across newlines.
+# Matches ```json … ``` blocks only (language tag is required).
+# Using a strict match ensures bare ``` … ``` fences fall through to _BARE_FENCE_RE.
 _JSON_FENCE_RE = re.compile(
-    r"```(?:json)?\s*\n(.*?)\n```",
+    r"```json\s*\n(.*?)\n```",
     re.DOTALL | re.IGNORECASE,
 )
 
-# Also accept bare ``` … ``` fences (no language tag).
+# Matches bare ``` … ``` fences (no language tag).
+# Only reached when _JSON_FENCE_RE does not match.
 _BARE_FENCE_RE = re.compile(
     r"```\s*\n(.*?)\n```",
     re.DOTALL,

@@ -308,8 +308,11 @@ async def score_branch(
     if new_score >= SCORE_TRIBUNAL_THRESHOLD and prior_grants >= 1:
         proposed_total = branch.budget_allocated + BUDGET_GRANT_SCORE8
         if proposed_total <= BUDGET_HARD_CAP:
-            await grant_budget(branch_id, BUDGET_GRANT_SCORE8, db, cost_tracker)
+            # grant_budget updates budget_allocated and grants_log directly in DB.
+            # We persist score_history/budget_spent/cycles first, THEN grant,
+            # so the grant is not overwritten by stale in-memory state.
             await _persist_branch(branch, db)
+            await grant_budget(branch_id, BUDGET_GRANT_SCORE8, db, cost_tracker)
             return BranchDecision(
                 action="GRANT_50",
                 reason=(
@@ -333,8 +336,9 @@ async def score_branch(
     if new_score >= SCORE_DEEPEN_THRESHOLD and prior_grants == 0:
         proposed_total = branch.budget_allocated + BUDGET_GRANT_SCORE7
         if proposed_total <= BUDGET_HARD_CAP:
-            await grant_budget(branch_id, BUDGET_GRANT_SCORE7, db, cost_tracker)
+            # Persist cycle data first, then grant (avoids overwriting grant with stale state)
             await _persist_branch(branch, db)
+            await grant_budget(branch_id, BUDGET_GRANT_SCORE7, db, cost_tracker)
             return BranchDecision(
                 action="GRANT_20",
                 reason=(

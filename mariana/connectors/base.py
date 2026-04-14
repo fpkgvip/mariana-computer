@@ -47,11 +47,15 @@ class BaseConnector(ABC):
     def __init__(self, config: Any, cache: Any | None = None) -> None:
         self.config = config
         self.cache = cache
-        self.client = httpx.AsyncClient(timeout=30.0)
+        self.client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        self._closed: bool = False
         self._log = logger.bind(connector=self.__class__.__name__)
 
     async def close(self) -> None:
         """Release the underlying HTTP client."""
+        if self._closed:
+            return
+        self._closed = True
         await self.client.aclose()
 
     async def __aenter__(self) -> "BaseConnector":
@@ -116,6 +120,12 @@ class BaseConnector(ABC):
 
         return resp.json()
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=16),
+        retry=retry_if_exception_type((httpx.HTTPStatusError, RateLimitError)),
+        reraise=True,
+    )
     async def _request_text(self, method: str, url: str, **kwargs: Any) -> str:
         """
         Like _request() but returns the raw response text instead of JSON.

@@ -27,12 +27,13 @@ Optional but rendered when present:
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger(__name__)
+import structlog
+
+logger = structlog.get_logger(__name__)
 
 # Default template filename expected inside template_dir.
 _DEFAULT_TEMPLATE_NAME: str = "report.html.j2"
@@ -87,7 +88,7 @@ def _prepare_context(report_data: dict[str, Any]) -> dict[str, Any]:
     elif isinstance(raw_dt, str):
         ctx["generated_at_str"] = raw_dt
     else:
-        ctx["generated_at_str"] = _format_datetime(datetime.utcnow())
+        ctx["generated_at_str"] = _format_datetime(datetime.now())
 
     # Format cost to 4 decimal places.
     ctx["total_cost_usd_str"] = f"${ctx.get('total_cost_usd', 0.0):.4f}"
@@ -158,9 +159,9 @@ def render_pdf(
 
     # ── Step 1: render HTML ──────────────────────────────────────────────────
     logger.info(
-        "Rendering HTML template: dir=%s template=%s",
-        template_dir_path,
-        template_name,
+        "render_html_template",
+        template_dir=str(template_dir_path),
+        template_name=template_name,
     )
 
     env = Environment(
@@ -185,17 +186,17 @@ def render_pdf(
     try:
         html_content = template.render(**ctx)
     except TemplateError as exc:
-        logger.error("Jinja2 template render failed: %s", exc)
+        logger.error("jinja2_template_render_failed", error=str(exc))
         raise ReportRenderError(
             stage="template",
             message=str(exc),
             cause=exc,
         ) from exc
 
-    logger.debug("HTML rendered: %d characters", len(html_content))
+    logger.debug("html_rendered", char_count=len(html_content))
 
     # ── Step 2: convert HTML → PDF ───────────────────────────────────────────
-    logger.info("Converting HTML to PDF: output=%s", output_path)
+    logger.info("converting_html_to_pdf", output_path=output_path)
 
     try:
         from weasyprint import HTML as WeasyHTML  # noqa: PLC0415
@@ -211,7 +212,7 @@ def render_pdf(
             output_path
         )
     except Exception as exc:
-        logger.error("WeasyPrint PDF conversion failed: %s", exc)
+        logger.error("weasyprint_pdf_conversion_failed", error=str(exc))
         raise ReportRenderError(
             stage="pdf",
             message=str(exc),
@@ -220,9 +221,9 @@ def render_pdf(
 
     output_size = Path(output_path).stat().st_size
     logger.info(
-        "PDF written: path=%s size_bytes=%d",
-        output_path,
-        output_size,
+        "pdf_written",
+        output_path=output_path,
+        size_bytes=output_size,
     )
 
     return output_path

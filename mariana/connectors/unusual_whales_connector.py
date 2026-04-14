@@ -24,8 +24,17 @@ _TTL_REFERENCE = 24 * 3600
 
 _BASE_URL = "https://api.unusualwhales.com/api"
 
-# Rough regex to pull uppercase ticker symbols out of a free-form string
-_TICKER_RE = re.compile(r"\b([A-Z]{1,5})\b")
+# Rough regex to pull uppercase ticker symbols out of a free-form string.
+# Requires 2-5 uppercase letters to avoid matching single-letter words (I, A).
+_TICKER_RE = re.compile(r"\b([A-Z]{2,5})\b")
+
+# Common uppercase acronyms/words that are not stock tickers.
+_TICKER_BLOCKLIST: frozenset[str] = frozenset({
+    "US", "GDP", "FED", "SEC", "ETF", "IPO", "CEO", "CFO", "COO", "CTO",
+    "AI", "ML", "IT", "HR", "PR", "TV", "UK", "EU", "UN", "IMF", "WTO",
+    "EPS", "PE", "YOY", "QOQ", "TTM", "ATH", "ATL", "NAV", "AUM",
+    "USD", "EUR", "GBP", "JPY", "CNY", "BTC", "ETH",
+})
 
 
 class UnusualWhalesConnector(BaseConnector):
@@ -45,7 +54,9 @@ class UnusualWhalesConnector(BaseConnector):
         api_key = getattr(config, "UNUSUAL_WHALES_API_KEY", "")
         if not api_key:
             logger.warning("unusual_whales_api_key_missing")
-        self._auth_headers = {"Authorization": f"Bearer {api_key}"}
+            self._auth_headers: dict[str, str] = {}
+        else:
+            self._auth_headers = {"Authorization": f"Bearer {api_key}"}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -90,7 +101,7 @@ class UnusualWhalesConnector(BaseConnector):
         try:
             if ticker:
                 ticker = ticker.upper().strip()
-                return await self._get(f"/stock/{ticker}/options-volume", ttl=_TTL_FLOW)
+                return await self._get(f"/stock/{ticker}/flow/options", ttl=_TTL_FLOW)
             return await self._get("/options/flow", ttl=_TTL_FLOW)
         except Exception as exc:
             self._log.error("get_options_flow_failed", ticker=ticker, error=str(exc))
@@ -114,8 +125,8 @@ class UnusualWhalesConnector(BaseConnector):
         try:
             if ticker:
                 ticker = ticker.upper().strip()
-                return await self._get(f"/darkpool/{ticker}", ttl=_TTL_FLOW)
-            return await self._get("/darkpool/flow", ttl=_TTL_FLOW)
+                return await self._get("/darkpool/recent", params={"ticker": ticker}, ttl=_TTL_FLOW)
+            return await self._get("/darkpool/recent", ttl=_TTL_FLOW)
         except Exception as exc:
             self._log.error("get_dark_pool_flow_failed", ticker=ticker, error=str(exc))
             raise ConnectorError(f"Failed to get dark pool flow for {ticker!r}") from exc
@@ -217,7 +228,10 @@ class UnusualWhalesConnector(BaseConnector):
         """
         self._log.info("search_for_topic", topic=topic)
 
-        candidate_tickers = list(dict.fromkeys(_TICKER_RE.findall(topic)))[:5]
+        candidate_tickers = [
+            t for t in list(dict.fromkeys(_TICKER_RE.findall(topic)))
+            if t not in _TICKER_BLOCKLIST
+        ][:5]
 
         findings: list[dict] = []
 
@@ -237,28 +251,24 @@ class UnusualWhalesConnector(BaseConnector):
                 self._log.warning("market_overview_failed", error=str(exc))
             return findings
 
+        import asyncio  # noqa: PLC0415
+
         for ticker in candidate_tickers:
             finding: dict = {"source": "unusual_whales", "ticker": ticker, "topic": topic}
 
-            try:
-                finding["options_flow"] = await self.get_options_flow(ticker)
-            except ConnectorError as exc:
-                finding["options_flow_error"] = str(exc)
-
-            try:
-                finding["dark_pool"] = await self.get_dark_pool_flow(ticker)
-            except ConnectorError as exc:
-                finding["dark_pool_error"] = str(exc)
-
-            try:
-                finding["insider_transactions"] = await self.get_insider_transactions(ticker)
-            except ConnectorError as exc:
-                finding["insider_transactions_error"] = str(exc)
-
-            try:
-                finding["congressional_trades"] = await self.get_congressional_trades(ticker)
-            except ConnectorError as exc:
-                finding["congressional_trades_error"] = str(exc)
+            results = await asyncio.gather(
+                self.get_options_flow(ticker),
+                self.get_dark_pool_flow(ticker),
+                self.get_insider_transactions(ticker),
+                self.get_congressional_trades(ticker),
+                return_exceptions=True,
+            )
+            keys = ["options_flow", "dark_pool", "insider_transactions", "congressional_trades"]
+            for key, result in zip(keys, results):
+                if isinstance(result, Exception):
+                    finding[f"{key}_error"] = str(result)
+                else:
+                    finding[key] = result
 
             findings.append(finding)
             self._log.info("topic_finding_collected", ticker=ticker)

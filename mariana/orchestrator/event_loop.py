@@ -551,7 +551,7 @@ async def handle_init(
     log = logger.bind(task_id=task.id, handler="init")
     log.info("generating_hypotheses")
 
-    _, ai_session = await spawn_model(
+    parsed_output, ai_session = await spawn_model(
         task_type=TaskType.HYPOTHESIS_GENERATION,
         context={
             "task_id": task.id,
@@ -564,23 +564,45 @@ async def handle_init(
         cost_tracker=cost_tracker,
         config=config,
     )
-    cost_tracker.record_call(ai_session, branch_id=None)
+    # spawn_model already records cost internally via _record_cost — do NOT
+    # call cost_tracker.record_call() again here (would double-count).
     task.ai_call_counter += 1
 
-    # The AI session result is a HypothesisGenerationOutput stored in DB by
-    # spawn_model; we now fetch the generated hypotheses and create branches.
-    hypotheses = await db.fetch(
-        "SELECT id FROM hypotheses WHERE task_id = $1 ORDER BY created_at ASC",
-        task.id,
-    )
-    for hyp in hypotheses:
+    # Use the parsed HypothesisGenerationOutput to persist hypotheses and
+    # create branches.  spawn_model does NOT write hypotheses to the DB —
+    # that is the orchestrator's responsibility.
+    hypothesis_output: HypothesisGenerationOutput = parsed_output  # type: ignore[assignment]
+    from mariana.data.models import Hypothesis, HypothesisStatus  # noqa: PLC0415
+    import uuid as _uuid  # noqa: PLC0415
+    created_hypotheses = []
+    for gen_hyp in hypothesis_output.hypotheses:
+        hyp = Hypothesis(
+            id=str(_uuid.uuid4()),
+            task_id=task.id,
+            statement=gen_hyp.statement,
+            statement_zh=gen_hyp.statement_zh,
+            rationale=gen_hyp.rationale,
+            status=HypothesisStatus.ACTIVE,
+        )
+        await db.execute(
+            """
+            INSERT INTO hypotheses (
+                id, task_id, parent_id, depth, statement, statement_zh,
+                status, score, momentum_note, rationale, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+            """,
+            hyp.id, hyp.task_id, None, 0,
+            hyp.statement, hyp.statement_zh,
+            hyp.status.value, None, None, hyp.rationale,
+        )
         await create_branch(
-            hypothesis_id=hyp["id"],
+            hypothesis_id=hyp.id,
             task_id=task.id,
             db=db,
         )
+        created_hypotheses.append(hyp)
 
-    log.info("hypotheses_ready", count=len(hypotheses))
+    log.info("hypotheses_ready", count=len(created_hypotheses))
 
 
 async def handle_search(
@@ -611,6 +633,9 @@ async def handle_search(
                 context={
                     "task_id": task.id,
                     "hypothesis_id": branch.hypothesis_id,
+                    "hypothesis_statement": branch.hypothesis_id,  # fetched by prompt_builder
+                    "page_content": "",
+                    "source_url": "",
                     "sources_already_searched": branch.sources_searched,
                     "budget_remaining": cost_tracker.budget_remaining,
                 },
@@ -620,7 +645,7 @@ async def handle_search(
                 cost_tracker=cost_tracker,
                 config=config,
             )
-            cost_tracker.record_call(ai_session, branch_id=branch.id)
+            # spawn_model already records cost internally — do NOT double-count
             task.ai_call_counter += 1
 
         except BudgetExhaustedError:
@@ -654,11 +679,24 @@ async def handle_evaluate(
             continue
 
         try:
+            # Fetch hypothesis statement for evaluation context
+            hyp_row = await db.fetchrow(
+                "SELECT statement FROM hypotheses WHERE id = $1",
+                branch.hypothesis_id,
+            )
+            hyp_statement = hyp_row["statement"] if hyp_row else ""
+
+            # Count sources searched for this branch as a proxy for sources_searched
+            sources_searched_count = len(branch.sources_searched)
+
             eval_output, ai_session = await spawn_model(
                 task_type=TaskType.EVALUATION,
                 context={
                     "task_id": task.id,
                     "hypothesis_id": branch.hypothesis_id,
+                    "hypothesis_statement": hyp_statement,
+                    "compressed_findings": "",
+                    "sources_searched": sources_searched_count,
                     "prior_scores": branch.score_history,
                     "budget_remaining": cost_tracker.budget_remaining,
                 },
@@ -668,7 +706,7 @@ async def handle_evaluate(
                 cost_tracker=cost_tracker,
                 config=config,
             )
-            cost_tracker.record_call(ai_session, branch_id=branch.id)
+            # spawn_model already records cost internally — do NOT double-count
             task.ai_call_counter += 1
 
             # Use the score directly from the parsed EvaluationOutput
@@ -723,6 +761,9 @@ async def handle_deepen(
                 context={
                     "task_id": task.id,
                     "hypothesis_id": branch.hypothesis_id,
+                    "hypothesis_statement": branch.hypothesis_id,
+                    "page_content": "",
+                    "source_url": "",
                     "mode": "DEEPEN",
                     "sources_already_searched": branch.sources_searched,
                     "prior_score": branch.latest_score,
@@ -734,7 +775,7 @@ async def handle_deepen(
                 cost_tracker=cost_tracker,
                 config=config,
             )
-            cost_tracker.record_call(ai_session, branch_id=branch.id)
+            # spawn_model already records cost internally — do NOT double-count
             task.ai_call_counter += 1
 
         except BudgetExhaustedError:
@@ -865,7 +906,7 @@ async def handle_tribunal(
             cost_tracker=cost_tracker,
             config=config,
         )
-        cost_tracker.record_call(ai_session, branch_id=None)
+        # spawn_model already records cost internally — do NOT double-count
         task.ai_call_counter += 1
 
     # Judge verdict
@@ -883,7 +924,7 @@ async def handle_tribunal(
         cost_tracker=cost_tracker,
         config=config,
     )
-    cost_tracker.record_call(judge_session, branch_id=None)
+    # spawn_model already records cost internally — do NOT double-count
     task.ai_call_counter += 1
 
     log.info("tribunal_complete", tribunal_id=tribunal_id, finding_id=finding_id)
@@ -917,7 +958,7 @@ async def handle_skeptic(
         cost_tracker=cost_tracker,
         config=config,
     )
-    cost_tracker.record_call(ai_session, branch_id=None)
+    # spawn_model already records cost internally — do NOT double-count
     task.ai_call_counter += 1
 
     log.info("skeptic_complete")

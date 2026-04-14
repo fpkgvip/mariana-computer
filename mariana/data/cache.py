@@ -273,7 +273,8 @@ class QueryDedup:
         key = _query_dedup_key(task_id)
         now = time.time()
 
-        pipe = self._redis.pipeline()
+        # Use transaction=True to wrap in MULTI/EXEC, preventing partial failure
+        pipe = self._redis.pipeline(transaction=True)
         pipe.zadd(key, {query_hash: now})
         # Trim to window: keep only the top window_size members (highest scores = most recent)
         pipe.zremrangebyrank(key, 0, -(self._window_size + 1))
@@ -285,12 +286,27 @@ class QueryDedup:
             query_hash,
         )
 
+    # Lua script for atomic check-and-set:
+    # Returns 1 if the member already existed (duplicate), 0 if it was novel.
+    _CHECK_AND_RECORD_SCRIPT = """
+        local key = KEYS[1]
+        local member = ARGV[1]
+        local now = tonumber(ARGV[2])
+        local window = tonumber(ARGV[3])
+        if redis.call('ZSCORE', key, member) then
+            return 1
+        end
+        redis.call('ZADD', key, now, member)
+        redis.call('ZREMRANGEBYRANK', key, 0, -(window + 1))
+        return 0
+    """
+
     async def check_and_record(self, task_id: str, query: str) -> bool:
         """
         Atomically check for a duplicate and, if novel, record the query.
 
-        This is the preferred single-call interface for the common pattern of
-        "is this query new? if so, mark it as seen."
+        Uses a Redis Lua script executed atomically to avoid the race
+        condition between is_duplicate and record_query.
 
         Args:
             task_id: The research task identifier (namespace).
@@ -300,10 +316,32 @@ class QueryDedup:
             *True* if the query was a duplicate (should be skipped).
             *False* if the query is novel (was just recorded).
         """
-        if await self.is_duplicate(task_id, query):
-            return True
-        await self.record_query(task_id, query)
-        return False
+        query_hash = self._hash_query(query)
+        key = _query_dedup_key(task_id)
+        now = time.time()
+
+        result = await self._redis.eval(
+            self._CHECK_AND_RECORD_SCRIPT,
+            1,
+            key,
+            query_hash,
+            now,
+            self._window_size,
+        )
+        is_dup = bool(result)
+        if is_dup:
+            logger.debug(
+                "Query dedup HIT (atomic) task=%s query_hash=%s",
+                task_id,
+                query_hash,
+            )
+        else:
+            logger.debug(
+                "Query dedup recorded (atomic) task=%s query_hash=%s",
+                task_id,
+                query_hash,
+            )
+        return is_dup
 
     async def get_seen_hashes(self, task_id: str) -> set[str]:
         """

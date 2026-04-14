@@ -142,13 +142,15 @@ async def save_checkpoint(
     )
 
     # ------------------------------------------------------------------ #
-    # Step 3 – Write JSON snapshot to disk
+    # Step 3 – Determine snapshot path and write to a temp file first
     # ------------------------------------------------------------------ #
     checkpoints_dir = Path(data_root) / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     snapshot_filename = f"{task.id}_{timestamp_str}.json"
     snapshot_path = checkpoints_dir / snapshot_filename
+    # Write to a .tmp file first; rename after DB insert succeeds (atomic)
+    tmp_path = checkpoints_dir / f"{snapshot_filename}.tmp"
 
     snapshot_blob: dict[str, Any] = {
         "checkpoint_id": checkpoint_id,
@@ -170,14 +172,14 @@ async def save_checkpoint(
     }
 
     try:
-        snapshot_path.write_text(
+        tmp_path.write_text(
             json.dumps(snapshot_blob, indent=2, default=str),
             encoding="utf-8",
         )
     except OSError as exc:
         logger.error(
             "checkpoint_disk_write_failed",
-            path=str(snapshot_path),
+            path=str(tmp_path),
             error=str(exc),
         )
         raise
@@ -185,38 +187,58 @@ async def save_checkpoint(
     checkpoint.snapshot_path = str(snapshot_path)
 
     # ------------------------------------------------------------------ #
-    # Step 4 – Upsert into DB
+    # Step 4 – Upsert into DB; only rename temp file if DB insert succeeds
     # ------------------------------------------------------------------ #
-    await db.execute(
-        """
-        INSERT INTO checkpoints (
-            id, task_id, timestamp, state_machine_state,
-            active_branch_ids, killed_branch_ids, compressed_findings,
-            budget_remaining, total_spent, diminishing_flags,
-            ai_call_counter, snapshot_path
-        ) VALUES (
-            $1, $2, $3, $4,
-            $5, $6, $7,
-            $8, $9, $10,
-            $11, $12
+    try:
+        await db.execute(
+            """
+            INSERT INTO checkpoints (
+                id, task_id, timestamp, state_machine_state,
+                active_branch_ids, killed_branch_ids, compressed_findings,
+                budget_remaining, total_spent, diminishing_flags,
+                ai_call_counter, snapshot_path
+            ) VALUES (
+                $1, $2, $3, $4,
+                $5, $6, $7,
+                $8, $9, $10,
+                $11, $12
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                snapshot_path = EXCLUDED.snapshot_path,
+                timestamp = EXCLUDED.timestamp
+            """,
+            checkpoint.id,
+            checkpoint.task_id,
+            checkpoint.timestamp,
+            checkpoint.state_machine_state.value,
+            checkpoint.active_branch_ids,
+            checkpoint.killed_branch_ids,
+            checkpoint.compressed_findings,
+            checkpoint.budget_remaining,
+            checkpoint.total_spent,
+            checkpoint.diminishing_flags,
+            checkpoint.ai_call_counter,
+            checkpoint.snapshot_path,
         )
-        ON CONFLICT (id) DO UPDATE SET
-            snapshot_path = EXCLUDED.snapshot_path,
-            timestamp = EXCLUDED.timestamp
-        """,
-        checkpoint.id,
-        checkpoint.task_id,
-        checkpoint.timestamp,
-        checkpoint.state_machine_state.value,
-        checkpoint.active_branch_ids,
-        checkpoint.killed_branch_ids,
-        checkpoint.compressed_findings,
-        checkpoint.budget_remaining,
-        checkpoint.total_spent,
-        checkpoint.diminishing_flags,
-        checkpoint.ai_call_counter,
-        checkpoint.snapshot_path,
-    )
+    except Exception:
+        # DB insert failed — remove the orphaned temp file and re-raise
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+    # DB insert succeeded — atomically rename temp file to final path
+    try:
+        tmp_path.rename(snapshot_path)
+    except OSError as exc:
+        logger.error(
+            "checkpoint_rename_failed",
+            tmp_path=str(tmp_path),
+            final_path=str(snapshot_path),
+            error=str(exc),
+        )
+        raise
 
     logger.info(
         "checkpoint_saved",

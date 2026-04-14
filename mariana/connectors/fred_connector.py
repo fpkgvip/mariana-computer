@@ -159,6 +159,8 @@ class FredConnector(BaseConnector):
         Returns:
             FRED category-series payload.
         """
+        if category_id <= 0:
+            raise ValueError(f"category_id must be a positive integer, got {category_id}")
         self._log.info("get_category_series", category_id=category_id)
         try:
             return await self._get("/category/series", params={"category_id": category_id})
@@ -192,9 +194,10 @@ class FredConnector(BaseConnector):
         topic_lower = topic.lower()
 
         # 1. Hint-based series IDs
+        # Use word-boundary matching to avoid false positives like "interesting" matching "interest".
         hinted_series: list[str] = []
         for keyword, series_ids in _TOPIC_HINTS.items():
-            if keyword in topic_lower:
+            if re.search(r"\b" + re.escape(keyword) + r"\b", topic_lower):
                 hinted_series.extend(series_ids)
 
         # 2. FRED keyword search

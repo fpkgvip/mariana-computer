@@ -168,9 +168,9 @@ class CostTracker:
     def record_branch_spend(self, branch_id: str, amount: float) -> None:
         """Manually charge *amount* USD to *branch_id* without an AISession.
 
-        Useful for charging browser/connector costs that don't go through
-        the AI layer.  Does **not** update ``total_spent`` — callers that
-        need task-level accounting must also call ``record_raw_spend``.
+        Updates both the per-branch sub-ledger AND ``total_spent`` so that
+        task-level budget enforcement remains accurate.  This is required
+        for browser/connector costs that don't go through the AI layer.
 
         Parameters
         ----------
@@ -182,6 +182,13 @@ class CostTracker:
         if amount < 0:
             raise ValueError(f"amount must be non-negative, got {amount!r}")
         self.per_branch[branch_id] = self.per_branch.get(branch_id, 0.0) + amount
+        self.total_spent += amount
+        logger.debug(
+            "branch_spend_recorded",
+            branch_id=branch_id,
+            amount=amount,
+            total=self.total_spent,
+        )
 
     def record_raw_spend(self, amount: float, label: str = "misc") -> None:
         """Charge *amount* to the task total without a session or branch.

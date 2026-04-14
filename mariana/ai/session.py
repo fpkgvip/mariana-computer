@@ -530,8 +530,11 @@ def _check_budget(cost_tracker: Any, branch_id: str | None) -> None:
     """
     Ask the cost_tracker whether the budget cap has been exceeded.
 
-    Checks both task-level and branch-level caps if the cost_tracker exposes
-    ``is_task_budget_exhausted()`` and ``is_branch_budget_exhausted()`` methods.
+    Uses the correct attribute names from ``orchestrator.cost_tracker.CostTracker``:
+      - ``is_exhausted``  (property, bool) for task-level cap
+      - ``branch_remaining(branch_id)``  (method, float) for branch-level cap
+      - ``total_spent``   (float) — NOT ``total_spent_usd``
+      - ``task_budget``   (float) — NOT ``task_budget_usd``
 
     Raises:
         BudgetExhaustedError: If any cap is exceeded.
@@ -540,17 +543,19 @@ def _check_budget(cost_tracker: Any, branch_id: str | None) -> None:
         return
 
     try:
-        task_exhausted_fn = getattr(cost_tracker, "is_task_budget_exhausted", None)
-        if callable(task_exhausted_fn) and task_exhausted_fn():
-            spent = getattr(cost_tracker, "total_spent_usd", 0.0)
-            cap = getattr(cost_tracker, "task_budget_usd", 400.0)
+        # Task-level cap: use the ``is_exhausted`` property (not a method)
+        is_exhausted = getattr(cost_tracker, "is_exhausted", False)
+        if is_exhausted:
+            spent = getattr(cost_tracker, "total_spent", 0.0)
+            cap = getattr(cost_tracker, "task_budget", 400.0)
             raise BudgetExhaustedError(cap_usd=cap, spent_usd=spent)
 
+        # Branch-level cap: use branch_remaining(branch_id)
         if branch_id is not None:
-            branch_exhausted_fn = getattr(cost_tracker, "is_branch_budget_exhausted", None)
-            if callable(branch_exhausted_fn) and branch_exhausted_fn(branch_id):
-                spent = getattr(cost_tracker, "total_spent_usd", 0.0)
-                cap = getattr(cost_tracker, "branch_budget_usd", 75.0)
+            branch_remaining_fn = getattr(cost_tracker, "branch_remaining", None)
+            if callable(branch_remaining_fn) and branch_remaining_fn(branch_id) <= 0:
+                spent = getattr(cost_tracker, "total_spent", 0.0)
+                cap = getattr(cost_tracker, "branch_hard_cap", 75.0)
                 raise BudgetExhaustedError(cap_usd=cap, spent_usd=spent)
     except BudgetExhaustedError:
         raise

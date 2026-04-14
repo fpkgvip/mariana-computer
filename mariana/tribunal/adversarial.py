@@ -203,11 +203,21 @@ async def run_tribunal(
     log.info("tribunal_session", role="PLAINTIFF")
     t0 = time.monotonic()
 
+    # Build a distinct supporting_evidence block from individual supporting findings.
+    if supporting_findings:
+        supporting_evidence_block = "\n".join(
+            f"[{i}] ID={sf.id}  confidence={sf.confidence:.2f}\n"
+            f"{sf.content[:600]}{'\u2026' if len(sf.content) > 600 else ''}"
+            for i, sf in enumerate(supporting_findings, start=1)
+        )
+    else:
+        supporting_evidence_block = "(no separate supporting findings)"
+
     plaintiff_parsed, plaintiff_session = await spawn_model(
         task_type=TaskType.TRIBUNAL_PLAINTIFF,
         context={
             "finding_summary": finding_summary,
-            "supporting_evidence": finding_summary,  # included in summary
+            "supporting_evidence": supporting_evidence_block,
             "sources": source_summary,
         },
         output_schema=TribunalArgumentOutput,
@@ -427,7 +437,7 @@ async def _persist_tribunal_session(
                 session.judge_plaintiff_score,
                 session.judge_defendant_score,
                 session.judge_reasoning,
-                json.dumps(session.unanswered_questions),
+                json.dumps(session.unanswered_questions, default=str),
                 session.total_cost_usd,
             )
 

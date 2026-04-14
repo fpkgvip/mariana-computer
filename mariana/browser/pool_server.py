@@ -18,7 +18,8 @@ Usage (standalone):
     BROWSER_POOL_PORT=9090 python -m mariana.browser.pool_server
 
 Environment variables:
-    BROWSER_POOL_HOST   — bind address (default: 0.0.0.0)
+    BROWSER_POOL_HOST   — bind address (default: 127.0.0.1; set explicitly to
+                          0.0.0.0 only for network-accessible deployments)
     BROWSER_POOL_PORT   — bind port    (default: 8888)
     BROWSER_POOL_SIZE   — target pool size for future production use
                           (default: 5, currently unused in prototype)
@@ -26,16 +27,16 @@ Environment variables:
 
 from __future__ import annotations
 
-import logging
 import os
 from datetime import datetime, timezone
 
+import structlog
 import uvicorn
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Request / response models
@@ -79,6 +80,10 @@ class DispatchResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 _STARTUP_TIME: datetime = datetime.now(tz=timezone.utc)
+
+# Module-level counters for monitoring.
+_SKIPPED_COUNT: int = 0
+_ERROR_COUNT: int = 0
 
 app = FastAPI(
     title="Mariana Browser Pool",
@@ -131,19 +136,17 @@ async def health() -> JSONResponse:
     "/dispatch",
     summary="Dispatch a browser task",
     description=(
-        "In prototype mode all dispatch requests are acknowledged but not executed. "
+        "Browser pool is not yet configured. Returns HTTP 503 for every request. "
         "The orchestrator should fall back to the HTTP connectors for data retrieval."
     ),
-    response_model=DispatchResponse,
 )
-async def dispatch_task(task: BrowserTask) -> DispatchResponse:
+async def dispatch_task(task: BrowserTask) -> JSONResponse:
     """
-    Accept and acknowledge a browser task without executing it.
+    Return HTTP 503 for every dispatch request — the browser pool is not active.
 
-    The orchestrator is designed to treat a ``status='skipped'`` response as a
-    signal to fall through to the API connector layer.  This keeps the
-    orchestrator logic consistent between prototype and production without
-    requiring conditional branches.
+    The orchestrator must handle this 503 by falling through to the API connector
+    layer (httpx).  A 503 is used instead of a 200/skipped so that callers that
+    do not explicitly handle the skipped status still surface a visible error.
 
     In production this endpoint will:
     1. Acquire a Playwright context from the pool.
@@ -152,18 +155,17 @@ async def dispatch_task(task: BrowserTask) -> DispatchResponse:
     4. Extract and return page text or HTML.
     5. Release the context back to the pool.
     """
-    logger.info(
-        "browser_dispatch_received (prototype — skipped): url=%s task_id=%s",
-        task.url,
-        task.task_id,
-    )
-    return DispatchResponse(
-        status="skipped",
+    global _SKIPPED_COUNT
+    _SKIPPED_COUNT += 1
+    logger.warning(
+        "browser_dispatch_unavailable",
         url=task.url,
-        reason=(
-            "Prototype mode: browser pool is not active.  "
-            "Caller should use HTTP connector (httpx) for this URL."
-        ),
+        task_id=task.task_id,
+        skipped_total=_SKIPPED_COUNT,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"error": "Browser pool not configured"},
     )
 
 
@@ -187,7 +189,8 @@ async def pool_status() -> JSONResponse:
             "busy_workers": 0,
             "queued_tasks": 0,
             "completed_tasks": 0,
-            "failed_tasks": 0,
+            "failed_tasks": _ERROR_COUNT,
+            "skipped_tasks": _SKIPPED_COUNT,
             "mode": "prototype",
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         }
@@ -200,7 +203,9 @@ async def generic_exception_handler(request: Request, exc: Exception) -> JSONRes
     Catch-all exception handler so the pool server never returns a raw 500
     stack trace to the orchestrator.
     """
-    logger.error("Unhandled error in browser pool server: %s", exc, exc_info=True)
+    global _ERROR_COUNT
+    _ERROR_COUNT += 1
+    logger.error("unhandled_browser_pool_error", error=str(exc), error_type=type(exc).__name__)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
@@ -218,11 +223,11 @@ async def generic_exception_handler(request: Request, exc: Exception) -> JSONRes
 
 def main() -> None:
     """Start the browser pool server using configuration from environment."""
-    host = os.getenv("BROWSER_POOL_HOST", "0.0.0.0")
+    host = os.getenv("BROWSER_POOL_HOST", "127.0.0.1")
     port = int(os.getenv("BROWSER_POOL_PORT", "8888"))
     log_level = os.getenv("LOG_LEVEL", "info").lower()
 
-    logger.info("Starting Mariana browser pool server (prototype): %s:%d", host, port)
+    print(f"Starting Mariana browser pool server (prototype): {host}:{port}")
 
     uvicorn.run(
         "mariana.browser.pool_server:app",

@@ -66,7 +66,8 @@ _STOPWORDS: frozenset[str] = frozenset(
 )
 
 # Minimum keyword overlap between a question and a finding to count as resolved.
-_MIN_KEYWORD_MATCH: int = 3
+# Set to 5 to reduce false-positive RESOLVED classifications from casual word overlap.
+_MIN_KEYWORD_MATCH: int = 5
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +85,9 @@ def _extract_keywords(text: str) -> list[str]:
 
     Returns a list of unique keyword strings.
     """
-    cleaned = re.sub(r"[^\w\s]", " ", text.lower())
+    # Replace underscores (treated as word chars by \w) and other punctuation with spaces
+    # so that identifiers like debt_to_equity are split into separate keywords.
+    cleaned = re.sub(r"[^\w\s]|_", " ", text.lower())
     tokens = cleaned.split()
     seen: set[str] = set()
     keywords: list[str] = []
@@ -314,7 +317,7 @@ async def run_skeptic(
     # Tally for logging.
     counts = {cls: 0 for cls in QuestionClassification}
     for q in classified_questions:
-        counts[q.classification] += 1
+        counts[q.classification] = counts.get(q.classification, 0) + 1
 
     log.info(
         "skeptic_classification_done",

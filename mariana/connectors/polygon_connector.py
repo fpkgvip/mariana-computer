@@ -13,6 +13,7 @@ Cache policy:
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any
 
@@ -30,8 +31,17 @@ _TTL_AGGREGATES = 3600
 
 _BASE_URL = "https://api.polygon.io"
 
-# Rough regex to pull uppercase ticker symbols out of a free-form string
-_TICKER_RE = re.compile(r"\b([A-Z]{1,5})\b")
+# Rough regex to pull uppercase ticker symbols out of a free-form string.
+# Requires 2-5 uppercase letters to avoid matching single-letter words (I, A).
+_TICKER_RE = re.compile(r"\b([A-Z]{2,5})\b")
+
+# Common uppercase acronyms/words that are not stock tickers.
+_TICKER_BLOCKLIST: frozenset[str] = frozenset({
+    "US", "GDP", "FED", "SEC", "ETF", "IPO", "CEO", "CFO", "COO", "CTO",
+    "AI", "ML", "IT", "HR", "PR", "TV", "UK", "EU", "UN", "IMF", "WTO",
+    "EPS", "PE", "YOY", "QOQ", "TTM", "ATH", "ATL", "NAV", "AUM",
+    "USD", "EUR", "GBP", "JPY", "CNY", "BTC", "ETH",
+})
 
 
 class PolygonConnector(BaseConnector):
@@ -206,7 +216,7 @@ class PolygonConnector(BaseConnector):
         self._log.info("get_ticker_news", ticker=ticker, limit=limit)
         try:
             return await self._get(
-                "/v2/reference/news",
+                "/v3/reference/news",
                 params={"ticker": ticker, "limit": limit},
                 ttl=_TTL_NEWS,
             )
@@ -278,7 +288,10 @@ class PolygonConnector(BaseConnector):
         self._log.info("search_for_topic", topic=topic)
 
         # Extract uppercase tokens that could be ticker symbols
-        candidate_tickers = list(dict.fromkeys(_TICKER_RE.findall(topic)))
+        candidate_tickers = [
+            t for t in list(dict.fromkeys(_TICKER_RE.findall(topic)))
+            if t not in _TICKER_BLOCKLIST
+        ]
 
         # If no plausible tickers found, do a keyword search first
         if not candidate_tickers:
@@ -297,20 +310,19 @@ class PolygonConnector(BaseConnector):
 
         for ticker in candidate_tickers[:5]:  # cap at 5 to respect rate limits
             finding: dict = {"source": "polygon", "ticker": ticker, "topic": topic}
-            try:
-                finding["details"] = await self.get_ticker_details(ticker)
-            except ConnectorError as exc:
-                finding["details_error"] = str(exc)
 
-            try:
-                finding["news"] = await self.get_ticker_news(ticker)
-            except ConnectorError as exc:
-                finding["news_error"] = str(exc)
-
-            try:
-                finding["financials"] = await self.get_financials(ticker)
-            except ConnectorError as exc:
-                finding["financials_error"] = str(exc)
+            results = await asyncio.gather(
+                self.get_ticker_details(ticker),
+                self.get_ticker_news(ticker),
+                self.get_financials(ticker),
+                return_exceptions=True,
+            )
+            keys = ["details", "news", "financials"]
+            for key, result in zip(keys, results):
+                if isinstance(result, Exception):
+                    finding[f"{key}_error"] = str(result)
+                else:
+                    finding[key] = result
 
             findings.append(finding)
             self._log.info("topic_finding_collected", ticker=ticker)

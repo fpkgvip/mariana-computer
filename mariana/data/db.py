@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS sources (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sources_task_id  ON sources(task_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_url_hash ON sources(url_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_url_hash ON sources(task_id, url_hash);
 
 CREATE TABLE IF NOT EXISTS ai_sessions (
     id                    TEXT        PRIMARY KEY,
@@ -248,7 +248,7 @@ CREATE INDEX IF NOT EXISTS idx_skeptic_results_task_id    ON skeptic_results(tas
 CREATE INDEX IF NOT EXISTS idx_skeptic_results_finding_id ON skeptic_results(finding_id);
 
 CREATE TABLE IF NOT EXISTS report_generations (
-    id              SERIAL      PRIMARY KEY,
+    id              TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
     task_id         TEXT        NOT NULL REFERENCES research_tasks(id) ON DELETE CASCADE,
     pdf_path        TEXT,
     docx_path       TEXT,
@@ -293,16 +293,37 @@ async def init_schema(pool: asyncpg.Pool) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Columns that are stored as JSONB in PostgreSQL and should be JSON-decoded.
+_JSON_COLUMNS: frozenset[str] = frozenset({
+    # research_tasks
+    "metadata",
+    # findings
+    "source_ids",
+    # branches
+    "score_history",
+    "grants_log",
+    "sources_searched",
+    # checkpoints
+    "active_branch_ids",
+    "killed_branch_ids",
+    "compressed_findings",
+    # tribunal_sessions
+    "unanswered_questions",
+    # skeptic_results
+    "questions",
+    # evaluation_results
+    "next_search_keywords",
+})
+
+
 def _row_to_dict(row: asyncpg.Record) -> dict[str, Any]:
-    """Convert an asyncpg Record to a plain dict, decoding JSON columns."""
+    """Convert an asyncpg Record to a plain dict, decoding known JSON columns."""
     result: dict[str, Any] = {}
     for key, value in row.items():
-        if isinstance(value, str):
-            # Attempt to decode JSONB columns that asyncpg returns as strings
+        if key in _JSON_COLUMNS and isinstance(value, str):
+            # Only attempt JSON decoding for columns known to be JSONB
             try:
-                decoded = json.loads(value)
-                if isinstance(decoded, (list, dict)):
-                    value = decoded
+                value = json.loads(value)
             except (json.JSONDecodeError, TypeError):
                 pass
         result[key] = value
@@ -399,12 +420,22 @@ async def update_research_task(
         else:
             serialised[k] = v
 
+    # Column-name whitelist to prevent SQL injection
+    _ALLOWED_TASK_COLUMNS: frozenset[str] = frozenset({
+        "topic", "budget_usd", "status", "current_state", "total_spent_usd",
+        "diminishing_flags", "ai_call_counter", "started_at", "completed_at",
+        "error_message", "output_pdf_path", "output_docx_path", "metadata",
+    })
+    unknown = set(serialised.keys()) - _ALLOWED_TASK_COLUMNS
+    if unknown:
+        raise ValueError(f"update_research_task: unknown column(s): {unknown!r}")
+
     set_clauses = ", ".join(f"{col} = ${i + 2}" for i, col in enumerate(serialised))
     values = list(serialised.values())
 
     async with pool.acquire() as conn:
         await conn.execute(
-            f"UPDATE research_tasks SET {set_clauses} WHERE id = $1",  # noqa: S608
+            f"UPDATE research_tasks SET {set_clauses} WHERE id = $1",
             task_id,
             *values,
         )
@@ -584,7 +615,7 @@ async def insert_source(pool: asyncpg.Pool, source: Source) -> None:
                 $7, $8, $9, $10,
                 $11, $12, $13, $14
             )
-            ON CONFLICT (url_hash) DO NOTHING
+            ON CONFLICT (task_id, url_hash) DO NOTHING
             """,
             source.id,
             source.task_id,
@@ -745,12 +776,22 @@ async def update_branch(
         else:
             serialised[k] = v
 
+    # Column-name whitelist to prevent SQL injection
+    _ALLOWED_BRANCH_COLUMNS: frozenset[str] = frozenset({
+        "hypothesis_id", "task_id", "status", "score_history", "budget_allocated",
+        "budget_spent", "grants_log", "cycles_completed", "kill_reason",
+        "sources_searched", "updated_at",
+    })
+    unknown = set(serialised.keys()) - _ALLOWED_BRANCH_COLUMNS
+    if unknown:
+        raise ValueError(f"update_branch: unknown column(s): {unknown!r}")
+
     set_clauses = ", ".join(f"{col} = ${i + 2}" for i, col in enumerate(serialised))
     values = list(serialised.values())
 
     async with pool.acquire() as conn:
         await conn.execute(
-            f"UPDATE branches SET {set_clauses} WHERE id = $1",  # noqa: S608
+            f"UPDATE branches SET {set_clauses} WHERE id = $1",
             branch_id,
             *values,
         )
@@ -821,6 +862,73 @@ async def insert_checkpoint(pool: asyncpg.Pool, checkpoint: Checkpoint) -> None:
         checkpoint.task_id,
         checkpoint.state_machine_state.value,
     )
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint retrieval helpers
+# ---------------------------------------------------------------------------
+
+
+async def get_checkpoint(
+    pool: asyncpg.Pool,
+    checkpoint_id: str,
+) -> Checkpoint | None:
+    """Retrieve a specific Checkpoint by its primary key.
+
+    Returns:
+        A :class:`Checkpoint` instance, or *None* if not found.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, task_id, timestamp, state_machine_state,
+                   active_branch_ids, killed_branch_ids, compressed_findings,
+                   budget_remaining, total_spent, diminishing_flags,
+                   ai_call_counter, snapshot_path, diminishing_result
+            FROM checkpoints WHERE id = $1
+            """,
+            checkpoint_id,
+        )
+    if row is None:
+        return None
+    data = _row_to_dict(row)
+    data["state_machine_state"] = State(data["state_machine_state"])
+    return Checkpoint.model_validate(data)
+
+
+async def get_latest_checkpoint(
+    pool: asyncpg.Pool,
+    task_id: str,
+) -> Checkpoint | None:
+    """Retrieve the most recent Checkpoint for a task.
+
+    Returns:
+        The most recent :class:`Checkpoint`, or *None* if none exist.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, task_id, timestamp, state_machine_state,
+                   active_branch_ids, killed_branch_ids, compressed_findings,
+                   budget_remaining, total_spent, diminishing_flags,
+                   ai_call_counter, snapshot_path, diminishing_result
+            FROM checkpoints
+            WHERE task_id = $1
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            task_id,
+        )
+    if row is None:
+        return None
+    data = _row_to_dict(row)
+    data["state_machine_state"] = State(data["state_machine_state"])
+    logger.debug(
+        "Retrieved latest Checkpoint task=%s checkpoint=%s",
+        task_id,
+        data["id"],
+    )
+    return Checkpoint.model_validate(data)
 
 
 # ---------------------------------------------------------------------------

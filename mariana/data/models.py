@@ -8,7 +8,7 @@ Every other module imports exclusively from this file for type safety.
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -189,7 +189,7 @@ class ResearchTask(BaseModel):
         description="Count of consecutive diminishing-returns signals",
     )
     ai_call_counter: int = Field(default=0, ge=0, description="Total AI API calls made")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
     started_at: datetime | None = Field(default=None)
     completed_at: datetime | None = Field(default=None)
     error_message: str | None = Field(default=None, description="Last error if status==FAILED")
@@ -225,8 +225,8 @@ class Hypothesis(BaseModel):
     score: float | None = Field(
         default=None,
         ge=0.0,
-        le=1.0,
-        description="Latest evaluation score [0, 1]",
+        le=10.0,
+        description="Latest evaluation score [0, 10]",
     )
     momentum_note: str | None = Field(
         default=None,
@@ -238,8 +238,8 @@ class Hypothesis(BaseModel):
         max_length=4096,
         description="Why this hypothesis was generated",
     )
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
 
 
 class Finding(BaseModel):
@@ -277,7 +277,7 @@ class Finding(BaseModel):
         default=None,
         description="Filesystem path to raw content (pre-compression)",
     )
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -299,7 +299,7 @@ class Source(BaseModel):
         default=None,
         description="SHA-256 of fetched content body (for change detection)",
     )
-    fetched_at: datetime = Field(default_factory=datetime.utcnow)
+    fetched_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
     cache_expiry: datetime | None = Field(default=None, description="When the cached copy expires")
     source_type: SourceType = Field(default=SourceType.NEWS)
     language: str = Field(default="en", min_length=2, max_length=10)
@@ -346,7 +346,7 @@ class AISession(BaseModel):
     used_batch_api: bool = Field(default=False, description="Whether the Batch API was used")
     batch_id: str | None = Field(default=None, description="Batch job ID if used_batch_api=True")
     cache_hit: bool = Field(default=False, description="Whether response came from prompt cache")
-    started_at: datetime = Field(default_factory=datetime.utcnow)
+    started_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
     error: str | None = Field(default=None, description="Error message if the call failed")
 
 
@@ -383,8 +383,8 @@ class Branch(BaseModel):
         default_factory=list,
         description="URL hashes already queried to prevent re-fetching",
     )
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
 
     @property
     def budget_remaining(self) -> float:
@@ -404,7 +404,7 @@ class Checkpoint(BaseModel):
 
     id: str = Field(..., min_length=1, description="UUID for the checkpoint")
     task_id: str = Field(..., min_length=1)
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
     state_machine_state: State = Field(..., description="State at time of snapshot")
     active_branch_ids: list[str] = Field(default_factory=list)
     killed_branch_ids: list[str] = Field(default_factory=list)
@@ -447,7 +447,7 @@ class TribunalSession(BaseModel):
         description="Questions the tribunal could not resolve",
     )
     total_cost_usd: float = Field(default=0.0, ge=0.0)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
 
 
 class SkepticQuestion(BaseModel):
@@ -490,7 +490,7 @@ class SkepticResult(BaseModel):
         description="True when no CRITICAL open questions remain",
     )
     cost_usd: float = Field(default=0.0, ge=0.0)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
 
     @model_validator(mode="after")
     def compute_question_counts(self) -> SkepticResult:
@@ -506,12 +506,21 @@ class SkepticResult(BaseModel):
         self.critical_open_count = sum(
             1 for q in open_qs if q.severity == QuestionSeverity.CRITICAL
         )
-        self.passes_publishing_threshold = self.critical_open_count == 0
+        # Also check total open question count (config default: max 2 open questions allowed)
+        _max_open = getattr(self, "_max_open_questions", 2)
+        self.passes_publishing_threshold = (
+            self.critical_open_count == 0
+            and self.open_count <= _max_open
+        )
         return self
 
 
 class CostTracker(BaseModel):
-    """Running cost ledger for a research task."""
+    """Serialisable snapshot of a running cost ledger for a research task.
+
+    The live mutable version is ``mariana.orchestrator.cost_tracker.CostTracker``.
+    This Pydantic model is only used for checkpoint serialisation.
+    """
 
     model_config = _COMMON_CONFIG
 
@@ -805,7 +814,7 @@ class CompressedFindings(BaseModel):
     confidence_score: float = Field(..., ge=0.0, le=1.0)
     key_sources: list[str] = Field(default_factory=list, description="Most important source URLs")
     momentum_note: str | None = Field(default=None, max_length=512)
-    compressed_at: datetime = Field(default_factory=datetime.utcnow)
+    compressed_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
     raw_finding_count: int = Field(..., ge=0, description="Number of raw findings replaced by this summary")
 
 
