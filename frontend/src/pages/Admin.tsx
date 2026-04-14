@@ -92,10 +92,18 @@ export default function Admin() {
   const [showUsers, setShowUsers] = useState(true);
   const [showInvestigations, setShowInvestigations] = useState(true);
 
-  /* Auth guard — admin only */
+  /* Auth guard — redirect non-admins (including unauthenticated users) */
   useEffect(() => {
-    if (user === null) return; // still loading
-    if (!user || user.role !== "admin") {
+    console.log("[Admin] auth guard — user:", user ? { id: user.id, role: user.role, email: user.email } : null);
+    // user is null = not logged in (AuthProvider's loading spinner already
+    // handled the "still loading" state).  Redirect to login.
+    if (user === null) {
+      navigate("/login", { replace: true });
+      return;
+    }
+    // Logged in but not admin — send to chat.
+    if (user.role !== "admin") {
+      console.warn("[Admin] non-admin user, redirecting to /chat", user.role);
       navigate("/chat", { replace: true });
     }
   }, [user, navigate]);
@@ -204,7 +212,15 @@ export default function Admin() {
     }
   };
 
-  if (!user || user.role !== "admin") return null;
+  // While the useEffect redirect is in flight, show a brief loading indicator
+  // instead of a blank page.
+  if (!user || user.role !== "admin") {
+    return (
+      <div className="flex h-screen items-center justify-center bg-background">
+        <Loader2 size={18} className="animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-background px-4 py-10 sm:px-8 md:py-16">
