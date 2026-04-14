@@ -23,6 +23,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Copy only the Python package and essential files
+COPY mariana/ ./mariana/
+COPY README.md .
 
 CMD ["python", "-m", "mariana.main", "--mode", "daemon"]
