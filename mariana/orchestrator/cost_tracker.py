@@ -1,0 +1,241 @@
+"""
+mariana/orchestrator/cost_tracker.py
+
+In-memory cost tracking with hard budget enforcement.
+
+All mutations happen in the asyncio event loop (single-threaded), so no
+locking is required.  The companion Pydantic model `CostTracker` in
+`mariana.data.models` is the *serialisable* snapshot; this class is the
+*live* mutable state that owns the enforcement logic.
+"""
+
+from __future__ import annotations
+
+import structlog
+
+from mariana.data.models import AISession
+from mariana.data.models import CostTracker as CostTrackerModel
+
+logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+
+class BudgetExhaustedError(Exception):
+    """Raised when a cost-cap (task-level or branch-level) is exceeded.
+
+    Attributes
+    ----------
+    scope:
+        ``"task"`` when the task-level budget is blown;
+        ``"branch"`` when a single branch exceeds its hard cap.
+    spent:
+        Cumulative USD spend that triggered the error.
+    cap:
+        The limit that was exceeded.
+    """
+
+    def __init__(self, scope: str, spent: float, cap: float) -> None:
+        self.scope = scope
+        self.spent = spent
+        self.cap = cap
+        super().__init__(
+            f"Budget exhausted ({scope}): ${spent:.4f} / ${cap:.4f}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Live cost tracker
+# ---------------------------------------------------------------------------
+
+
+class CostTracker:
+    """Mutable in-memory cost tracker; thread-safe for asyncio (single-threaded).
+
+    Parameters
+    ----------
+    task_id:
+        UUID of the owning ResearchTask.
+    task_budget:
+        Maximum USD allowed for the entire task.
+    branch_hard_cap:
+        Per-branch hard spending ceiling (default $75).  A branch that
+        exceeds this cap will be killed regardless of its score.
+    """
+
+    def __init__(
+        self,
+        task_id: str,
+        task_budget: float,
+        branch_hard_cap: float = 75.0,
+    ) -> None:
+        if task_budget <= 0:
+            raise ValueError(f"task_budget must be positive, got {task_budget!r}")
+        if branch_hard_cap <= 0:
+            raise ValueError(
+                f"branch_hard_cap must be positive, got {branch_hard_cap!r}"
+            )
+
+        self.task_id: str = task_id
+        self.task_budget: float = task_budget
+        self.branch_hard_cap: float = branch_hard_cap
+
+        # Running totals
+        self.total_spent: float = 0.0
+        self.per_model: dict[str, float] = {}
+        self.per_branch: dict[str, float] = {}
+        self.call_count: int = 0
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def record_call(
+        self,
+        session: AISession,
+        branch_id: str | None = None,
+    ) -> None:
+        """Record the cost from a completed AI session.
+
+        Updates running totals and enforces both branch and task caps.
+
+        Parameters
+        ----------
+        session:
+            The completed ``AISession`` whose ``cost_usd`` is to be
+            charged.
+        branch_id:
+            If provided, the cost is also charged to this branch's
+            sub-ledger and the branch hard-cap is checked.
+
+        Raises
+        ------
+        BudgetExhaustedError
+            If the branch cap or task budget is exceeded *after* recording
+            the cost (i.e., the call itself was the straw that broke the
+            camel's back).
+        """
+        cost = session.cost_usd
+
+        # Accumulate totals
+        self.total_spent += cost
+        model_key = session.model_used.value
+        self.per_model[model_key] = self.per_model.get(model_key, 0.0) + cost
+        self.call_count += 1
+
+        # Branch-level accounting + cap check
+        if branch_id:
+            self.per_branch[branch_id] = (
+                self.per_branch.get(branch_id, 0.0) + cost
+            )
+            if self.per_branch[branch_id] > self.branch_hard_cap:
+                logger.warning(
+                    "branch_budget_exhausted",
+                    branch_id=branch_id,
+                    branch_spent=self.per_branch[branch_id],
+                    cap=self.branch_hard_cap,
+                )
+                raise BudgetExhaustedError(
+                    "branch",
+                    self.per_branch[branch_id],
+                    self.branch_hard_cap,
+                )
+
+        # Task-level cap check
+        if self.total_spent > self.task_budget:
+            logger.warning(
+                "task_budget_exhausted",
+                total_spent=self.total_spent,
+                task_budget=self.task_budget,
+            )
+            raise BudgetExhaustedError(
+                "task", self.total_spent, self.task_budget
+            )
+
+        logger.info(
+            "cost_recorded",
+            cost_usd=cost,
+            total_usd=self.total_spent,
+            budget_remaining_usd=self.budget_remaining,
+            model=model_key,
+            call_count=self.call_count,
+            branch_id=branch_id,
+        )
+
+    def record_branch_spend(self, branch_id: str, amount: float) -> None:
+        """Manually charge *amount* USD to *branch_id* without an AISession.
+
+        Useful for charging browser/connector costs that don't go through
+        the AI layer.  Does **not** update ``total_spent`` — callers that
+        need task-level accounting must also call ``record_raw_spend``.
+
+        Parameters
+        ----------
+        branch_id:
+            Branch to charge.
+        amount:
+            USD amount (must be ≥ 0).
+        """
+        if amount < 0:
+            raise ValueError(f"amount must be non-negative, got {amount!r}")
+        self.per_branch[branch_id] = self.per_branch.get(branch_id, 0.0) + amount
+
+    def record_raw_spend(self, amount: float, label: str = "misc") -> None:
+        """Charge *amount* to the task total without a session or branch.
+
+        Parameters
+        ----------
+        amount:
+            USD to charge (must be ≥ 0).
+        label:
+            Human-readable category for logging only.
+        """
+        if amount < 0:
+            raise ValueError(f"amount must be non-negative, got {amount!r}")
+        self.total_spent += amount
+        logger.debug("raw_spend_recorded", amount=amount, label=label, total=self.total_spent)
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def budget_remaining(self) -> float:
+        """Remaining task budget in USD (never negative)."""
+        return max(0.0, self.task_budget - self.total_spent)
+
+    @property
+    def is_exhausted(self) -> bool:
+        """True when the task budget has been fully consumed."""
+        return self.total_spent >= self.task_budget
+
+    def branch_remaining(self, branch_id: str) -> float:
+        """Remaining budget for a specific branch (never negative)."""
+        spent = self.per_branch.get(branch_id, 0.0)
+        return max(0.0, self.branch_hard_cap - spent)
+
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
+
+    def to_model(self) -> CostTrackerModel:
+        """Return a serialisable Pydantic snapshot of the current state."""
+        return CostTrackerModel(
+            task_id=self.task_id,
+            total_spent=self.total_spent,
+            task_budget=self.task_budget,
+            per_model_breakdown=dict(self.per_model),
+            per_branch_breakdown=dict(self.per_branch),
+            call_count=self.call_count,
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"CostTracker(task_id={self.task_id!r}, "
+            f"spent=${self.total_spent:.4f}, "
+            f"budget=${self.task_budget:.2f}, "
+            f"calls={self.call_count})"
+        )

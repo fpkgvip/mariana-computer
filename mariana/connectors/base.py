@@ -1,0 +1,206 @@
+"""
+Base connector class for all Mariana data connectors.
+
+Provides common HTTP client, retry logic, caching, and error handling
+that all concrete connectors inherit.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from abc import ABC, abstractmethod
+from typing import Any
+
+import httpx
+import structlog
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+logger = structlog.get_logger(__name__)
+
+
+class ConnectorError(Exception):
+    """Base error for all connector-level failures."""
+
+
+class RateLimitError(ConnectorError):
+    """Raised when the upstream API returns HTTP 429."""
+
+
+class BaseConnector(ABC):
+    """
+    Abstract base class for all Mariana data connectors.
+
+    Subclasses should call super().__init__(config, cache) and use
+    self._request() for every outbound HTTP call so they get automatic
+    retry, rate-limit handling, and cache integration for free.
+
+    Args:
+        config: Application config object with API keys and settings.
+        cache:  Optional async cache object exposing get/set(key, value, ttl).
+    """
+
+    def __init__(self, config: Any, cache: Any | None = None) -> None:
+        self.config = config
+        self.cache = cache
+        self.client = httpx.AsyncClient(timeout=30.0)
+        self._log = logger.bind(connector=self.__class__.__name__)
+
+    async def close(self) -> None:
+        """Release the underlying HTTP client."""
+        await self.client.aclose()
+
+    async def __aenter__(self) -> "BaseConnector":
+        return self
+
+    async def __aexit__(self, *_: Any) -> None:
+        await self.close()
+
+    # ------------------------------------------------------------------
+    # HTTP helpers
+    # ------------------------------------------------------------------
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=16),
+        retry=retry_if_exception_type((httpx.HTTPStatusError, RateLimitError)),
+        reraise=True,
+    )
+    async def _request(self, method: str, url: str, **kwargs: Any) -> dict:
+        """
+        Execute an HTTP request with automatic retry on transient errors.
+
+        Retries up to 3 times with exponential back-off for HTTP errors
+        and explicit rate-limit responses.  All other exceptions propagate
+        immediately.
+
+        Args:
+            method: HTTP verb ("GET", "POST", …).
+            url:    Full request URL.
+            **kwargs: Passed verbatim to httpx.AsyncClient.request().
+
+        Returns:
+            Parsed JSON response body as a dict.
+
+        Raises:
+            RateLimitError: When the upstream returns HTTP 429.
+            httpx.HTTPStatusError: For other non-2xx responses after retries.
+            ConnectorError: For non-HTTP failures (network, timeout, etc.).
+        """
+        self._log.debug("http_request", method=method, url=url)
+        try:
+            resp = await self.client.request(method, url, **kwargs)
+        except httpx.TimeoutException as exc:
+            raise ConnectorError(f"Request timed out: {url}") from exc
+        except httpx.RequestError as exc:
+            raise ConnectorError(f"Network error for {url}: {exc}") from exc
+
+        if resp.status_code == 429:
+            self._log.warning("rate_limited", url=url)
+            raise RateLimitError(f"Rate limited: {url}")
+
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError:
+            self._log.error(
+                "http_error",
+                url=url,
+                status_code=resp.status_code,
+                body=resp.text[:500],
+            )
+            raise
+
+        return resp.json()
+
+    async def _request_text(self, method: str, url: str, **kwargs: Any) -> str:
+        """
+        Like _request() but returns the raw response text instead of JSON.
+
+        Useful for fetching filing documents, HTML pages, etc.
+        """
+        self._log.debug("http_request_text", method=method, url=url)
+        try:
+            resp = await self.client.request(method, url, **kwargs)
+        except httpx.TimeoutException as exc:
+            raise ConnectorError(f"Request timed out: {url}") from exc
+        except httpx.RequestError as exc:
+            raise ConnectorError(f"Network error for {url}: {exc}") from exc
+
+        if resp.status_code == 429:
+            raise RateLimitError(f"Rate limited: {url}")
+
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError:
+            self._log.error(
+                "http_error",
+                url=url,
+                status_code=resp.status_code,
+            )
+            raise
+
+        return resp.text
+
+    # ------------------------------------------------------------------
+    # Cache helpers
+    # ------------------------------------------------------------------
+
+    def _cache_key(self, *parts: str) -> str:
+        """
+        Build a deterministic cache key from arbitrary string parts.
+
+        Uses SHA-256 so that long or special-character values are safe
+        to use as cache identifiers.
+        """
+        raw = ":".join(parts)
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def _hash_url(self, url: str) -> str:
+        """Return a SHA-256 hex digest of the given URL string."""
+        return hashlib.sha256(url.encode()).hexdigest()
+
+    async def _cache_get(self, key: str) -> Any | None:
+        """Return a cached value or None if the cache is absent / cold."""
+        if self.cache is None:
+            return None
+        try:
+            return await self.cache.get(key)
+        except Exception as exc:  # cache should never crash the connector
+            self._log.warning("cache_get_error", key=key, error=str(exc))
+            return None
+
+    async def _cache_set(self, key: str, value: Any, ttl: int) -> None:
+        """Store a value in the cache with the given TTL (seconds)."""
+        if self.cache is None:
+            return
+        try:
+            await self.cache.set(key, value, ttl=ttl)
+        except Exception as exc:
+            self._log.warning("cache_set_error", key=key, error=str(exc))
+
+    # ------------------------------------------------------------------
+    # Subclass contract
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    async def search_for_topic(self, topic: str) -> list[dict]:
+        """
+        High-level entry point used by the orchestrator.
+
+        Implementations should:
+          1. Extract relevant search terms / tickers from `topic`.
+          2. Fan-out across relevant endpoints.
+          3. Return a list of structured finding dicts ready for the
+             orchestrator to process.
+
+        Args:
+            topic: Free-form research topic string.
+
+        Returns:
+            List of finding dicts (schema varies by connector).
+        """
+        ...

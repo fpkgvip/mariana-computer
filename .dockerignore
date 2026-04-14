@@ -1,0 +1,14 @@
+__pycache__
+*.pyc
+*.pyo
+.git
+.gitignore
+.env
+.env.local
+*.tar.gz
+*.zip
+data/
+skills/
+*.md
+!README.md
+deploy.sh

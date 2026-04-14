@@ -1,0 +1,526 @@
+"""
+mariana/orchestrator/branch_manager.py
+
+Pure-Python branch lifecycle management.  NO AI calls; this is Layer 1
+deterministic logic only.
+
+All functions accept an ``asyncpg.Pool`` (typed as ``Any`` to avoid a
+hard dependency on asyncpg at import time — the type annotation is kept
+for documentation purposes).
+
+Budget constants mirror ``mariana.config.AppConfig`` defaults and are
+re-declared here so the module is testable without a live config object.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
+
+import structlog
+
+from mariana.data.models import Branch, BranchStatus
+
+if TYPE_CHECKING:
+    # Avoid circular imports at runtime; only used for type-checker hints.
+    from mariana.orchestrator.cost_tracker import CostTracker
+
+logger = structlog.get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Budget / scoring constants  (mirrors AppConfig defaults)
+# ---------------------------------------------------------------------------
+
+SCORE_KILL_THRESHOLD: float = 4.0
+"""Branches with a score strictly below this are killed immediately."""
+
+SCORE_DEEPEN_THRESHOLD: float = 7.0
+"""Branches at or above this score qualify for the first budget grant."""
+
+SCORE_TRIBUNAL_THRESHOLD: float = 8.0
+"""Branches at or above this score qualify for the larger $50 grant."""
+
+BUDGET_INITIAL: float = 5.00
+"""Starting budget allocated to every new branch (USD)."""
+
+BUDGET_GRANT_SCORE7: float = 20.00
+"""Additional budget granted when a branch first reaches score ≥ 7."""
+
+BUDGET_GRANT_SCORE8: float = 50.00
+"""Additional budget granted when a branch reaches score ≥ 8 after the
+first grant has already been issued."""
+
+BUDGET_HARD_CAP: float = 75.00
+"""Absolute per-branch ceiling in USD; enforced by CostTracker."""
+
+_PLATEAU_DELTA_THRESHOLD: float = 1.0
+"""Score improvement below this value across the last two cycles is
+considered a plateau (when in the 4–6 score band)."""
+
+_PLATEAU_MIN_CYCLES: int = 2
+"""Minimum number of completed cycles before a plateau check fires."""
+
+
+# ---------------------------------------------------------------------------
+# Return types
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BranchDecision:
+    """Outcome returned by :func:`score_branch`.
+
+    Attributes
+    ----------
+    action:
+        One of ``"KILL"``, ``"CONTINUE"``, ``"GRANT_20"``, ``"GRANT_50"``.
+    reason:
+        Human-readable explanation logged to the orchestrator journal.
+    grant_amount:
+        The USD amount that should be granted (0.0 unless action is a
+        GRANT_* variant).
+    """
+
+    action: str
+    reason: str
+    grant_amount: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Branch lifecycle helpers
+# ---------------------------------------------------------------------------
+
+
+async def create_branch(
+    hypothesis_id: str,
+    task_id: str,
+    db: Any,  # asyncpg.Pool
+) -> Branch:
+    """Create and persist a new Branch for the given hypothesis.
+
+    The branch is initialised with the default starting budget
+    (:data:`BUDGET_INITIAL`) and inserted into the database.
+
+    Parameters
+    ----------
+    hypothesis_id:
+        UUID of the parent :class:`~mariana.data.models.Hypothesis`.
+    task_id:
+        UUID of the parent :class:`~mariana.data.models.ResearchTask`.
+    db:
+        An asyncpg connection pool.
+
+    Returns
+    -------
+    Branch
+        The newly created and persisted branch.
+    """
+    branch = Branch(
+        id=str(uuid.uuid4()),
+        hypothesis_id=hypothesis_id,
+        task_id=task_id,
+        status=BranchStatus.ACTIVE,
+        score_history=[],
+        budget_allocated=BUDGET_INITIAL,
+        budget_spent=0.0,
+        grants_log=[],
+        cycles_completed=0,
+    )
+
+    await db.execute(
+        """
+        INSERT INTO branches (
+            id, hypothesis_id, task_id, status,
+            score_history, budget_allocated, budget_spent,
+            grants_log, cycles_completed, kill_reason,
+            sources_searched, created_at, updated_at
+        ) VALUES (
+            $1, $2, $3, $4,
+            $5, $6, $7,
+            $8, $9, $10,
+            $11, $12, $13
+        )
+        """,
+        branch.id,
+        branch.hypothesis_id,
+        branch.task_id,
+        branch.status.value,
+        json.dumps(branch.score_history),
+        branch.budget_allocated,
+        branch.budget_spent,
+        json.dumps(branch.grants_log),
+        branch.cycles_completed,
+        branch.kill_reason,
+        json.dumps(branch.sources_searched),
+        branch.created_at,
+        branch.updated_at,
+    )
+
+    logger.info(
+        "branch_created",
+        branch_id=branch.id,
+        hypothesis_id=hypothesis_id,
+        task_id=task_id,
+        initial_budget=BUDGET_INITIAL,
+    )
+    return branch
+
+
+async def score_branch(
+    branch_id: str,
+    new_score: float,
+    cost_spent_this_cycle: float,
+    db: Any,  # asyncpg.Pool
+    cost_tracker: CostTracker,
+) -> BranchDecision:
+    """Evaluate a branch after a research cycle and decide what to do next.
+
+    Implements the exact decision tree from the architecture spec:
+
+    1. Append *new_score* to ``score_history``.
+    2. Hard budget cap check → ``KILL``.
+    3. Score < :data:`SCORE_KILL_THRESHOLD` → ``KILL``.
+    4. Score 4–6: plateau check (delta < :data:`_PLATEAU_DELTA_THRESHOLD`
+       for two cycles after initial budget exhausted) → ``KILL``; else
+       ``CONTINUE``.
+    5. Score ≥ :data:`SCORE_DEEPEN_THRESHOLD`: grant $20 on first trigger;
+       score ≥ :data:`SCORE_TRIBUNAL_THRESHOLD` with ≥1 prior grants:
+       grant $50 (subject to hard cap).
+
+    Parameters
+    ----------
+    branch_id:
+        UUID of the branch to evaluate.
+    new_score:
+        The latest evaluation score (0–10 scale).
+    cost_spent_this_cycle:
+        USD spent during this cycle; used to update the branch's
+        ``budget_spent`` field before running cap checks.
+    db:
+        asyncpg connection pool.
+    cost_tracker:
+        Live cost tracker; its ``per_branch`` ledger is updated.
+
+    Returns
+    -------
+    BranchDecision
+        The recommended action and (if a grant) the grant amount.
+    """
+    # ------------------------------------------------------------------ #
+    # Step 0: Load branch record from DB
+    # ------------------------------------------------------------------ #
+    row = await db.fetchrow(
+        """
+        SELECT id, hypothesis_id, task_id, status,
+               score_history, budget_allocated, budget_spent,
+               grants_log, cycles_completed, kill_reason,
+               sources_searched, created_at, updated_at
+        FROM branches WHERE id = $1
+        """,
+        branch_id,
+    )
+    if row is None:
+        raise ValueError(f"Branch {branch_id!r} not found in database")
+
+    branch = Branch.model_validate(dict(row))
+
+    # ------------------------------------------------------------------ #
+    # Step 1: Record new score and update spend
+    # ------------------------------------------------------------------ #
+    branch.score_history.append(new_score)
+    branch.budget_spent += cost_spent_this_cycle
+    branch.cycles_completed += 1
+    branch.updated_at = datetime.utcnow()
+
+    # Sync the per-branch ledger in the live cost tracker
+    cost_tracker.record_branch_spend(branch_id, cost_spent_this_cycle)
+
+    # ------------------------------------------------------------------ #
+    # Step 2: Hard branch budget cap check
+    # ------------------------------------------------------------------ #
+    if branch.budget_spent >= BUDGET_HARD_CAP:
+        decision = BranchDecision(
+            action="KILL",
+            reason=(
+                f"Hard branch cap reached: ${branch.budget_spent:.2f} "
+                f">= ${BUDGET_HARD_CAP:.2f}"
+            ),
+        )
+        await kill_branch(branch_id, decision.reason, db)
+        return decision
+
+    # ------------------------------------------------------------------ #
+    # Step 3: Hard score kill
+    # ------------------------------------------------------------------ #
+    if new_score < SCORE_KILL_THRESHOLD:
+        decision = BranchDecision(
+            action="KILL",
+            reason=f"Score {new_score:.1f} < kill threshold {SCORE_KILL_THRESHOLD:.1f}",
+        )
+        await kill_branch(branch_id, decision.reason, db)
+        return decision
+
+    # ------------------------------------------------------------------ #
+    # Step 4: Mid-range plateau detection (score 4–6)
+    # ------------------------------------------------------------------ #
+    if new_score < SCORE_DEEPEN_THRESHOLD:
+        # Plateau check: only fires once the initial budget has been
+        # consumed (i.e., after at least _PLATEAU_MIN_CYCLES cycles) and
+        # when we have enough score history to compute a delta.
+        past_initial = branch.cycles_completed >= _PLATEAU_MIN_CYCLES
+        has_prior_scores = len(branch.score_history) >= 2
+
+        if past_initial and has_prior_scores:
+            score_delta = abs(
+                branch.score_history[-1] - branch.score_history[-2]
+            )
+            if score_delta < _PLATEAU_DELTA_THRESHOLD:
+                decision = BranchDecision(
+                    action="KILL",
+                    reason=(
+                        f"Score plateau detected: delta {score_delta:.2f} < "
+                        f"{_PLATEAU_DELTA_THRESHOLD:.1f} after "
+                        f"{branch.cycles_completed} cycles (score={new_score:.1f})"
+                    ),
+                )
+                await kill_branch(branch_id, decision.reason, db)
+                return decision
+
+        # No plateau; keep going in the mid-range
+        await _persist_branch(branch, db)
+        logger.info(
+            "branch_continue",
+            branch_id=branch_id,
+            score=new_score,
+            cycles=branch.cycles_completed,
+        )
+        return BranchDecision(action="CONTINUE", reason=f"Score {new_score:.1f} in mid-range, no plateau")
+
+    # ------------------------------------------------------------------ #
+    # Step 5: High score — grant budget
+    # ------------------------------------------------------------------ #
+    prior_grants = len(branch.grants_log)
+
+    # Score ≥ 8 with at least one prior grant → try to give $50
+    if new_score >= SCORE_TRIBUNAL_THRESHOLD and prior_grants >= 1:
+        proposed_total = branch.budget_allocated + BUDGET_GRANT_SCORE8
+        if proposed_total <= BUDGET_HARD_CAP:
+            await grant_budget(branch_id, BUDGET_GRANT_SCORE8, db, cost_tracker)
+            await _persist_branch(branch, db)
+            return BranchDecision(
+                action="GRANT_50",
+                reason=(
+                    f"Score {new_score:.1f} >= {SCORE_TRIBUNAL_THRESHOLD:.1f} "
+                    f"with {prior_grants} prior grant(s); granting ${BUDGET_GRANT_SCORE8:.2f}"
+                ),
+                grant_amount=BUDGET_GRANT_SCORE8,
+            )
+        else:
+            # Would exceed hard cap; just continue without a grant
+            await _persist_branch(branch, db)
+            return BranchDecision(
+                action="CONTINUE",
+                reason=(
+                    f"Score {new_score:.1f} qualifies for $50 grant but "
+                    f"would exceed hard cap (current alloc=${branch.budget_allocated:.2f})"
+                ),
+            )
+
+    # Score ≥ 7 with no prior grants → give $20
+    if new_score >= SCORE_DEEPEN_THRESHOLD and prior_grants == 0:
+        proposed_total = branch.budget_allocated + BUDGET_GRANT_SCORE7
+        if proposed_total <= BUDGET_HARD_CAP:
+            await grant_budget(branch_id, BUDGET_GRANT_SCORE7, db, cost_tracker)
+            await _persist_branch(branch, db)
+            return BranchDecision(
+                action="GRANT_20",
+                reason=(
+                    f"Score {new_score:.1f} >= {SCORE_DEEPEN_THRESHOLD:.1f}; "
+                    f"first grant of ${BUDGET_GRANT_SCORE7:.2f}"
+                ),
+                grant_amount=BUDGET_GRANT_SCORE7,
+            )
+        else:
+            await _persist_branch(branch, db)
+            return BranchDecision(
+                action="CONTINUE",
+                reason=(
+                    f"Score {new_score:.1f} qualifies for $20 grant but "
+                    f"would exceed hard cap (current alloc=${branch.budget_allocated:.2f})"
+                ),
+            )
+
+    # Score ≥ 7 but already granted once and not yet at $50 threshold;
+    # continue deepening.
+    await _persist_branch(branch, db)
+    return BranchDecision(
+        action="CONTINUE",
+        reason=f"Score {new_score:.1f} high; continuing with existing allocation",
+    )
+
+
+async def kill_branch(
+    branch_id: str,
+    reason: str,
+    db: Any,  # asyncpg.Pool
+) -> None:
+    """Mark a branch as KILLED and persist the kill reason.
+
+    Parameters
+    ----------
+    branch_id:
+        UUID of the branch to kill.
+    reason:
+        Human-readable explanation stored in ``kill_reason``.
+    db:
+        asyncpg connection pool.
+    """
+    now = datetime.utcnow()
+    await db.execute(
+        """
+        UPDATE branches
+        SET status = $1,
+            kill_reason = $2,
+            updated_at = $3
+        WHERE id = $4
+        """,
+        BranchStatus.KILLED.value,
+        reason,
+        now,
+        branch_id,
+    )
+    logger.info("branch_killed", branch_id=branch_id, reason=reason)
+
+
+async def grant_budget(
+    branch_id: str,
+    amount: float,
+    db: Any,  # asyncpg.Pool
+    cost_tracker: CostTracker,
+) -> None:
+    """Increase a branch's allocated budget by *amount* and log the grant.
+
+    The grant is appended to ``grants_log`` with a timestamp.  The live
+    cost tracker's branch ledger is **not** updated here (grants represent
+    future authorised spend, not actual spend).
+
+    Parameters
+    ----------
+    branch_id:
+        UUID of the branch to grant.
+    amount:
+        USD to add to ``budget_allocated``.
+    db:
+        asyncpg connection pool.
+    cost_tracker:
+        Live cost tracker (currently unused but kept for future hard-cap
+        cross-checks at grant time).
+    """
+    if amount <= 0:
+        raise ValueError(f"Grant amount must be positive, got {amount!r}")
+
+    now = datetime.utcnow()
+    grant_record = {"reason": "score_grant", "amount": amount, "timestamp": now.isoformat()}
+
+    # Fetch current grants_log and budget_allocated
+    row = await db.fetchrow(
+        "SELECT budget_allocated, grants_log FROM branches WHERE id = $1",
+        branch_id,
+    )
+    if row is None:
+        raise ValueError(f"Branch {branch_id!r} not found")
+
+    current_allocated: float = row["budget_allocated"]
+    raw_grants = row["grants_log"]
+    if isinstance(raw_grants, str):
+        current_grants = json.loads(raw_grants) if raw_grants else []
+    elif isinstance(raw_grants, list):
+        current_grants = list(raw_grants)
+    else:
+        current_grants = []
+    current_grants.append(grant_record)
+
+    new_allocated = current_allocated + amount
+
+    await db.execute(
+        """
+        UPDATE branches
+        SET budget_allocated = $1,
+            grants_log = $2,
+            updated_at = $3
+        WHERE id = $4
+        """,
+        new_allocated,
+        json.dumps(current_grants),
+        now,
+        branch_id,
+    )
+
+    logger.info(
+        "budget_granted",
+        branch_id=branch_id,
+        amount=amount,
+        new_allocated=new_allocated,
+    )
+
+
+async def get_active_branches(
+    task_id: str,
+    db: Any,  # asyncpg.Pool
+) -> list[Branch]:
+    """Fetch all ACTIVE branches for a given task.
+
+    Parameters
+    ----------
+    task_id:
+        UUID of the parent ResearchTask.
+    db:
+        asyncpg connection pool.
+
+    Returns
+    -------
+    list[Branch]
+        All branches with ``status == ACTIVE``, ordered by
+        ``created_at ASC``.
+    """
+    rows = await db.fetch(
+        """
+        SELECT id, hypothesis_id, task_id, status,
+               score_history, budget_allocated, budget_spent,
+               grants_log, cycles_completed, kill_reason,
+               sources_searched, created_at, updated_at
+        FROM branches
+        WHERE task_id = $1 AND status = $2
+        ORDER BY created_at ASC
+        """,
+        task_id,
+        BranchStatus.ACTIVE.value,
+    )
+    return [Branch.model_validate(dict(row)) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+
+async def _persist_branch(branch: Branch, db: Any) -> None:
+    """Write the mutable fields of *branch* back to the database."""
+    await db.execute(
+        """
+        UPDATE branches
+        SET score_history = $1,
+            budget_spent = $2,
+            cycles_completed = $3,
+            updated_at = $4
+        WHERE id = $5
+        """,
+        json.dumps(branch.score_history),
+        branch.budget_spent,
+        branch.cycles_completed,
+        branch.updated_at,
+        branch.id,
+    )

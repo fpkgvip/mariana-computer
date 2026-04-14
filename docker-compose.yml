@@ -1,0 +1,100 @@
+services:
+  mariana-orchestrator:
+    build: .
+    container_name: mariana-orchestrator
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - mariana-data:/data/mariana
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mariana-net
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+
+  mariana-api:
+    build: .
+    container_name: mariana-api
+    command:
+      - python
+      - -m
+      - uvicorn
+      - mariana.api:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8080"
+    ports:
+      - "8080:8080"
+    env_file: .env
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - mariana-data:/data/mariana
+    networks:
+      - mariana-net
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  postgresql:
+    image: pgvector/pgvector:pg16
+    container_name: mariana-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mariana}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-mariana}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mariana"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mariana-net
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+
+  redis:
+    image: redis:7-alpine
+    container_name: mariana-redis
+    restart: unless-stopped
+    command: >-
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 4gb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mariana-net
+
+volumes:
+  postgres-data:
+  redis-data:
+  mariana-data:
+
+networks:
+  mariana-net:
+    driver: bridge

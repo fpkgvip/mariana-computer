@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ title_en }}</title>
+  <style>
+    /* =========================================================
+       MARIANA RESEARCH — INSTITUTIONAL REPORT STYLESHEET
+       Optimised for WeasyPrint / A4 print.
+       Fonts: system stack with Noto Sans CJK fallback.
+    ========================================================= */
+
+    /* ── Font imports (WeasyPrint loads fonts from system) ── */
+    @page {
+      size: A4;
+      margin: 22mm 20mm 24mm 20mm;
+
+      @top-center {
+        content: "MARIANA RESEARCH — CONFIDENTIAL";
+        font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+                     "Noto Sans CJK SC", "Source Han Sans SC", sans-serif;
+        font-size: 7pt;
+        letter-spacing: 0.12em;
+        color: #9ca3af;
+        padding-top: 6mm;
+      }
+
+      @bottom-left {
+        content: "{{ task_topic | truncate(60) }}";
+        font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+                     "Noto Sans CJK SC", "Source Han Sans SC", sans-serif;
+        font-size: 7pt;
+        color: #9ca3af;
+        padding-bottom: 5mm;
+      }
+
+      @bottom-right {
+        content: "Page " counter(page) " of " counter(pages);
+        font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+                     "Noto Sans CJK SC", "Source Han Sans SC", sans-serif;
+        font-size: 7pt;
+        color: #9ca3af;
+        padding-bottom: 5mm;
+      }
+    }
+
+    /* ── Reset & base ── */
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html, body {
+      font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+                   "Noto Sans CJK SC", "Source Han Sans SC",
+                   "WenQuanYi Micro Hei", sans-serif;
+      font-size: 9.5pt;
+      line-height: 1.65;
+      color: #1a1a2e;
+      background: #ffffff;
+    }
+
+    /* ── Typography scale ── */
+    h1 { font-size: 22pt; font-weight: 700; line-height: 1.2; }
+    h2 { font-size: 13pt; font-weight: 700; line-height: 1.3; }
+    h3 { font-size: 11pt; font-weight: 600; line-height: 1.3; }
+    h4 { font-size: 9.5pt; font-weight: 600; }
+
+    p  { margin-bottom: 0.75em; }
+    p:last-child { margin-bottom: 0; }
+
+    /* ── Cover / header block ── */
+    .cover {
+      background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%);
+      color: #ffffff;
+      padding: 28mm 22mm 20mm 22mm;
+      margin: -22mm -20mm 10mm -20mm;  /* bleed to page edges */
+      page-break-after: avoid;
+    }
+
+    .cover-brand {
+      font-size: 7.5pt;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      color: #60a5fa;
+      font-weight: 600;
+      margin-bottom: 10mm;
+    }
+
+    .cover-title-en {
+      font-size: 24pt;
+      font-weight: 800;
+      line-height: 1.15;
+      margin-bottom: 4mm;
+      color: #f1f5f9;
+    }
+
+    .cover-title-zh {
+      font-size: 15pt;
+      font-weight: 400;
+      color: #94a3b8;
+      margin-bottom: 12mm;
+      letter-spacing: 0.04em;
+    }
+
+    .cover-meta {
+      border-top: 1px solid rgba(255,255,255,0.15);
+      padding-top: 6mm;
+      display: flex;
+      gap: 12mm;
+      font-size: 8pt;
+      color: #94a3b8;
+    }
+
+    .cover-meta-item strong {
+      display: block;
+      color: #e2e8f0;
+      font-size: 9pt;
+      margin-bottom: 1mm;
+    }
+
+    /* ── Section dividers ── */
+    .section-rule {
+      border: none;
+      border-top: 2px solid #1e3a5f;
+      margin: 8mm 0 5mm 0;
+    }
+
+    .section-rule-light {
+      border: none;
+      border-top: 1px solid #e2e8f0;
+      margin: 6mm 0 4mm 0;
+    }
+
+    /* ── Executive summary box ── */
+    .exec-summary {
+      background: #f8fafc;
+      border-left: 4px solid #1e3a5f;
+      border-radius: 2px;
+      padding: 7mm 9mm;
+      margin-bottom: 9mm;
+      page-break-inside: avoid;
+    }
+
+    .exec-summary-label {
+      font-size: 7pt;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      font-weight: 700;
+      color: #64748b;
+      margin-bottom: 3mm;
+    }
+
+    .exec-summary-text-en {
+      font-size: 10pt;
+      line-height: 1.7;
+      color: #0f172a;
+      margin-bottom: 5mm;
+    }
+
+    .exec-summary-text-zh {
+      font-size: 9.5pt;
+      line-height: 1.85;
+      color: #334155;
+      border-top: 1px solid #e2e8f0;
+      padding-top: 4mm;
+      letter-spacing: 0.02em;
+    }
+
+    /* ── Body sections ── */
+    .section {
+      margin-bottom: 10mm;
+      page-break-inside: avoid;
+    }
+
+    .section-heading {
+      margin-bottom: 4mm;
+    }
+
+    .section-heading h2 {
+      color: #0f172a;
+    }
+
+    .section-heading .title-zh {
+      font-size: 11pt;
+      color: #64748b;
+      font-weight: 400;
+      margin-top: 1mm;
+      letter-spacing: 0.03em;
+    }
+
+    .section-content-en {
+      font-size: 9.5pt;
+      line-height: 1.68;
+      color: #1e293b;
+      margin-bottom: 4mm;
+    }
+
+    .section-content-zh {
+      font-size: 9pt;
+      line-height: 1.85;
+      color: #475569;
+      background: #f8fafc;
+      border-left: 3px solid #cbd5e1;
+      padding: 3mm 5mm;
+      border-radius: 1px;
+      letter-spacing: 0.02em;
+    }
+
+    /* ── Citations ── */
+    .citations-block {
+      margin-top: 3mm;
+    }
+
+    .citations-label {
+      font-size: 7pt;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: #94a3b8;
+      font-weight: 600;
+      margin-bottom: 1.5mm;
+    }
+
+    .citations-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+
+    .citations-list li {
+      font-size: 7.5pt;
+      color: #64748b;
+      line-height: 1.5;
+      padding-left: 10pt;
+      text-indent: -10pt;
+    }
+
+    .citations-list li::before {
+      content: "↗ ";
+      color: #3b82f6;
+      font-size: 7pt;
+    }
+
+    .citation-url {
+      color: #2563eb;
+      word-break: break-all;
+    }
+
+    /* ── Conclusion box ── */
+    .conclusion {
+      background: #0f172a;
+      color: #f1f5f9;
+      padding: 7mm 9mm;
+      border-radius: 3px;
+      margin-top: 10mm;
+      margin-bottom: 8mm;
+      page-break-inside: avoid;
+    }
+
+    .conclusion-label {
+      font-size: 7pt;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: #60a5fa;
+      font-weight: 700;
+      margin-bottom: 3mm;
+    }
+
+    .conclusion-en {
+      font-size: 10pt;
+      line-height: 1.7;
+      margin-bottom: 5mm;
+    }
+
+    .conclusion-zh {
+      font-size: 9.5pt;
+      line-height: 1.85;
+      color: #94a3b8;
+      border-top: 1px solid rgba(255,255,255,0.1);
+      padding-top: 4mm;
+      letter-spacing: 0.02em;
+    }
+
+    /* ── Statistics summary bar ── */
+    .stats-bar {
+      display: flex;
+      gap: 0;
+      border: 1px solid #e2e8f0;
+      border-radius: 3px;
+      overflow: hidden;
+      margin-bottom: 8mm;
+      page-break-inside: avoid;
+    }
+
+    .stats-bar-item {
+      flex: 1;
+      padding: 4mm 5mm;
+      text-align: center;
+      border-right: 1px solid #e2e8f0;
+    }
+
+    .stats-bar-item:last-child {
+      border-right: none;
+    }
+
+    .stats-bar-value {
+      font-size: 16pt;
+      font-weight: 700;
+      color: #1e3a5f;
+      line-height: 1.1;
+    }
+
+    .stats-bar-label {
+      font-size: 7pt;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      margin-top: 1mm;
+    }
+
+    /* ── Data tables ── */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 8.5pt;
+      margin: 4mm 0;
+    }
+
+    thead tr {
+      background: #1e3a5f;
+      color: #ffffff;
+    }
+
+    thead th {
+      padding: 3mm 4mm;
+      text-align: left;
+      font-weight: 600;
+      font-size: 8pt;
+      letter-spacing: 0.04em;
+    }
+
+    tbody tr:nth-child(odd) {
+      background: #f8fafc;
+    }
+
+    tbody tr:nth-child(even) {
+      background: #ffffff;
+    }
+
+    tbody td {
+      padding: 2.5mm 4mm;
+      border-bottom: 1px solid #f1f5f9;
+      vertical-align: top;
+      line-height: 1.5;
+    }
+
+    /* ── Disclaimer ── */
+    .disclaimer {
+      border-top: 1px solid #e2e8f0;
+      padding-top: 6mm;
+      margin-top: 10mm;
+      page-break-inside: avoid;
+    }
+
+    .disclaimer-label {
+      font-size: 7pt;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      color: #94a3b8;
+      font-weight: 700;
+      margin-bottom: 2mm;
+    }
+
+    .disclaimer-en {
+      font-size: 7.5pt;
+      color: #6b7280;
+      line-height: 1.6;
+      margin-bottom: 3mm;
+    }
+
+    .disclaimer-zh {
+      font-size: 7pt;
+      color: #9ca3af;
+      line-height: 1.7;
+      letter-spacing: 0.01em;
+    }
+
+    /* ── Table of contents ── */
+    .toc {
+      border: 1px solid #e2e8f0;
+      border-radius: 3px;
+      padding: 5mm 7mm;
+      margin-bottom: 9mm;
+      page-break-inside: avoid;
+    }
+
+    .toc-title {
+      font-size: 8pt;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      font-weight: 700;
+      color: #64748b;
+      margin-bottom: 3mm;
+    }
+
+    .toc-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
+
+    .toc-item {
+      display: flex;
+      align-items: baseline;
+      gap: 2mm;
+      font-size: 9pt;
+      padding: 1mm 0;
+      border-bottom: 1px dotted #e2e8f0;
+    }
+
+    .toc-item:last-child {
+      border-bottom: none;
+    }
+
+    .toc-num {
+      font-weight: 700;
+      color: #1e3a5f;
+      min-width: 12mm;
+      font-size: 8.5pt;
+    }
+
+    .toc-en {
+      color: #0f172a;
+      flex: 1;
+    }
+
+    .toc-zh {
+      color: #94a3b8;
+      font-size: 8pt;
+    }
+
+    /* ── Utility: page break ── */
+    .page-break {
+      page-break-after: always;
+    }
+
+    /* ── Print optimisations ── */
+    @media print {
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ================================================================ -->
+  <!-- COVER BLOCK                                                        -->
+  <!-- ================================================================ -->
+  <div class="cover">
+    <div class="cover-brand">Mariana Research &nbsp;·&nbsp; Autonomous Financial Intelligence</div>
+    <div class="cover-title-en">{{ title_en }}</div>
+    <div class="cover-title-zh">{{ title_zh }}</div>
+
+    <div class="cover-meta">
+      <div class="cover-meta-item">
+        <strong>Generated</strong>
+        {{ generated_at_str }}
+      </div>
+      <div class="cover-meta-item">
+        <strong>Confirmed Findings</strong>
+        {{ total_findings }}
+      </div>
+      <div class="cover-meta-item">
+        <strong>Sources Reviewed</strong>
+        {{ total_sources }}
+      </div>
+      <div class="cover-meta-item">
+        <strong>Research Cost</strong>
+        {{ total_cost_usd_str }}
+      </div>
+    </div>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- RESEARCH SUMMARY STATISTICS BAR                                    -->
+  <!-- ================================================================ -->
+  <div class="stats-bar">
+    <div class="stats-bar-item">
+      <div class="stats-bar-value">{{ total_findings }}</div>
+      <div class="stats-bar-label">Confirmed Findings</div>
+    </div>
+    <div class="stats-bar-item">
+      <div class="stats-bar-value">{{ total_sources }}</div>
+      <div class="stats-bar-label">Sources Reviewed</div>
+    </div>
+    <div class="stats-bar-item">
+      <div class="stats-bar-value">{{ sections | length }}</div>
+      <div class="stats-bar-label">Report Sections</div>
+    </div>
+    <div class="stats-bar-item">
+      <div class="stats-bar-value">{{ total_cost_usd_str }}</div>
+      <div class="stats-bar-label">AI Research Cost</div>
+    </div>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- TABLE OF CONTENTS                                                  -->
+  <!-- ================================================================ -->
+  {% if sections %}
+  <div class="toc">
+    <div class="toc-title">Contents &nbsp;·&nbsp; 目录</div>
+    <ul class="toc-list">
+      <li class="toc-item">
+        <span class="toc-num">—</span>
+        <span class="toc-en">Executive Summary</span>
+        <span class="toc-zh">执行摘要</span>
+      </li>
+      {% for section in sections %}
+      <li class="toc-item">
+        <span class="toc-num">{{ loop.index }}</span>
+        <span class="toc-en">{{ section.title_en }}</span>
+        <span class="toc-zh">{{ section.title_zh }}</span>
+      </li>
+      {% endfor %}
+      <li class="toc-item">
+        <span class="toc-num">—</span>
+        <span class="toc-en">Conclusion</span>
+        <span class="toc-zh">结论</span>
+      </li>
+    </ul>
+  </div>
+  {% endif %}
+
+  <!-- ================================================================ -->
+  <!-- EXECUTIVE SUMMARY                                                  -->
+  <!-- ================================================================ -->
+  <hr class="section-rule" />
+  <div class="exec-summary">
+    <div class="exec-summary-label">Executive Summary &nbsp;·&nbsp; 执行摘要</div>
+    <div class="exec-summary-text-en">
+      {% for paragraph in executive_summary_en.split('\n\n') %}
+        <p>{{ paragraph | trim }}</p>
+      {% endfor %}
+    </div>
+    <div class="exec-summary-text-zh">
+      {% for paragraph in executive_summary_zh.split('\n\n') %}
+        <p>{{ paragraph | trim }}</p>
+      {% endfor %}
+    </div>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- BODY SECTIONS                                                      -->
+  <!-- ================================================================ -->
+  {% for section in sections %}
+  <div class="section" id="section-{{ section.section_id }}">
+    <hr class="section-rule-light" />
+    <div class="section-heading">
+      <h2>{{ loop.index }}.&nbsp; {{ section.title_en }}</h2>
+      <div class="title-zh">{{ section.title_zh }}</div>
+    </div>
+
+    <div class="section-content-en">
+      {% for paragraph in section.content_en.split('\n\n') %}
+        <p>{{ paragraph | trim }}</p>
+      {% endfor %}
+    </div>
+
+    <div class="section-content-zh">
+      {% for paragraph in section.content_zh.split('\n\n') %}
+        <p>{{ paragraph | trim }}</p>
+      {% endfor %}
+    </div>
+
+    {% if section.citations %}
+    <div class="citations-block">
+      <div class="citations-label">Sources &nbsp;·&nbsp; 数据来源</div>
+      <ul class="citations-list">
+        {% for citation in section.citations %}
+        <li>
+          {% if citation.startswith('http') %}
+            <span class="citation-url">{{ citation }}</span>
+          {% else %}
+            {{ citation }}
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+
+  <!-- ================================================================ -->
+  <!-- CONCLUSION                                                         -->
+  <!-- ================================================================ -->
+  <div class="conclusion">
+    <div class="conclusion-label">Conclusion &nbsp;·&nbsp; 结论</div>
+    <div class="conclusion-en">
+      {% for paragraph in conclusion_en.split('\n\n') %}
+        <p>{{ paragraph | trim }}</p>
+      {% endfor %}
+    </div>
+    <div class="conclusion-zh">
+      {% for paragraph in conclusion_zh.split('\n\n') %}
+        <p>{{ paragraph | trim }}</p>
+      {% endfor %}
+    </div>
+  </div>
+
+  <!-- ================================================================ -->
+  <!-- DISCLAIMER                                                         -->
+  <!-- ================================================================ -->
+  <div class="disclaimer">
+    <div class="disclaimer-label">Important Disclaimers &nbsp;·&nbsp; 重要声明</div>
+    <div class="disclaimer-en">{{ disclaimer_en }}</div>
+    <div class="disclaimer-zh">{{ disclaimer_zh }}</div>
+  </div>
+
+</body>
+</html>
