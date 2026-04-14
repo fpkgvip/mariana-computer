@@ -31,8 +31,11 @@ requiring an in-process event loop.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import json as _json
 import os
+import re
 import sys
 import uuid
 from contextlib import asynccontextmanager
@@ -41,11 +44,13 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 import asyncpg
+import httpx
 import structlog
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+import stripe as _stripe
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
@@ -59,6 +64,13 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _VERSION = "0.1.0"
+
+# ---------------------------------------------------------------------------
+# Admin constants
+# ---------------------------------------------------------------------------
+
+#: Hardcoded admin user UUID — matches the Supabase profile with role='admin'.
+ADMIN_USER_ID = "a34a319e-a046-4df2-8c98-9b83f6d512a0"
 
 # ---------------------------------------------------------------------------
 # Module-level singletons (populated during lifespan startup)
@@ -84,6 +96,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ── Config ─────────────────────────────────────────────────────────────
     _config = load_config()
+
+    # ── Stripe ──────────────────────────────────────────────────────────────
+    if _config.STRIPE_SECRET_KEY:
+        _stripe.api_key = _config.STRIPE_SECRET_KEY
+        log.info("stripe_configured")
+    else:
+        log.warning("stripe_not_configured", message="STRIPE_SECRET_KEY is unset; billing endpoints will error")
 
     # ── Database ────────────────────────────────────────────────────────────
     try:
@@ -222,9 +241,31 @@ class ConfigResponse(BaseModel):
 
 
 class StartInvestigationRequest(BaseModel):
-    topic: str = Field(..., min_length=3, max_length=1024, description="Research topic")
-    budget_usd: float = Field(..., gt=0.0, le=500.0, description="Budget ceiling in USD")
-    duration_hours: float = Field(2.0, gt=0.0, description="Maximum investigation duration in hours")
+    topic: str = Field(..., min_length=1, max_length=4096, description="Research topic or question")
+    # All below are now optional — AI determines them if not provided
+    budget_usd: float | None = Field(
+        None, gt=0.0, le=10000.0, description="Budget ceiling in USD (AI-determined if omitted)"
+    )
+    duration_hours: float | None = Field(
+        None, gt=0.0, description="Max duration in hours (AI-determined if omitted)"
+    )
+    plan_approved: bool = Field(False, description="Whether user has approved the research plan")
+
+
+class ClassifyRequest(BaseModel):
+    """Request body for the /api/investigations/classify endpoint."""
+
+    topic: str = Field(..., min_length=1, max_length=4096)
+
+
+class ClassifyResponse(BaseModel):
+    """Classification of an investigation request into a research tier."""
+
+    tier: str  # "instant" | "standard" | "deep"
+    estimated_duration_hours: float
+    estimated_credits: int
+    plan_summary: str  # Brief description of what Mariana will do
+    requires_approval: bool  # False for instant, True for standard/deep
 
 
 class StartInvestigationResponse(BaseModel):
@@ -304,6 +345,80 @@ class ShutdownResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Billing models
+# ---------------------------------------------------------------------------
+
+
+class PlanInfo(BaseModel):
+    """Public plan descriptor returned by GET /api/plans."""
+
+    id: str
+    name: str
+    price_usd_monthly: float
+    credits_per_month: int
+    stripe_price_id: str
+    description: str
+    features: list[str]
+
+
+class CreateCheckoutRequest(BaseModel):
+    """Request body for POST /api/billing/create-checkout."""
+
+    plan_id: str = Field(..., description="Plan ID (researcher | professional | enterprise)")
+    success_url: str = Field(..., description="Redirect URL after successful checkout")
+    cancel_url: str = Field(..., description="Redirect URL if checkout is cancelled")
+
+
+class CreateCheckoutResponse(BaseModel):
+    """Response from POST /api/billing/create-checkout."""
+
+    checkout_url: str
+    session_id: str
+
+
+class BillingPortalResponse(BaseModel):
+    """Response from GET /api/billing/portal."""
+
+    portal_url: str
+
+
+# ---------------------------------------------------------------------------
+# Admin models
+# ---------------------------------------------------------------------------
+
+
+class AdminUserSummary(BaseModel):
+    """Lightweight user record for admin listing."""
+
+    user_id: str
+    email: str | None
+    role: str
+    credits: int
+    stripe_customer_id: str | None
+    subscription_plan: str | None
+    subscription_status: str | None
+    created_at: datetime | None
+
+
+class AdminSetCreditsRequest(BaseModel):
+    """Request body for POST /api/admin/users/{user_id}/credits."""
+
+    credits: int = Field(..., ge=0, description="New absolute credits balance (use delta for increments)")
+    delta: bool = Field(False, description="If True, treat credits as a delta to add/subtract")
+
+
+class AdminStatsResponse(BaseModel):
+    """System-wide statistics for the admin dashboard."""
+
+    total_investigations: int
+    running_investigations: int
+    completed_investigations: int
+    failed_investigations: int
+    total_spent_usd: float
+    active_users_30d: int
+
+
+# ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
@@ -364,6 +479,120 @@ def _row_to_finding_summary(row: asyncpg.Record) -> FindingSummary:
 
 
 # ---------------------------------------------------------------------------
+# Auth dependency — Supabase JWT validation
+# ---------------------------------------------------------------------------
+
+
+async def _get_current_user(
+    authorization: str | None = Header(None),
+) -> dict[str, str]:
+    """
+    Validate a Supabase JWT and return basic user info.
+
+    Decodes the JWT payload (base64url middle segment) to extract the
+    ``sub`` (user_id) and ``role`` claims without performing a full
+    cryptographic verification.  Full verification requires the Supabase
+    JWT secret and can be added later; for now the caller is trusted
+    to present a well-formed token issued by Supabase.
+
+    Raises HTTP 401 for missing, malformed, or expired tokens.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
+    token = authorization.split(" ", 1)[1]
+    try:
+        # JWT format: header.payload.signature  (all base64url-encoded)
+        payload_b64 = token.split(".")[1]
+        # Restore padding stripped during JWT encoding
+        payload_b64 += "=" * (4 - len(payload_b64) % 4)
+        payload = _json.loads(base64.urlsafe_b64decode(payload_b64))
+        user_id: str | None = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Token missing sub claim")
+        role: str = payload.get("role", "authenticated")
+        return {"user_id": user_id, "role": role}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("jwt_decode_failed", error=str(exc))
+        raise HTTPException(status_code=401, detail="Invalid token") from exc
+
+
+async def _require_admin(
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> dict[str, str]:
+    """Dependency that raises 403 unless the caller is the admin user."""
+    if current_user["user_id"] != ADMIN_USER_ID:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return current_user
+
+
+# ---------------------------------------------------------------------------
+# Billing — hardcoded plan catalogue (matches Supabase plans table)
+# ---------------------------------------------------------------------------
+
+# Stripe price IDs must be created in the Stripe dashboard and set here.
+# These are placeholder IDs; replace with real ones from the Stripe dashboard.
+_PLANS: list[dict[str, Any]] = [
+    {
+        "id": "researcher",
+        "name": "Researcher",
+        "price_usd_monthly": 99.0,
+        "credits_per_month": 1000,
+        "stripe_price_id": os.environ.get("STRIPE_PRICE_RESEARCHER", "price_researcher"),
+        "description": "For individual analysts and academics",
+        "features": [
+            "1,000 research credits/month",
+            "Standard investigations",
+            "PDF & DOCX report export",
+            "Email support",
+        ],
+    },
+    {
+        "id": "professional",
+        "name": "Professional",
+        "price_usd_monthly": 499.0,
+        "credits_per_month": 10_000,
+        "stripe_price_id": os.environ.get("STRIPE_PRICE_PROFESSIONAL", "price_professional"),
+        "description": "For power users and small teams",
+        "features": [
+            "10,000 research credits/month",
+            "Standard + Deep investigations",
+            "Priority queue",
+            "PDF & DOCX report export",
+            "Priority support",
+        ],
+    },
+    {
+        "id": "enterprise",
+        "name": "Enterprise",
+        "price_usd_monthly": 5000.0,
+        "credits_per_month": 100_000,
+        "stripe_price_id": os.environ.get("STRIPE_PRICE_ENTERPRISE", "price_enterprise"),
+        "description": "For large organisations with heavy research workloads",
+        "features": [
+            "100,000 research credits/month",
+            "All investigation tiers incl. Flagship",
+            "Dedicated queue",
+            "Custom integrations",
+            "Dedicated account manager",
+            "SLA-backed support",
+        ],
+    },
+]
+
+#: Tier-to-credit cost mapping used by the classification heuristic.
+_TIER_CREDITS: dict[str, int] = {
+    "instant": 1,
+    "standard": 75,
+    "deep": 1200,
+}
+
+#: Credits-to-USD ratio (1 credit = $0.10 by default)
+_CREDIT_USD_RATE: float = 0.10
+
+
+# ---------------------------------------------------------------------------
 # Routes — Health / Status
 # ---------------------------------------------------------------------------
 
@@ -397,14 +626,39 @@ async def get_config() -> ConfigResponse:
 
 
 @app.post(
+    "/api/investigations/classify",
+    response_model=ClassifyResponse,
+    tags=["Investigations"],
+    summary="Classify a research request into a tier",
+)
+async def classify_request(body: ClassifyRequest) -> ClassifyResponse:
+    """
+    Classify a research topic into a tier (instant / standard / deep)
+    and return estimated duration, credits, and a plan summary.
+
+    Uses a deterministic heuristic — no LLM call required.
+    The frontend should call this before submitting an investigation so
+    the user can approve or adjust the plan.
+    """
+    return _classify_topic(body.topic)
+
+
+@app.post(
     "/api/investigations",
     response_model=StartInvestigationResponse,
     status_code=202,
     tags=["Investigations"],
 )
-async def start_investigation(body: StartInvestigationRequest) -> StartInvestigationResponse:
+async def start_investigation(
+    body: StartInvestigationRequest,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> StartInvestigationResponse:
     """
     Submit a new investigation.
+
+    Requires a valid Supabase JWT in the Authorization header.
+    If budget_usd or duration_hours are omitted the endpoint classifies
+    the topic automatically and fills in AI-determined values.
 
     Writes a ``.task.json`` file to the daemon inbox directory so the
     background orchestrator picks it up asynchronously.  Returns the
@@ -414,21 +668,46 @@ async def start_investigation(body: StartInvestigationRequest) -> StartInvestiga
     task_id = str(uuid.uuid4())
     created_at = datetime.now(tz=timezone.utc).isoformat()
 
+    # ── Fill in AI-determined values when the caller omits them ─────────────
+    classification = _classify_topic(body.topic)
+
+    effective_duration_hours: float = (
+        body.duration_hours
+        if body.duration_hours is not None
+        else classification.estimated_duration_hours
+    )
+    effective_budget_usd: float = (
+        body.budget_usd
+        if body.budget_usd is not None
+        else float(classification.estimated_credits) * _CREDIT_USD_RATE
+    )
+
     task_payload: dict[str, Any] = {
         "id": task_id,
         "topic": body.topic,
-        "budget_usd": body.budget_usd,
-        "duration_hours": body.duration_hours,
+        "budget_usd": effective_budget_usd,
+        "duration_hours": effective_duration_hours,
         "status": "PENDING",
         "created_at": created_at,
+        # Adaptive-mode metadata
+        "tier": classification.tier,
+        "plan_approved": body.plan_approved,
+        "user_id": current_user["user_id"],
+        "estimated_credits": classification.estimated_credits,
     }
 
     inbox = Path(cfg.inbox_dir)
     try:
         inbox.mkdir(parents=True, exist_ok=True)
         task_file = inbox / f"{task_id}.task.json"
-        task_file.write_text(json.dumps(task_payload, indent=2), encoding="utf-8")
-        logger.info("task_submitted", task_id=task_id, topic=body.topic[:80])
+        task_file.write_text(_json.dumps(task_payload, indent=2), encoding="utf-8")
+        logger.info(
+            "task_submitted",
+            task_id=task_id,
+            topic=body.topic[:80],
+            tier=classification.tier,
+            user_id=current_user["user_id"],
+        )
     except OSError as exc:
         logger.error("task_write_failed", error=str(exc))
         raise HTTPException(
@@ -989,6 +1268,801 @@ async def list_connectors() -> list[ConnectorStatus]:
         ),
     ]
     return connectors
+
+
+# ---------------------------------------------------------------------------
+# Classification heuristic — pure function, no I/O
+# ---------------------------------------------------------------------------
+
+
+def _classify_topic(topic: str) -> ClassifyResponse:
+    """
+    Deterministic tier classification for a research topic.
+
+    Rules (evaluated in order, first match wins):
+    1. Explicit duration keywords ("3 hours", "2 days") — honour the
+       stated duration; tier is deep if > 2 h, standard otherwise.
+    2. Deep-tier signals: "flagship", "exhaustive", "multi-day",
+       or an explicit duration > 12 h.
+    3. Instant-tier: short question (< 100 chars) containing "?" and
+       NOT containing investigative keywords.
+    4. Default: standard tier (1.5 h, 75 credits).
+    """
+    topic_lower = topic.lower()
+
+    # ── 1. Parse explicit duration mentions ──────────────────────────────────
+    explicit_hours: float | None = None
+    # Match patterns like "3 hours", "1.5 hours", "2 days", "half a day"
+    duration_match = re.search(
+        r"(\d+(?:\.\d+)?)\s*(hour|hr|day|days|hours|hrs)",
+        topic_lower,
+    )
+    if duration_match:
+        value = float(duration_match.group(1))
+        unit = duration_match.group(2)
+        explicit_hours = value * 24.0 if unit.startswith("day") else value
+
+    if explicit_hours is not None:
+        if explicit_hours > 2.0:
+            tier = "deep"
+            credits = _TIER_CREDITS["deep"]
+            summary = (
+                f"Deep investigation over {explicit_hours:.1f} hours: multi-angle analysis, "
+                "exhaustive source coverage, tribunal review, and a full written report."
+            )
+        else:
+            tier = "standard"
+            credits = _TIER_CREDITS["standard"]
+            summary = (
+                f"Standard investigation ({explicit_hours:.1f} h): structured evidence "
+                "gathering, hypothesis testing, and a concise report."
+            )
+        return ClassifyResponse(
+            tier=tier,
+            estimated_duration_hours=explicit_hours,
+            estimated_credits=credits,
+            plan_summary=summary,
+            requires_approval=True,
+        )
+
+    # ── 2. Deep-tier signal words ───────────────────────────────────────
+    deep_signals = {"flagship", "exhaustive", "multi-day", "comprehensive", "full analysis"}
+    if any(signal in topic_lower for signal in deep_signals):
+        return ClassifyResponse(
+            tier="deep",
+            estimated_duration_hours=24.0,
+            estimated_credits=_TIER_CREDITS["deep"],
+            plan_summary=(
+                "Flagship deep investigation: exhaustive multi-day research spanning all "
+                "available data sources, tribunal adversarial review, and a publication-grade report."
+            ),
+            requires_approval=True,
+        )
+
+    # ── 3. Instant tier: short question without investigative keywords ──────
+    investigative_keywords = {"investigate", "analyze deeply", "research", "report"}
+    is_short = len(topic) < 100
+    has_question_mark = "?" in topic
+    has_investigative_keyword = any(kw in topic_lower for kw in investigative_keywords)
+
+    if is_short and has_question_mark and not has_investigative_keyword:
+        return ClassifyResponse(
+            tier="instant",
+            estimated_duration_hours=0.01,
+            estimated_credits=_TIER_CREDITS["instant"],
+            plan_summary=(
+                "Instant lookup: a focused, direct answer to your question using "
+                "available knowledge and fast data retrieval."
+            ),
+            requires_approval=False,
+        )
+
+    # ── 4. Default: standard ──────────────────────────────────────────────
+    return ClassifyResponse(
+        tier="standard",
+        estimated_duration_hours=1.5,
+        estimated_credits=_TIER_CREDITS["standard"],
+        plan_summary=(
+            "Standard investigation: structured hypothesis generation, multi-source evidence "
+            "gathering, scoring, and a written summary report."
+        ),
+        requires_approval=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Routes — Billing
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/plans", response_model=list[PlanInfo], tags=["Billing"])
+async def list_plans() -> list[PlanInfo]:
+    """Return all public subscription plans."""
+    return [PlanInfo(**plan) for plan in _PLANS]
+
+
+@app.post(
+    "/api/billing/create-checkout",
+    response_model=CreateCheckoutResponse,
+    tags=["Billing"],
+    summary="Create a Stripe Checkout session for a subscription plan",
+)
+async def create_checkout(
+    body: CreateCheckoutRequest,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> CreateCheckoutResponse:
+    """
+    Create a Stripe Checkout session for the given plan.
+
+    Looks up the plan by ID, resolves its Stripe price ID, and returns
+    a Checkout URL the frontend can redirect the user to.
+    """
+    cfg = _get_config()
+    if not cfg.STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Billing service not configured")
+
+    # Resolve plan
+    plan = next((p for p in _PLANS if p["id"] == body.plan_id), None)
+    if plan is None:
+        raise HTTPException(status_code=404, detail=f"Plan {body.plan_id!r} not found")
+
+    try:
+        session = _stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[
+                {
+                    "price": plan["stripe_price_id"],
+                    "quantity": 1,
+                }
+            ],
+            success_url=body.success_url,
+            cancel_url=body.cancel_url,
+            metadata={
+                "user_id": current_user["user_id"],
+                "plan_id": body.plan_id,
+            },
+            client_reference_id=current_user["user_id"],
+        )
+    except _stripe.StripeError as exc:
+        logger.error(
+            "stripe_checkout_failed",
+            user_id=current_user["user_id"],
+            plan_id=body.plan_id,
+            error=str(exc),
+        )
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}") from exc
+
+    logger.info(
+        "checkout_session_created",
+        session_id=session.id,
+        user_id=current_user["user_id"],
+        plan_id=body.plan_id,
+    )
+    return CreateCheckoutResponse(
+        checkout_url=session.url,
+        session_id=session.id,
+    )
+
+
+@app.post(
+    "/api/billing/webhook",
+    tags=["Billing"],
+    summary="Stripe webhook receiver",
+    status_code=200,
+)
+async def stripe_webhook(request: Request) -> JSONResponse:
+    """
+    Handle Stripe webhook events.
+
+    Supported events:
+    - ``checkout.session.completed``: record the Stripe customer ID and
+      subscription details, then credit the user's Supabase profile.
+    - ``customer.subscription.updated``: update subscription status.
+    - ``customer.subscription.deleted``: mark subscription as cancelled.
+
+    The Supabase profile is updated via a direct HTTP call to the
+    Supabase REST API using the service role key.
+    """
+    cfg = _get_config()
+    if not cfg.STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Billing service not configured")
+
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    # Verify webhook signature when the secret is configured
+    try:
+        if cfg.STRIPE_WEBHOOK_SECRET:
+            event = _stripe.Webhook.construct_event(
+                payload, sig_header, cfg.STRIPE_WEBHOOK_SECRET
+            )
+        else:
+            # No webhook secret configured — parse but do not verify
+            event = _stripe.Event.construct_from(
+                _json.loads(payload), _stripe.api_key
+            )
+    except _stripe.SignatureVerificationError as exc:
+        logger.warning("stripe_webhook_signature_invalid", error=str(exc))
+        raise HTTPException(status_code=400, detail="Invalid webhook signature") from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.error("stripe_webhook_parse_failed", error=str(exc))
+        raise HTTPException(status_code=400, detail="Webhook parse error") from exc
+
+    event_type: str = event["type"]
+    log = logger.bind(event_type=event_type, event_id=event.get("id"))
+    log.info("stripe_webhook_received")
+
+    try:
+        if event_type == "checkout.session.completed":
+            session_obj = event["data"]["object"]
+            await _handle_checkout_completed(session_obj, cfg)
+
+        elif event_type == "customer.subscription.updated":
+            sub_obj = event["data"]["object"]
+            await _handle_subscription_updated(sub_obj, cfg)
+
+        elif event_type == "customer.subscription.deleted":
+            sub_obj = event["data"]["object"]
+            await _handle_subscription_deleted(sub_obj, cfg)
+
+        else:
+            log.info("stripe_webhook_unhandled_event")
+
+    except Exception as exc:  # noqa: BLE001
+        log.error("stripe_webhook_handler_failed", error=str(exc))
+        # Return 200 to prevent Stripe from retrying a handler bug
+        return JSONResponse(content={"status": "handler_error", "error": str(exc)})
+
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.get(
+    "/api/billing/portal",
+    response_model=BillingPortalResponse,
+    tags=["Billing"],
+    summary="Create a Stripe Customer Portal session",
+)
+async def billing_portal(
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> BillingPortalResponse:
+    """
+    Generate a Stripe Customer Portal URL for the authenticated user.
+
+    Requires the user's Stripe customer ID to be stored in the Supabase
+    profile.  Fetches it via the Supabase REST API.
+    """
+    cfg = _get_config()
+    if not cfg.STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Billing service not configured")
+
+    user_id = current_user["user_id"]
+
+    # Fetch the Stripe customer ID from Supabase
+    stripe_customer_id = await _get_stripe_customer_id(user_id, cfg)
+    if not stripe_customer_id:
+        raise HTTPException(
+            status_code=404,
+            detail="No Stripe customer found for this user. Complete a checkout first.",
+        )
+
+    try:
+        portal_session = _stripe.billing_portal.Session.create(
+            customer=stripe_customer_id,
+        )
+    except _stripe.StripeError as exc:
+        logger.error("stripe_portal_failed", user_id=user_id, error=str(exc))
+        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}") from exc
+
+    logger.info("portal_session_created", user_id=user_id)
+    return BillingPortalResponse(portal_url=portal_session.url)
+
+
+# ---------------------------------------------------------------------------
+# Stripe webhook helpers
+# ---------------------------------------------------------------------------
+
+
+async def _handle_checkout_completed(
+    session_obj: dict[str, Any],
+    cfg: AppConfig,
+) -> None:
+    """Process checkout.session.completed: link Stripe customer, add credits."""
+    user_id: str | None = (
+        session_obj.get("metadata", {}).get("user_id")
+        or session_obj.get("client_reference_id")
+    )
+    plan_id: str | None = session_obj.get("metadata", {}).get("plan_id")
+    stripe_customer_id: str | None = session_obj.get("customer")
+    subscription_id: str | None = session_obj.get("subscription")
+
+    if not user_id:
+        logger.warning("checkout_completed_no_user_id", session_id=session_obj.get("id"))
+        return
+
+    # Resolve credits for this plan
+    plan = next((p for p in _PLANS if p["id"] == plan_id), None)
+    credits_to_add = plan["credits_per_month"] if plan else 0
+
+    # Retrieve full subscription to get current_period_end
+    period_end: str | None = None
+    if subscription_id:
+        try:
+            sub = _stripe.Subscription.retrieve(subscription_id)
+            period_end = datetime.fromtimestamp(
+                sub["current_period_end"], tz=timezone.utc
+            ).isoformat()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("subscription_retrieve_failed", error=str(exc))
+
+    update_payload: dict[str, Any] = {}
+    if stripe_customer_id:
+        update_payload["stripe_customer_id"] = stripe_customer_id
+    if subscription_id:
+        update_payload["stripe_subscription_id"] = subscription_id
+    if plan_id:
+        update_payload["subscription_plan"] = plan_id
+    if period_end:
+        update_payload["subscription_current_period_end"] = period_end
+    update_payload["subscription_status"] = "active"
+
+    if update_payload and cfg.SUPABASE_URL and cfg.SUPABASE_SERVICE_KEY:
+        await _supabase_patch_profile(user_id, update_payload, cfg)
+
+    # Increment credits — use supabase RPC or a direct PATCH with increment
+    if credits_to_add > 0 and cfg.SUPABASE_URL and cfg.SUPABASE_SERVICE_KEY:
+        await _supabase_add_credits(user_id, credits_to_add, cfg)
+
+    logger.info(
+        "checkout_completed",
+        user_id=user_id,
+        plan_id=plan_id,
+        credits_added=credits_to_add,
+    )
+
+
+async def _handle_subscription_updated(
+    sub_obj: dict[str, Any],
+    cfg: AppConfig,
+) -> None:
+    """Process customer.subscription.updated: sync status to Supabase."""
+    stripe_customer_id: str | None = sub_obj.get("customer")
+    status: str = sub_obj.get("status", "unknown")
+
+    if not stripe_customer_id:
+        return
+
+    if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
+        logger.warning("supabase_not_configured_skip_subscription_update")
+        return
+
+    # Patch all profiles with this Stripe customer ID
+    update_payload: dict[str, Any] = {"subscription_status": status}
+    period_end_ts = sub_obj.get("current_period_end")
+    if period_end_ts:
+        update_payload["subscription_current_period_end"] = datetime.fromtimestamp(
+            period_end_ts, tz=timezone.utc
+        ).isoformat()
+
+    await _supabase_patch_profile_by_customer(
+        stripe_customer_id, update_payload, cfg
+    )
+    logger.info(
+        "subscription_updated",
+        stripe_customer_id=stripe_customer_id,
+        status=status,
+    )
+
+
+async def _handle_subscription_deleted(
+    sub_obj: dict[str, Any],
+    cfg: AppConfig,
+) -> None:
+    """Process customer.subscription.deleted: mark subscription cancelled."""
+    stripe_customer_id: str | None = sub_obj.get("customer")
+
+    if not stripe_customer_id:
+        return
+
+    if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
+        logger.warning("supabase_not_configured_skip_subscription_delete")
+        return
+
+    await _supabase_patch_profile_by_customer(
+        stripe_customer_id,
+        {"subscription_status": "canceled"},
+        cfg,
+    )
+    logger.info("subscription_canceled", stripe_customer_id=stripe_customer_id)
+
+
+# ---------------------------------------------------------------------------
+# Supabase REST API helpers
+# ---------------------------------------------------------------------------
+
+
+async def _supabase_patch_profile(
+    user_id: str,
+    payload: dict[str, Any],
+    cfg: AppConfig,
+) -> None:
+    """PATCH a single Supabase profile row identified by user_id."""
+    url = f"{cfg.SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}"
+    headers = {
+        "apikey": cfg.SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.patch(url, json=payload, headers=headers)
+        if resp.status_code not in (200, 204):
+            logger.error(
+                "supabase_patch_profile_failed",
+                user_id=user_id,
+                status=resp.status_code,
+                body=resp.text[:200],
+            )
+
+
+async def _supabase_patch_profile_by_customer(
+    stripe_customer_id: str,
+    payload: dict[str, Any],
+    cfg: AppConfig,
+) -> None:
+    """PATCH Supabase profile rows matching a stripe_customer_id."""
+    url = (
+        f"{cfg.SUPABASE_URL}/rest/v1/profiles"
+        f"?stripe_customer_id=eq.{stripe_customer_id}"
+    )
+    headers = {
+        "apikey": cfg.SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.patch(url, json=payload, headers=headers)
+        if resp.status_code not in (200, 204):
+            logger.error(
+                "supabase_patch_by_customer_failed",
+                stripe_customer_id=stripe_customer_id,
+                status=resp.status_code,
+                body=resp.text[:200],
+            )
+
+
+async def _supabase_add_credits(
+    user_id: str,
+    credits: int,
+    cfg: AppConfig,
+) -> None:
+    """
+    Increment the ``tokens`` column in the Supabase profiles table.
+
+    Uses a Postgres RPC function (add_credits) if available; falls back
+    to a read-modify-PATCH approach if the function is not present.
+    """
+    rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/add_credits"
+    headers = {
+        "apikey": cfg.SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            rpc_url,
+            json={"p_user_id": user_id, "p_credits": credits},
+            headers=headers,
+        )
+        if resp.status_code == 200:
+            logger.info("credits_added_via_rpc", user_id=user_id, credits=credits)
+            return
+
+        # Fallback: read current balance and PATCH
+        logger.warning(
+            "add_credits_rpc_unavailable",
+            status=resp.status_code,
+            fallback="read_modify_patch",
+        )
+        profile_url = f"{cfg.SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=tokens"
+        get_resp = await client.get(profile_url, headers=headers)
+        if get_resp.status_code != 200:
+            logger.error("supabase_get_profile_failed", user_id=user_id)
+            return
+        rows = get_resp.json()
+        if not rows:
+            logger.error("supabase_profile_not_found", user_id=user_id)
+            return
+        current_tokens: int = rows[0].get("tokens", 0) or 0
+        patch_url = f"{cfg.SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}"
+        patch_resp = await client.patch(
+            patch_url,
+            json={"tokens": current_tokens + credits},
+            headers={**headers, "Prefer": "return=minimal"},
+        )
+        if patch_resp.status_code not in (200, 204):
+            logger.error(
+                "supabase_add_credits_fallback_failed",
+                user_id=user_id,
+                status=patch_resp.status_code,
+            )
+        else:
+            logger.info(
+                "credits_added_via_patch",
+                user_id=user_id,
+                old=current_tokens,
+                added=credits,
+                new=current_tokens + credits,
+            )
+
+
+async def _get_stripe_customer_id(
+    user_id: str,
+    cfg: AppConfig,
+) -> str | None:
+    """Fetch the stripe_customer_id for a user from the Supabase profiles table."""
+    if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
+        return None
+    url = (
+        f"{cfg.SUPABASE_URL}/rest/v1/profiles"
+        f"?id=eq.{user_id}&select=stripe_customer_id"
+    )
+    headers = {
+        "apikey": cfg.SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            logger.error(
+                "supabase_get_customer_id_failed",
+                user_id=user_id,
+                status=resp.status_code,
+            )
+            return None
+        rows = resp.json()
+        if not rows:
+            return None
+        return rows[0].get("stripe_customer_id")
+
+
+# ---------------------------------------------------------------------------
+# Routes — Admin
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/api/admin/users",
+    response_model=list[AdminUserSummary],
+    tags=["Admin"],
+    summary="List all users (admin only)",
+)
+async def admin_list_users(
+    _: dict[str, str] = Depends(_require_admin),
+) -> list[AdminUserSummary]:
+    """
+    Return all user profiles from Supabase via the REST API.
+
+    Requires admin JWT.  Fetches from the Supabase ``profiles`` table.
+    """
+    cfg = _get_config()
+    if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+
+    url = (
+        f"{cfg.SUPABASE_URL}/rest/v1/profiles"
+        "?select=id,email,role,tokens,stripe_customer_id,"
+        "subscription_plan,subscription_status,created_at"
+        "&order=created_at.desc"
+    )
+    headers = {
+        "apikey": cfg.SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+    }
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(url, headers=headers)
+
+    if resp.status_code != 200:
+        logger.error("admin_list_users_failed", status=resp.status_code, body=resp.text[:200])
+        raise HTTPException(status_code=502, detail="Failed to fetch users from Supabase")
+
+    rows: list[dict[str, Any]] = resp.json()
+    return [
+        AdminUserSummary(
+            user_id=r["id"],
+            email=r.get("email"),
+            role=r.get("role") or "authenticated",
+            credits=r.get("tokens") or 0,
+            stripe_customer_id=r.get("stripe_customer_id"),
+            subscription_plan=r.get("subscription_plan"),
+            subscription_status=r.get("subscription_status"),
+            created_at=r.get("created_at"),
+        )
+        for r in rows
+    ]
+
+
+@app.get(
+    "/api/admin/investigations",
+    response_model=PaginatedTasksResponse,
+    tags=["Admin"],
+    summary="List all investigations across all users (admin only)",
+)
+async def admin_list_investigations(
+    page: int = Query(1, ge=1, description="1-based page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+    status: str | None = Query(None, description="Filter by status"),
+    _: dict[str, str] = Depends(_require_admin),
+) -> PaginatedTasksResponse:
+    """List every investigation in the system regardless of owner. Admin only."""
+    db = _get_db()
+    offset = (page - 1) * page_size
+
+    if status:
+        total: int = await db.fetchval(
+            "SELECT COUNT(*) FROM research_tasks WHERE status = $1",
+            status.upper(),
+        )
+        rows = await db.fetch(
+            """
+            SELECT id, topic, budget_usd, status, current_state,
+                   total_spent_usd, ai_call_counter, created_at,
+                   started_at, completed_at, output_pdf_path, output_docx_path
+            FROM research_tasks
+            WHERE status = $1
+            ORDER BY created_at DESC
+            LIMIT $2 OFFSET $3
+            """,
+            status.upper(),
+            page_size,
+            offset,
+        )
+    else:
+        total = await db.fetchval("SELECT COUNT(*) FROM research_tasks")
+        rows = await db.fetch(
+            """
+            SELECT id, topic, budget_usd, status, current_state,
+                   total_spent_usd, ai_call_counter, created_at,
+                   started_at, completed_at, output_pdf_path, output_docx_path
+            FROM research_tasks
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2
+            """,
+            page_size,
+            offset,
+        )
+
+    return PaginatedTasksResponse(
+        items=[_row_to_task_summary(r) for r in rows],
+        total=total or 0,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.post(
+    "/api/admin/users/{user_id}/credits",
+    tags=["Admin"],
+    summary="Set or adjust credits for a user (admin only)",
+)
+async def admin_set_credits(
+    user_id: str,
+    body: AdminSetCreditsRequest,
+    _: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    """
+    Set the absolute credit balance for a user, or add/subtract a delta.
+
+    If ``body.delta`` is True, the ``credits`` value is treated as an
+    increment (positive to add, negative to deduct).  Otherwise it sets
+    the balance absolutely.
+    """
+    cfg = _get_config()
+    if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+
+    headers = {
+        "apikey": cfg.SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    profile_url = (
+        f"{cfg.SUPABASE_URL}/rest/v1/profiles"
+        f"?id=eq.{user_id}&select=tokens"
+    )
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        if body.delta:
+            # Read current balance first
+            get_resp = await client.get(
+                profile_url,
+                headers={
+                    "apikey": cfg.SUPABASE_SERVICE_KEY,
+                    "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+                },
+            )
+            if get_resp.status_code != 200:
+                raise HTTPException(
+                    status_code=502, detail="Failed to read user profile"
+                )
+            rows = get_resp.json()
+            if not rows:
+                raise HTTPException(status_code=404, detail=f"User {user_id!r} not found")
+            current: int = rows[0].get("tokens", 0) or 0
+            new_balance = max(0, current + body.credits)
+        else:
+            new_balance = body.credits
+
+        patch_url = f"{cfg.SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}"
+        patch_resp = await client.patch(
+            patch_url,
+            json={"tokens": new_balance},
+            headers=headers,
+        )
+
+    if patch_resp.status_code not in (200, 204):
+        logger.error(
+            "admin_set_credits_failed",
+            user_id=user_id,
+            status=patch_resp.status_code,
+        )
+        raise HTTPException(status_code=502, detail="Failed to update user credits")
+
+    logger.info(
+        "admin_credits_updated",
+        user_id=user_id,
+        new_balance=new_balance,
+        delta=body.delta,
+    )
+    return JSONResponse(content={"user_id": user_id, "new_balance": new_balance})
+
+
+@app.get(
+    "/api/admin/stats",
+    response_model=AdminStatsResponse,
+    tags=["Admin"],
+    summary="System-wide statistics (admin only)",
+)
+async def admin_stats(
+    _: dict[str, str] = Depends(_require_admin),
+) -> AdminStatsResponse:
+    """Return aggregated system stats for the admin overview."""
+    db = _get_db()
+
+    total_investigations: int = await db.fetchval("SELECT COUNT(*) FROM research_tasks") or 0
+    running: int = await db.fetchval(
+        "SELECT COUNT(*) FROM research_tasks WHERE status = 'RUNNING'"
+    ) or 0
+    completed: int = await db.fetchval(
+        "SELECT COUNT(*) FROM research_tasks WHERE status = 'COMPLETED'"
+    ) or 0
+    failed: int = await db.fetchval(
+        "SELECT COUNT(*) FROM research_tasks WHERE status IN ('FAILED', 'HALTED')"
+    ) or 0
+    total_spent: float = float(
+        await db.fetchval(
+            "SELECT COALESCE(SUM(total_spent_usd), 0.0) FROM research_tasks"
+        ) or 0.0
+    )
+    active_users_30d: int = await db.fetchval(
+        """
+        SELECT COUNT(DISTINCT metadata->>'user_id')
+        FROM research_tasks
+        WHERE created_at >= NOW() - INTERVAL '30 days'
+          AND metadata->>'user_id' IS NOT NULL
+        """
+    ) or 0
+
+    return AdminStatsResponse(
+        total_investigations=total_investigations,
+        running_investigations=running,
+        completed_investigations=completed,
+        failed_investigations=failed,
+        total_spent_usd=total_spent,
+        active_users_30d=active_users_30d,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -4,7 +4,6 @@ import { Link, useNavigate } from "react-router-dom";
 import {
   Send,
   AlertTriangle,
-  ChevronDown,
   Menu,
   X,
   Download,
@@ -12,6 +11,8 @@ import {
   RefreshCw,
   Clock,
   Loader2,
+  CheckCircle,
+  XCircle,
 } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
@@ -23,7 +24,7 @@ import { supabase } from "@/lib/supabase";
 interface Message {
   role: "user" | "assistant" | "system";
   content: string;
-  type?: "text" | "code" | "status" | "error";
+  type?: "text" | "code" | "status" | "error" | "plan";
   id?: string; // dedup key for status messages
   _id: string; // stable React key, always set
 }
@@ -58,6 +59,23 @@ interface InvestigationPollResponse {
   error?: string;
 }
 
+/** POST /api/investigations/classify response */
+interface ClassifyResponse {
+  tier: "instant" | "standard" | "deep";
+  plan_summary: string;
+  estimated_duration: string;
+  estimated_credits: number;
+}
+
+/** Pending research plan to show in the chat before approval */
+interface ResearchPlan {
+  topic: string;
+  tier: ClassifyResponse["tier"];
+  plan_summary: string;
+  estimated_duration: string;
+  estimated_credits: number;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Constants                                                         */
 /* ------------------------------------------------------------------ */
@@ -68,28 +86,12 @@ const API_URL = import.meta.env.VITE_API_URL ?? "";
 /** Generate a stable unique ID for message list keys */
 const makeMessageId = () => `msg-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-interface DurationOption {
-  value: string;
-  label: string;
-  timeLabel: string;
-  hours: number; // midpoint used for budget and countdown
-  warn: boolean;
-}
-
-const durationOptions: DurationOption[] = [
-  { value: "quick", label: "Quick", timeLabel: "5–15 min", hours: 0.17, warn: false },
-  { value: "deep", label: "Deep", timeLabel: "1–2 hours", hours: 1.5, warn: false },
-  { value: "professional", label: "Professional", timeLabel: "6–12 hours", hours: 9, warn: true },
-  { value: "flagship", label: "Flagship", timeLabel: "24–72 hours", hours: 48, warn: true },
-  { value: "marathon", label: "Marathon", timeLabel: "3–5 days", hours: 96, warn: true },
-  { value: "custom", label: "Custom", timeLabel: "", hours: 0, warn: false },
-];
-
 const STATUS_COLORS: Record<InvestigationStatus, string> = {
   PENDING: "bg-yellow-500/20 text-yellow-400 ring-yellow-500/30",
   RUNNING: "bg-blue-500/20 text-blue-400 ring-blue-500/30",
   COMPLETED: "bg-green-500/20 text-green-400 ring-green-500/30",
   FAILED: "bg-red-500/20 text-red-400 ring-red-500/30",
+  HALTED: "bg-red-500/20 text-red-400 ring-red-500/30",
 };
 
 /* ------------------------------------------------------------------ */
@@ -149,27 +151,16 @@ function renderMarkdown(text: string): string {
   return html;
 }
 
-function formatDuration(hours: number): string {
-  if (hours < 1) {
-    const mins = Math.round(hours * 60);
-    return `${mins} min`;
-  }
-  if (hours < 24) {
-    const h = Math.floor(hours);
-    const m = Math.round((hours - h) * 60);
+/** Format elapsed seconds as "Xh Ym" or "Ym Zs" */
+function formatElapsed(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) {
     return m > 0 ? `${h}h ${m}m` : `${h}h`;
   }
-  const days = Math.round(hours / 24 * 10) / 10;
-  return `${days} ${days === 1 ? "day" : "days"}`; // BUG-R2-20: fix "1 days" grammar
-}
-
-function formatCountdown(secondsRemaining: number): string {
-  if (secondsRemaining <= 0) return "0:00";
-  const h = Math.floor(secondsRemaining / 3600);
-  const m = Math.floor((secondsRemaining % 3600) / 60);
-  const s = Math.floor(secondsRemaining % 60);
-  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-  return `${m}:${String(s).padStart(2, "0")}`;
+  return s > 0 ? `${m}m ${s}s` : `${m}m`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -183,17 +174,19 @@ export default function Chat() {
   // Messages for the currently viewed investigation
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
-  const [duration, setDuration] = useState("deep");
-  const [customHours, setCustomHours] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isSending, setIsSending] = useState(false);
+  const [isClassifying, setIsClassifying] = useState(false);
   const [retryPayload, setRetryPayload] = useState<{ topic: string } | null>(null);
+
+  // Pending research plan awaiting user approval
+  const [pendingPlan, setPendingPlan] = useState<ResearchPlan | null>(null);
 
   // Investigation management
   const [investigations, setInvestigations] = useState<Investigation[]>([]);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
 
-  // Timer state
+  // Timer state — elapsed time only
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startTimeRef = useRef<number | null>(null);
@@ -662,21 +655,6 @@ export default function Chat() {
   );
 
   /* ---------------------------------------------------------------- */
-  /*  Resolve effective duration hours                                */
-  /* ---------------------------------------------------------------- */
-
-  const getEffectiveHours = useCallback((): number => {
-    if (duration === "custom") {
-      const parsed = parseFloat(customHours);
-      // BUG-R2-03: Cap at 100 hours so budget_usd ≤ $500 (100 × $5 = $500).
-      // Previous cap was 240 hours which would produce $1200, exceeding the backend hard limit.
-      return isNaN(parsed) || parsed <= 0 ? 1 : Math.min(parsed, 100);
-    }
-    const opt = durationOptions.find((d) => d.value === duration);
-    return opt?.hours ?? 1.5;
-  }, [duration, customHours]);
-
-  /* ---------------------------------------------------------------- */
   /*  Switch active investigation                                     */
   /* ---------------------------------------------------------------- */
 
@@ -690,6 +668,9 @@ export default function Chat() {
 
       // Stop any active connections
       stopAllConnections();
+
+      // Dismiss any pending plan when switching investigations
+      setPendingPlan(null);
 
       // Load stored messages for the target investigation
       // BUG-R2-06: Fall back to messages currently shown if no store entry
@@ -729,24 +710,23 @@ export default function Chat() {
   );
 
   /* ---------------------------------------------------------------- */
-  /*  Send investigation                                              */
+  /*  Classify topic and start investigation flow                     */
   /* ---------------------------------------------------------------- */
 
-  // BUG-R2-01: Wrapped in useCallback to prevent stale closures in handleRetry.
-  // Without memoization, handleRetry captures an old handleSend where isSending=false,
-  // allowing duplicate investigation submissions via the Retry button.
+  /**
+   * Entry point: user hits send. We classify the topic first.
+   * - instant tier → skip plan, go straight to startInvestigation
+   * - standard/deep tier → show ResearchPlan card for user approval
+   */
   const handleSend = useCallback(async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    // BUG-R2-01: Check isSending at the top as a synchronous guard
-    if (isSending) return;
-    // BUG-R2-10: Input takes priority over retryPayload topic.
-    // If the user edits input while a retry is showing, the edited text wins.
+    if (isSending || isClassifying) return;
+
     const topic = input.trim() || retryPayload?.topic || "";
     if (!topic) return;
 
     setRetryPayload(null);
     setInput("");
-    setIsSending(true);
 
     // Save current investigation messages before starting new
     if (activeTaskId && messagesRef.current.length > 0) {
@@ -757,6 +737,7 @@ export default function Chat() {
     // stopAllConnections sets isSending=false then we immediately set it true
     seenStatusIds.current.clear();
     stopConnectionsOnly();
+    setPendingPlan(null);
 
     const newMessages: Message[] = [
       { role: "user", content: topic, type: "text", _id: makeMessageId() },
@@ -769,10 +750,71 @@ export default function Chat() {
       toast.error("Not authenticated", {
         description: "Please sign in to run an investigation.",
       });
-      setIsSending(false);
       navigate("/login");
       return;
     }
+
+    setIsClassifying(true);
+
+    try {
+      const classifyRes = await fetch(`${API_URL}/api/investigations/classify`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ topic }),
+      });
+
+      if (classifyRes.status === 401) {
+        toast.error("Session expired", { description: "Please sign in again." });
+        navigate("/login");
+        return;
+      }
+
+      if (!classifyRes.ok) {
+        // Classify failed — fall through to direct investigation start
+        console.warn("[Chat] Classify failed, starting investigation directly.");
+        setIsClassifying(false);
+        await startInvestigation(topic, token, true);
+        return;
+      }
+
+      const classifyData: ClassifyResponse = await classifyRes.json();
+      setIsClassifying(false);
+
+      if (classifyData.tier === "instant") {
+        // No approval needed — go straight to investigation
+        await startInvestigation(topic, token, true);
+      } else {
+        // Show research plan card for user approval
+        setPendingPlan({
+          topic,
+          tier: classifyData.tier,
+          plan_summary: classifyData.plan_summary,
+          estimated_duration: classifyData.estimated_duration,
+          estimated_credits: classifyData.estimated_credits,
+        });
+      }
+    } catch (err) {
+      setIsClassifying(false);
+      console.warn("[Chat] Classify error, starting investigation directly:", err);
+      await startInvestigation(topic, token, true);
+    }
+  // BUG-R2-01: Dependency array for useCallback — all captured values listed
+  }, [isSending, isClassifying, input, retryPayload, activeTaskId, stopConnectionsOnly, navigate]);
+
+  /* ---------------------------------------------------------------- */
+  /*  Start investigation (after classify or after plan approval)     */
+  /* ---------------------------------------------------------------- */
+
+  const startInvestigation = useCallback(async (
+    topic: string,
+    token: string,
+    planApproved: boolean,
+  ) => {
+    setIsSending(true);
+    setPendingPlan(null);
 
     // Show initializing status
     const initMsg: Message = {
@@ -785,11 +827,6 @@ export default function Chat() {
     seenStatusIds.current.add("init");
     setMessages((prev) => [...prev, initMsg]);
 
-    const effectiveHours = getEffectiveHours();
-    // BUG-R2-03: Cap budget_usd at $500 — backend Pydantic model enforces le=500.0.
-    // With uncapped customHours (was 240 max), budgetUsd could reach $1200, causing HTTP 422.
-    const budgetUsd = Math.min(500, Math.max(1, Math.round(effectiveHours * 5)));
-
     try {
       const res = await fetch(`${API_URL}/api/investigations`, {
         method: "POST",
@@ -799,8 +836,7 @@ export default function Chat() {
         },
         body: JSON.stringify({
           topic,
-          budget_usd: budgetUsd,
-          duration_hours: effectiveHours,
+          plan_approved: planApproved,
         }),
       });
 
@@ -839,8 +875,8 @@ export default function Chat() {
         topic,
         status: "PENDING",
         created_at: new Date().toISOString(),
-        duration_hours: effectiveHours,
-        budget_usd: budgetUsd,
+        duration_hours: 0,
+        budget_usd: 0,
       };
 
       setInvestigations((prev) => [newInvestigation, ...prev]);
@@ -856,8 +892,8 @@ export default function Chat() {
             task_id: taskId,
             topic,
             status: "PENDING",
-            duration_hours: effectiveHours,
-            budget_usd: budgetUsd,
+            duration_hours: 0,
+            budget_usd: 0,
             user_id: user.id, // guaranteed non-null
           })
           .then(({ error }) => {
@@ -867,7 +903,7 @@ export default function Chat() {
 
       appendMessage({
         role: "system",
-        content: `Investigation started (ID: ${taskId}). Estimated duration: ${formatDuration(effectiveHours)}. Monitoring progress...`,
+        content: `Investigation started (ID: ${taskId}). Monitoring progress...`,
         type: "status",
         id: `started-${taskId}`,
         _id: makeMessageId(),
@@ -889,10 +925,38 @@ export default function Chat() {
       });
       setIsSending(false);
     }
-  // BUG-R2-01: Dependency array for useCallback — all captured values listed
-  }, [isSending, input, retryPayload, duration, customHours, user,
-      getEffectiveHours, appendMessage, stopConnectionsOnly,
-      startTimer, startSSE, navigate, refreshUser, activeTaskId]);
+  }, [user, appendMessage, startTimer, startSSE, navigate]);
+
+  /* ---------------------------------------------------------------- */
+  /*  Approve research plan                                           */
+  /* ---------------------------------------------------------------- */
+
+  const handleApprovePlan = useCallback(async () => {
+    if (!pendingPlan) return;
+    const { topic } = pendingPlan;
+    setPendingPlan(null);
+
+    const token = await getAccessToken();
+    if (!token) {
+      toast.error("Not authenticated", { description: "Please sign in again." });
+      navigate("/login");
+      return;
+    }
+
+    await startInvestigation(topic, token, true);
+  }, [pendingPlan, startInvestigation, navigate]);
+
+  /* ---------------------------------------------------------------- */
+  /*  Cancel research plan                                            */
+  /* ---------------------------------------------------------------- */
+
+  const handleCancelPlan = useCallback(() => {
+    setPendingPlan(null);
+    // Remove the user message and plan from the chat — reset to empty
+    setMessages([]);
+    setActiveTaskId(null);
+    seenStatusIds.current.clear();
+  }, []);
 
   /* ---------------------------------------------------------------- */
   /*  Retry handler                                                   */
@@ -950,12 +1014,6 @@ export default function Chat() {
   /*  Derived state                                                   */
   /* ---------------------------------------------------------------- */
 
-  const selectedDuration = durationOptions.find((d) => d.value === duration);
-  const effectiveHours = getEffectiveHours();
-  const totalSeconds = effectiveHours * 3600;
-  const progressPercent = totalSeconds > 0 ? Math.min(100, (elapsedSeconds / totalSeconds) * 100) : 0;
-  const secondsRemaining = Math.max(0, totalSeconds - elapsedSeconds);
-
   const activeInvestigation = investigations.find((i) => i.task_id === activeTaskId);
   const isRunning = activeInvestigation?.status === "RUNNING" || activeInvestigation?.status === "PENDING";
   const isCompleted = activeInvestigation?.status === "COMPLETED";
@@ -1003,6 +1061,7 @@ export default function Chat() {
               stopAllConnections();
               setActiveTaskId(null);
               setMessages([]);
+              setPendingPlan(null);
               seenStatusIds.current.clear();
               setSidebarOpen(false);
             }}
@@ -1050,9 +1109,9 @@ export default function Chat() {
         <div className="border-t border-border px-4 py-3">
           <div className="text-xs text-muted-foreground">
             <span className="font-medium text-foreground">
-              ${(user.tokens / 10).toFixed(2)}
+              {user.tokens.toLocaleString()}
             </span>{" "}
-            credit remaining
+            credits
           </div>
           <p className="mt-1 text-[10px] text-muted-foreground">
             {user.name} · {user.email}
@@ -1085,7 +1144,7 @@ export default function Chat() {
             </span>
           </div>
 
-          {/* Running indicator + timer */}
+          {/* Running indicator + elapsed timer */}
           <div className="flex items-center gap-3">
             {isRunning && isSending && (
               <div className="flex items-center gap-2 text-xs text-blue-400">
@@ -1094,24 +1153,14 @@ export default function Chat() {
                   <span className="relative inline-flex h-2 w-2 rounded-full bg-blue-500" />
                 </span>
                 <Clock size={12} />
-                <span className="font-mono">{formatCountdown(secondsRemaining)}</span>
+                <span className="font-mono">Elapsed: {formatElapsed(elapsedSeconds)}</span>
               </div>
             )}
             <div className="text-xs text-muted-foreground md:hidden">
-              ${(user.tokens / 10).toFixed(2)} credit
+              {user.tokens.toLocaleString()} credits
             </div>
           </div>
         </div>
-
-        {/* Progress bar */}
-        {isRunning && isSending && (
-          <div className="h-1 w-full bg-zinc-800">
-            <div
-              className="h-full bg-blue-500 transition-all duration-1000 ease-linear"
-              style={{ width: `${progressPercent}%` }}
-            />
-          </div>
-        )}
 
         {/* ---------------------------------------------------------- */}
         {/*  Messages area                                             */}
@@ -1122,14 +1171,13 @@ export default function Chat() {
         >
           <div className="mx-auto max-w-2xl space-y-4">
             {/* Empty state */}
-            {messages.length === 0 && !isSending && (
+            {messages.length === 0 && !isSending && !pendingPlan && (
               <div className="flex flex-col items-center justify-center py-24 text-center">
                 <h2 className="font-serif text-xl font-semibold text-foreground mb-2">
-                  What would you like Mariana to investigate?
+                  What would you like to know?
                 </h2>
                 <p className="text-sm text-muted-foreground max-w-md">
-                  Describe a financial research question, company analysis, or market investigation.
-                  Mariana will autonomously research and compile a comprehensive report.
+                  Ask anything. Mariana adapts — from quick answers to multi-day investigations.
                 </p>
               </div>
             )}
@@ -1186,7 +1234,53 @@ export default function Chat() {
               </div>
             ))}
 
-            {/* Loading indicator while sending */}
+            {/* Research Plan Card — shown after classify for standard/deep tiers */}
+            {pendingPlan && (
+              <div className="animate-fade-in rounded-lg border border-border bg-card p-5 shadow-sm">
+                <p className="mb-1 text-[10px] font-medium uppercase tracking-[0.15em] text-muted-foreground">
+                  Research Plan
+                </p>
+                <p className="mt-3 text-sm leading-relaxed text-foreground">
+                  {pendingPlan.plan_summary}
+                </p>
+                <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+                  <span className="flex items-center gap-1">
+                    <Clock size={11} />
+                    Estimated: ~{pendingPlan.estimated_duration}
+                  </span>
+                  <span>·</span>
+                  <span>{pendingPlan.estimated_credits.toLocaleString()} credits</span>
+                </div>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <button
+                    onClick={handleApprovePlan}
+                    className="inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                  >
+                    <CheckCircle size={13} />
+                    Approve &amp; Start
+                  </button>
+                  <button
+                    onClick={handleCancelPlan}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-border px-4 py-2 text-xs font-medium text-foreground transition-colors hover:bg-secondary"
+                  >
+                    <XCircle size={13} />
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Loading indicator while classifying */}
+            {isClassifying && (
+              <div className="border-l-2 border-accent/40 pl-4 py-2">
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Loader2 size={12} className="animate-spin" />
+                  <span>Analyzing your question...</span>
+                </div>
+              </div>
+            )}
+
+            {/* Loading indicator while investigation is running */}
             {isSending && (
               <div className="border-l-2 border-blue-500/40 pl-4 py-2">
                 <div className="flex items-center gap-2 text-xs text-blue-400">
@@ -1234,79 +1328,18 @@ export default function Chat() {
         {/* ---------------------------------------------------------- */}
         <div className="border-t border-border px-4 py-4 sm:px-6">
           <div className="mx-auto max-w-2xl">
-            {/* Duration selector */}
-            <div className="mb-3 flex flex-wrap items-center gap-2 sm:gap-3">
-              <div className="relative">
-                <select
-                  value={duration}
-                  onChange={(e) => setDuration(e.target.value)}
-                  className="appearance-none rounded-md border border-border bg-card py-1.5 pl-3 pr-8 text-xs text-foreground focus:border-primary focus:outline-none"
-                  disabled={isSending}
-                >
-                  {durationOptions.map((d) => (
-                    <option key={d.value} value={d.value}>
-                      {d.label}
-                      {d.timeLabel ? ` (${d.timeLabel})` : ""}
-                    </option>
-                  ))}
-                </select>
-                <ChevronDown
-                  size={12}
-                  className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground"
-                />
-              </div>
-
-              {/* Custom hours input */}
-              {duration === "custom" && (
-                <input
-                  type="number"
-                  min="0.1"
-                  max="100"
-                  step="0.1"
-                  value={customHours}
-                  onChange={(e) => setCustomHours(e.target.value)}
-                  placeholder="Hours"
-                  className="w-20 rounded-md border border-border bg-card px-2 py-1.5 text-xs text-foreground placeholder:text-muted-foreground/50 focus:border-primary focus:outline-none"
-                  disabled={isSending}
-                />
-              )}
-
-              {/* Estimated time display */}
-              <span className="text-[10px] text-muted-foreground">
-                {duration === "custom"
-                  ? customHours && parseFloat(customHours) > 0
-                    ? `≈ ${formatDuration(parseFloat(customHours))}` // BUG-R2-13: skip 0 — shows "Enter hours" instead of "≈ 0 min"
-                    : "Enter hours"
-                  : `≈ ${selectedDuration?.timeLabel}`}
-              </span>
-            </div>
-
-            {/* High-cost warning */}
-            {selectedDuration?.warn && (
-              <div className="mb-3 flex items-start gap-2 rounded-md bg-amber-950/50 px-3 py-2 text-xs text-amber-400 ring-1 ring-amber-500/20">
-                <AlertTriangle size={13} className="mt-0.5 shrink-0" />
-                <span>
-                  {duration === "marathon"
-                    ? "Marathon research runs for multiple days and consumes significant resources. Ensure your credit balance is sufficient."
-                    : duration === "flagship"
-                    ? "Flagship research runs for 24–72 hours and can consume a significant number of credits."
-                    : "Professional research runs for 6–12 hours. Review the cost estimate before proceeding."}
-                </span>
-              </div>
-            )}
-
             <form onSubmit={handleSend} className="flex gap-2 sm:gap-3">
               <input
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                placeholder="Describe what you want Mariana to investigate..."
+                placeholder="Ask Mariana anything..."
                 className="min-w-0 flex-1 rounded-md border border-border bg-card px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary/20 sm:px-4"
-                disabled={isSending}
+                disabled={isSending || isClassifying}
               />
               <button
                 type="submit"
-                disabled={isSending || !input.trim()}
-                aria-label="Send investigation"
+                disabled={isSending || isClassifying || !input.trim()}
+                aria-label="Send"
                 className="flex shrink-0 items-center gap-2 rounded-md bg-primary px-3 py-2.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50 sm:px-4"
               >
                 <Send size={14} />

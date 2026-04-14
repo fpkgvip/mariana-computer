@@ -195,6 +195,19 @@ class AppConfig:
     ADMIN_SECRET_KEY: str = ""  # Set in env to enable /api/shutdown auth (BUG-009)
 
     # ------------------------------------------------------------------
+    # Stripe — billing integration
+    # ------------------------------------------------------------------
+    STRIPE_SECRET_KEY: str = ""
+    STRIPE_PUBLISHABLE_KEY: str = ""
+    STRIPE_WEBHOOK_SECRET: str = ""
+
+    # ------------------------------------------------------------------
+    # Supabase — used by backend for REST API calls (webhooks, admin)
+    # ------------------------------------------------------------------
+    SUPABASE_URL: str = ""
+    SUPABASE_SERVICE_KEY: str = ""
+
+    # ------------------------------------------------------------------
     # CORS — BUG-NEW-06: field added so _get_cors_origins() in api.py can
     # read origins from config rather than the dead-code branch being
     # permanently unreachable.
@@ -337,4 +350,11 @@ def load_config(env_file: str | Path | None = None) -> AppConfig:
         LOG_JSON=_bool("LOG_JSON", True),
         ADMIN_SECRET_KEY=_str("ADMIN_SECRET_KEY", ""),
         CORS_ALLOWED_ORIGINS=_str("CORS_ALLOWED_ORIGINS", ""),
+        # Stripe
+        STRIPE_SECRET_KEY=_str("STRIPE_SECRET_KEY", ""),
+        STRIPE_PUBLISHABLE_KEY=_str("STRIPE_PUBLISHABLE_KEY", ""),
+        STRIPE_WEBHOOK_SECRET=_str("STRIPE_WEBHOOK_SECRET", ""),
+        # Supabase
+        SUPABASE_URL=_str("SUPABASE_URL", ""),
+        SUPABASE_SERVICE_KEY=_str("SUPABASE_SERVICE_KEY", ""),
     )

@@ -1,6 +1,6 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useState, useEffect, useRef } from "react";
-import { Menu, X, User, LogOut, CreditCard, Settings } from "lucide-react";
+import { Menu, X, User, LogOut, CreditCard, Settings, ShieldCheck } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 
 const navLinks = [
@@ -92,20 +92,25 @@ export function Navbar() {
                 <span>{user.name}</span>
               </button>
               {userMenuOpen && (
-                <div role="menu" className="absolute right-0 top-full mt-2 w-52 rounded-lg border border-border bg-card py-1 shadow-lg">
+                <div role="menu" className="absolute right-0 top-full mt-2 w-56 rounded-lg border border-border bg-card py-1 shadow-lg">
                   <Link role="menuitem" to="/chat" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
-                    Mariana Computer
+                    Research
                   </Link>
                   <Link role="menuitem" to="/account" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
                     <Settings size={13} /> Account
                   </Link>
-                  <Link role="menuitem" to="/buy-credits" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
-                    <CreditCard size={13} /> Buy credits
+                  <Link role="menuitem" to="/checkout" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
+                    <CreditCard size={13} /> Upgrade plan
                   </Link>
+                  {user.role === "admin" && (
+                    <Link role="menuitem" to="/admin" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
+                      <ShieldCheck size={13} /> Admin
+                    </Link>
+                  )}
                   <div className="mx-4 my-1 border-t border-border" />
                   <div className="px-4 py-2">
                     <p className="text-xs text-muted-foreground/60">
-                      ${(user.tokens / 10).toFixed(2)} credit remaining
+                      {user.tokens.toLocaleString()} credits
                     </p>
                   </div>
                   <button
@@ -173,11 +178,14 @@ export function Navbar() {
             {user ? (
               <>
                 <Link to="/account" className="py-1 text-sm text-muted-foreground">Account</Link>
-                <Link to="/buy-credits" className="py-1 text-sm text-muted-foreground">Buy credits</Link>
-                <Link to="/chat" className="py-1 text-sm text-muted-foreground">Mariana Computer</Link>
+                <Link to="/checkout" className="py-1 text-sm text-muted-foreground">Upgrade plan</Link>
+                <Link to="/chat" className="py-1 text-sm text-muted-foreground">Research</Link>
+                {user.role === "admin" && (
+                  <Link to="/admin" className="py-1 text-sm text-muted-foreground">Admin</Link>
+                )}
                 <div className="my-1 border-t border-border" />
                 <p className="text-xs text-muted-foreground/60">
-                  {user.name} · ${(user.tokens / 10).toFixed(2)} credit
+                  {user.name} · {user.tokens.toLocaleString()} credits
                 </p>
                 <button
                   onClick={handleLogout}

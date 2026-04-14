@@ -123,8 +123,8 @@ export default function Index() {
               </h2>
               <p className="mt-4 text-[15px] leading-[1.8] text-muted-foreground">
                 Read our work first. Institutional-grade analysis across
-                equities, macro, fixed income, commodities, and crypto — some
-                available free, premium reports for token holders.
+                equities, macro, fixed income, commodities, and crypto — browse
+                the full research library.
               </p>
               <Link
                 to="/research"
@@ -176,7 +176,7 @@ export default function Index() {
                   hours, not minutes.
                 </p>
                 <p>
-                  A Flagship investigation can run for 12+ hours continuously:
+                  A deep investigation can run for 12+ hours continuously:
                   reading filings, writing code, testing hypotheses, refining
                   models — all without losing track of what it's doing or why.
                   The longer it runs, the deeper it gets.
@@ -195,15 +195,14 @@ export default function Index() {
               Start with a single question.
             </h2>
             <p className="mt-4 text-[16px] leading-[1.7] text-muted-foreground">
-              Every account gets $5 in free credits. No commitment, no
-              subscription required. Pay as you go after that.
+              Every account includes research credits to get started.
             </p>
             <div className="mt-8 flex flex-wrap items-center gap-5">
               <Link
                 to="/signup"
                 className="inline-flex items-center gap-2.5 rounded-md bg-primary px-6 py-3 text-sm font-medium text-primary-foreground transition-all hover:bg-primary/90 hover:shadow-xl hover:shadow-primary/10"
               >
-                Create free account <ArrowRight size={15} />
+                Get started <ArrowRight size={15} />
               </Link>
               <Link
                 to="/pricing"

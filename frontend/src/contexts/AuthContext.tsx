@@ -16,6 +16,9 @@ interface User {
   email: string;
   name: string;
   tokens: number;
+  role: string;                 // "user" | "admin"
+  subscription_plan: string;    // "none" | "researcher" | "professional" | "enterprise"
+  subscription_status: string;  // "none" | "active" | "canceled" | etc.
 }
 
 /** Shape of a row from the public.profiles table */
@@ -24,6 +27,9 @@ interface ProfileRow {
   email: string;
   full_name: string | null;
   tokens: number;
+  role: string | null;
+  subscription_plan: string | null;
+  subscription_status: string | null;
 }
 
 /** Public API surface of the auth context */
@@ -34,9 +40,6 @@ interface AuthContextType {
   logout: () => Promise<void>;
   /** No-op stub kept for backward compatibility — guest access removed */
   skip: () => void;
-  addTokens: (amount: number) => void;
-  /** Purchase credits — credits coming soon (real payment not yet wired) */
-  buyCredits: (dollars: number) => void;
   /** Re-fetch the user profile from Supabase to pick up server-side balance changes */
   refreshUser: () => Promise<void>;
 }
@@ -50,7 +53,7 @@ const AuthContext = createContext<AuthContextType | null>(null);
 async function fetchProfile(userId: string): Promise<ProfileRow | null> {
   const { data, error } = await supabase
     .from("profiles")
-    .select("id, email, full_name, tokens")
+    .select("id, email, full_name, tokens, role, subscription_plan, subscription_status")
     .eq("id", userId)
     .single();
 
@@ -74,6 +77,9 @@ function buildUser(session: Session, profile: ProfileRow | null): User {
     email,
     name: profile?.full_name ?? (metaName || email.split("@")[0]),
     tokens: profile?.tokens ?? 0,
+    role: profile?.role ?? "user",
+    subscription_plan: profile?.subscription_plan ?? "none",
+    subscription_status: profile?.subscription_status ?? "none",
   };
 }
 
@@ -207,14 +213,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     console.warn("[AuthContext] skip() is no longer supported.");
   };
 
-  const addTokens = (amount: number): void => {
-    if (user) setUser({ ...user, tokens: user.tokens + amount });
-  };
-
-  const buyCredits = (dollars: number): void => {
-    addTokens(dollars * 10);
-  };
-
   /**
    * BUG-018: Re-fetch the user profile from Supabase.
    * Call after an investigation completes to pick up server-side token balance changes.
@@ -237,7 +235,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, login, signup, logout, skip, addTokens, buyCredits, refreshUser }}
+      value={{ user, login, signup, logout, skip, refreshUser }}
     >
       {children}
     </AuthContext.Provider>

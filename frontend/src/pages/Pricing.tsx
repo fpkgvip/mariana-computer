@@ -1,41 +1,156 @@
+import { useState } from "react";
 import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
 import { ScrollReveal } from "@/components/ScrollReveal";
-import { Link } from "react-router-dom";
-import { ArrowRight, Check } from "lucide-react";
+import { Link, useNavigate } from "react-router-dom";
+import { ArrowRight, Check, Loader2 } from "lucide-react";
+import { useAuth } from "@/contexts/AuthContext";
+import { supabase } from "@/lib/supabase";
+import { toast } from "sonner";
+
+const API_URL = import.meta.env.VITE_API_URL ?? "";
+
+interface Plan {
+  id: string;
+  name: string;
+  price: number;
+  credits: number;
+  features: string[];
+  highlighted?: boolean;
+}
+
+const plans: Plan[] = [
+  {
+    id: "researcher",
+    name: "Researcher",
+    price: 99,
+    credits: 1000,
+    features: [
+      "1,000 credits/month",
+      "Full access to Mariana Computer",
+      "Instant, standard, and deep investigations",
+      "PDF and Word report downloads",
+      "Published research library access",
+      "Email support",
+    ],
+  },
+  {
+    id: "professional",
+    name: "Professional",
+    price: 499,
+    credits: 10000,
+    highlighted: true,
+    features: [
+      "10,000 credits/month",
+      "Everything in Researcher",
+      "Priority compute allocation",
+      "Multi-day autonomous investigations",
+      "Advanced data source access",
+      "Priority support",
+    ],
+  },
+  {
+    id: "enterprise",
+    name: "Enterprise",
+    price: 5000,
+    credits: 100000,
+    features: [
+      "100,000 credits/month",
+      "Everything in Professional",
+      "SLA guarantees",
+      "Dedicated research liaison",
+      "Custom data source integration",
+      "White-glove onboarding",
+    ],
+  },
+];
 
 const faqs = [
   {
-    q: "What are tokens?",
-    a: "Tokens are the unit of usage for Mariana. Each query consumes tokens based on the depth of research, model selected, data sources accessed, and compute used. $1 buys 10 tokens.",
+    q: "What are credits?",
+    a: "Credits are the unit of research capacity. Each investigation consumes credits based on complexity, data sources accessed, and compute used.",
   },
   {
-    q: "How do I know how many tokens a query will use?",
-    a: "Before Mariana begins, it estimates the token cost based on the scope of the query and your selected research depth and model tier. You approve the estimate before any tokens are consumed. Actual costs may vary — AI workloads are inherently unpredictable.",
+    q: "How does billing work?",
+    a: "Choose a plan that fits your research volume. Credits refresh monthly. Unused credits do not roll over.",
   },
   {
-    q: "What model tiers are available?",
-    a: "Four tiers: Cheap (fastest, least capable), Fast (good balance), Pro (high-quality reasoning), and Frontier (Claude Opus — maximum depth and capability). Higher tiers consume more tokens per query.",
+    q: "Can I upgrade or downgrade?",
+    a: "Yes, changes take effect at your next billing cycle. Use the billing portal in your account settings.",
   },
   {
-    q: "Do unused tokens expire?",
-    a: "Tokens are valid for 12 months from purchase. Enterprise plans can negotiate custom terms.",
+    q: "What happens if I run out of credits?",
+    a: "Your investigations will pause until your credits refresh or you upgrade your plan.",
   },
   {
     q: "What data sources does Mariana access?",
     a: "SEC EDGAR, earnings transcripts, corporate registries, academic databases, and select financial data providers. Enterprise clients can connect their own proprietary data feeds and terminal credentials.",
   },
+];
+
+const howItWorks = [
   {
-    q: "What does Enterprise include?",
-    a: "A flat $5,000/month fee covers enterprise features: SLA guarantees, a dedicated research liaison, custom integrations, and priority compute. Token usage is billed separately at volume rates. No sales call required — sign up directly.",
+    step: "01",
+    title: "Describe your question",
+    desc: "Type anything — from a quick factual question to a complex multi-day investigation. Mariana classifies your request automatically.",
   },
   {
-    q: "What is the Custom plan?",
-    a: "Starting at $10,000/month, Custom plans include everything in Enterprise plus dedicated infrastructure, locally hosted models, custom dashboards, and bespoke research workflows. Contact us to scope your deployment.",
+    step: "02",
+    title: "Review the plan",
+    desc: "For substantial research, Mariana proposes an approach: data sources, methodology, estimated duration. Approve with one click.",
+  },
+  {
+    step: "03",
+    title: "Receive results",
+    desc: "Mariana works autonomously — reading filings, writing code, building models. You get notified when deliverables are ready.",
   },
 ];
 
 export default function Pricing() {
+  const { user } = useAuth();
+  const navigate = useNavigate();
+  const [loadingPlanId, setLoadingPlanId] = useState<string | null>(null);
+
+  const handleSubscribe = async (planId: string) => {
+    if (!user) {
+      navigate("/signup");
+      return;
+    }
+
+    setLoadingPlanId(planId);
+
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      const token = session?.access_token;
+      if (!token) {
+        toast.error("Not authenticated", { description: "Please sign in first." });
+        navigate("/login");
+        return;
+      }
+
+      const res = await fetch(`${API_URL}/api/billing/create-checkout`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ plan_id: planId }),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => res.statusText);
+        throw new Error(`HTTP ${res.status}: ${errText}`);
+      }
+
+      const data: { url: string } = await res.json();
+      window.location.href = data.url;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      toast.error("Could not start checkout", { description: msg });
+      setLoadingPlanId(null);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-background">
       <Navbar />
@@ -46,164 +161,93 @@ export default function Pricing() {
             Simple, transparent pricing.
           </h1>
           <p className="mt-6 max-w-lg text-lg leading-[1.7] text-muted-foreground">
-            Every account gets full access to Mariana. Pay only for what you use.
-            No subscriptions, no per-seat fees.
+            Choose the plan that fits your research volume. Credits refresh monthly.
           </p>
         </ScrollReveal>
 
-        {/* Three-column: Pay-as-you-go + Enterprise + Custom */}
-        <div className="mt-12 grid gap-6 sm:mt-16 md:grid-cols-2 lg:grid-cols-3">
-          {/* Pay as you go */}
-          <ScrollReveal>
-            <div className="flex h-full flex-col rounded-lg bg-card p-8 shadow-sm ring-1 ring-border">
-              <p className="text-xs font-medium uppercase tracking-[0.15em] text-muted-foreground">
-                Pay as you go
-              </p>
-              <h2 className="mt-4 font-serif text-4xl font-semibold text-foreground">
-                $0<span className="text-lg font-normal text-muted-foreground">/month</span>
-              </h2>
-              <p className="mt-2 text-sm text-muted-foreground">
-                $1 = 10 tokens. $5 free credit on signup.
-              </p>
+        {/* Three subscription plans */}
+        <div className="mt-12 grid gap-6 sm:mt-16 md:grid-cols-3">
+          {plans.map((plan, i) => (
+            <ScrollReveal key={plan.id} delay={i * 100}>
+              <div
+                className={`flex h-full flex-col rounded-lg p-8 shadow-sm ring-1 ${
+                  plan.highlighted
+                    ? "bg-primary/5 ring-primary/30"
+                    : "bg-card ring-border"
+                }`}
+              >
+                {plan.highlighted && (
+                  <p className="mb-3 inline-block self-start rounded-full bg-primary/10 px-3 py-0.5 text-[11px] font-medium text-primary">
+                    Most popular
+                  </p>
+                )}
+                <p className="text-xs font-medium uppercase tracking-[0.15em] text-muted-foreground">
+                  {plan.name}
+                </p>
+                <h2 className="mt-4 font-serif text-4xl font-semibold text-foreground">
+                  ${plan.price.toLocaleString()}
+                  <span className="text-lg font-normal text-muted-foreground">/month</span>
+                </h2>
+                <p className="mt-2 text-sm text-muted-foreground">
+                  {plan.credits.toLocaleString()} credits/month
+                </p>
 
-              <div className="my-6 border-t border-border" />
+                <div className="my-6 border-t border-border" />
 
-              <ul className="flex-1 space-y-3">
-                {[
-                  "Full access to Mariana Computer",
-                  "All research depth tiers",
-                  "All model tiers (Cheap → Frontier)",
-                  "PDF, dashboard, and app deliverables",
-                  "Published research library access",
-                  "$5 free credit on every new account",
-                ].map((f) => (
-                  <li key={f} className="flex items-start gap-2.5 text-[15px] text-foreground">
-                    <Check size={15} className="mt-0.5 shrink-0 text-accent" strokeWidth={2} />
-                    {f}
-                  </li>
-                ))}
-              </ul>
+                <ul className="flex-1 space-y-3">
+                  {plan.features.map((f) => (
+                    <li key={f} className="flex items-start gap-2.5 text-[15px] text-foreground">
+                      <Check size={15} className="mt-0.5 shrink-0 text-accent" strokeWidth={2} />
+                      {f}
+                    </li>
+                  ))}
+                </ul>
 
-              <div className="mt-8">
-                <Link
-                  to="/signup"
-                  className="flex w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-3 text-sm font-medium text-primary-foreground transition-all hover:bg-primary/90"
-                >
-                  Get started free <ArrowRight size={15} />
-                </Link>
+                <div className="mt-8">
+                  <button
+                    onClick={() => handleSubscribe(plan.id)}
+                    disabled={loadingPlanId !== null}
+                    className={`flex w-full items-center justify-center gap-2 rounded-md px-4 py-3 text-sm font-medium transition-all disabled:opacity-60 ${
+                      plan.highlighted
+                        ? "bg-primary text-primary-foreground hover:bg-primary/90"
+                        : "bg-primary text-primary-foreground hover:bg-primary/90"
+                    }`}
+                  >
+                    {loadingPlanId === plan.id ? (
+                      <Loader2 size={14} className="animate-spin" />
+                    ) : (
+                      <>
+                        Subscribe <ArrowRight size={15} />
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
-            </div>
-          </ScrollReveal>
-
-          {/* Enterprise */}
-          <ScrollReveal delay={150}>
-            <div className="flex h-full flex-col rounded-lg bg-card p-8 shadow-sm ring-1 ring-border">
-              <p className="text-xs font-medium uppercase tracking-[0.15em] text-muted-foreground">
-                Enterprise
-              </p>
-              <h2 className="mt-4 font-serif text-4xl font-semibold text-foreground">
-                $5,000<span className="text-lg font-normal text-muted-foreground">/month</span>
-              </h2>
-              <p className="mt-2 text-sm text-muted-foreground">
-                Plus token usage at volume rates.
-              </p>
-
-              <div className="my-6 border-t border-border" />
-
-              <ul className="flex-1 space-y-3">
-                {[
-                  "Everything in pay-as-you-go",
-                  "SLA guarantees",
-                  "Dedicated research liaison",
-                  "Custom data source integration",
-                  "Priority compute allocation",
-                  "Volume token pricing",
-                ].map((f) => (
-                  <li key={f} className="flex items-start gap-2.5 text-[15px] text-foreground">
-                    <Check size={15} className="mt-0.5 shrink-0 text-accent" strokeWidth={2} />
-                    {f}
-                  </li>
-                ))}
-              </ul>
-
-              <div className="mt-8">
-                <Link
-                  to="/signup"
-                  className="flex w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-3 text-sm font-medium text-primary-foreground transition-all hover:bg-primary/90"
-                >
-                  Get started <ArrowRight size={15} />
-                </Link>
-              </div>
-            </div>
-          </ScrollReveal>
-
-          {/* Custom */}
-          <ScrollReveal delay={300}>
-            <div className="flex h-full flex-col rounded-lg bg-card p-8 shadow-sm ring-1 ring-border">
-              <p className="text-xs font-medium uppercase tracking-[0.15em] text-muted-foreground">
-                Custom
-              </p>
-              <h2 className="mt-4 font-serif text-4xl font-semibold text-foreground">
-                $10,000+<span className="text-lg font-normal text-muted-foreground">/month</span>
-              </h2>
-              <p className="mt-2 text-sm text-muted-foreground">
-                Dedicated infrastructure. Bespoke deployment.
-              </p>
-
-              <div className="my-6 border-t border-border" />
-
-              <ul className="flex-1 space-y-3">
-                {[
-                  "Everything in Enterprise",
-                  "Dedicated infrastructure",
-                  "Locally hosted models",
-                  "Custom research dashboards",
-                  "Bespoke workflows and pipelines",
-                  "On-premise deployment",
-                  "White-glove onboarding",
-                ].map((f) => (
-                  <li key={f} className="flex items-start gap-2.5 text-[15px] text-foreground">
-                    <Check size={15} className="mt-0.5 shrink-0 text-accent" strokeWidth={2} />
-                    {f}
-                  </li>
-                ))}
-              </ul>
-
-              <div className="mt-8">
-                <Link to="/contact" className="flex w-full items-center justify-center gap-2 rounded-md border border-border px-4 py-3 text-sm font-medium text-foreground transition-all hover:bg-secondary">
-                  Contact sales
-                </Link>
-              </div>
-            </div>
-          </ScrollReveal>
+            </ScrollReveal>
+          ))}
         </div>
 
-        {/* How tokens work */}
+        {/* Not sure? */}
+        <ScrollReveal>
+          <div className="mt-8 text-center text-sm text-muted-foreground">
+            Not sure which plan fits?{" "}
+            <Link to="/contact" className="text-foreground underline underline-offset-2 hover:text-accent transition-colors">
+              Contact us
+            </Link>{" "}
+            and we'll help you choose.
+          </div>
+        </ScrollReveal>
+
+        {/* How it works */}
         <div className="mt-24">
           <ScrollReveal>
             <h2 className="font-serif text-2xl font-semibold text-foreground md:text-3xl">
-              How tokens work
+              How it works
             </h2>
           </ScrollReveal>
           <ScrollReveal delay={100}>
-            <div className="mt-8 grid gap-6 sm:grid-cols-2 md:grid-cols-3">
-              {[
-                {
-                  step: "01",
-                  title: "Submit a query",
-                  desc: "Choose your research depth and model tier. Mariana estimates the token cost before it begins.",
-                },
-                {
-                  step: "02",
-                  title: "Approve and run",
-                  desc: "Review the estimate and approve. Mariana begins autonomous research — you can close your browser.",
-                },
-                {
-                  step: "03",
-                  title: "Receive deliverables",
-                  desc: "Get notified when research is complete. Download reports, models, dashboards, or whatever Mariana built.",
-                },
-              ].map((s) => (
+            <div className="mt-8 grid gap-6 sm:grid-cols-3">
+              {howItWorks.map((s) => (
                 <div key={s.step} className="rounded-lg bg-card p-6 shadow-sm ring-1 ring-border">
                   <span className="font-mono text-xs text-accent">{s.step}</span>
                   <h3 className="mt-2 text-[15px] font-semibold text-foreground">{s.title}</h3>

@@ -11,8 +11,9 @@ import Mariana from "./pages/Mariana";
 import Chat from "./pages/Chat";
 import Pricing from "./pages/Pricing";
 import Contact from "./pages/Contact";
-import BuyCredits from "./pages/BuyCredits";
+import Checkout from "./pages/Checkout";
 import Account from "./pages/Account";
+import Admin from "./pages/Admin";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
 import ResetPassword from "./pages/ResetPassword";
@@ -41,8 +42,11 @@ const App = () => (
             <Route path="/chat" element={<Chat />} />
             <Route path="/pricing" element={<Pricing />} />
             <Route path="/contact" element={<Contact />} />
-            <Route path="/buy-credits" element={<BuyCredits />} />
+            <Route path="/checkout" element={<Checkout />} />
+            {/* BUG-legacy: /buy-credits now redirects to /checkout for backward compat */}
+            <Route path="/buy-credits" element={<Checkout />} />
             <Route path="/account" element={<Account />} />
+            <Route path="/admin" element={<Admin />} />
             <Route path="/login" element={<Login />} />
             <Route path="/signup" element={<Signup />} />
             <Route path="/reset-password" element={<ResetPassword />} />
