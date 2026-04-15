@@ -94,11 +94,15 @@ export default function Admin() {
   const [showUsers, setShowUsers] = useState(true);
   const [showInvestigations, setShowInvestigations] = useState(true);
 
-  /* Auth guard — redirect non-admins (including unauthenticated users) */
+  /* Auth guard — redirect non-admins (including unauthenticated users)
+     BUG-C3-02 fix: Add 500ms grace period matching other protected pages
+     to survive the brief user=null during Supabase token refresh. */
   useEffect(() => {
     if (user === null) {
-      navigate("/login", { replace: true });
-      return;
+      const timer = setTimeout(() => {
+        navigate("/login", { replace: true });
+      }, 500);
+      return () => clearTimeout(timer);
     }
     if (user.role !== "admin") {
       navigate("/chat", { replace: true });

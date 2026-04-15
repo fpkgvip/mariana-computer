@@ -682,8 +682,14 @@ async def health_check() -> HealthResponse:
 
 
 @app.get("/api/config", response_model=ConfigResponse, tags=["Status"])
-async def get_config() -> ConfigResponse:
-    """Return sanitised runtime configuration (API keys are never exposed)."""
+async def get_config(
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> ConfigResponse:
+    """Return sanitised runtime configuration (API keys are never exposed).
+
+    VULN-C2-07 fix: Requires authentication to prevent information disclosure
+    of internal paths and deployment details.
+    """
     cfg = _get_config()
     return ConfigResponse(
         model_cheap=cfg.MODEL_CHEAP,
@@ -693,7 +699,7 @@ async def get_config() -> ConfigResponse:
         budget_task_hard_cap=cfg.BUDGET_TASK_HARD_CAP,
         score_kill_threshold=cfg.SCORE_KILL_THRESHOLD,
         score_deepen_threshold=cfg.SCORE_DEEPEN_THRESHOLD,
-        data_root=cfg.DATA_ROOT,
+        data_root="[redacted]",
         log_level=cfg.LOG_LEVEL,
     )
 
@@ -761,9 +767,15 @@ async def start_investigation(
     )
 
     # ── Reserve estimated credits up-front to prevent concurrent overspend ──
-    # estimated_credits_needed = budget_usd * 120 (real cost → tokens at
-    # $0.01/token, with 20% markup: budget * 100 * 1.20 = budget * 120)
-    estimated_credits_needed = int(effective_budget_usd * 120)
+    # VULN-C2-01 fix: Enforce a minimum reservation equal to the tier's base
+    # credit cost to prevent users from submitting with tiny budgets and
+    # receiving underpaid model work.  The reservation is the greater of
+    # (budget * 120) and the tier's base credit cost.
+    tier_base_credits = _TIER_CREDITS.get(classification.tier, 50)
+    estimated_credits_needed = max(
+        int(effective_budget_usd * 120),
+        tier_base_credits,
+    )
     reserved_credits = 0
     if estimated_credits_needed > 0:
         reserved = await _supabase_deduct_credits(current_user["user_id"], estimated_credits_needed, cfg)
@@ -1804,9 +1816,12 @@ async def upload_pending_files(
     response_model=list[ConnectorStatus],
     tags=["Connectors"],
 )
-async def list_connectors() -> list[ConnectorStatus]:
-    """
-    Report which external data connectors are configured and available.
+async def list_connectors(
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> list[ConnectorStatus]:
+    """Report which external data connectors are configured and available.
+
+    VULN-C2-07 fix: Requires authentication.
 
     ``available`` is True when the corresponding API key is non-empty.
     Full health checks (live HTTP probes) are not performed here to keep
@@ -2032,6 +2047,26 @@ async def create_checkout(
     if not cfg.STRIPE_SECRET_KEY:
         raise HTTPException(status_code=503, detail="Billing service not configured")
 
+    # VULN-C2-03 fix: Validate redirect URLs to prevent open-redirect phishing.
+    _ALLOWED_REDIRECT_HOSTS = {
+        "frontend-tau-navy-80.vercel.app",
+        "localhost",
+        "127.0.0.1",
+    }
+    for url_field, url_value in [("success_url", body.success_url), ("cancel_url", body.cancel_url)]:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url_value)
+            if parsed.hostname not in _ALLOWED_REDIRECT_HOSTS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid {url_field}: host {parsed.hostname!r} is not allowed",
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Invalid {url_field}: malformed URL")
+
     # Resolve plan
     plan = next((p for p in _PLANS if p["id"] == body.plan_id), None)
     if plan is None:
@@ -2126,7 +2161,18 @@ async def stripe_webhook(request: Request) -> JSONResponse:
     if not event_id:
         raise HTTPException(status_code=400, detail="Webhook event missing id")
 
-    recorded = await _record_webhook_event_once(event_id, event_type)
+    # BUG-C1-08 fix: If idempotency check fails due to DB error, return 500
+    # so Stripe retries later (instead of silently processing and risking
+    # double-crediting if idempotency INSERT never committed).
+    try:
+        recorded = await _record_webhook_event_once(event_id, event_type)
+    except Exception as exc:  # noqa: BLE001
+        log.error("stripe_idempotency_check_failed", error=str(exc))
+        return JSONResponse(
+            status_code=500,
+            content={"status": "idempotency_error", "error": str(exc)},
+        )
+
     if not recorded:
         log.info("stripe_webhook_replay_ignored")
         return JSONResponse(content={"status": "duplicate", "event_id": event_id})
@@ -2149,6 +2195,14 @@ async def stripe_webhook(request: Request) -> JSONResponse:
         else:
             log.info("stripe_webhook_unhandled_event")
 
+    except HTTPException:
+        # BUG-C1-09 fix: Let 503 from _supabase_add_credits propagate as
+        # 500 so Stripe retries when the credit RPC is down.
+        log.error("stripe_webhook_handler_failed_retriable")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "handler_error_retriable"},
+        )
     except Exception as exc:  # noqa: BLE001
         log.error("stripe_webhook_handler_failed", error=str(exc))
         # Return 200 to prevent Stripe from retrying a handler bug
@@ -2402,42 +2456,27 @@ async def _supabase_add_credits(
             logger.info("credits_added_via_rpc", user_id=user_id, credits=credits)
             return
 
-        # Fallback: read current balance and PATCH
-        logger.warning(
+        # BUG-C1-09 fix: The previous read-modify-PATCH fallback was not
+        # atomic and could corrupt credit balances on concurrent webhooks.
+        # Now we use a raw SQL approach via PostgREST RPC or fail loudly
+        # so Stripe can retry the webhook later.
+        logger.error(
             "add_credits_rpc_unavailable",
             status=resp.status_code,
-            fallback="read_modify_patch",
+            user_id=user_id,
+            credits=credits,
+            message=(
+                "The add_credits RPC is unavailable.  Credit grant was NOT "
+                "applied.  Stripe webhook should retry.  Create the RPC: "
+                "CREATE FUNCTION add_credits(p_user_id UUID, p_credits INT) "
+                "RETURNS VOID AS $$ UPDATE profiles SET tokens = tokens + "
+                "p_credits WHERE id = p_user_id; $$ LANGUAGE sql;"
+            ),
         )
-        profile_url = f"{cfg.SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=tokens"
-        get_resp = await client.get(profile_url, headers=headers)
-        if get_resp.status_code != 200:
-            logger.error("supabase_get_profile_failed", user_id=user_id)
-            return
-        rows = get_resp.json()
-        if not rows:
-            logger.error("supabase_profile_not_found", user_id=user_id)
-            return
-        current_tokens: int = rows[0].get("tokens", 0) or 0
-        patch_url = f"{cfg.SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}"
-        patch_resp = await client.patch(
-            patch_url,
-            json={"tokens": current_tokens + credits},
-            headers={**headers, "Prefer": "return=minimal"},
+        raise HTTPException(
+            status_code=503,
+            detail="Credit service (add_credits RPC) unavailable",
         )
-        if patch_resp.status_code not in (200, 204):
-            logger.error(
-                "supabase_add_credits_fallback_failed",
-                user_id=user_id,
-                status=patch_resp.status_code,
-            )
-        else:
-            logger.info(
-                "credits_added_via_patch",
-                user_id=user_id,
-                old=current_tokens,
-                added=credits,
-                new=current_tokens + credits,
-            )
 
 
 async def _supabase_get_user_tokens(

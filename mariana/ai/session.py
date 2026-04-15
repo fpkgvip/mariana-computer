@@ -147,22 +147,11 @@ class ModelCallError(Exception):
         self.response_body = response_body[:500] if response_body else ""
 
 
-class BudgetExhaustedError(Exception):
-    """
-    Raised when the cost_tracker's hard cap has been exceeded before or
-    during an AI call.
-
-    Attributes:
-        cap_usd: The budget cap that was exceeded.
-        spent_usd: The amount spent so far.
-    """
-
-    def __init__(self, cap_usd: float, spent_usd: float) -> None:
-        super().__init__(
-            f"Budget cap exceeded: spent=${spent_usd:.4f} cap=${cap_usd:.4f}"
-        )
-        self.cap_usd = cap_usd
-        self.spent_usd = spent_usd
+# BUG-C1-01 fix: Import the canonical BudgetExhaustedError from cost_tracker
+# so event_loop.py's `except BudgetExhaustedError` catches pre-call budget
+# violations raised by _check_budget().  Previously session.py defined its own
+# incompatible class that was never caught, causing FAILED instead of HALTED.
+from mariana.orchestrator.cost_tracker import BudgetExhaustedError  # noqa: E402
 
 
 class ContextTooLargeError(Exception):
@@ -619,7 +608,7 @@ def _check_budget(cost_tracker: Any, branch_id: str | None) -> None:
         if is_exhausted:
             spent = getattr(cost_tracker, "total_spent", 0.0)
             cap = getattr(cost_tracker, "task_budget", 400.0)
-            raise BudgetExhaustedError(cap_usd=cap, spent_usd=spent)
+            raise BudgetExhaustedError(scope="task", spent=spent, cap=cap)
 
         # Branch-level cap: use branch_remaining(branch_id)
         if branch_id is not None:
@@ -627,7 +616,7 @@ def _check_budget(cost_tracker: Any, branch_id: str | None) -> None:
             if callable(branch_remaining_fn) and branch_remaining_fn(branch_id) <= 0:
                 spent = getattr(cost_tracker, "total_spent", 0.0)
                 cap = getattr(cost_tracker, "branch_hard_cap", 75.0)
-                raise BudgetExhaustedError(cap_usd=cap, spent_usd=spent)
+                raise BudgetExhaustedError(scope="branch", spent=spent, cap=cap)
     except BudgetExhaustedError:
         raise
     except Exception as exc:

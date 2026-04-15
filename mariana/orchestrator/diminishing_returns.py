@@ -124,8 +124,8 @@ def check_diminishing_returns(
     task:
         The parent ResearchTask; ``diminishing_flags`` is mutated in-place.
     config:
-        Application configuration (unused currently — thresholds are
-        module-level constants; reserved for future override support).
+        Application configuration.  ``DIMINISHING_SCORE_DELTA_THRESHOLD``
+        overrides the module-level ``_SCORE_DELTA_THRESHOLD`` constant.
 
     Returns
     -------
@@ -159,10 +159,15 @@ def check_diminishing_returns(
     # ------------------------------------------------------------------
     # 4. Flag logic
     # ------------------------------------------------------------------
+    # BUG-C1-03 fix: honour config.DIMINISHING_SCORE_DELTA_THRESHOLD so
+    # operators can tune the plateau threshold via environment variable.
+    effective_score_delta_threshold = getattr(
+        config, "DIMINISHING_SCORE_DELTA_THRESHOLD", _SCORE_DELTA_THRESHOLD,
+    )
     all_stale = (
         novelty < _NOVELTY_THRESHOLD
         and new_sources < _NEW_SOURCES_THRESHOLD
-        and score_delta < _SCORE_DELTA_THRESHOLD
+        and score_delta < effective_score_delta_threshold
     )
 
     if all_stale:

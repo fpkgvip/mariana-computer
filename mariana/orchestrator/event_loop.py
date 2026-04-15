@@ -26,6 +26,7 @@ Architecture constraints enforced here
 from __future__ import annotations
 
 import asyncio
+import json
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -1827,7 +1828,11 @@ def _sync_cost(task: ResearchTask, cost_tracker: CostTracker) -> None:
 
 
 async def _persist_task(task: ResearchTask, db: Any) -> None:
-    """Upsert the mutable task fields back to the database."""
+    """Upsert the mutable task fields back to the database.
+
+    BUG-C1-02 fix: Added ``metadata`` to the UPDATE so skill/memory/sub-agent
+    context set in ``handle_init`` is persisted and survives crash recovery.
+    """
     await db.execute(
         """
         UPDATE research_tasks
@@ -1840,8 +1845,9 @@ async def _persist_task(task: ResearchTask, db: Any) -> None:
             completed_at = $7,
             error_message = $8,
             output_pdf_path = $9,
-            output_docx_path = $10
-        WHERE id = $11
+            output_docx_path = $10,
+            metadata = $11
+        WHERE id = $12
         """,
         task.status.value,
         task.current_state.value,
@@ -1853,6 +1859,7 @@ async def _persist_task(task: ResearchTask, db: Any) -> None:
         task.error_message,
         task.output_pdf_path,
         task.output_docx_path,
+        json.dumps(task.metadata),
         task.id,
     )
 

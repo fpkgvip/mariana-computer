@@ -784,8 +784,14 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
             )
 
             # Rename to .running to prevent re-pickup on next poll
+            # BUG-C1-06 fix: wrap in try/except to handle concurrent daemon
+            # instances that may have already claimed this file.
             running_file = tf.with_suffix(".running")
-            tf.rename(running_file)
+            try:
+                tf.rename(running_file)
+            except FileNotFoundError:
+                logger.warning("daemon_task_already_claimed", file=tf.name)
+                continue
 
             # Spawn as a concurrent task
             task = asyncio.create_task(

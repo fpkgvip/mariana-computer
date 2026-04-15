@@ -326,6 +326,10 @@ export default function Chat() {
   // Timeline steps for structured progress events
   const [timelineSteps, setTimelineSteps] = useState<TimelineStep[]>([]);
   const timelineStoreRef = useRef<Record<string, TimelineStep[]>>({});
+  // BUG-C3-04 fix: Ref to always read the latest timelineSteps in
+  // switchInvestigation without adding timelineSteps to its deps.
+  const timelineStepsRef = useRef<TimelineStep[]>([]);
+  timelineStepsRef.current = timelineSteps;
 
   // File viewer state
   const [viewingFile, setViewingFile] = useState<FileAttachment | null>(null);
@@ -794,8 +798,9 @@ export default function Chat() {
             ].includes(eventType)) {
               processStructuredEvent(parsed as StructuredEvent);
 
-              // Also check for terminal status in structured events
-              if (eventType === "status_change" && parsed.state === "HALT") {
+              // BUG-C3-01 fix: Check for correct terminal states from backend.
+              // Backend emits "HALTED", "COMPLETED", or "FAILED" — not "HALT".
+              if (eventType === "status_change" && ["HALTED", "COMPLETED"].includes(parsed.state as string)) {
                 updateInvestigationStatus(taskId, "COMPLETED");
                 appendMessage({
                   role: "system",
@@ -984,8 +989,9 @@ export default function Chat() {
         messageStoreRef.current[activeTaskId] = [...messagesRef.current];
       }
       // Save timeline steps for current investigation
+      // BUG-C3-04 fix: Use ref instead of closure value to avoid stale data.
       if (activeTaskId) {
-        timelineStoreRef.current[activeTaskId] = [...timelineSteps];
+        timelineStoreRef.current[activeTaskId] = [...timelineStepsRef.current];
       }
 
       // Stop any active connections
@@ -1029,8 +1035,9 @@ export default function Chat() {
         });
       }
     },
-    // messages removed from deps — using messagesRef.current instead
-    [activeTaskId, investigations, timelineSteps, stopAllConnections, startSSE, startTimer]
+    // messages and timelineSteps removed from deps — using refs instead
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeTaskId, investigations, stopAllConnections, startSSE, startTimer]
   );
 
   /* ---------------------------------------------------------------- */
@@ -1103,7 +1110,7 @@ export default function Chat() {
         // Classify failed — fall through to direct investigation start
         console.warn("[Chat] Classify failed, starting investigation directly.");
         setIsClassifying(false);
-        await startInvestigation(topic, token, true);
+        await startInvestigationRef.current(topic, token, true);
         return;
       }
 
@@ -1112,7 +1119,7 @@ export default function Chat() {
 
       if (classifyData.tier === "instant" || classifyData.tier === "quick") {
         // No approval needed for instant/quick — go straight to investigation
-        await startInvestigation(topic, token, true);
+        await startInvestigationRef.current(topic, token, true);
       } else {
         // Show research plan card for user approval
         setPendingPlan({
@@ -1126,14 +1133,11 @@ export default function Chat() {
     } catch (err) {
       setIsClassifying(false);
       console.warn("[Chat] Classify error, starting investigation directly:", err);
-      await startInvestigation(topic, token, true);
+      await startInvestigationRef.current(topic, token, true);
     }
-  // BUG-R2-01: Dependency array for useCallback — all captured values listed.
-  // Note: startInvestigation is defined AFTER handleSend, so it cannot be included
-  // in the deps array (temporal dead zone). This is acceptable because the closure
-  // captures the variable by reference — when handleSend is *called*, startInvestigation
-  // will have been assigned in the same render cycle. The minor staleness risk is
-  // mitigated by handleSend re-creating whenever its own deps change.
+  // BUG-C3-06 fix: startInvestigation accessed via startInvestigationRef.current
+  // so handleSend always calls the latest version (avoids stale uploadSessionUuid).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isSending, isClassifying, input, retryPayload, activeTaskId, stopConnectionsOnly, navigate]);
 
   /* ---------------------------------------------------------------- */
@@ -1288,6 +1292,12 @@ export default function Chat() {
       setIsSending(false);
     }
   }, [user, uploadSessionUuid, appendMessage, startTimer, startSSE, navigate]);
+
+  // BUG-C3-06 fix: Ref to hold the latest startInvestigation so handleSend
+  // (defined before startInvestigation) always calls the current version,
+  // avoiding stale closures when uploadSessionUuid changes.
+  const startInvestigationRef = useRef(startInvestigation);
+  startInvestigationRef.current = startInvestigation;
 
   /* ---------------------------------------------------------------- */
   /*  Approve research plan                                           */

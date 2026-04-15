@@ -102,12 +102,10 @@ export default function FileUpload({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragCounterRef = useRef(0);
 
-  // BUG-R2-S2-09: The original implementation spread `uploadedFiles` from the closure
-  // to build the new array. When multiple files are uploaded concurrently (user selects
-  // 3 at once), each uploadFile call captures the same stale snapshot, so the second
-  // upload's onFilesChange([...staleFiles, file2]) overwrites file1, losing it.
-  // Fix: use a ref to always read the latest files, and use functional updates where
-  // possible. Also, XHR progress callbacks read from the ref.
+  // BUG-R2-S2-09 + BUG-C3-03 fix: Use a local accumulator ref that is updated
+  // synchronously on each uploadFile call, so concurrent uploads in the same tick
+  // don't overwrite each other.  The ref is synced FROM React state on re-render
+  // AND updated optimistically in uploadFile before onFilesChange fires.
   const uploadedFilesRef = useRef(uploadedFiles);
   uploadedFilesRef.current = uploadedFiles;
 
@@ -127,7 +125,11 @@ export default function FileUpload({
         progress: 0,
       };
 
-      onFilesChange([...uploadedFilesRef.current, newFile]);
+      // BUG-C3-03 fix: Synchronously push into the ref BEFORE calling
+      // onFilesChange so the next concurrent uploadFile call sees it.
+      const snapshot = [...uploadedFilesRef.current, newFile];
+      uploadedFilesRef.current = snapshot;
+      onFilesChange(snapshot);
 
       const formData = new FormData();
       formData.append("files", file);
