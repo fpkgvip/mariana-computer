@@ -508,6 +508,7 @@ async def _run_single(
     budget: float,
     user_id: str = "",
     task_id: str | None = None,
+    tier: str = "standard",
 ) -> int:
     """
     Run a single investigation and return exit code.
@@ -524,7 +525,7 @@ async def _run_single(
         status=TaskStatus.RUNNING,
         current_state=State.INIT,
         started_at=datetime.now(tz=timezone.utc),
-        metadata={"user_id": user_id} if user_id else {},
+        metadata={"user_id": user_id, "tier": tier} if user_id else {"tier": tier},
     )
 
     await _insert_task(db, task)
@@ -598,6 +599,7 @@ async def _run_single_guarded(
     user_id: str,
     task_id: str | None,
     task_file: Path,
+    tier: str = "standard",
 ) -> None:
     """Run a single investigation guarded by a concurrency semaphore.
 
@@ -619,6 +621,7 @@ async def _run_single_guarded(
             budget=budget,
             user_id=user_id,
             task_id=task_id,
+            tier=tier,
         )
         if exit_code == 0:
             task_file.rename(task_file.with_suffix(".done"))
@@ -676,6 +679,7 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
             budget_r = float(resume_data.get("budget_usd", resume_data.get("budget", 50.0)))
             user_id_r = resume_data.get("user_id", "")
             task_id_r = resume_data.get("id", "")
+            tier_r = resume_data.get("tier", "standard")
             if topic_r:
                 logger.info(
                     "daemon_resuming_interrupted",
@@ -695,6 +699,7 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
                         user_id=user_id_r,
                         task_id=task_id_r or None,
                         task_file=rf,
+                        tier=tier_r,
                     ),
                     name=f"resume-{task_id_r or rf.stem}",
                 )
@@ -745,6 +750,7 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
             budget = float(task_data.get("budget_usd", task_data.get("budget", 50.0)))
             user_id = task_data.get("user_id", "")
             file_task_id = task_data.get("id", "")
+            file_tier = task_data.get("tier", "standard")
             # max_duration_hours: null/missing = unlimited (never kill prematurely)
             _max_dur = task_data.get("max_duration_hours")  # noqa: F841  (reserved for future use)
 
@@ -783,6 +789,7 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
                     user_id=user_id,
                     task_id=file_task_id or None,
                     task_file=running_file,
+                    tier=file_tier,
                 ),
                 name=f"investigation-{file_task_id or tf.stem}",
             )

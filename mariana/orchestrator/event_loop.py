@@ -152,6 +152,83 @@ async def run(
     })
 
     # ------------------------------------------------------------------
+    # Fast path for instant / quick tiers
+    # ------------------------------------------------------------------
+    tier = (task.metadata or {}).get("tier", "standard")
+    if tier in ("instant", "quick"):
+        log.info("fast_path_tier", tier=tier)
+        _emit_progress(redis_client, task.id, {
+            "type": "status_change",
+            "state": "SEARCH",
+            "message": "Generating response...",
+        })
+        try:
+            from mariana.ai.session import spawn_model as _fast_spawn  # noqa: PLC0415
+
+            system_prompt = (
+                "You are Mariana, an elite AI research assistant. "
+                "Answer the user directly and concisely. "
+                "If the user is just greeting or testing, respond warmly and briefly. "
+                "If the user asks a factual question, answer it with citations where possible. "
+                "Never refuse. Always be helpful."
+            )
+            fast_output, fast_session = await _fast_spawn(
+                task_type=TaskType.HYPOTHESIS_GENERATION,
+                context={
+                    "task_id": task.id,
+                    "topic": task.topic,
+                    "budget_remaining": cost_tracker.budget_remaining,
+                    "system_override": system_prompt,
+                },
+                output_schema=HypothesisGenerationOutput,
+                branch_id=None,
+                db=db,
+                cost_tracker=cost_tracker,
+                config=config,
+            )
+            task.ai_call_counter += 1
+
+            # Extract the answer text from the output
+            answer_text = ""
+            if hasattr(fast_output, "hypotheses") and fast_output.hypotheses:
+                answer_text = "\n\n".join(
+                    h.statement for h in fast_output.hypotheses if hasattr(h, "statement")
+                )
+            if not answer_text and hasattr(fast_output, "score_rationale"):
+                answer_text = fast_output.score_rationale
+            if not answer_text:
+                answer_text = str(fast_output)
+
+            _emit_progress(redis_client, task.id, {
+                "type": "text",
+                "content": answer_text,
+            })
+            _emit_progress(redis_client, task.id, {
+                "type": "status_change",
+                "state": "HALT",
+                "message": "Complete.",
+            })
+        except Exception as fast_exc:
+            log.error("fast_path_error", error=str(fast_exc))
+            _emit_progress(redis_client, task.id, {
+                "type": "text",
+                "content": f"I encountered an error: {fast_exc}",
+            })
+            _emit_progress(redis_client, task.id, {
+                "type": "status_change",
+                "state": "HALT",
+                "message": "Failed.",
+            })
+
+        # Mark task complete
+        task.current_state = State.HALT
+        task.status = TaskStatus.COMPLETED
+        task.completed_at = datetime.now(timezone.utc)
+        _sync_cost(task, cost_tracker)
+        await _persist_task(task, db)
+        return  # Skip the full research pipeline
+
+    # ------------------------------------------------------------------
     # Attempt checkpoint resume
     # ------------------------------------------------------------------
     latest_cp = await checkpoint_module.load_latest_checkpoint(

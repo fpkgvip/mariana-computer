@@ -83,7 +83,7 @@ services:
       --maxmemory 4gb
       --maxmemory-policy allkeys-lru
       --bind 0.0.0.0
-      --protected-mode yes
+      --protected-mode no
     volumes:
       - redis-data:/data
     healthcheck:

@@ -587,7 +587,8 @@ _PLANS: list[dict[str, Any]] = [
 #: At $0.01/credit, these map to: instant=$0.10, standard=$5, deep=$20.
 #: Minimum budgets: standard=$5, deep=$20 per the architecture spec.
 _TIER_CREDITS: dict[str, int] = {
-    "instant": 10,
+    "instant": 5,
+    "quick": 50,
     "standard": 500,
     "deep": 2000,
 }
@@ -1711,19 +1712,19 @@ def _classify_topic(topic: str) -> ClassifyResponse:
     Deterministic tier classification for a research topic.
 
     Rules (evaluated in order, first match wins):
-    1. Explicit duration keywords ("3 hours", "2 days") — honour the
-       stated duration; tier is deep if > 2 h, standard otherwise.
-    2. Deep-tier signals: "flagship", "exhaustive", "multi-day",
-       or an explicit duration > 12 h.
-    3. Instant-tier: short question (< 100 chars) containing "?" and
-       NOT containing investigative keywords.
-    4. Default: standard tier (1.5 h, 75 credits).
+    1. Explicit duration keywords ("3 hours", "2 days") — honour the stated
+       duration; tier is deep if > 2 h, standard otherwise.
+    2. Deep-tier signals: "flagship", "exhaustive", "multi-day", etc.
+    3. Instant-tier: greetings, simple tests, trivial messages.
+    4. Quick-tier: short questions, simple lookups, single-fact queries.
+    5. Standard-tier: moderate research requiring structured analysis.
+    6. Default: quick (safe default — avoids overkill on simple tasks).
     """
-    topic_lower = topic.lower()
+    topic_lower = topic.lower().strip()
+    word_count = len(topic_lower.split())
 
     # ── 1. Parse explicit duration mentions ──────────────────────────────────
     explicit_hours: float | None = None
-    # Match patterns like "3 hours", "1.5 hours", "2 days", "half a day"
     duration_match = re.search(
         r"(\d+(?:\.\d+)?)\s*(hour|hr|day|days|hours|hrs)",
         topic_lower,
@@ -1757,7 +1758,8 @@ def _classify_topic(topic: str) -> ClassifyResponse:
         )
 
     # ── 2. Deep-tier signal words ───────────────────────────────────────
-    deep_signals = {"flagship", "exhaustive", "multi-day", "comprehensive", "full analysis"}
+    deep_signals = {"flagship", "exhaustive", "multi-day", "full analysis",
+                    "deep dive", "deep research", "thorough investigation"}
     if any(signal in topic_lower for signal in deep_signals):
         return ClassifyResponse(
             tier="deep",
@@ -1770,25 +1772,60 @@ def _classify_topic(topic: str) -> ClassifyResponse:
             requires_approval=True,
         )
 
-    # ── 3. Instant tier: short question without investigative keywords ──────
-    investigative_keywords = {"investigate", "analyze deeply", "research", "report"}
-    is_short = len(topic) < 100
-    has_question_mark = "?" in topic
-    has_investigative_keyword = any(kw in topic_lower for kw in investigative_keywords)
-
-    if is_short and has_question_mark and not has_investigative_keyword:
+    # ── 3. Instant-tier: greetings, tests, trivial messages ────────────
+    greeting_patterns = {
+        "hello", "hi", "hey", "test", "ping", "yo", "sup",
+        "good morning", "good afternoon", "good evening",
+        "are you there", "are you alive", "are you live",
+        "are you working", "who are you", "what are you",
+        "thanks", "thank you", "ok", "okay", "cool", "nice",
+    }
+    # Check if the whole message is basically a greeting/test
+    topic_stripped = topic_lower.rstrip(".!?,")
+    if topic_stripped in greeting_patterns or word_count <= 3:
         return ClassifyResponse(
             tier="instant",
             estimated_duration_hours=0.01,
             estimated_credits=_TIER_CREDITS["instant"],
+            plan_summary="Quick response to your message.",
+            requires_approval=False,
+        )
+    # Also catch "hello, let me test if you are live" style messages
+    if any(g in topic_lower for g in ("hello", "hi ", "hey ", "test")) and word_count < 15:
+        if not any(kw in topic_lower for kw in ("research", "analyze", "investigate", "report", "find")):
+            return ClassifyResponse(
+                tier="instant",
+                estimated_duration_hours=0.01,
+                estimated_credits=_TIER_CREDITS["instant"],
+                plan_summary="Quick response to your message.",
+                requires_approval=False,
+            )
+
+    # ── 4. Quick-tier: short questions, simple lookups ──────────────────
+    is_short = len(topic) < 200
+    has_question = "?" in topic
+    # Research-demanding keywords that push toward standard tier
+    research_keywords = {
+        "investigate", "research", "analyze", "analysis", "report",
+        "compare", "evaluate", "comprehensive", "in-depth", "detailed",
+        "thesis", "paper", "study", "survey", "assessment",
+        "market analysis", "due diligence", "competitive analysis",
+    }
+    has_research_keyword = any(kw in topic_lower for kw in research_keywords)
+
+    if is_short and not has_research_keyword:
+        return ClassifyResponse(
+            tier="quick",
+            estimated_duration_hours=0.08,
+            estimated_credits=_TIER_CREDITS["quick"],
             plan_summary=(
-                "Instant lookup: a focused, direct answer to your question using "
-                "available knowledge and fast data retrieval."
+                "Quick investigation: focused lookup with web search and "
+                "a concise answer with sources."
             ),
             requires_approval=False,
         )
 
-    # ── 4. Default: standard ──────────────────────────────────────────────
+    # ── 5. Standard-tier: moderate research ──────────────────────────────
     return ClassifyResponse(
         tier="standard",
         estimated_duration_hours=1.5,

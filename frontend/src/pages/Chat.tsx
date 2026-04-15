@@ -73,7 +73,7 @@ interface InvestigationPollResponse {
 
 /** POST /api/investigations/classify response */
 interface ClassifyResponse {
-  tier: "instant" | "standard" | "deep";
+  tier: "instant" | "quick" | "standard" | "deep";
   plan_summary: string;
   estimated_duration_hours: number;
   estimated_credits: number;
@@ -1101,8 +1101,8 @@ export default function Chat() {
       const classifyData: ClassifyResponse = await classifyRes.json();
       setIsClassifying(false);
 
-      if (classifyData.tier === "instant") {
-        // No approval needed — go straight to investigation
+      if (classifyData.tier === "instant" || classifyData.tier === "quick") {
+        // No approval needed for instant/quick — go straight to investigation
         await startInvestigation(topic, token, true);
       } else {
         // Show research plan card for user approval

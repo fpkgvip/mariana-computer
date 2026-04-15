@@ -184,8 +184,7 @@ class AppConfig:
     PERPLEXITY_API_KEY: str = ""
     NANOBANANA_API_KEY: str = ""
     VEO_API_KEY: str = ""
-    QUARTR_API_KEY: str = ""
-    FACTSET_API_KEY: str = ""
+    # Quartr and FactSet removed per user request
 
     # ------------------------------------------------------------------
     # Batch API
@@ -355,8 +354,7 @@ def load_config(env_file: str | Path | None = None) -> AppConfig:
         PERPLEXITY_API_KEY=_str("PERPLEXITY_API_KEY", ""),
         NANOBANANA_API_KEY=_str("NANOBANANA_API_KEY", ""),
         VEO_API_KEY=_str("VEO_API_KEY", ""),
-        QUARTR_API_KEY=_str("QUARTR_API_KEY", ""),
-        FACTSET_API_KEY=_str("FACTSET_API_KEY", ""),
+        # Quartr and FactSet removed per user request
         # Batch
         BATCH_POLL_INTERVAL_SECONDS=_int("BATCH_POLL_INTERVAL_SECONDS", 300),
         # Timer

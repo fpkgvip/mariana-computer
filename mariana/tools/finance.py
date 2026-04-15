@@ -119,28 +119,4 @@ async def get_coinbase_price(
 # ---------------------------------------------------------------------------
 
 
-async def search_quartr(
-    query: str,
-    api_key: str,
-    timeout: float = 30.0,
-) -> FinancialDataResult:
-    """Search Quartr for earnings call transcripts.
-
-    Parameters
-    ----------
-    query:
-        Search string (company name, ticker, topic).
-    api_key:
-        Quartr API key.
-    """
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.get(
-            "https://api.quartr.com/v1/search",
-            params={"q": query},
-            headers={"Authorization": f"Bearer {api_key}"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-    logger.info("quartr_search", query=query[:60])
-    return FinancialDataResult(source="Quartr", query=query, data=data, citations=[])
+# Quartr integration removed per user request.
