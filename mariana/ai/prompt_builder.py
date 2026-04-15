@@ -740,6 +740,11 @@ def build_messages(
     For non-Claude models, ``content`` is a plain string (no cache_control),
     because OpenAI and DeepSeek use automatic (implicit) caching.
 
+    If ``context["system_override"]`` is set, it replaces the default system
+    prompt entirely (Blocks 1 + 2).  This is used by the fast path for
+    instant/quick tiers that need a simple conversational prompt rather than
+    the full investigative-analyst identity.
+
     Args:
         task_type: Determines which dynamic context builder is used.
         context: Task-specific data dict.  Keys are documented in the module
@@ -757,6 +762,26 @@ def build_messages(
     """
     # ── Resolve whether to use cache_control format ───────────────────────────
     use_cache_control = model_id is not None and _is_claude_model(model_id)
+
+    # ── BUG-S5-01 fix: honour system_override for fast-path tiers ────────────
+    # When system_override is present in context, skip the full Mariana identity
+    # prompt and use the override as the system message directly.  This allows
+    # the instant/quick fast path to produce a simple conversational response
+    # instead of forcing the model through the investigative analyst persona.
+    system_override = context.get("system_override")
+    if system_override:
+        block3_text = (
+            _build_dynamic_context(task_type, context)
+            + "\n\n"
+            + "OUTPUT SCHEMA (your response must conform to this JSON schema):\n"
+            + _schema_json(output_schema)
+            + "\n\nRespond with a single valid JSON object matching the schema above. "
+              "No other text."
+        )
+        return [
+            {"role": "system", "content": system_override},
+            {"role": "user", "content": block3_text},
+        ]
 
     # ── Build the three blocks ────────────────────────────────────────────────
     # Inject universal research context prefix before the static identity prompt

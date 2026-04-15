@@ -208,8 +208,11 @@ async def run(
                 "state": "HALT",
                 "message": "Complete.",
             })
+            # BUG-S5-02 fix: mark as COMPLETED only on success (set below)
+            fast_success = True
         except Exception as fast_exc:
-            log.error("fast_path_error", error=str(fast_exc))
+            fast_success = False
+            log.error("fast_path_error", error=str(fast_exc), exc_info=True)
             _emit_progress(redis_client, task.id, {
                 "type": "text",
                 "content": f"I encountered an error: {fast_exc}",
@@ -220,9 +223,13 @@ async def run(
                 "message": "Failed.",
             })
 
-        # Mark task complete
+        # BUG-S5-02 fix: mark task FAILED on error, not COMPLETED.
+        # Previously the code unconditionally set status=COMPLETED even
+        # when the fast path raised an exception.
         task.current_state = State.HALT
-        task.status = TaskStatus.COMPLETED
+        task.status = TaskStatus.COMPLETED if fast_success else TaskStatus.FAILED
+        if not fast_success:
+            task.error_message = "Fast path LLM call failed"
         task.completed_at = datetime.now(timezone.utc)
         _sync_cost(task, cost_tracker)
         await _persist_task(task, db)

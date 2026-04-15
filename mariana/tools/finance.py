@@ -1,4 +1,4 @@
-"""Financial data tools — SEC EDGAR, Coinbase, Quartr, etc.
+"""Financial data tools — SEC EDGAR, Coinbase, etc.
 
 Consolidates public-API financial data connectors used by the research
 orchestrator.  Each function returns a ``FinancialDataResult`` with source

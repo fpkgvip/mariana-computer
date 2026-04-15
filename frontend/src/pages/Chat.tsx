@@ -776,7 +776,13 @@ export default function Chat() {
         // BUG-002: Guard against multiple fallback polling loops
         let hasFailedOver = false;
 
-        es.onmessage = (event) => {
+        // BUG-R5-01: The main handler processes both unnamed "message" events
+        // (es.onmessage) and named "log" events (es.addEventListener("log")).
+        // The backend Redis pub/sub path emits structured JSON as event type "log",
+        // which es.onmessage silently ignores. Without the named listener, all
+        // real-time progress events (text, status_change, step_start, etc.) from
+        // the primary Redis path were dropped.
+        const handleLogEvent = (event: MessageEvent) => {
           try {
             const parsed = JSON.parse(event.data);
 
@@ -862,9 +868,12 @@ export default function Chat() {
           }
         };
 
+        // Wire up the handler for both unnamed "message" events AND named "log" events.
+        es.onmessage = handleLogEvent;
+        es.addEventListener("log", handleLogEvent);
+
         // BUG-R2-08: Register named event listeners for server-emitted event types.
-        // es.onmessage only handles the default (unnamed) event type.
-        // The backend emits: "done", "ping", "state_change", "error" — all ignored by onmessage.
+        // The backend also emits: "done", "ping", "state_change", "error".
 
         es.addEventListener("done", (event: MessageEvent) => {
           try {

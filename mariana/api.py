@@ -1781,8 +1781,12 @@ def _classify_topic(topic: str) -> ClassifyResponse:
         "thanks", "thank you", "ok", "okay", "cool", "nice",
     }
     # Check if the whole message is basically a greeting/test
+    # BUG-S5-03 fix: word_count <= 3 was too aggressive — "What is CATL" (3 words)
+    # is a real query, not a greeting.  Only use word_count <= 2 for the auto-instant
+    # bucket ("hello", "hi there", "ok"), and rely on the greeting_patterns set for
+    # exact matches of 3-word greetings like "are you there".
     topic_stripped = topic_lower.rstrip(".!?,")
-    if topic_stripped in greeting_patterns or word_count <= 3:
+    if topic_stripped in greeting_patterns or word_count <= 2:
         return ClassifyResponse(
             tier="instant",
             estimated_duration_hours=0.01,
