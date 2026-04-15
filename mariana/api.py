@@ -47,7 +47,7 @@ import asyncpg
 import httpx
 import structlog
 import stripe as _stripe
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -488,45 +488,111 @@ def _row_to_finding_summary(row: asyncpg.Record) -> FindingSummary:
 # ---------------------------------------------------------------------------
 
 
+async def _authenticate_supabase_token(token: str) -> dict[str, str]:
+    """Verify a Supabase access token with Supabase Auth and return user info.
+
+    BUG-V2-01 fix: the previous implementation only base64-decoded the JWT
+    payload and trusted attacker-controlled claims, so an unsigned forged token
+    could impersonate any user. This helper now asks Supabase Auth to verify the
+    token cryptographically via ``GET /auth/v1/user`` before accepting it.
+    """
+    cfg = _get_config()
+    if not cfg.SUPABASE_URL:
+        raise HTTPException(status_code=503, detail="Authentication service not configured")
+
+    headers = {"Authorization": f"Bearer {token}"}
+    if cfg.SUPABASE_ANON_KEY:
+        headers["apikey"] = cfg.SUPABASE_ANON_KEY
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{cfg.SUPABASE_URL}/auth/v1/user", headers=headers)
+    except httpx.HTTPError as exc:
+        logger.warning("supabase_auth_unreachable", error=str(exc))
+        raise HTTPException(status_code=503, detail="Authentication service unavailable") from exc
+
+    if resp.status_code != 200:
+        logger.warning("supabase_auth_rejected_token", status=resp.status_code)
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        logger.error("supabase_auth_invalid_json", error=str(exc))
+        raise HTTPException(status_code=503, detail="Authentication service unavailable") from exc
+
+    user_id: str | None = payload.get("id") or payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token missing user identifier")
+
+    app_metadata = payload.get("app_metadata") or {}
+    role: str = payload.get("role") or app_metadata.get("role") or "authenticated"
+    return {"user_id": user_id, "role": role}
+
+
 async def _get_current_user(
     authorization: str | None = Header(None),
 ) -> dict[str, str]:
-    """
-    Validate a Supabase JWT and return basic user info.
-
-    Decodes the JWT payload (base64url middle segment) to extract the
-    ``sub`` (user_id) and ``role`` claims without performing a full
-    cryptographic verification.  Full verification requires the Supabase
-    JWT secret and can be added later; for now the caller is trusted
-    to present a well-formed token issued by Supabase.
-
-    Raises HTTP 401 for missing, malformed, or expired tokens.
-    """
+    """Validate a bearer token and return basic user info."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
-    token = authorization.split(" ", 1)[1]
-    try:
-        # JWT format: header.payload.signature  (all base64url-encoded)
-        payload_b64 = token.split(".")[1]
-        # Restore padding stripped during JWT encoding
-        payload_b64 += "=" * (4 - len(payload_b64) % 4)
-        payload = _json.loads(base64.urlsafe_b64decode(payload_b64))
-        # BUG-S2-02 fix: check the "exp" claim so expired JWTs are rejected.
-        # Without this, a stolen token works indefinitely.
-        import time as _time  # noqa: PLC0415
-        exp = payload.get("exp")
-        if exp is not None and _time.time() > float(exp):
-            raise HTTPException(status_code=401, detail="Token has expired")
-        user_id: str | None = payload.get("sub")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Token missing sub claim")
-        role: str = payload.get("role", "authenticated")
-        return {"user_id": user_id, "role": role}
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("jwt_decode_failed", error=str(exc))
-        raise HTTPException(status_code=401, detail="Invalid token") from exc
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    return await _authenticate_supabase_token(token)
+
+
+async def _get_current_user_from_header_or_query(
+    authorization: str | None = Header(None),
+    token: str | None = Query(None),
+) -> dict[str, str]:
+    """Authenticate from Authorization header or ``?token=`` query param."""
+    if authorization and authorization.startswith("Bearer "):
+        return await _get_current_user(authorization)
+    if token:
+        return await _authenticate_supabase_token(token.strip())
+    raise HTTPException(status_code=401, detail="Missing or invalid authorization credentials")
+
+
+async def _require_investigation_owner(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> dict[str, str]:
+    """Dependency that restricts a task-scoped endpoint to its owner or admin."""
+    db = _get_db()
+    row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+    if current_user["user_id"] == ADMIN_USER_ID:
+        return current_user
+
+    metadata = row.get("metadata") or {}
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    if metadata.get("user_id") != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="You do not own this investigation")
+    return current_user
+
+
+async def _require_investigation_owner_header_or_query(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user_from_header_or_query),
+) -> dict[str, str]:
+    """SSE-friendly ownership dependency for task-scoped endpoints."""
+    db = _get_db()
+    row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+    if current_user["user_id"] == ADMIN_USER_ID:
+        return current_user
+
+    metadata = row.get("metadata") or {}
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    if metadata.get("user_id") != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="You do not own this investigation")
+    return current_user
+
 
 
 async def _require_admin(
@@ -706,7 +772,8 @@ async def start_investigation(
     # ── Move pending uploads to task directory ──────────────────────────────
     uploaded_file_names: list[str] = []
     if body.upload_session_uuid:
-        pending_dir = Path(cfg.DATA_ROOT) / "uploads" / "pending" / body.upload_session_uuid
+        session_uuid = _validate_upload_session_uuid(body.upload_session_uuid)
+        pending_dir = Path(cfg.DATA_ROOT) / "uploads" / "pending" / session_uuid
         if pending_dir.is_dir():
             task_upload_dir = Path(cfg.DATA_ROOT) / "uploads" / task_id
             task_upload_dir.mkdir(parents=True, exist_ok=True)
@@ -723,7 +790,7 @@ async def start_investigation(
                 pass
             logger.info(
                 "pending_uploads_moved",
-                session_uuid=body.upload_session_uuid,
+                session_uuid=session_uuid,
                 task_id=task_id,
                 files=uploaded_file_names,
             )
@@ -872,7 +939,7 @@ async def get_investigation(
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
     task_user_id = metadata.get("user_id", "")
-    if task_user_id and task_user_id != current_user["user_id"] and current_user["user_id"] != ADMIN_USER_ID:
+    if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
     return _row_to_task_summary(row)
 
@@ -906,7 +973,7 @@ async def kill_investigation(
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
     task_user_id = metadata.get("user_id", "")
-    if task_user_id and task_user_id != current_user["user_id"] and current_user["user_id"] != ADMIN_USER_ID:
+    if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
 
     # BUG-021: Atomic conditional UPDATE to avoid race condition
@@ -942,7 +1009,10 @@ async def kill_investigation(
     response_model=list[BranchSummary],
     tags=["Branches"],
 )
-async def list_branches(task_id: str) -> list[BranchSummary]:
+async def list_branches(
+    task_id: str,
+    _: dict[str, str] = Depends(_require_investigation_owner),
+) -> list[BranchSummary]:
     """List all research branches for a given investigation."""
     db = _get_db()
     _ensure_task_exists(await db.fetchrow(
@@ -977,6 +1047,7 @@ async def list_findings(
     task_id: str,
     limit: int = Query(50, ge=1, le=500, description="Max findings to return"),
     evidence_type: str | None = Query(None, description="Filter by FOR / AGAINST / NEUTRAL"),
+    _: dict[str, str] = Depends(_require_investigation_owner),
 ) -> list[FindingSummary]:
     """List findings (evidence items) collected for an investigation."""
     db = _get_db()
@@ -1024,7 +1095,10 @@ async def list_findings(
     response_model=CostBreakdown,
     tags=["Cost"],
 )
-async def get_cost_breakdown(task_id: str) -> CostBreakdown:
+async def get_cost_breakdown(
+    task_id: str,
+    _: dict[str, str] = Depends(_require_investigation_owner),
+) -> CostBreakdown:
     """Return a detailed cost breakdown for an investigation."""
     db = _get_db()
     task_row = await db.fetchrow(
@@ -1093,6 +1167,7 @@ async def stream_logs(
     request: Request,
     task_id: str,
     format: str | None = Query(None, description="Set to 'legacy' for plain text events"),
+    _: dict[str, str] = Depends(_require_investigation_owner_header_or_query),
 ) -> EventSourceResponse:
     """
     Subscribe to live log events for a running investigation.
@@ -1217,7 +1292,10 @@ async def stream_logs(
     tags=["Reports"],
     summary="Download the PDF report for a completed investigation",
 )
-async def download_report_pdf(task_id: str) -> FileResponse:
+async def download_report_pdf(
+    task_id: str,
+    _: dict[str, str] = Depends(_require_investigation_owner),
+) -> FileResponse:
     """
     Stream the generated PDF report for a completed investigation.
 
@@ -1269,7 +1347,10 @@ async def download_report_pdf(task_id: str) -> FileResponse:
     tags=["Reports"],
     summary="Download the DOCX report (future capability)",
 )
-async def download_report_docx(task_id: str) -> FileResponse:
+async def download_report_docx(
+    task_id: str,
+    _: dict[str, str] = Depends(_require_investigation_owner),
+) -> FileResponse:
     """
     Stream the generated DOCX report for a completed investigation.
 
@@ -1369,7 +1450,7 @@ async def list_investigation_files(
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
     task_user_id = metadata.get("user_id", "")
-    if task_user_id and task_user_id != current_user["user_id"] and current_user["user_id"] != ADMIN_USER_ID:
+    if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
 
     files_dir = Path(cfg.DATA_ROOT) / "files" / task_id
@@ -1416,7 +1497,7 @@ async def download_investigation_file(
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
     task_user_id = metadata.get("user_id", "")
-    if task_user_id and task_user_id != current_user["user_id"] and current_user["user_id"] != ADMIN_USER_ID:
+    if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
 
     files_dir = Path(cfg.DATA_ROOT) / "files" / task_id
@@ -1448,7 +1529,7 @@ _UPLOAD_MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
 _UPLOAD_MAX_FILES_PER_INVESTIGATION: int = 5
 _UPLOAD_ALLOWED_EXTENSIONS: frozenset[str] = frozenset({
     ".pdf", ".txt", ".md", ".csv", ".json", ".html",
-    ".png", ".jpg", ".xlsx", ".docx",
+    ".png", ".jpg", ".jpeg", ".xlsx", ".docx",
 })
 
 _UPLOAD_MIME_MAP: dict[str, str] = {
@@ -1460,6 +1541,7 @@ _UPLOAD_MIME_MAP: dict[str, str] = {
     ".html": "text/html",
     ".png": "image/png",
     ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
@@ -1479,6 +1561,14 @@ class UploadResponse(BaseModel):
     files: list[UploadedFileInfo]
     task_id: str | None = None
     session_uuid: str | None = None
+
+
+def _validate_upload_session_uuid(session_uuid: str) -> str:
+    """Validate and normalize a pending-upload session UUID."""
+    try:
+        return str(uuid.UUID(session_uuid))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid upload session UUID") from exc
 
 
 @app.post(
@@ -1512,7 +1602,7 @@ async def upload_investigation_files(
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
     task_user_id = metadata.get("user_id", "")
-    if task_user_id and task_user_id != current_user["user_id"] and current_user["user_id"] != ADMIN_USER_ID:
+    if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
 
     if len(files) > _UPLOAD_MAX_FILES_PER_INVESTIGATION:
@@ -1578,6 +1668,7 @@ async def upload_investigation_files(
 )
 async def upload_pending_files(
     files: list[UploadFile] = File(...),
+    session_uuid: str | None = Form(None),
     current_user: dict[str, str] = Depends(_get_current_user),
 ) -> UploadResponse:
     """Upload files before an investigation exists (pre-submission).
@@ -1594,9 +1685,22 @@ async def upload_pending_files(
             detail=f"Maximum {_UPLOAD_MAX_FILES_PER_INVESTIGATION} files per upload",
         )
 
-    session_uuid = str(uuid.uuid4())
-    pending_dir = Path(cfg.DATA_ROOT) / "uploads" / "pending" / session_uuid
+    normalized_session_uuid = (
+        _validate_upload_session_uuid(session_uuid)
+        if session_uuid else str(uuid.uuid4())
+    )
+    pending_dir = Path(cfg.DATA_ROOT) / "uploads" / "pending" / normalized_session_uuid
     pending_dir.mkdir(parents=True, exist_ok=True)
+
+    existing_count = sum(1 for f in pending_dir.iterdir() if f.is_file())
+    if existing_count + len(files) > _UPLOAD_MAX_FILES_PER_INVESTIGATION:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Upload session already has {existing_count} files; max is "
+                f"{_UPLOAD_MAX_FILES_PER_INVESTIGATION}"
+            ),
+        )
 
     uploaded: list[UploadedFileInfo] = []
     for upload_file in files:
@@ -1628,11 +1732,11 @@ async def upload_pending_files(
 
     logger.info(
         "pending_files_uploaded",
-        session_uuid=session_uuid,
+        session_uuid=normalized_session_uuid,
         count=len(uploaded),
         user_id=current_user["user_id"],
     )
-    return UploadResponse(files=uploaded, session_uuid=session_uuid)
+    return UploadResponse(files=uploaded, session_uuid=normalized_session_uuid)
 
 
 # ---------------------------------------------------------------------------
