@@ -765,19 +765,25 @@ export default function Chat() {
   /* ---------------------------------------------------------------- */
 
   const startSSE = useCallback(
-    (taskId: string, token: string) => {
-      // BUG-001 / BUG-R1-09: Native EventSource cannot send custom headers,
-      // so the auth token must be passed as a URL query parameter instead.
-      // KNOWN TRADE-OFF: The token will appear in server access logs, browser
-      // history, and any monitoring tools that record full URLs.
-      // Mitigations:
-      //   1. Configure the backend to redact the `token` query param from logs.
-      //   2. Ideally, use a short-lived "stream token" from a dedicated endpoint
-      //      (POST /api/investigations/{id}/stream-token) rather than the
-      //      long-lived JWT, so a leaked URL has a narrow exposure window.
-      //   3. Long-term: replace EventSource with fetch + ReadableStream to
-      //      allow proper Authorization headers.
-      const url = `${API_URL}/api/investigations/${taskId}/logs?token=${encodeURIComponent(token)}`;
+    async (taskId: string, token: string) => {
+      // SEC-E3-R1-01: Mint a short-lived stream token instead of exposing
+      // the full JWT in the SSE query string. The stream token is HMAC-signed,
+      // bound to this specific task, and expires in 2 minutes.
+      let streamToken = token; // Fallback to JWT if mint fails
+      try {
+        const res = await fetch(`${API_URL}/api/investigations/${taskId}/stream-token`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (res.ok) {
+          const data = await res.json();
+          streamToken = data.stream_token;
+        }
+      } catch {
+        // Fallback: use JWT directly (backward compat with older backends)
+      }
+
+      const url = `${API_URL}/api/investigations/${taskId}/logs?token=${encodeURIComponent(streamToken)}`;
 
       try {
         const es = new EventSource(url);

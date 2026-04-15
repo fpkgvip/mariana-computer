@@ -266,7 +266,7 @@ async def generate_report(
         try:
             async with db.acquire() as _conn:
                 await _conn.execute(
-                    "UPDATE research_tasks SET status = 'FAILED' WHERE id = $1",
+                    "UPDATE research_tasks SET status = 'FAILED' WHERE id = $1 AND status != 'HALTED'",
                     task.id,
                 )
         except Exception as db_exc:

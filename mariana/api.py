@@ -32,9 +32,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import json as _json
 import os
+import secrets
 import re
 import sys
 import time
@@ -581,6 +584,52 @@ async def _require_investigation_owner(
     return current_user
 
 
+# ---------------------------------------------------------------------------
+# Stream token — short-lived HMAC-signed token for SSE (never expose full JWT)
+# ---------------------------------------------------------------------------
+_STREAM_TOKEN_SECRET: bytes = os.environ.get("STREAM_TOKEN_SECRET", secrets.token_hex(32)).encode()
+_STREAM_TOKEN_TTL_SECONDS = 120  # 2 minutes — client must refresh
+
+
+def _mint_stream_token(user_id: str, task_id: str) -> str:
+    """Create a short-lived HMAC-signed stream token for SSE.
+
+    Payload: ``{user_id}|{task_id}|{exp_timestamp}``
+    The token cannot be used for any other API endpoint.
+    """
+    exp = int(time.time()) + _STREAM_TOKEN_TTL_SECONDS
+    payload = f"{user_id}|{task_id}|{exp}"
+    sig = hmac.new(_STREAM_TOKEN_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
+
+
+def _verify_stream_token(token: str, task_id: str) -> str:
+    """Verify a stream token and return the user_id.
+
+    Raises HTTPException on any validation failure.
+    """
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode()).decode()
+        parts = decoded.split("|")
+        if len(parts) != 4:
+            raise ValueError("malformed")
+        user_id, tok_task_id, exp_str, sig = parts
+        # Verify HMAC
+        payload = f"{user_id}|{tok_task_id}|{exp_str}"
+        expected_sig = hmac.new(_STREAM_TOKEN_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            raise ValueError("bad signature")
+        # Verify task_id matches
+        if tok_task_id != task_id:
+            raise ValueError("task mismatch")
+        # Verify not expired
+        if int(exp_str) < int(time.time()):
+            raise ValueError("expired")
+        return user_id
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired stream token")
+
+
 async def _require_investigation_owner_header_or_query(
     task_id: str,
     current_user: dict[str, str] = Depends(_get_current_user_from_header_or_query),
@@ -599,6 +648,40 @@ async def _require_investigation_owner_header_or_query(
     if metadata.get("user_id") != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
     return current_user
+
+
+async def _authenticate_stream_token_or_header(
+    task_id: str,
+    authorization: str | None = Header(None),
+    stream_token: str | None = Query(None, alias="token"),
+) -> dict[str, str]:
+    """Authenticate SSE requests via stream token (preferred) or Authorization header.
+
+    Stream tokens are short-lived HMAC-signed tokens minted by
+    ``POST /api/investigations/{task_id}/stream-token``.
+    The full JWT is never sent in the query string.
+    """
+    if stream_token:
+        # Verify the stream token (short-lived, single-purpose)
+        user_id = _verify_stream_token(stream_token, task_id)
+        return {"user_id": user_id}
+    elif authorization and authorization.startswith("Bearer "):
+        raw_token = authorization.split(" ", 1)[1].strip()
+        if raw_token:
+            user = await _authenticate_supabase_token(raw_token)
+            # Verify ownership
+            db = _get_db()
+            row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+            if user["user_id"] != ADMIN_USER_ID:
+                metadata = row.get("metadata") or {}
+                if isinstance(metadata, str):
+                    metadata = json.loads(metadata)
+                if metadata.get("user_id") != user["user_id"]:
+                    raise HTTPException(status_code=403, detail="You do not own this investigation")
+            return user
+    raise HTTPException(status_code=401, detail="Missing or invalid authorization credentials")
 
 
 
@@ -1209,6 +1292,25 @@ async def get_cost_breakdown(
 # ---------------------------------------------------------------------------
 
 
+@app.post(
+    "/api/investigations/{task_id}/stream-token",
+    tags=["Logs"],
+    summary="Mint a short-lived stream token for SSE log streaming",
+)
+async def create_stream_token(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_require_investigation_owner),
+) -> dict[str, str]:
+    """Issue a short-lived HMAC-signed token for the SSE log endpoint.
+
+    The token is bound to the specific task and user, expires in 2 minutes,
+    and cannot be used for any other API endpoint. This avoids exposing the
+    full JWT bearer token in the SSE query string.
+    """
+    token = _mint_stream_token(current_user["user_id"], task_id)
+    return {"stream_token": token, "expires_in_seconds": _STREAM_TOKEN_TTL_SECONDS}
+
+
 @app.get(
     "/api/investigations/{task_id}/logs",
     tags=["Logs"],
@@ -1218,7 +1320,7 @@ async def stream_logs(
     request: Request,
     task_id: str,
     format: str | None = Query(None, description="Set to 'legacy' for plain text events"),
-    auth_context: dict[str, str] = Depends(_require_investigation_owner_header_or_query),
+    auth_context: dict[str, str] = Depends(_authenticate_stream_token_or_header),
 ) -> EventSourceResponse:
     """
     Subscribe to live log events for a running investigation.
@@ -1231,7 +1333,9 @@ async def stream_logs(
     """
 
     use_legacy = format == "legacy"
-    stream_token = auth_context.get("access_token", "")
+    # Stream tokens are short-lived and single-purpose — no JWT to re-validate.
+    # Periodic re-check verifies the task still exists and user still owns it.
+    _sse_user_id = auth_context["user_id"]
     auth_recheck_interval_seconds = 30.0
 
     async def _event_generator() -> AsyncIterator[dict[str, str]]:
@@ -1246,15 +1350,19 @@ async def stream_logs(
                         break
                     if time.monotonic() - last_auth_check >= auth_recheck_interval_seconds:
                         try:
-                            await _authenticate_supabase_token(stream_token)
-                        except HTTPException as exc:
-                            if exc.status_code == 401:
-                                yield {
-                                    "data": json.dumps({"error": "authentication_revoked"}),
-                                    "event": "error",
-                                }
+                            db = _get_db()
+                            row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
+                            if row is None:
+                                yield {"data": json.dumps({"error": "task_deleted"}), "event": "error"}
                                 break
-                            raise
+                            meta = row.get("metadata") or {}
+                            if isinstance(meta, str):
+                                meta = json.loads(meta)
+                            if _sse_user_id != ADMIN_USER_ID and meta.get("user_id") != _sse_user_id:
+                                yield {"data": json.dumps({"error": "authentication_revoked"}), "event": "error"}
+                                break
+                        except Exception:
+                            pass  # Transient DB issue — skip re-check, retry next cycle
                         last_auth_check = time.monotonic()
                     message = await pubsub.get_message(
                         ignore_subscribe_messages=True,
@@ -1315,15 +1423,18 @@ async def stream_logs(
                     break
                 if time.monotonic() - last_auth_check >= auth_recheck_interval_seconds:
                     try:
-                        await _authenticate_supabase_token(stream_token)
-                    except HTTPException as exc:
-                        if exc.status_code == 401:
-                            yield {
-                                "data": json.dumps({"error": "authentication_revoked"}),
-                                "event": "error",
-                            }
+                        row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
+                        if row is None:
+                            yield {"data": json.dumps({"error": "task_deleted"}), "event": "error"}
                             break
-                        raise
+                        meta = row.get("metadata") or {}
+                        if isinstance(meta, str):
+                            meta = json.loads(meta)
+                        if _sse_user_id != ADMIN_USER_ID and meta.get("user_id") != _sse_user_id:
+                            yield {"data": json.dumps({"error": "authentication_revoked"}), "event": "error"}
+                            break
+                    except Exception:
+                        pass  # Transient DB issue — skip re-check
                     last_auth_check = time.monotonic()
                 row = await db.fetchrow(
                     "SELECT status, current_state, total_spent_usd "
@@ -1608,6 +1719,16 @@ async def download_investigation_file(
 
 _UPLOAD_MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
 _UPLOAD_MAX_FILES_PER_INVESTIGATION: int = 5
+# SEC-E3-R1-02: Per-target lock to serialize file-count-and-write, preventing
+# parallel requests from bypassing the file cap via TOCTOU race.
+_upload_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_upload_lock(target_id: str) -> asyncio.Lock:
+    """Return a per-target asyncio.Lock for serializing upload file-count checks."""
+    if target_id not in _upload_locks:
+        _upload_locks[target_id] = asyncio.Lock()
+    return _upload_locks[target_id]
 _UPLOAD_ALLOWED_EXTENSIONS: frozenset[str] = frozenset({
     ".pdf", ".txt", ".md", ".csv", ".json", ".html",
     ".png", ".jpg", ".jpeg", ".xlsx", ".docx",
@@ -1695,42 +1816,44 @@ async def upload_investigation_files(
     upload_dir = Path(cfg.DATA_ROOT) / "uploads" / task_id
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    # Check existing file count
-    existing_count = sum(1 for f in upload_dir.iterdir() if f.is_file())
-    if existing_count + len(files) > _UPLOAD_MAX_FILES_PER_INVESTIGATION:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Investigation already has {existing_count} files; max is {_UPLOAD_MAX_FILES_PER_INVESTIGATION}",
-        )
-
-    uploaded: list[UploadedFileInfo] = []
-    for upload_file in files:
-        filename = upload_file.filename or "untitled"
-        suffix = Path(filename).suffix.lower()
-
-        if suffix not in _UPLOAD_ALLOWED_EXTENSIONS:
+    # SEC-E3-R1-02: Serialize count-check-and-write to prevent TOCTOU race
+    async with _get_upload_lock(task_id):
+        # Check existing file count
+        existing_count = sum(1 for f in upload_dir.iterdir() if f.is_file())
+        if existing_count + len(files) > _UPLOAD_MAX_FILES_PER_INVESTIGATION:
             raise HTTPException(
                 status_code=400,
-                detail=f"File type {suffix!r} not supported. Allowed: {', '.join(sorted(_UPLOAD_ALLOWED_EXTENSIONS))}",
+                detail=f"Investigation already has {existing_count} files; max is {_UPLOAD_MAX_FILES_PER_INVESTIGATION}",
             )
 
-        content = await upload_file.read()
-        if len(content) > _UPLOAD_MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=400,
-                detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024*1024)}MB limit",
-            )
+        uploaded: list[UploadedFileInfo] = []
+        for upload_file in files:
+            filename = upload_file.filename or "untitled"
+            suffix = Path(filename).suffix.lower()
 
-        # Sanitize filename (keep only safe characters)
-        safe_name = re.sub(r"[^\w\-.]", "_", filename)
-        dest = upload_dir / safe_name
-        dest.write_bytes(content)
+            if suffix not in _UPLOAD_ALLOWED_EXTENSIONS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File type {suffix!r} not supported. Allowed: {', '.join(sorted(_UPLOAD_ALLOWED_EXTENSIONS))}",
+                )
 
-        uploaded.append(UploadedFileInfo(
-            filename=safe_name,
-            size=len(content),
-            content_type=_UPLOAD_MIME_MAP.get(suffix, "application/octet-stream"),
-        ))
+            content = await upload_file.read()
+            if len(content) > _UPLOAD_MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024*1024)}MB limit",
+                )
+
+            # Sanitize filename (keep only safe characters)
+            safe_name = re.sub(r"[^\w\-.]", "_", filename)
+            dest = upload_dir / safe_name
+            dest.write_bytes(content)
+
+            uploaded.append(UploadedFileInfo(
+                filename=safe_name,
+                size=len(content),
+                content_type=_UPLOAD_MIME_MAP.get(suffix, "application/octet-stream"),
+            ))
 
     logger.info(
         "files_uploaded",
@@ -1786,43 +1909,45 @@ async def upload_pending_files(
     else:
         owner_meta.write_text(current_user["user_id"], encoding="utf-8")
 
-    existing_count = sum(1 for f in pending_dir.iterdir() if f.is_file() and f.name != ".owner")
-    if existing_count + len(files) > _UPLOAD_MAX_FILES_PER_INVESTIGATION:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Upload session already has {existing_count} files; max is "
-                f"{_UPLOAD_MAX_FILES_PER_INVESTIGATION}"
-            ),
-        )
-
-    uploaded: list[UploadedFileInfo] = []
-    for upload_file in files:
-        filename = upload_file.filename or "untitled"
-        suffix = Path(filename).suffix.lower()
-
-        if suffix not in _UPLOAD_ALLOWED_EXTENSIONS:
+    # SEC-E3-R1-02: Serialize count-check-and-write to prevent TOCTOU race
+    async with _get_upload_lock(f"pending-{normalized_session_uuid}"):
+        existing_count = sum(1 for f in pending_dir.iterdir() if f.is_file() and f.name != ".owner")
+        if existing_count + len(files) > _UPLOAD_MAX_FILES_PER_INVESTIGATION:
             raise HTTPException(
                 status_code=400,
-                detail=f"File type {suffix!r} not supported. Allowed: {', '.join(sorted(_UPLOAD_ALLOWED_EXTENSIONS))}",
+                detail=(
+                    f"Upload session already has {existing_count} files; max is "
+                    f"{_UPLOAD_MAX_FILES_PER_INVESTIGATION}"
+                ),
             )
 
-        content = await upload_file.read()
-        if len(content) > _UPLOAD_MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=400,
-                detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024*1024)}MB limit",
-            )
+        uploaded: list[UploadedFileInfo] = []
+        for upload_file in files:
+            filename = upload_file.filename or "untitled"
+            suffix = Path(filename).suffix.lower()
 
-        safe_name = re.sub(r"[^\w\-.]", "_", filename)
-        dest = pending_dir / safe_name
-        dest.write_bytes(content)
+            if suffix not in _UPLOAD_ALLOWED_EXTENSIONS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File type {suffix!r} not supported. Allowed: {', '.join(sorted(_UPLOAD_ALLOWED_EXTENSIONS))}",
+                )
 
-        uploaded.append(UploadedFileInfo(
-            filename=safe_name,
-            size=len(content),
-            content_type=_UPLOAD_MIME_MAP.get(suffix, "application/octet-stream"),
-        ))
+            content = await upload_file.read()
+            if len(content) > _UPLOAD_MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024*1024)}MB limit",
+                )
+
+            safe_name = re.sub(r"[^\w\-.]", "_", filename)
+            dest = pending_dir / safe_name
+            dest.write_bytes(content)
+
+            uploaded.append(UploadedFileInfo(
+                filename=safe_name,
+                size=len(content),
+                content_type=_UPLOAD_MIME_MAP.get(suffix, "application/octet-stream"),
+            ))
 
     logger.info(
         "pending_files_uploaded",
