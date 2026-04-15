@@ -29,6 +29,7 @@ import asyncio
 import traceback
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -43,6 +44,7 @@ from mariana.data.models import (
     Finding,
     HypothesisGenerationOutput,
     ReportDraftOutput,
+    ResearchArchitectureOutput,
     ResearchTask,
     SkepticQuestionsOutput,
     Source,
@@ -143,6 +145,11 @@ async def run(
     await _persist_task(task, db)
 
     log.info("event_loop_started", budget=task.budget_usd)
+    _emit_progress(redis_client, task.id, {
+        "type": "status_change",
+        "state": "INIT",
+        "message": "Investigation starting...",
+    })
 
     # ------------------------------------------------------------------
     # Attempt checkpoint resume
@@ -197,6 +204,26 @@ async def run(
                 state=task.current_state.value,
                 spent=cost_tracker.total_spent,
             )
+
+            # --------------------------------------------------------- #
+            # 0.5  Periodic credit balance check (every 50 iterations)
+            # --------------------------------------------------------- #
+            if iteration % 50 == 0:
+                user_id = getattr(task, "metadata", {}).get("user_id", "")
+                if user_id and getattr(config, "SUPABASE_URL", "") and getattr(config, "SUPABASE_SERVICE_KEY", ""):
+                    try:
+                        remaining_tokens = await _check_user_credits(user_id, config)
+                        if remaining_tokens is not None and remaining_tokens <= 0:
+                            log.warning("user_credits_exhausted", user_id=user_id)
+                            _emit_progress(redis_client, task.id, {
+                                "type": "text",
+                                "content": "Investigation paused \u2014 please add credits to continue.",
+                            })
+                            task.status = TaskStatus.HALTED
+                            task.current_state = State.HALT
+                            break
+                    except Exception as exc:
+                        log.debug("credit_check_failed", error=str(exc))
 
             # --------------------------------------------------------- #
             # 1. Build session data
@@ -265,6 +292,16 @@ async def run(
             await _persist_task(task, db)
 
             log.info("state_advanced", new_state=next_state.value, iteration=iteration)
+            _emit_progress(redis_client, task.id, {
+                "type": "status_change",
+                "state": next_state.value,
+                "message": f"Transitioned to {next_state.value}",
+            })
+            _emit_progress(redis_client, task.id, {
+                "type": "cost_update",
+                "spent_usd": round(cost_tracker.total_spent, 4),
+                "budget_usd": cost_tracker.task_budget,
+            })
 
             # Allow other coroutines to run (cooperative multitasking)
             await asyncio.sleep(0)
@@ -293,6 +330,17 @@ async def run(
             iterations=iteration,
             total_spent=cost_tracker.total_spent,
         )
+
+        # ── Save investigation to user memory for cross-session context ──
+        _mem_user_id = (task.metadata or {}).get("user_id", "")
+        if _mem_user_id and task.status == TaskStatus.COMPLETED:
+            try:
+                from mariana.tools.memory import UserMemory  # noqa: PLC0415
+                _mem = UserMemory(user_id=_mem_user_id, data_root=Path(config.DATA_ROOT))
+                _mem.add_to_history(task.topic, f"Completed in {iteration} iterations, cost ${cost_tracker.total_spent:.2f}")
+                log.info("user_memory_updated", user_id=_mem_user_id)
+            except Exception as _mem_exc:
+                log.debug("user_memory_save_skipped", error=str(_mem_exc))
 
     except BudgetExhaustedError as exc:
         log.warning(
@@ -581,12 +629,55 @@ async def handle_init(
     redis_client: Any,
     config: Any,
 ) -> None:
-    """Generate initial hypotheses for the task.
+    """Multi-step INIT: research architecture → hypothesis generation.
 
-    Calls the AI hypothesis-generation model and persists the resulting
-    Hypothesis records, creating one Branch per hypothesis.
+    Step 1: Generate a detailed research architecture (topic analysis,
+    research plan, hypotheses to test, data sources, timeline).
+    Step 2: Generate specific hypotheses informed by the architecture.
+    This ensures investigations are focused and cost-effective.
     """
     log = logger.bind(task_id=task.id, handler="init")
+
+    # ── Step 1: Research Architecture ─────────────────────────────────────
+    log.info("generating_research_architecture")
+    _emit_progress(redis_client, task.id, {
+        "type": "status_change",
+        "state": "INIT",
+        "message": "Analyzing topic and designing research architecture...",
+    })
+
+    arch_output, arch_session = await spawn_model(
+        task_type=TaskType.RESEARCH_ARCHITECTURE,
+        context={
+            "task_id": task.id,
+            "topic": task.topic,
+            "budget_remaining": cost_tracker.budget_remaining,
+            "budget_usd": task.budget_usd,
+        },
+        output_schema=ResearchArchitectureOutput,
+        branch_id=None,
+        db=db,
+        cost_tracker=cost_tracker,
+        config=config,
+    )
+    task.ai_call_counter += 1
+
+    architecture: ResearchArchitectureOutput = arch_output  # type: ignore[assignment]
+    log.info(
+        "research_architecture_ready",
+        hypotheses_count=len(architecture.hypotheses),
+        data_sources=len(architecture.data_sources),
+        complexity=architecture.estimated_complexity,
+    )
+
+    _emit_progress(redis_client, task.id, {
+        "type": "status_change",
+        "state": "INIT",
+        "message": f"Research plan ready ({len(architecture.hypotheses)} hypotheses, "
+                   f"{len(architecture.data_sources)} data sources). Generating detailed hypotheses...",
+    })
+
+    # ── Step 2: Hypothesis Generation (informed by architecture) ──────────
     log.info("generating_hypotheses")
 
     parsed_output, ai_session = await spawn_model(
@@ -595,6 +686,13 @@ async def handle_init(
             "task_id": task.id,
             "topic": task.topic,
             "budget_remaining": cost_tracker.budget_remaining,
+            "research_architecture": architecture.topic_analysis,
+            "research_plan": architecture.research_plan,
+            "architecture_hypotheses": [
+                {"statement": h.statement, "test_strategy": h.test_strategy}
+                for h in architecture.hypotheses
+            ],
+            "data_sources": architecture.data_sources,
         },
         output_schema=HypothesisGenerationOutput,
         branch_id=None,
@@ -665,6 +763,60 @@ async def handle_init(
                 created_hypotheses.append(hyp)
 
     log.info("hypotheses_ready", count=len(created_hypotheses))
+    _emit_progress(redis_client, task.id, {
+        "type": "text",
+        "content": f"Generated {len(created_hypotheses)} research hypotheses. Beginning investigation...",
+    })
+
+    # ── Skills detection ─────────────────────────────────────────────────
+    try:
+        from mariana.tools.skills import SkillManager  # noqa: PLC0415
+        skill_mgr = SkillManager(data_root=Path(config.DATA_ROOT))
+        detected_skill = skill_mgr.detect_skill(task.topic)
+        if detected_skill:
+            log.info("skill_detected", skill_id=detected_skill.id, skill_name=detected_skill.name)
+            # Store skill context on the task metadata for later prompt injection
+            task.metadata = {**(task.metadata or {}), "active_skill": detected_skill.id}
+            _emit_progress(redis_client, task.id, {
+                "type": "text",
+                "content": f"Activated skill: {detected_skill.name}",
+            })
+    except Exception as exc:
+        log.debug("skill_detection_skipped", error=str(exc))
+
+    # ── User memory injection ────────────────────────────────────────────
+    user_id = (task.metadata or {}).get("user_id", "")
+    if user_id:
+        try:
+            from mariana.tools.memory import UserMemory  # noqa: PLC0415
+            memory = UserMemory(user_id=user_id, data_root=Path(config.DATA_ROOT))
+            memory_ctx = memory.get_context_for_prompt()
+            if memory_ctx:
+                task.metadata = {**(task.metadata or {}), "user_memory_context": memory_ctx}
+                log.info("user_memory_loaded", user_id=user_id)
+        except Exception as exc:
+            log.debug("user_memory_skipped", error=str(exc))
+
+    # ── Sub-agent delegation for complex multi-faceted queries ───────────
+    if len(created_hypotheses) >= 3:
+        try:
+            from mariana.orchestrator.sub_agents import SubAgentManager, SubAgentRole  # noqa: PLC0415
+            sub_mgr = SubAgentManager(task.id, cost_tracker, redis_client, config)
+            # Delegate fact-checking to a sub-agent for the top hypothesis
+            top_hyp = created_hypotheses[0]
+            await sub_mgr.delegate(
+                SubAgentRole.FACT_CHECKER,
+                f"Preliminary fact-check: {top_hyp.statement}",
+                context=architecture.topic_analysis,
+            )
+            completed = await sub_mgr.execute_all(db=db, config=config)
+            if completed:
+                sub_ctx = sub_mgr.get_completed_context()
+                if sub_ctx:
+                    task.metadata = {**(task.metadata or {}), "sub_agent_findings": sub_ctx[:2000]}
+            log.info("sub_agents_complete", count=len(completed))
+        except Exception as exc:
+            log.debug("sub_agent_delegation_skipped", error=str(exc))
 
 
 async def handle_search(
@@ -678,12 +830,57 @@ async def handle_search(
     """Dispatch browser/connector searches for all active branches.
 
     For each active branch, dispatches evidence-extraction AI calls
-    against the current search plan.
+    against the current search plan.  When ``PERPLEXITY_API_KEY`` is
+    configured, a parallel Perplexity Sonar search is run first and
+    the results (with citations) are injected into the AI context.
     """
     log = logger.bind(task_id=task.id, handler="search")
     active = session_data.active_branches
 
     log.info("dispatching_search", active_branches=len(active))
+    _emit_progress(redis_client, task.id, {
+        "type": "status_change",
+        "state": "SEARCH",
+        "message": f"Searching across {len(active)} active branches...",
+    })
+
+    # ── Optional Perplexity parallel search ──────────────────────────────
+    perplexity_key: str = getattr(config, "PERPLEXITY_API_KEY", "") or ""
+    perplexity_context: dict[str, str] = {}  # branch_id → formatted results
+
+    if perplexity_key:
+        # Build one query per active branch from its hypothesis statement
+        branch_queries: list[tuple[str, str]] = []  # (branch_id, query)
+        for branch in active:
+            if branch.status != BranchStatus.ACTIVE:
+                continue
+            _h_row = await db.fetchrow(
+                "SELECT statement FROM hypotheses WHERE id = $1",
+                branch.hypothesis_id,
+            )
+            stmt = _h_row["statement"] if _h_row else ""
+            if stmt:
+                branch_queries.append((branch.id, stmt))
+
+        if branch_queries:
+            _emit_progress(redis_client, task.id, {
+                "type": "status_change",
+                "state": "SEARCH",
+                "message": f"Running {len(branch_queries)} Perplexity searches in parallel...",
+            })
+            try:
+                from mariana.tools.perplexity_search import (  # noqa: PLC0415
+                    format_results_with_citations,
+                    parallel_search,
+                )
+                queries = [q for _, q in branch_queries]
+                results = await parallel_search(queries, perplexity_key, max_concurrent=5)
+                for (bid, _query), result in zip(branch_queries, results):
+                    perplexity_context[bid] = format_results_with_citations([result])
+                log.info("perplexity_search_complete", results=len(results))
+            except Exception as exc:
+                log.warning("perplexity_search_failed", error=str(exc))
+    # ─────────────────────────────────────────────────────────────────────
 
     for branch in active:
         if branch.status != BranchStatus.ACTIVE:
@@ -697,13 +894,16 @@ async def handle_search(
             )
             _hyp_statement = _hyp_row["statement"] if _hyp_row else ""
 
+            # Inject Perplexity results as additional page_content if available
+            page_content = perplexity_context.get(branch.id, "")
+
             _, ai_session = await spawn_model(
                 task_type=TaskType.EVIDENCE_EXTRACTION,
                 context={
                     "task_id": task.id,
                     "hypothesis_id": branch.hypothesis_id,
                     "hypothesis_statement": _hyp_statement,
-                    "page_content": "",
+                    "page_content": page_content,
                     "source_url": "",
                     "sources_already_searched": branch.sources_searched,
                     "budget_remaining": cost_tracker.budget_remaining,
@@ -742,6 +942,11 @@ async def handle_evaluate(
     active = session_data.active_branches
 
     log.info("evaluating_branches", count=len(active))
+    _emit_progress(redis_client, task.id, {
+        "type": "status_change",
+        "state": "EVALUATE",
+        "message": f"Evaluating {len(active)} active branches...",
+    })
 
     for branch in active:
         if branch.status != BranchStatus.ACTIVE:
@@ -970,6 +1175,11 @@ async def handle_tribunal(
     counter-rebuttal, then judge verdict.
     """
     log = logger.bind(task_id=task.id, handler="tribunal")
+    _emit_progress(redis_client, task.id, {
+        "type": "status_change",
+        "state": "TRIBUNAL",
+        "message": "Running adversarial tribunal review...",
+    })
 
     # Find the highest-confidence finding to put on trial
     top_finding = await db.fetchrow(
@@ -1609,3 +1819,47 @@ def _best_branch_score(branches: list[Branch]) -> float | None:
     """Return the highest latest score among a list of branches, or None."""
     scores = [b.latest_score for b in branches if b.latest_score is not None]
     return max(scores) if scores else None
+
+
+async def _check_user_credits(user_id: str, config: Any) -> int | None:
+    """Check the user's remaining credit balance via Supabase REST API.
+
+    Returns the token count, or ``None`` if the check could not be performed.
+    """
+    import httpx as _httpx_check  # noqa: PLC0415
+
+    url = f"{config.SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=tokens"
+    headers = {
+        "apikey": config.SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {config.SUPABASE_SERVICE_KEY}",
+    }
+    async with _httpx_check.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            return None
+        rows = resp.json()
+        if not rows:
+            return None
+        return int(rows[0].get("tokens", 0) or 0)
+
+
+def _emit_progress(redis_client: Any, task_id: str, event: dict[str, Any]) -> None:
+    """Publish a structured progress event to the Redis logs channel.
+
+    Fire-and-forget: errors are logged but never raised, since progress
+    events are advisory and must not abort the investigation.
+    """
+    if redis_client is None:
+        return
+    import json as _json_emit  # noqa: PLC0415
+
+    try:
+        # redis.asyncio publish returns a coroutine; we schedule it but
+        # don't await it to keep the helper synchronous-callable.
+        import asyncio as _asyncio_emit  # noqa: PLC0415
+        loop = _asyncio_emit.get_running_loop()
+        loop.create_task(
+            redis_client.publish(f"logs:{task_id}", _json_emit.dumps(event))
+        )
+    except Exception as exc:
+        logger.debug("emit_progress_failed", task_id=task_id, error=str(exc))

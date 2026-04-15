@@ -21,44 +21,32 @@ interface Plan {
 
 const plans: Plan[] = [
   {
-    id: "researcher",
-    name: "Researcher",
-    price: 99,
-    credits: 1000,
-    features: [
-      "1,000 credits/month",
-      "Full access to Mariana Computer",
-      "Instant, standard, and deep investigations",
-      "PDF and Word report downloads",
-      "Published research library access",
-      "Email support",
-    ],
-  },
-  {
-    id: "professional",
-    name: "Professional",
-    price: 499,
-    credits: 10000,
+    id: "individual",
+    name: "Individual",
+    price: 299,
+    credits: 30000,
     highlighted: true,
     features: [
-      "10,000 credits/month",
-      "Everything in Researcher",
-      "Priority compute allocation",
-      "Multi-day autonomous investigations",
-      "Advanced data source access",
+      "30,000 credits/month",
+      "Full access to Mariana Computer",
+      "Instant, standard, and deep investigations",
+      "All built-in research skills",
+      "PDF, Word, and Excel report downloads",
+      "File uploads and attachments",
       "Priority support",
     ],
   },
   {
     id: "enterprise",
     name: "Enterprise",
-    price: 5000,
-    credits: 100000,
+    price: 3999,
+    credits: 500000,
     features: [
-      "100,000 credits/month",
-      "Everything in Professional",
-      "SLA guarantees",
-      "Dedicated research liaison",
+      "500,000 credits/month",
+      "Everything in Individual",
+      "Custom skills and workflows",
+      "Dedicated account manager",
+      "SLA-backed support",
       "Custom data source integration",
       "White-glove onboarding",
     ],
@@ -165,8 +153,8 @@ export default function Pricing() {
           </p>
         </ScrollReveal>
 
-        {/* Three subscription plans */}
-        <div className="mt-12 grid gap-6 sm:mt-16 md:grid-cols-3">
+        {/* Subscription plans */}
+        <div className="mt-12 grid gap-6 sm:mt-16 md:grid-cols-2 max-w-4xl mx-auto">
           {plans.map((plan, i) => (
             <ScrollReveal key={plan.id} delay={i * 100}>
               <div
@@ -204,23 +192,28 @@ export default function Pricing() {
                 </ul>
 
                 <div className="mt-8">
-                  <button
-                    onClick={() => handleSubscribe(plan.id)}
-                    disabled={loadingPlanId !== null}
-                    className={`flex w-full items-center justify-center gap-2 rounded-md px-4 py-3 text-sm font-medium transition-all disabled:opacity-60 ${
-                      plan.highlighted
-                        ? "bg-primary text-primary-foreground hover:bg-primary/90"
-                        : "bg-primary text-primary-foreground hover:bg-primary/90"
-                    }`}
-                  >
-                    {loadingPlanId === plan.id ? (
-                      <Loader2 size={14} className="animate-spin" />
-                    ) : (
-                      <>
-                        Subscribe <ArrowRight size={15} />
-                      </>
-                    )}
-                  </button>
+                  {plan.id === "enterprise" ? (
+                    <Link
+                      to="/contact"
+                      className="flex w-full items-center justify-center gap-2 rounded-md border border-border px-4 py-3 text-sm font-medium text-foreground transition-all hover:bg-secondary"
+                    >
+                      Contact Sales <ArrowRight size={15} />
+                    </Link>
+                  ) : (
+                    <button
+                      onClick={() => handleSubscribe(plan.id)}
+                      disabled={loadingPlanId !== null}
+                      className="flex w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-3 text-sm font-medium text-primary-foreground transition-all hover:bg-primary/90 disabled:opacity-60"
+                    >
+                      {loadingPlanId === plan.id ? (
+                        <Loader2 size={14} className="animate-spin" />
+                      ) : (
+                        <>
+                          Get Started <ArrowRight size={15} />
+                        </>
+                      )}
+                    </button>
+                  )}
                 </div>
               </div>
             </ScrollReveal>

@@ -13,9 +13,21 @@ import {
   Loader2,
   CheckCircle,
   XCircle,
+  Paperclip,
+  ExternalLink,
+  Zap,
+  Brain,
+  Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
+import ProgressTimeline, {
+  parseStructuredEvent,
+  type TimelineStep,
+  type StructuredEvent,
+} from "@/components/ProgressTimeline";
+import FileViewer, { FileCard, type FileAttachment } from "@/components/FileViewer";
+import FileUpload, { type UploadedFile } from "@/components/FileUpload";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
@@ -145,10 +157,54 @@ function renderMarkdown(text: string): string {
     .replace(/\*\*([^\n]{1,200})\*\*/g, "<strong>$1</strong>")
     // Italic — applied after bold so ** is already consumed
     .replace(/\*([^*\n]{1,200})\*/g, "<em>$1</em>")
+    // Links — [text](url) with XSS-safe href check (only http/https)
+    .replace(/\[([^\]]{1,200})\]\((https?:\/\/[^)]{1,500})\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-0.5 text-primary/80 hover:text-primary text-xs underline decoration-primary/30">$1<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="inline ml-0.5"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg></a>')
     // Newlines
     .replace(/\n/g, "<br />");
 
   return html;
+}
+
+/**
+ * Extract all citation URLs from a text string.
+ * Returns unique {text, url} pairs from markdown-style links.
+ */
+function extractCitations(text: string): Array<{ text: string; url: string }> {
+  const citations: Array<{ text: string; url: string }> = [];
+  const seen = new Set<string>();
+  const re = /\[([^\]]{1,200})\]\((https?:\/\/[^)]{1,500})\)/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const url = match[2];
+    if (!seen.has(url)) {
+      seen.add(url);
+      citations.push({ text: match[1], url });
+    }
+  }
+  return citations;
+}
+
+/** Auto-detect skill from topic text (client-side mirror of backend skill detection) */
+const SKILL_KEYWORDS: Array<{ id: string; name: string; keywords: string[] }> = [
+  { id: "research-report", name: "Research Report", keywords: ["report", "research report", "analysis", "deep dive"] },
+  { id: "financial-analysis", name: "Financial Analysis", keywords: ["financial", "earnings", "valuation", "SEC filing", "balance sheet"] },
+  { id: "competitive-analysis", name: "Competitive Analysis", keywords: ["competitive", "competition", "market share", "landscape"] },
+  { id: "data-analysis", name: "Data Analysis", keywords: ["data", "statistics", "quantitative", "correlation", "regression"] },
+  { id: "presentation-builder", name: "Presentation Builder", keywords: ["presentation", "slides", "pptx", "powerpoint", "deck"] },
+  { id: "excel-model", name: "Excel Model Builder", keywords: ["excel", "model", "spreadsheet", "dcf", "valuation model"] },
+];
+
+function detectSkill(topic: string): { id: string; name: string } | null {
+  const lower = topic.toLowerCase();
+  for (const skill of SKILL_KEYWORDS) {
+    for (const kw of skill.keywords) {
+      if (lower.includes(kw.toLowerCase())) {
+        return { id: skill.id, name: skill.name };
+      }
+    }
+  }
+  return null;
 }
 
 /** Format elapsed seconds as "Xh Ym" or "Ym Zs" */
@@ -203,6 +259,27 @@ export default function Chat() {
   // Per-investigation message store
   const messageStoreRef = useRef<Record<string, Message[]>>({});
 
+  // Timeline steps for structured progress events
+  const [timelineSteps, setTimelineSteps] = useState<TimelineStep[]>([]);
+  const timelineStoreRef = useRef<Record<string, TimelineStep[]>>({});
+
+  // File viewer state
+  const [viewingFile, setViewingFile] = useState<FileAttachment | null>(null);
+
+  // File upload state
+  const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
+  const [uploadSessionUuid, setUploadSessionUuid] = useState<string | null>(null);
+
+  // Credit animation state
+  const [creditAnimating, setCreditAnimating] = useState(false);
+  const prevTokensRef = useRef<number>(user?.tokens ?? 0);
+
+  // Memory panel state
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [memoryFacts, setMemoryFacts] = useState<Array<{ fact: string; category: string }>>([]);
+  const [memoryPrefs, setMemoryPrefs] = useState<Record<string, string>>({});
+  const [memoryLoading, setMemoryLoading] = useState(false);
+
   // Stable ref to current messages — prevents stale closure in switchInvestigation.
   // BUG-R2-11: Assign directly during render instead of via useEffect.
   // React docs explicitly sanction writing to a ref during render for this synchronization
@@ -222,6 +299,80 @@ export default function Chat() {
       return () => clearTimeout(timer);
     }
   }, [user, navigate]);
+
+  /* ---------------------------------------------------------------- */
+  /*  Credit change animation                                         */
+  /* ---------------------------------------------------------------- */
+
+  useEffect(() => {
+    if (!user) return;
+    if (prevTokensRef.current !== user.tokens && prevTokensRef.current > 0) {
+      setCreditAnimating(true);
+      const timer = setTimeout(() => setCreditAnimating(false), 1500);
+      return () => clearTimeout(timer);
+    }
+    prevTokensRef.current = user.tokens;
+  }, [user?.tokens]);
+
+  /* ---------------------------------------------------------------- */
+  /*  Memory panel helpers                                            */
+  /* ---------------------------------------------------------------- */
+
+  const loadMemory = useCallback(async () => {
+    setMemoryLoading(true);
+    try {
+      const token = await getAccessToken();
+      if (!token) return;
+      const res = await fetch(`${API_URL}/api/memory`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setMemoryFacts(data.facts || []);
+        setMemoryPrefs(data.preferences || {});
+      }
+    } catch {
+      // Memory API may not exist yet — silently ignore
+    } finally {
+      setMemoryLoading(false);
+    }
+  }, []);
+
+  const deleteMemoryFact = useCallback(async (fact: string) => {
+    try {
+      const token = await getAccessToken();
+      if (!token) return;
+      await fetch(`${API_URL}/api/memory/facts`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ fact }),
+      });
+      setMemoryFacts((prev) => prev.filter((f) => f.fact !== fact));
+      toast.success("Memory entry deleted");
+    } catch {
+      toast.error("Failed to delete memory entry");
+    }
+  }, []);
+
+  const deleteMemoryPref = useCallback(async (key: string) => {
+    try {
+      const token = await getAccessToken();
+      if (!token) return;
+      await fetch(`${API_URL}/api/memory/preferences`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ key }),
+      });
+      setMemoryPrefs((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      toast.success("Preference deleted");
+    } catch {
+      toast.error("Failed to delete preference");
+    }
+  }, []);
 
   /* ---------------------------------------------------------------- */
   /*  Load investigations from Supabase on mount                      */
@@ -313,6 +464,72 @@ export default function Chat() {
     const msgWithId: Message = msg._id ? msg : { ...msg, _id: makeMessageId() };
     setMessages((prev) => [...prev, msgWithId]);
   }, []);
+
+  /* ---------------------------------------------------------------- */
+  /*  Process structured SSE event into timeline step                 */
+  /* ---------------------------------------------------------------- */
+
+  const processStructuredEvent = useCallback((event: StructuredEvent) => {
+    if (event.type === "step_complete" || event.type === "step_error") {
+      // Update an existing step in-place
+      setTimelineSteps((prev) => {
+        const idx = prev.findIndex((s) => s.id === event.step_id);
+        if (idx >= 0) {
+          const updated = [...prev];
+          const existing = updated[idx];
+          updated[idx] = {
+            ...existing,
+            type: event.type as TimelineStep["type"],
+            status: event.type === "step_error" ? "error" : "complete",
+            duration_ms: event.duration_ms ?? existing.duration_ms,
+            detail: event.message ?? existing.detail,
+          };
+          return updated;
+        }
+        // Step not found — create a new one
+        const newStep = parseStructuredEvent(event, prev);
+        return newStep ? [...prev, newStep] : prev;
+      });
+    } else {
+      setTimelineSteps((prev) => {
+        const newStep = parseStructuredEvent(event, prev);
+        return newStep ? [...prev, newStep] : prev;
+      });
+    }
+
+    // For file_attached events, also add a message so it shows in the chat
+    if (event.type === "file_attached" && event.filename) {
+      appendMessage({
+        role: "system",
+        content: JSON.stringify({
+          type: "file_attached",
+          filename: event.filename,
+          size: event.size ?? 0,
+          mime: event.mime,
+        }),
+        type: "status",
+        id: `file-${event.filename}`,
+        _id: makeMessageId(),
+      });
+    }
+
+    // For cost_update events at investigation completion, show credit summary
+    if (event.type === "cost_update" && event.spent_usd != null) {
+      const creditsUsed = Math.round(event.spent_usd * 1.20 * 100);
+      appendMessage({
+        role: "system",
+        content: JSON.stringify({
+          type: "cost_summary",
+          credits_used: creditsUsed,
+          spent_usd: event.spent_usd,
+          budget_usd: event.budget_usd,
+        }),
+        type: "status",
+        id: `cost-final-${Date.now()}`,
+        _id: makeMessageId(),
+      });
+    }
+  }, [appendMessage]);
 
   /* ---------------------------------------------------------------- */
   /*  Update investigation status locally and in Supabase             */
@@ -494,6 +711,32 @@ export default function Chat() {
         es.onmessage = (event) => {
           try {
             const parsed = JSON.parse(event.data);
+
+            // Check if this is a structured progress event (has a "type" field)
+            const eventType = parsed.type as string | undefined;
+            if (eventType && [
+              "step_start", "step_complete", "step_error", "status_change",
+              "file_attached", "cost_update", "hypothesis_update", "text",
+            ].includes(eventType)) {
+              processStructuredEvent(parsed as StructuredEvent);
+
+              // Also check for terminal status in structured events
+              if (eventType === "status_change" && parsed.state === "HALT") {
+                updateInvestigationStatus(taskId, "COMPLETED");
+                appendMessage({
+                  role: "system",
+                  content: "Investigation complete. Reports are ready for download.",
+                  type: "status",
+                  id: `completed-${taskId}`,
+                  _id: makeMessageId(),
+                });
+                stopAllConnections();
+                refreshUser();
+              }
+              return;
+            }
+
+            // Legacy event format — fallback
             const content = parsed.message || parsed.content || parsed.data || event.data;
             const status = parsed.status as InvestigationStatus | undefined;
 
@@ -527,7 +770,6 @@ export default function Chat() {
                 _id: makeMessageId(),
               });
               stopAllConnections();
-              // BUG-018: Refresh credit balance after investigation completes
               refreshUser();
             } else if (status === "FAILED") {
               updateInvestigationStatus(taskId, "FAILED");
@@ -538,11 +780,10 @@ export default function Chat() {
                 _id: makeMessageId(),
               });
               stopAllConnections();
-              // BUG-018: Refresh credit balance after investigation completes
               refreshUser();
             }
           } catch {
-            // Plain text SSE event
+            // Plain text SSE event — add as legacy status message
             appendMessage({
               role: "system",
               content: event.data,
@@ -651,7 +892,7 @@ export default function Chat() {
         startPolling(taskId, token);
       }
     },
-    [appendMessage, refreshUser, startPolling, stopAllConnections, updateInvestigationStatus]
+    [appendMessage, processStructuredEvent, refreshUser, startPolling, stopAllConnections, updateInvestigationStatus]
   );
 
   /* ---------------------------------------------------------------- */
@@ -665,12 +906,20 @@ export default function Chat() {
       if (activeTaskId && messagesRef.current.length > 0) {
         messageStoreRef.current[activeTaskId] = [...messagesRef.current];
       }
+      // Save timeline steps for current investigation
+      if (activeTaskId) {
+        timelineStoreRef.current[activeTaskId] = [...timelineSteps];
+      }
 
       // Stop any active connections
       stopAllConnections();
 
       // Dismiss any pending plan when switching investigations
       setPendingPlan(null);
+
+      // Clear file upload state when switching
+      setUploadedFiles([]);
+      setUploadSessionUuid(null);
 
       // Load stored messages for the target investigation
       // BUG-R2-06: Fall back to messages currently shown if no store entry
@@ -680,6 +929,9 @@ export default function Chat() {
       setMessages(targetMessages);
       setActiveTaskId(taskId);
       setSidebarOpen(false);
+
+      // Restore timeline steps for target investigation
+      setTimelineSteps(timelineStoreRef.current[taskId] || []);
 
       // BUG-R2-06: Reseed seenStatusIds from the messages we're about to display.
       // Must happen after clear() so we don't leave stale IDs from the previous investigation.
@@ -692,11 +944,6 @@ export default function Chat() {
       const inv = investigations.find((i) => i.task_id === taskId);
       if (inv && (inv.status === "RUNNING" || inv.status === "PENDING")) {
         setIsSending(true);
-        // BUG-R2-05: getAccessToken() fetches the current session token.
-        // The token is baked into the SSE URL at connection time; if the user
-        // leaves this view open for >1h the EventSource reconnect will use the
-        // original (now-expired) URL and get 401s, triggering the onerror
-        // failover to polling which then fetches a fresh token on each tick.
         getAccessToken().then((token) => {
           if (token) {
             startTimer();
@@ -706,7 +953,7 @@ export default function Chat() {
       }
     },
     // messages removed from deps — using messagesRef.current instead
-    [activeTaskId, investigations, stopAllConnections, startSSE, startTimer]
+    [activeTaskId, investigations, timelineSteps, stopAllConnections, startSSE, startTimer]
   );
 
   /* ---------------------------------------------------------------- */
@@ -738,6 +985,9 @@ export default function Chat() {
     seenStatusIds.current.clear();
     stopConnectionsOnly();
     setPendingPlan(null);
+
+    // Clear timeline for new investigation
+    setTimelineSteps([]);
 
     const newMessages: Message[] = [
       { role: "user", content: topic, type: "text", _id: makeMessageId() },
@@ -828,22 +1078,48 @@ export default function Chat() {
     setMessages((prev) => [...prev, initMsg]);
 
     try {
+      const requestBody: Record<string, unknown> = {
+        topic,
+        plan_approved: planApproved,
+      };
+      if (uploadSessionUuid) {
+        requestBody.upload_session_uuid = uploadSessionUuid;
+      }
+
       const res = await fetch(`${API_URL}/api/investigations`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          topic,
-          plan_approved: planApproved,
-        }),
+        body: JSON.stringify(requestBody),
       });
 
       if (res.status === 401) {
         setIsSending(false);
         toast.error("Session expired", { description: "Please sign in again." });
         navigate("/login");
+        return;
+      }
+
+      if (res.status === 402) {
+        setIsSending(false);
+        setRetryPayload({ topic });
+        const errorData = await res.json().catch(() => ({}));
+        const detail = errorData.detail || "Insufficient credits to start this investigation.";
+        const estimated = errorData.estimated_credits;
+        const balance = user?.tokens ?? 0;
+        const msg = estimated
+          ? `Insufficient credits to start this investigation. Estimated cost: ${Number(estimated).toLocaleString()} credits. Your balance: ${balance.toLocaleString()} credits.`
+          : detail;
+        toast.error("Insufficient credits", { description: msg });
+        appendMessage({
+          role: "system",
+          content: msg,
+          type: "error",
+          id: `credits-${Date.now()}`,
+          _id: makeMessageId(),
+        });
         return;
       }
 
@@ -909,6 +1185,10 @@ export default function Chat() {
         _id: makeMessageId(),
       });
 
+      // Clear upload state after investigation starts
+      setUploadedFiles([]);
+      setUploadSessionUuid(null);
+
       // Start timer and SSE
       startTimer();
       startSSE(taskId, token);
@@ -925,7 +1205,7 @@ export default function Chat() {
       });
       setIsSending(false);
     }
-  }, [user, appendMessage, startTimer, startSSE, navigate]);
+  }, [user, uploadSessionUuid, appendMessage, startTimer, startSSE, navigate]);
 
   /* ---------------------------------------------------------------- */
   /*  Approve research plan                                           */
@@ -954,7 +1234,10 @@ export default function Chat() {
     setPendingPlan(null);
     // Remove the user message and plan from the chat — reset to empty
     setMessages([]);
+    setTimelineSteps([]);
     setActiveTaskId(null);
+    setUploadedFiles([]);
+    setUploadSessionUuid(null);
     seenStatusIds.current.clear();
   }, []);
 
@@ -1058,10 +1341,16 @@ export default function Chat() {
               if (activeTaskId && messagesRef.current.length > 0) {
                 messageStoreRef.current[activeTaskId] = [...messagesRef.current];
               }
+              if (activeTaskId) {
+                timelineStoreRef.current[activeTaskId] = [...timelineSteps];
+              }
               stopAllConnections();
               setActiveTaskId(null);
               setMessages([]);
+              setTimelineSteps([]);
               setPendingPlan(null);
+              setUploadedFiles([]);
+              setUploadSessionUuid(null);
               seenStatusIds.current.clear();
               setSidebarOpen(false);
             }}
@@ -1080,38 +1369,57 @@ export default function Chat() {
             {investigations.length === 0 && (
               <p className="text-xs text-muted-foreground/60 py-2">No investigations yet</p>
             )}
-            {investigations.map((inv) => (
-              <button
-                key={inv.task_id}
-                onClick={() => switchInvestigation(inv.task_id)}
-                className={`w-full rounded-md px-3 py-2 text-left text-xs transition-colors ${
-                  activeTaskId === inv.task_id
-                    ? "bg-secondary text-foreground"
-                    : "text-muted-foreground hover:bg-secondary/50 hover:text-foreground"
-                }`}
-              >
-                <div className="flex items-center gap-2">
-                  <span
-                    className={`inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[9px] font-medium ring-1 ring-inset ${
-                      STATUS_COLORS[inv.status]
-                    }`}
-                  >
-                    {inv.status}
-                  </span>
-                  <span className="truncate">{inv.topic}</span>
-                </div>
-              </button>
-            ))}
+            {investigations.map((inv) => {
+              const isActive = activeTaskId === inv.task_id;
+              const isInvRunning = inv.status === "RUNNING" || inv.status === "PENDING";
+              return (
+                <button
+                  key={inv.task_id}
+                  onClick={() => switchInvestigation(inv.task_id)}
+                  className={`w-full rounded-md px-3 py-2 text-left text-xs transition-colors ${
+                    isActive
+                      ? "bg-secondary text-foreground ring-1 ring-primary/30"
+                      : "text-muted-foreground hover:bg-secondary/50 hover:text-foreground"
+                  } ${isInvRunning && !isActive ? "ring-1 ring-blue-500/20" : ""}`}
+                >
+                  <div className="flex items-center gap-2">
+                    {isInvRunning && (
+                      <span className="relative flex h-2 w-2 shrink-0">
+                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
+                        <span className="relative inline-flex h-2 w-2 rounded-full bg-blue-500" />
+                      </span>
+                    )}
+                    <span
+                      className={`inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[9px] font-medium ring-1 ring-inset ${
+                        STATUS_COLORS[inv.status]
+                      }`}
+                    >
+                      {inv.status}
+                    </span>
+                    <span className="truncate">{inv.topic}</span>
+                  </div>
+                </button>
+              );
+            })}
           </div>
         </div>
 
         {/* User info */}
         <div className="border-t border-border px-4 py-3">
-          <div className="text-xs text-muted-foreground">
-            <span className="font-medium text-foreground">
-              {user.tokens.toLocaleString()}
-            </span>{" "}
-            credits
+          <div className="flex items-center justify-between">
+            <div className="text-xs text-muted-foreground">
+              <span className={`font-medium text-foreground ${creditAnimating ? "animate-credit-pulse" : ""}`}>
+                {user.tokens.toLocaleString()}
+              </span>{" "}
+              credits
+            </div>
+            <button
+              onClick={() => { setMemoryOpen(true); loadMemory(); }}
+              className="rounded-md p-1.5 text-muted-foreground/50 hover:text-primary hover:bg-secondary/50 transition-colors"
+              title="Memory"
+            >
+              <Brain size={14} />
+            </button>
           </div>
           <p className="mt-1 text-[10px] text-muted-foreground">
             {user.name} · {user.email}
@@ -1156,7 +1464,7 @@ export default function Chat() {
                 <span className="font-mono">Elapsed: {formatElapsed(elapsedSeconds)}</span>
               </div>
             )}
-            <div className="text-xs text-muted-foreground md:hidden">
+            <div className={`text-xs text-muted-foreground md:hidden ${creditAnimating ? "animate-credit-pulse" : ""}`}>
               {user.tokens.toLocaleString()} credits
             </div>
           </div>
@@ -1170,6 +1478,40 @@ export default function Chat() {
           className="flex-1 overflow-y-auto px-4 py-6 sm:px-6"
         >
           <div className="mx-auto max-w-2xl space-y-4">
+            {/* Zero credits banner */}
+            {user.tokens <= 0 && (
+              <div className="rounded-lg border border-red-500/30 bg-red-500/5 px-4 py-3">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle size={14} className="shrink-0 text-red-400" />
+                  <span className="text-sm font-medium text-red-400">
+                    You&apos;re out of credits. Upgrade your plan to continue researching.
+                  </span>
+                </div>
+                <Link
+                  to="/pricing"
+                  className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                >
+                  Upgrade
+                </Link>
+              </div>
+            )}
+
+            {/* Low credits warning */}
+            {user.tokens > 0 && user.tokens < 1000 && (
+              <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2">
+                <div className="flex items-center gap-2 text-xs text-amber-400">
+                  <AlertTriangle size={12} className="shrink-0" />
+                  <span>Low credits: {user.tokens.toLocaleString()} remaining</span>
+                  <Link
+                    to="/pricing"
+                    className="ml-auto text-[10px] underline underline-offset-2 hover:text-amber-300"
+                  >
+                    Upgrade
+                  </Link>
+                </div>
+              </div>
+            )}
+
             {/* Empty state */}
             {messages.length === 0 && !isSending && !pendingPlan && (
               <div className="flex flex-col items-center justify-center py-24 text-center">
@@ -1195,6 +1537,95 @@ export default function Chat() {
                       {msg.content}
                     </div>
                   </div>
+                ) : msg.type === "status" && (() => {
+                  // Try to parse structured content for special rendering
+                  try {
+                    const parsed = JSON.parse(msg.content);
+                    if (parsed.type === "file_attached") return true;
+                    if (parsed.type === "cost_summary") return true;
+                  } catch { /* not JSON, render normally */ }
+                  return false;
+                })() ? (
+                  (() => {
+                    try {
+                      const parsed = JSON.parse(msg.content);
+                      if (parsed.type === "file_attached") {
+                        const ext = (parsed.filename as string).split(".").pop()?.toLowerCase() || "";
+                        const isImage = ["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(ext);
+                        const isVideo = ["mp4", "webm", "mov"].includes(ext);
+                        const fileUrl = `${API_URL}/api/investigations/${activeTaskId || ""}/files/${encodeURIComponent(parsed.filename)}`;
+
+                        if (isImage) {
+                          return (
+                            <div className="space-y-1">
+                              <button
+                                onClick={() =>
+                                  setViewingFile({
+                                    filename: parsed.filename,
+                                    size: parsed.size,
+                                    mime: parsed.mime,
+                                    taskId: activeTaskId || "",
+                                  })
+                                }
+                                className="block max-w-sm rounded-md overflow-hidden border border-border hover:ring-1 hover:ring-primary/30 transition-all cursor-pointer"
+                              >
+                                <img
+                                  src={fileUrl}
+                                  alt={parsed.filename}
+                                  className="max-h-64 w-auto object-contain bg-black/20"
+                                  loading="lazy"
+                                />
+                              </button>
+                              <p className="text-[10px] text-muted-foreground/50">{parsed.filename}</p>
+                            </div>
+                          );
+                        }
+
+                        if (isVideo) {
+                          return (
+                            <div className="space-y-1 max-w-md">
+                              <video
+                                controls
+                                className="w-full rounded-md border border-border"
+                                preload="metadata"
+                              >
+                                <source src={fileUrl} type={`video/${ext === "mov" ? "mp4" : ext}`} />
+                                Your browser does not support video playback.
+                              </video>
+                              <p className="text-[10px] text-muted-foreground/50">{parsed.filename}</p>
+                            </div>
+                          );
+                        }
+
+                        return (
+                          <FileCard
+                            filename={parsed.filename}
+                            size={parsed.size}
+                            onClick={() =>
+                              setViewingFile({
+                                filename: parsed.filename,
+                                size: parsed.size,
+                                mime: parsed.mime,
+                                taskId: activeTaskId || "",
+                              })
+                            }
+                          />
+                        );
+                      }
+                      if (parsed.type === "cost_summary") {
+                        return (
+                          <div className="rounded-md border border-border bg-card/50 px-3 py-2 text-xs text-muted-foreground">
+                            <span className="font-medium text-foreground">
+                              {Number(parsed.credits_used).toLocaleString()} credits used
+                            </span>
+                            {" "}
+                            (${Number(parsed.spent_usd).toFixed(2)} + 20% markup)
+                          </div>
+                        );
+                      }
+                    } catch { /* fallthrough */ }
+                    return null;
+                  })()
                 ) : msg.type === "status" ? (
                   <div className="border-l-2 border-accent/40 pl-4 py-2">
                     <pre className="font-mono text-xs leading-6 text-muted-foreground whitespace-pre-wrap break-words">
@@ -1226,13 +1657,58 @@ export default function Chat() {
                     </pre>
                   </div>
                 ) : (
-                  <div
-                    className="max-w-[90%] text-sm leading-relaxed text-muted-foreground sm:max-w-lg"
-                    dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
-                  />
+                  <div className="max-w-[90%] sm:max-w-lg">
+                    <div
+                      className="text-sm leading-relaxed text-muted-foreground"
+                      dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
+                    />
+                    {(() => {
+                      const citations = extractCitations(msg.content);
+                      if (citations.length === 0) return null;
+                      return (
+                        <div className="mt-3 border-t border-border/50 pt-2">
+                          <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/50 mb-1">
+                            Sources
+                          </p>
+                          <div className="flex flex-wrap gap-x-3 gap-y-1">
+                            {citations.map((c) => (
+                              <a
+                                key={c.url}
+                                href={c.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-0.5 text-[11px] text-primary/70 hover:text-primary underline decoration-primary/20 underline-offset-2"
+                              >
+                                {c.text}
+                                <ExternalLink size={9} />
+                              </a>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
                 )}
               </div>
             ))}
+
+            {/* Progress Timeline — structured step events */}
+            {timelineSteps.length > 0 && (
+              <div className="border-l-2 border-blue-500/20 pl-4 py-2">
+                <ProgressTimeline
+                  steps={timelineSteps}
+                  onFileClick={(filename) => {
+                    if (activeTaskId) {
+                      setViewingFile({
+                        filename,
+                        size: 0,
+                        taskId: activeTaskId,
+                      });
+                    }
+                  }}
+                />
+              </div>
+            )}
 
             {/* Research Plan Card — shown after classify for standard/deep tiers */}
             {pendingPlan && (
@@ -1328,17 +1804,37 @@ export default function Chat() {
         {/* ---------------------------------------------------------- */}
         <div className="border-t border-border px-4 py-4 sm:px-6">
           <div className="mx-auto max-w-2xl">
+            {/* File upload previews */}
+            <FileUpload
+              uploadedFiles={uploadedFiles}
+              onFilesChange={setUploadedFiles}
+              sessionUuid={uploadSessionUuid}
+              onSessionUuid={setUploadSessionUuid}
+              disabled={isSending || isClassifying}
+              apiUrl={API_URL}
+            />
+            {/* Skill detection indicator */}
+            {input.trim().length > 3 && (() => {
+              const skill = detectSkill(input);
+              if (!skill) return null;
+              return (
+                <div className="mb-1.5 flex items-center gap-1.5 text-[10px] text-primary/70">
+                  <Zap size={10} />
+                  <span>Skill detected: <span className="font-medium">{skill.name}</span></span>
+                </div>
+              );
+            })()}
             <form onSubmit={handleSend} className="flex gap-2 sm:gap-3">
               <input
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                placeholder="Ask Mariana anything..."
+                placeholder={user.tokens <= 0 ? "Add credits to continue..." : "Ask Mariana anything..."}
                 className="min-w-0 flex-1 rounded-md border border-border bg-card px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary/20 sm:px-4"
-                disabled={isSending || isClassifying}
+                disabled={isSending || isClassifying || user.tokens <= 0}
               />
               <button
                 type="submit"
-                disabled={isSending || isClassifying || !input.trim()}
+                disabled={isSending || isClassifying || !input.trim() || user.tokens <= 0}
                 aria-label="Send"
                 className="flex shrink-0 items-center gap-2 rounded-md bg-primary px-3 py-2.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50 sm:px-4"
               >
@@ -1348,6 +1844,107 @@ export default function Chat() {
           </div>
         </div>
       </div>
+
+      {/* Memory panel slide-over */}
+      {memoryOpen && (
+        <>
+          <div className="fixed inset-0 z-50 bg-black/50" onClick={() => setMemoryOpen(false)} />
+          <div className="fixed inset-y-0 right-0 z-50 flex w-full max-w-sm flex-col border-l border-border bg-card shadow-2xl animate-slide-in-right">
+            <div className="flex items-center justify-between border-b border-border px-4 py-3">
+              <div className="flex items-center gap-2">
+                <Brain size={16} className="text-primary" />
+                <span className="text-sm font-medium text-foreground">Memory</span>
+              </div>
+              <button
+                onClick={() => setMemoryOpen(false)}
+                className="rounded-md p-1.5 text-muted-foreground hover:bg-secondary transition-colors"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto px-4 py-4">
+              {memoryLoading ? (
+                <div className="flex justify-center py-8">
+                  <Loader2 size={16} className="animate-spin text-muted-foreground" />
+                </div>
+              ) : (
+                <div className="space-y-6">
+                  {/* Facts */}
+                  <div>
+                    <h3 className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60 mb-2">
+                      Stored Facts
+                    </h3>
+                    {memoryFacts.length === 0 ? (
+                      <p className="text-xs text-muted-foreground/40">No facts stored yet</p>
+                    ) : (
+                      <div className="space-y-1.5">
+                        {memoryFacts.map((f, i) => (
+                          <div
+                            key={`${f.fact}-${i}`}
+                            className="group flex items-start gap-2 rounded-md border border-border/50 px-3 py-2"
+                          >
+                            <span className="flex-1 text-xs text-foreground leading-relaxed">{f.fact}</span>
+                            <button
+                              onClick={() => deleteMemoryFact(f.fact)}
+                              className="shrink-0 mt-0.5 opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-300 transition-opacity"
+                              title="Delete"
+                            >
+                              <Trash2 size={11} />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Preferences */}
+                  <div>
+                    <h3 className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60 mb-2">
+                      Preferences
+                    </h3>
+                    {Object.keys(memoryPrefs).length === 0 ? (
+                      <p className="text-xs text-muted-foreground/40">No preferences stored yet</p>
+                    ) : (
+                      <div className="space-y-1.5">
+                        {Object.entries(memoryPrefs).map(([key, value]) => (
+                          <div
+                            key={key}
+                            className="group flex items-start gap-2 rounded-md border border-border/50 px-3 py-2"
+                          >
+                            <div className="flex-1 min-w-0">
+                              <p className="text-[10px] font-medium text-muted-foreground">{key}</p>
+                              <p className="text-xs text-foreground">{value}</p>
+                            </div>
+                            <button
+                              onClick={() => deleteMemoryPref(key)}
+                              className="shrink-0 mt-0.5 opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-300 transition-opacity"
+                              title="Delete"
+                            >
+                              <Trash2 size={11} />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="border-t border-border px-4 py-3">
+              <p className="text-[10px] text-muted-foreground/40">
+                Memory persists across research sessions to improve results.
+              </p>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* File Viewer slide-over */}
+      <FileViewer
+        file={viewingFile}
+        onClose={() => setViewingFile(null)}
+        apiUrl={API_URL}
+      />
     </div>
   );
 }

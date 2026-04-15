@@ -96,6 +96,15 @@ export default {
           from: { opacity: "0", transform: "scale(0.97)" },
           to: { opacity: "1", transform: "scale(1)" },
         },
+        "slide-in-right": {
+          from: { transform: "translateX(100%)" },
+          to: { transform: "translateX(0)" },
+        },
+        "credit-pulse": {
+          "0%": { color: "hsl(var(--foreground))" },
+          "25%": { color: "hsl(45, 93%, 58%)" },
+          "100%": { color: "hsl(var(--foreground))" },
+        },
       },
       animation: {
         "accordion-down": "accordion-down 0.2s ease-out",
@@ -105,6 +114,8 @@ export default {
         "slide-up": "slide-up 1s cubic-bezier(0.16, 1, 0.3, 1) forwards",
         "fade-in-slow": "fade-in-slow 1.2s ease-out forwards",
         "scale-in": "scale-in 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards",
+        "slide-in-right": "slide-in-right 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards",
+        "credit-pulse": "credit-pulse 1.5s ease-out",
       },
     },
   },

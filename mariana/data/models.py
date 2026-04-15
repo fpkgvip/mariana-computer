@@ -81,6 +81,7 @@ class SourceType(str, Enum):
 class TaskType(str, Enum):
     """Logical type of an AI sub-task dispatched by the orchestrator."""
 
+    RESEARCH_ARCHITECTURE = "RESEARCH_ARCHITECTURE"
     HYPOTHESIS_GENERATION = "HYPOTHESIS_GENERATION"
     EVIDENCE_EXTRACTION = "EVIDENCE_EXTRACTION"
     EVALUATION = "EVALUATION"
@@ -551,6 +552,58 @@ class CostTracker(BaseModel):
 # ===========================================================================
 # AI Output Schemas
 # ===========================================================================
+
+
+class ResearchArchitectureHypothesis(BaseModel):
+    """A hypothesis proposed during the architecture phase."""
+
+    model_config = _COMMON_CONFIG
+
+    statement: str = Field(..., min_length=10, max_length=2048, description="Testable hypothesis")
+    test_strategy: str = Field(
+        ..., min_length=10, max_length=2048,
+        description="How to test this hypothesis — specific data sources, metrics, comparisons",
+    )
+    expected_outcome: str = Field(
+        ..., min_length=5, max_length=1024,
+        description="What finding would confirm or refute this hypothesis",
+    )
+    priority: int = Field(..., ge=1, le=10, description="Priority (1=lowest, 10=highest)")
+
+
+class ResearchArchitectureOutput(BaseModel):
+    """Structured output from the ResearchArchitecture planning phase.
+
+    This is the first AI call in an investigation. It produces a detailed
+    research plan BEFORE any search begins, ensuring the investigation is
+    focused and cost-effective.
+    """
+
+    model_config = _COMMON_CONFIG
+
+    topic_analysis: str = Field(
+        ..., min_length=50, max_length=4096,
+        description="Deep analysis of the research topic: key entities, relationships, regulatory context",
+    )
+    research_plan: str = Field(
+        ..., min_length=50, max_length=4096,
+        description="Step-by-step research plan with specific data sources and expected timeline",
+    )
+    hypotheses: list[ResearchArchitectureHypothesis] = Field(
+        ..., min_length=1,
+        description="Specific, actionable hypotheses to test during the investigation",
+    )
+    data_sources: list[str] = Field(
+        ..., min_length=1,
+        description="Prioritised list of data sources to check (Tier 1 first, then Tier 2)",
+    )
+    risk_factors: list[str] = Field(
+        default_factory=list,
+        description="Known risks or challenges for this investigation",
+    )
+    estimated_complexity: str = Field(
+        ..., description="low / medium / high — affects branch count and search depth",
+    )
 
 
 class GeneratedHypothesis(BaseModel):

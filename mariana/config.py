@@ -179,6 +179,15 @@ class AppConfig:
     DEEPSEEK_API_KEY: str = ""
 
     # ------------------------------------------------------------------
+    # External tool APIs
+    # ------------------------------------------------------------------
+    PERPLEXITY_API_KEY: str = ""
+    NANOBANANA_API_KEY: str = ""
+    VEO_API_KEY: str = ""
+    QUARTR_API_KEY: str = ""
+    FACTSET_API_KEY: str = ""
+
+    # ------------------------------------------------------------------
     # Batch API
     # ------------------------------------------------------------------
     BATCH_POLL_INTERVAL_SECONDS: int = 300
@@ -342,6 +351,12 @@ def load_config(env_file: str | Path | None = None) -> AppConfig:
         UNUSUAL_WHALES_API_KEY=_str("UNUSUAL_WHALES_API_KEY", ""),
         FRED_API_KEY=_str("FRED_API_KEY", ""),
         DEEPSEEK_API_KEY=_str("DEEPSEEK_API_KEY", ""),
+        # External tool APIs
+        PERPLEXITY_API_KEY=_str("PERPLEXITY_API_KEY", ""),
+        NANOBANANA_API_KEY=_str("NANOBANANA_API_KEY", ""),
+        VEO_API_KEY=_str("VEO_API_KEY", ""),
+        QUARTR_API_KEY=_str("QUARTR_API_KEY", ""),
+        FACTSET_API_KEY=_str("FACTSET_API_KEY", ""),
         # Batch
         BATCH_POLL_INTERVAL_SECONDS=_int("BATCH_POLL_INTERVAL_SECONDS", 300),
         # Timer

@@ -17,6 +17,7 @@ import Admin from "./pages/Admin";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
 import ResetPassword from "./pages/ResetPassword";
+import Skills from "./pages/Skills";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -46,6 +47,7 @@ const App = () => (
             {/* BUG-legacy: /buy-credits now redirects to /checkout for backward compat */}
             <Route path="/buy-credits" element={<Checkout />} />
             <Route path="/account" element={<Account />} />
+            <Route path="/skills" element={<Skills />} />
             <Route path="/admin" element={<Admin />} />
             <Route path="/login" element={<Login />} />
             <Route path="/signup" element={<Signup />} />

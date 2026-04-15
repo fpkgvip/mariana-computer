@@ -217,6 +217,11 @@ class CostTracker:
         return max(0.0, self.task_budget - self.total_spent)
 
     @property
+    def total_with_markup(self) -> float:
+        """Total USD spent including 20% platform markup."""
+        return self.total_spent * 1.20
+
+    @property
     def is_exhausted(self) -> bool:
         """True when the task budget has been fully consumed."""
         return self.total_spent >= self.task_budget

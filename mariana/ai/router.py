@@ -46,6 +46,12 @@ class ModelConfig:
 # ─── Routing table ───────────────────────────────────────────────────────────
 
 ROUTING_TABLE: dict[TaskType, ModelConfig] = {
+    TaskType.RESEARCH_ARCHITECTURE: ModelConfig(
+        model_id=ModelID.OPUS_46,
+        max_tokens=4096,
+        temperature=0.5,
+        use_batch=False,
+    ),
     TaskType.HYPOTHESIS_GENERATION: ModelConfig(
         model_id=ModelID.OPUS_46,
         max_tokens=4096,

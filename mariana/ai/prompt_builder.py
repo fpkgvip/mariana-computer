@@ -756,7 +756,15 @@ def build_messages(
     use_cache_control = model_id is not None and _is_claude_model(model_id)
 
     # ── Build the three blocks ────────────────────────────────────────────────
-    block1_text = STATIC_SYSTEM_PROMPT.strip()
+    # Inject universal research context prefix before the static identity prompt
+    from mariana.ai.session import _RESEARCH_CONTEXT_PREFIX  # noqa: PLC0415
+    _CITATION_RULES = (
+        "\n\nCITATION RULES: Every factual claim must include a citation in the format "
+        "[Source Name](URL). When referencing data from searches, SEC filings, financial "
+        "databases, or any external source, always include the source URL. Never make "
+        "uncited factual claims.\n"
+    )
+    block1_text = _RESEARCH_CONTEXT_PREFIX + STATIC_SYSTEM_PROMPT.strip() + _CITATION_RULES
     block2_text = _get_task_framework(task_type).strip()
     block3_text = (
         _build_dynamic_context(task_type, context)

@@ -403,12 +403,111 @@ async def _run_kill_task(db: Any, task_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+async def _deduct_user_credits(
+    user_id: str,
+    cost_tracker: Any,
+    config: Config,
+) -> None:
+    """Deduct credits from the user's Supabase profile after investigation.
+
+    Calculates tokens_to_deduct = int(cost_tracker.total_spent * 1.20 * 100)
+    (real cost + 20% markup, converted to tokens at $0.01/token).
+    """
+    if not user_id:
+        return
+    if not getattr(config, "SUPABASE_URL", "") or not getattr(config, "SUPABASE_SERVICE_KEY", ""):
+        logger.warning("supabase_not_configured_skip_credit_deduction")
+        return
+
+    total_with_markup = getattr(cost_tracker, "total_with_markup", cost_tracker.total_spent * 1.20)
+    tokens_to_deduct = int(total_with_markup * 100)
+
+    if tokens_to_deduct <= 0:
+        logger.info("no_credits_to_deduct", user_id=user_id, total_spent=cost_tracker.total_spent)
+        return
+
+    import httpx  # type: ignore[import]  # noqa: PLC0415
+
+    rpc_url = f"{config.SUPABASE_URL}/rest/v1/rpc/deduct_credits"
+    headers = {
+        "apikey": config.SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {config.SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                rpc_url,
+                json={"target_user_id": user_id, "amount": tokens_to_deduct},
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                logger.info(
+                    "credits_deducted",
+                    user_id=user_id,
+                    tokens_deducted=tokens_to_deduct,
+                    real_cost_usd=cost_tracker.total_spent,
+                    with_markup_usd=total_with_markup,
+                )
+                return
+
+            # Fallback: read-modify-PATCH
+            logger.warning(
+                "deduct_credits_rpc_unavailable",
+                status=resp.status_code,
+                fallback="read_modify_patch",
+            )
+            profile_url = (
+                f"{config.SUPABASE_URL}/rest/v1/profiles"
+                f"?id=eq.{user_id}&select=tokens"
+            )
+            get_resp = await client.get(profile_url, headers=headers)
+            if get_resp.status_code != 200:
+                logger.error("supabase_get_profile_failed_for_deduct", user_id=user_id)
+                return
+            rows = get_resp.json()
+            if not rows:
+                logger.error("supabase_profile_not_found_for_deduct", user_id=user_id)
+                return
+            current_tokens = int(rows[0].get("tokens", 0) or 0)
+            new_tokens = max(0, current_tokens - tokens_to_deduct)
+            patch_url = f"{config.SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}"
+            patch_resp = await client.patch(
+                patch_url,
+                json={"tokens": new_tokens},
+                headers={**headers, "Prefer": "return=minimal"},
+            )
+            if patch_resp.status_code not in (200, 204):
+                logger.error(
+                    "supabase_deduct_credits_fallback_failed",
+                    user_id=user_id,
+                    status=patch_resp.status_code,
+                )
+            else:
+                logger.info(
+                    "credits_deducted_via_patch",
+                    user_id=user_id,
+                    old=current_tokens,
+                    deducted=tokens_to_deduct,
+                    new=new_tokens,
+                )
+    except Exception as exc:
+        logger.error(
+            "credit_deduction_failed",
+            user_id=user_id,
+            error=str(exc),
+            tokens_to_deduct=tokens_to_deduct,
+        )
+
+
 async def _run_single(
     config: Config,
     db: Any,
     redis_client: Any,
     topic: str,
     budget: float,
+    user_id: str = "",
+    task_id: str | None = None,
 ) -> int:
     """
     Run a single investigation and return exit code.
@@ -419,12 +518,13 @@ async def _run_single(
     from mariana.orchestrator.cost_tracker import CostTracker  # noqa: PLC0415
 
     task = ResearchTask(
-        id=str(uuid.uuid4()),
+        id=task_id or str(uuid.uuid4()),
         topic=topic,
         budget_usd=budget,
         status=TaskStatus.RUNNING,
         current_state=State.INIT,
         started_at=datetime.now(tz=timezone.utc),
+        metadata={"user_id": user_id} if user_id else {},
     )
 
     await _insert_task(db, task)
@@ -433,6 +533,7 @@ async def _run_single(
         task_id=task.id,
         topic=topic,
         budget_usd=budget,
+        user_id=user_id or "none",
     )
 
     cost_tracker = CostTracker(task_id=task.id, task_budget=task.budget_usd)
@@ -451,12 +552,17 @@ async def _run_single(
             "investigation_complete",
             task_id=task.id,
             total_spent_usd=cost_tracker.total_spent,
+            total_with_markup_usd=cost_tracker.total_with_markup,
             total_calls=cost_tracker.call_count,
         )
+        # Deduct credits from user's Supabase profile
+        await _deduct_user_credits(user_id, cost_tracker, config)
         return 0
 
     except KeyboardInterrupt:
         logger.info("investigation_interrupted", task_id=task.id)
+        # Still deduct for work done before interruption
+        await _deduct_user_credits(user_id, cost_tracker, config)
         return 1
 
     except Exception as exc:
@@ -468,6 +574,8 @@ async def _run_single(
             exc_info=True,
         )
         await _mark_task_failed(db, task.id, f"{type(exc).__name__}: {exc}")
+        # Deduct credits even on failure — the cost was incurred
+        await _deduct_user_credits(user_id, cost_tracker, config)
         return 1
 
 
@@ -476,15 +584,66 @@ async def _run_single(
 # ---------------------------------------------------------------------------
 
 
+_MAX_CONCURRENT_INVESTIGATIONS: int = 4
+"""Maximum number of investigations that can run concurrently in daemon mode."""
+
+
+async def _run_single_guarded(
+    semaphore: asyncio.Semaphore,
+    config: Config,
+    db: Any,
+    redis_client: Any,
+    topic: str,
+    budget: float,
+    user_id: str,
+    task_id: str | None,
+    task_file: Path,
+) -> None:
+    """Run a single investigation guarded by a concurrency semaphore.
+
+    Renames the task file to ``.done`` or ``.error`` based on result.
+    """
+    async with semaphore:
+        logger.info(
+            "daemon_task_started",
+            file=task_file.name,
+            topic=topic[:60],
+            budget_usd=budget,
+            user_id=user_id or "none",
+        )
+        exit_code = await _run_single(
+            config=config,
+            db=db,
+            redis_client=redis_client,
+            topic=topic,
+            budget=budget,
+            user_id=user_id,
+            task_id=task_id,
+        )
+        if exit_code == 0:
+            task_file.rename(task_file.with_suffix(".done"))
+            logger.info("daemon_task_done", file=task_file.name)
+        else:
+            task_file.rename(task_file.with_suffix(".error"))
+            logger.warning("daemon_task_failed", file=task_file.name)
+
+
 async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
     """
     Poll an inbox directory for ``.task.json`` files and run investigations.
+
+    Supports up to ``_MAX_CONCURRENT_INVESTIGATIONS`` investigations running
+    in parallel via an ``asyncio.Semaphore``. The inbox is polled every
+    10 seconds; new tasks are spawned as ``asyncio.Task`` instances while
+    the polling loop continues.
 
     File format:
     {
         "topic":        "Research topic string",
         "budget_usd":   50.0,
-        "duration_hours": 2.0
+        "duration_hours": 2.0,
+        "user_id":      "uuid",
+        "id":           "task-uuid"
     }
 
     Processing:
@@ -495,9 +654,70 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
     """
     inbox = Path(config.DATA_ROOT) / "inbox"
     inbox.mkdir(parents=True, exist_ok=True)
-    logger.info("daemon_start", inbox=str(inbox), poll_interval_s=10)
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_INVESTIGATIONS)
+    active_tasks: set[asyncio.Task[None]] = set()
+
+    logger.info(
+        "daemon_start",
+        inbox=str(inbox),
+        poll_interval_s=10,
+        max_concurrent=_MAX_CONCURRENT_INVESTIGATIONS,
+    )
+
+    # ── Resume interrupted investigations from .running files ────────────
+    # On container restart, any .running files represent investigations that
+    # were in progress when the container was stopped.  Resume them.
+    running_files = sorted(inbox.glob("*.running"))
+    for rf in running_files:
+        try:
+            raw_resume = rf.read_text(encoding="utf-8")
+            resume_data = json.loads(raw_resume)
+            topic_r = resume_data.get("topic", "").strip()
+            budget_r = float(resume_data.get("budget_usd", resume_data.get("budget", 50.0)))
+            user_id_r = resume_data.get("user_id", "")
+            task_id_r = resume_data.get("id", "")
+            if topic_r:
+                logger.info(
+                    "daemon_resuming_interrupted",
+                    file=rf.name,
+                    task_id=task_id_r,
+                    topic=topic_r[:60],
+                )
+                budget_r = max(1.0, min(budget_r, config.BUDGET_TASK_HARD_CAP))
+                task = asyncio.create_task(
+                    _run_single_guarded(
+                        semaphore=semaphore,
+                        config=config,
+                        db=db,
+                        redis_client=redis_client,
+                        topic=topic_r,
+                        budget=budget_r,
+                        user_id=user_id_r,
+                        task_id=task_id_r or None,
+                        task_file=rf,
+                    ),
+                    name=f"resume-{task_id_r or rf.stem}",
+                )
+                active_tasks.add(task)
+        except Exception as exc:
+            logger.error("daemon_resume_failed", file=rf.name, error=str(exc))
+            rf.rename(rf.with_suffix(".error"))
+
+    if running_files:
+        logger.info("daemon_resumed_tasks", count=len(active_tasks))
 
     while not _SHUTDOWN.is_set():
+        # Clean up completed tasks
+        done_tasks = {t for t in active_tasks if t.done()}
+        for t in done_tasks:
+            # Log any unexpected exceptions from completed tasks
+            if t.exception() is not None:
+                logger.error(
+                    "daemon_task_exception",
+                    error=str(t.exception()),
+                )
+            active_tasks.discard(t)
+
         task_files = sorted(inbox.glob("*.task.json"))
 
         for tf in task_files:
@@ -518,7 +738,10 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
 
             topic = task_data.get("topic", "").strip()
             budget = float(task_data.get("budget_usd", task_data.get("budget", 50.0)))
-            duration_hours = float(task_data.get("duration_hours", 2.0))
+            user_id = task_data.get("user_id", "")
+            file_task_id = task_data.get("id", "")
+            # max_duration_hours: null/missing = unlimited (never kill prematurely)
+            _max_dur = task_data.get("max_duration_hours")  # noqa: F841  (reserved for future use)
 
             if not topic:
                 logger.warning(
@@ -535,29 +758,45 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
                 file=tf.name,
                 topic=topic[:60],
                 budget_usd=budget,
-                duration_hours=duration_hours,
+                user_id=user_id or "none",
+                active_tasks=len(active_tasks),
             )
 
-            exit_code = await _run_single(
-                config=config,
-                db=db,
-                redis_client=redis_client,
-                topic=topic,
-                budget=budget,
-            )
+            # Rename to .running to prevent re-pickup on next poll
+            running_file = tf.with_suffix(".running")
+            tf.rename(running_file)
 
-            if exit_code == 0:
-                tf.rename(tf.with_suffix(".done"))
-                logger.info("daemon_task_done", file=tf.name)
-            else:
-                tf.rename(tf.with_suffix(".error"))
-                logger.warning("daemon_task_failed", file=tf.name)
+            # Spawn as a concurrent task
+            task = asyncio.create_task(
+                _run_single_guarded(
+                    semaphore=semaphore,
+                    config=config,
+                    db=db,
+                    redis_client=redis_client,
+                    topic=topic,
+                    budget=budget,
+                    user_id=user_id,
+                    task_id=file_task_id or None,
+                    task_file=running_file,
+                ),
+                name=f"investigation-{file_task_id or tf.stem}",
+            )
+            active_tasks.add(task)
 
         # Wait 10 seconds before next poll, waking early on shutdown.
         try:
             await asyncio.wait_for(_SHUTDOWN.wait(), timeout=10.0)
         except asyncio.TimeoutError:
             pass  # Normal — no shutdown signal yet.
+
+    # On shutdown: wait for active tasks to checkpoint + complete (120s grace)
+    # Investigations use periodic checkpointing so they can resume after restart.
+    if active_tasks:
+        logger.info("daemon_waiting_for_active_tasks", count=len(active_tasks))
+        done, pending = await asyncio.wait(active_tasks, timeout=120.0)
+        for t in pending:
+            logger.warning("daemon_cancelling_task", task_name=t.get_name())
+            t.cancel()
 
     logger.info("daemon_stopped")
 

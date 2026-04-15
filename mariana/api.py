@@ -47,7 +47,7 @@ import asyncpg
 import httpx
 import structlog
 import stripe as _stripe
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -250,6 +250,9 @@ class StartInvestigationRequest(BaseModel):
         None, gt=0.0, description="Max duration in hours (AI-determined if omitted)"
     )
     plan_approved: bool = Field(False, description="Whether user has approved the research plan")
+    upload_session_uuid: str | None = Field(
+        None, description="Session UUID from pre-submission file uploads (from POST /api/upload)",
+    )
 
 
 class ClassifyRequest(BaseModel):
@@ -537,44 +540,35 @@ async def _require_admin(
 # These are placeholder IDs; replace with real ones from the Stripe dashboard.
 _PLANS: list[dict[str, Any]] = [
     {
-        "id": "researcher",
-        "name": "Researcher",
-        "price_usd_monthly": 99.0,
-        "credits_per_month": 1000,
-        "stripe_price_id": os.environ.get("STRIPE_PRICE_RESEARCHER", "price_researcher"),
-        "description": "For individual analysts and academics",
+        "id": "individual",
+        "name": "Individual",
+        "price_usd_monthly": 299.0,
+        "credits_per_month": 30_000,
+        "stripe_price_id": os.environ.get("STRIPE_PRICE_INDIVIDUAL", "price_individual"),
+        "description": "For individual analysts and researchers",
         "features": [
-            "1,000 research credits/month",
-            "Standard investigations",
-            "PDF & DOCX report export",
-            "Email support",
-        ],
-    },
-    {
-        "id": "professional",
-        "name": "Professional",
-        "price_usd_monthly": 499.0,
-        "credits_per_month": 10_000,
-        "stripe_price_id": os.environ.get("STRIPE_PRICE_PROFESSIONAL", "price_professional"),
-        "description": "For power users and small teams",
-        "features": [
-            "10,000 research credits/month",
+            "30,000 research credits/month",
             "Standard + Deep investigations",
-            "Priority queue",
-            "PDF & DOCX report export",
+            "PDF, DOCX, PPTX, XLSX report export",
+            "Perplexity-powered web search",
+            "Persistent memory across sessions",
             "Priority support",
         ],
     },
     {
         "id": "enterprise",
         "name": "Enterprise",
-        "price_usd_monthly": 5000.0,
-        "credits_per_month": 100_000,
+        "price_usd_monthly": 3999.0,
+        "credits_per_month": 500_000,
         "stripe_price_id": os.environ.get("STRIPE_PRICE_ENTERPRISE", "price_enterprise"),
         "description": "For large organisations with heavy research workloads",
         "features": [
-            "100,000 research credits/month",
+            "500,000 research credits/month",
             "All investigation tiers incl. Flagship",
+            "Concurrent investigations (up to 4)",
+            "Sub-agent delegation",
+            "Custom skills",
+            "Image & video generation",
             "Dedicated queue",
             "Custom integrations",
             "Dedicated account manager",
@@ -584,14 +578,16 @@ _PLANS: list[dict[str, Any]] = [
 ]
 
 #: Tier-to-credit cost mapping used by the classification heuristic.
+#: At $0.01/credit, these map to: instant=$0.10, standard=$5, deep=$20.
+#: Minimum budgets: standard=$5, deep=$20 per the architecture spec.
 _TIER_CREDITS: dict[str, int] = {
-    "instant": 1,
-    "standard": 75,
-    "deep": 1200,
+    "instant": 10,
+    "standard": 500,
+    "deep": 2000,
 }
 
-#: Credits-to-USD ratio (1 credit = $0.10 by default)
-_CREDIT_USD_RATE: float = 0.10
+#: Credits-to-USD ratio (1 credit = $0.01 USD)
+_CREDIT_USD_RATE: float = 0.01
 
 
 # ---------------------------------------------------------------------------
@@ -684,11 +680,53 @@ async def start_investigation(
         else float(classification.estimated_credits) * _CREDIT_USD_RATE
     )
 
+    # ── Pre-flight credit balance check ───────────────────────────────────
+    # estimated_credits_needed = budget_usd * 120 (real cost → tokens at
+    # $0.01/token, with 20% markup: budget * 100 * 1.20 = budget * 120)
+    estimated_credits_needed = int(effective_budget_usd * 120)
+    user_tokens = await _supabase_get_user_tokens(current_user["user_id"], cfg)
+    if user_tokens is not None and user_tokens < estimated_credits_needed:
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                f"Insufficient credits: you have {user_tokens} tokens but this "
+                f"investigation requires an estimated {estimated_credits_needed} tokens "
+                f"(budget ${effective_budget_usd:.2f} + 20% markup). "
+                "Please add credits or reduce the budget."
+            ),
+        )
+
+    # ── Move pending uploads to task directory ──────────────────────────────
+    uploaded_file_names: list[str] = []
+    if body.upload_session_uuid:
+        pending_dir = Path(cfg.DATA_ROOT) / "uploads" / "pending" / body.upload_session_uuid
+        if pending_dir.is_dir():
+            task_upload_dir = Path(cfg.DATA_ROOT) / "uploads" / task_id
+            task_upload_dir.mkdir(parents=True, exist_ok=True)
+            import shutil
+            for f in pending_dir.iterdir():
+                if f.is_file():
+                    dest = task_upload_dir / f.name
+                    shutil.move(str(f), str(dest))
+                    uploaded_file_names.append(f.name)
+            # Clean up empty pending directory
+            try:
+                pending_dir.rmdir()
+            except OSError:
+                pass
+            logger.info(
+                "pending_uploads_moved",
+                session_uuid=body.upload_session_uuid,
+                task_id=task_id,
+                files=uploaded_file_names,
+            )
+
     task_payload: dict[str, Any] = {
         "id": task_id,
         "topic": body.topic,
         "budget_usd": effective_budget_usd,
         "duration_hours": effective_duration_hours,
+        "max_duration_hours": None,  # null = unlimited; only set if user explicitly chooses a limit
         "status": "PENDING",
         "created_at": created_at,
         # Adaptive-mode metadata
@@ -696,6 +734,7 @@ async def start_investigation(
         "plan_approved": body.plan_approved,
         "user_id": current_user["user_id"],
         "estimated_credits": classification.estimated_credits,
+        "uploaded_files": uploaded_file_names,
     }
 
     inbox = Path(cfg.inbox_dir)
@@ -998,7 +1037,11 @@ async def get_cost_breakdown(task_id: str) -> CostBreakdown:
     tags=["Logs"],
     summary="Stream real-time log events via Server-Sent Events",
 )
-async def stream_logs(request: Request, task_id: str) -> EventSourceResponse:
+async def stream_logs(
+    request: Request,
+    task_id: str,
+    format: str | None = Query(None, description="Set to 'legacy' for plain text events"),
+) -> EventSourceResponse:
     """
     Subscribe to live log events for a running investigation.
 
@@ -1008,6 +1051,8 @@ async def stream_logs(request: Request, task_id: str) -> EventSourceResponse:
 
     Falls back to polling the DB ``task_logs`` table if Redis is unavailable.
     """
+
+    use_legacy = format == "legacy"
 
     async def _event_generator() -> AsyncIterator[dict[str, str]]:
         if _redis is not None:
@@ -1023,7 +1068,24 @@ async def stream_logs(request: Request, task_id: str) -> EventSourceResponse:
                         timeout=1.0,
                     )
                     if message is not None:
-                        yield {"data": message.get("data", ""), "event": "log"}
+                        raw_data = message.get("data", "")
+                        if use_legacy:
+                            # Convert structured JSON events to plain text
+                            try:
+                                evt = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
+                                if isinstance(evt, dict):
+                                    evt_type = evt.get("type", "")
+                                    if evt_type == "text":
+                                        raw_data = evt.get("content", raw_data)
+                                    elif evt_type == "status_change":
+                                        raw_data = f"[{evt.get('state', '')}] {evt.get('message', '')}"
+                                    elif evt_type == "cost_update":
+                                        raw_data = f"Cost: ${evt.get('spent_usd', 0):.4f} / ${evt.get('budget_usd', 0):.2f}"
+                                    elif evt_type == "file_attached":
+                                        raw_data = f"File: {evt.get('filename', '')} ({evt.get('size', 0)} bytes)"
+                            except (json.JSONDecodeError, ValueError):
+                                pass  # Use raw_data as-is
+                        yield {"data": raw_data, "event": "log"}
                     else:
                         # BUG-006: Use _db_pool directly to avoid HTTPException inside generator
                         if _db_pool is None:
@@ -1203,6 +1265,322 @@ async def download_report_docx(task_id: str) -> FileResponse:
         filename=filename,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ---------------------------------------------------------------------------
+# Routes — File Attachments (AI → User)
+# ---------------------------------------------------------------------------
+
+
+class FileAttachmentInfo(BaseModel):
+    """Metadata for an investigation artifact file."""
+
+    filename: str
+    size: int
+    mime: str
+    created_at: str
+
+
+_MIME_MAP: dict[str, str] = {
+    ".md": "text/markdown",
+    ".csv": "text/csv",
+    ".html": "text/html",
+    ".pdf": "application/pdf",
+    ".json": "application/json",
+    ".txt": "text/plain",
+}
+
+
+@app.get(
+    "/api/investigations/{task_id}/files",
+    response_model=list[FileAttachmentInfo],
+    tags=["Files"],
+    summary="List all artifact files for an investigation",
+)
+async def list_investigation_files(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> list[FileAttachmentInfo]:
+    """List all files (analysis, data, snapshots) produced by an investigation."""
+    cfg = _get_config()
+    db = _get_db()
+
+    # Verify user owns the investigation
+    row = await db.fetchrow(
+        "SELECT metadata FROM research_tasks WHERE id = $1",
+        task_id,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+
+    metadata = row.get("metadata") or {}
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    task_user_id = metadata.get("user_id", "")
+    if task_user_id and task_user_id != current_user["user_id"] and current_user["user_id"] != ADMIN_USER_ID:
+        raise HTTPException(status_code=403, detail="You do not own this investigation")
+
+    files_dir = Path(cfg.DATA_ROOT) / "files" / task_id
+    if not files_dir.is_dir():
+        return []
+
+    result: list[FileAttachmentInfo] = []
+    for f in sorted(files_dir.iterdir()):
+        if f.is_file():
+            stat = f.stat()
+            suffix = f.suffix.lower()
+            result.append(FileAttachmentInfo(
+                filename=f.name,
+                size=stat.st_size,
+                mime=_MIME_MAP.get(suffix, "application/octet-stream"),
+                created_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            ))
+    return result
+
+
+@app.get(
+    "/api/investigations/{task_id}/files/{filename:path}",
+    tags=["Files"],
+    summary="Download a specific artifact file",
+)
+async def download_investigation_file(
+    task_id: str,
+    filename: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> FileResponse:
+    """Download a specific file from an investigation's artifacts."""
+    cfg = _get_config()
+    db = _get_db()
+
+    # Verify user owns the investigation
+    row = await db.fetchrow(
+        "SELECT metadata FROM research_tasks WHERE id = $1",
+        task_id,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+
+    metadata = row.get("metadata") or {}
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    task_user_id = metadata.get("user_id", "")
+    if task_user_id and task_user_id != current_user["user_id"] and current_user["user_id"] != ADMIN_USER_ID:
+        raise HTTPException(status_code=403, detail="You do not own this investigation")
+
+    files_dir = Path(cfg.DATA_ROOT) / "files" / task_id
+    file_path = (files_dir / filename).resolve()
+
+    # Path traversal protection
+    data_root = Path(cfg.DATA_ROOT).resolve()
+    if not file_path.is_relative_to(data_root):
+        raise HTTPException(status_code=403, detail="Access denied: path outside data root")
+
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail=f"File {filename!r} not found")
+
+    suffix = file_path.suffix.lower()
+    mime = _MIME_MAP.get(suffix, "application/octet-stream")
+    return FileResponse(
+        path=str(file_path),
+        media_type=mime,
+        filename=file_path.name,
+        headers={"Content-Disposition": f'attachment; filename="{file_path.name}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Routes — File Uploads (User → Server)
+# ---------------------------------------------------------------------------
+
+_UPLOAD_MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
+_UPLOAD_MAX_FILES_PER_INVESTIGATION: int = 5
+_UPLOAD_ALLOWED_EXTENSIONS: frozenset[str] = frozenset({
+    ".pdf", ".txt", ".md", ".csv", ".json", ".html",
+    ".png", ".jpg", ".xlsx", ".docx",
+})
+
+_UPLOAD_MIME_MAP: dict[str, str] = {
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".csv": "text/csv",
+    ".json": "application/json",
+    ".html": "text/html",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+
+
+class UploadedFileInfo(BaseModel):
+    """Metadata for an uploaded file."""
+
+    filename: str
+    size: int
+    content_type: str
+
+
+class UploadResponse(BaseModel):
+    """Response from a file upload."""
+
+    files: list[UploadedFileInfo]
+    task_id: str | None = None
+    session_uuid: str | None = None
+
+
+@app.post(
+    "/api/investigations/{task_id}/upload",
+    response_model=UploadResponse,
+    tags=["Uploads"],
+    summary="Upload files to an existing investigation",
+)
+async def upload_investigation_files(
+    task_id: str,
+    files: list[UploadFile] = File(...),
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> UploadResponse:
+    """Upload files to an existing investigation.
+
+    Max 10MB per file, max 5 files per investigation.
+    Supported types: .pdf, .txt, .md, .csv, .json, .html, .png, .jpg, .xlsx, .docx
+    """
+    cfg = _get_config()
+    db = _get_db()
+
+    # Verify user owns the investigation
+    row = await db.fetchrow(
+        "SELECT metadata FROM research_tasks WHERE id = $1",
+        task_id,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+
+    metadata = row.get("metadata") or {}
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    task_user_id = metadata.get("user_id", "")
+    if task_user_id and task_user_id != current_user["user_id"] and current_user["user_id"] != ADMIN_USER_ID:
+        raise HTTPException(status_code=403, detail="You do not own this investigation")
+
+    if len(files) > _UPLOAD_MAX_FILES_PER_INVESTIGATION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum {_UPLOAD_MAX_FILES_PER_INVESTIGATION} files per upload",
+        )
+
+    upload_dir = Path(cfg.DATA_ROOT) / "uploads" / task_id
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check existing file count
+    existing_count = sum(1 for f in upload_dir.iterdir() if f.is_file())
+    if existing_count + len(files) > _UPLOAD_MAX_FILES_PER_INVESTIGATION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Investigation already has {existing_count} files; max is {_UPLOAD_MAX_FILES_PER_INVESTIGATION}",
+        )
+
+    uploaded: list[UploadedFileInfo] = []
+    for upload_file in files:
+        filename = upload_file.filename or "untitled"
+        suffix = Path(filename).suffix.lower()
+
+        if suffix not in _UPLOAD_ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File type {suffix!r} not supported. Allowed: {', '.join(sorted(_UPLOAD_ALLOWED_EXTENSIONS))}",
+            )
+
+        content = await upload_file.read()
+        if len(content) > _UPLOAD_MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024*1024)}MB limit",
+            )
+
+        # Sanitize filename (keep only safe characters)
+        safe_name = re.sub(r"[^\w\-.]", "_", filename)
+        dest = upload_dir / safe_name
+        dest.write_bytes(content)
+
+        uploaded.append(UploadedFileInfo(
+            filename=safe_name,
+            size=len(content),
+            content_type=_UPLOAD_MIME_MAP.get(suffix, "application/octet-stream"),
+        ))
+
+    logger.info(
+        "files_uploaded",
+        task_id=task_id,
+        count=len(uploaded),
+        user_id=current_user["user_id"],
+    )
+    return UploadResponse(files=uploaded, task_id=task_id)
+
+
+@app.post(
+    "/api/upload",
+    response_model=UploadResponse,
+    tags=["Uploads"],
+    summary="Upload files before creating an investigation",
+)
+async def upload_pending_files(
+    files: list[UploadFile] = File(...),
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> UploadResponse:
+    """Upload files before an investigation exists (pre-submission).
+
+    Files are saved to a temporary pending directory keyed by a session UUID.
+    When the investigation is created, these files can be moved to the
+    investigation's upload directory.
+    """
+    cfg = _get_config()
+
+    if len(files) > _UPLOAD_MAX_FILES_PER_INVESTIGATION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum {_UPLOAD_MAX_FILES_PER_INVESTIGATION} files per upload",
+        )
+
+    session_uuid = str(uuid.uuid4())
+    pending_dir = Path(cfg.DATA_ROOT) / "uploads" / "pending" / session_uuid
+    pending_dir.mkdir(parents=True, exist_ok=True)
+
+    uploaded: list[UploadedFileInfo] = []
+    for upload_file in files:
+        filename = upload_file.filename or "untitled"
+        suffix = Path(filename).suffix.lower()
+
+        if suffix not in _UPLOAD_ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File type {suffix!r} not supported. Allowed: {', '.join(sorted(_UPLOAD_ALLOWED_EXTENSIONS))}",
+            )
+
+        content = await upload_file.read()
+        if len(content) > _UPLOAD_MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024*1024)}MB limit",
+            )
+
+        safe_name = re.sub(r"[^\w\-.]", "_", filename)
+        dest = pending_dir / safe_name
+        dest.write_bytes(content)
+
+        uploaded.append(UploadedFileInfo(
+            filename=safe_name,
+            size=len(content),
+            content_type=_UPLOAD_MIME_MAP.get(suffix, "application/octet-stream"),
+        ))
+
+    logger.info(
+        "pending_files_uploaded",
+        session_uuid=session_uuid,
+        count=len(uploaded),
+        user_id=current_user["user_id"],
+    )
+    return UploadResponse(files=uploaded, session_uuid=session_uuid)
 
 
 # ---------------------------------------------------------------------------
@@ -1798,6 +2176,108 @@ async def _supabase_add_credits(
             )
 
 
+async def _supabase_get_user_tokens(
+    user_id: str,
+    cfg: AppConfig,
+) -> int | None:
+    """Fetch the current token balance for a user from Supabase profiles."""
+    if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
+        return None
+    url = (
+        f"{cfg.SUPABASE_URL}/rest/v1/profiles"
+        f"?id=eq.{user_id}&select=tokens"
+    )
+    headers = {
+        "apikey": cfg.SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            logger.error(
+                "supabase_get_tokens_failed",
+                user_id=user_id,
+                status=resp.status_code,
+            )
+            return None
+        rows = resp.json()
+        if not rows:
+            return None
+        return int(rows[0].get("tokens", 0) or 0)
+
+
+async def _supabase_deduct_credits(
+    user_id: str,
+    amount: int,
+    cfg: AppConfig,
+) -> bool:
+    """Deduct credits from a user's Supabase profile via RPC.
+
+    Calls the ``deduct_credits`` RPC function. Falls back to
+    read-modify-PATCH if the function is unavailable.
+
+    Returns True on success, False on failure.
+    """
+    if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
+        logger.warning("supabase_not_configured_skip_deduct")
+        return False
+
+    rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/deduct_credits"
+    headers = {
+        "apikey": cfg.SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            rpc_url,
+            json={"target_user_id": user_id, "amount": amount},
+            headers=headers,
+        )
+        if resp.status_code == 200:
+            logger.info("credits_deducted_via_rpc", user_id=user_id, amount=amount)
+            return True
+
+        # Fallback: read current balance and PATCH
+        logger.warning(
+            "deduct_credits_rpc_unavailable",
+            status=resp.status_code,
+            fallback="read_modify_patch",
+        )
+        profile_url = f"{cfg.SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=tokens"
+        get_resp = await client.get(profile_url, headers=headers)
+        if get_resp.status_code != 200:
+            logger.error("supabase_get_profile_failed_for_deduct", user_id=user_id)
+            return False
+        rows = get_resp.json()
+        if not rows:
+            logger.error("supabase_profile_not_found_for_deduct", user_id=user_id)
+            return False
+        current_tokens: int = int(rows[0].get("tokens", 0) or 0)
+        new_tokens = max(0, current_tokens - amount)
+        patch_url = f"{cfg.SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}"
+        patch_resp = await client.patch(
+            patch_url,
+            json={"tokens": new_tokens},
+            headers={**headers, "Prefer": "return=minimal"},
+        )
+        if patch_resp.status_code not in (200, 204):
+            logger.error(
+                "supabase_deduct_credits_fallback_failed",
+                user_id=user_id,
+                status=patch_resp.status_code,
+            )
+            return False
+        logger.info(
+            "credits_deducted_via_patch",
+            user_id=user_id,
+            old=current_tokens,
+            deducted=amount,
+            new=new_tokens,
+        )
+        return True
+
+
 async def _get_stripe_customer_id(
     user_id: str,
     cfg: AppConfig,
@@ -2126,6 +2606,177 @@ def _exit_process() -> None:
     """
     logger.info("api_process_exit")
     os._exit(0)  # noqa: SLF001
+
+
+# ---------------------------------------------------------------------------
+# Routes — Memory
+# ---------------------------------------------------------------------------
+
+
+class MemoryFactRequest(BaseModel):
+    """Request body for storing a user fact."""
+    fact: str = Field(..., min_length=1, max_length=2000)
+    category: str = Field(default="general", max_length=100)
+
+
+class MemoryPreferenceRequest(BaseModel):
+    """Request body for storing a user preference."""
+    key: str = Field(..., min_length=1, max_length=200)
+    value: str = Field(..., min_length=1, max_length=2000)
+
+
+class MemoryResponse(BaseModel):
+    """Response containing user memory data."""
+    facts: list[str]
+    preferences: dict[str, str]
+    history: list[dict[str, str]]
+
+
+@app.get("/api/memory", response_model=MemoryResponse, tags=["Memory"])
+async def get_memory(
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> MemoryResponse:
+    """Retrieve the current user's persistent memory."""
+    from pathlib import Path as _MemPath  # noqa: PLC0415
+    from mariana.tools.memory import UserMemory  # noqa: PLC0415
+
+    cfg = _get_config()
+    mem = UserMemory(user_id=current_user["user_id"], data_root=_MemPath(cfg.DATA_ROOT))
+    return MemoryResponse(
+        facts=mem.get_facts(),
+        preferences=mem.get_preferences(),
+        history=mem.get_history(limit=20),
+    )
+
+
+@app.post("/api/memory/facts", tags=["Memory"], status_code=201)
+async def store_fact(
+    body: MemoryFactRequest,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> dict[str, str]:
+    """Store a durable fact for the current user."""
+    from pathlib import Path as _MemPath  # noqa: PLC0415
+    from mariana.tools.memory import UserMemory  # noqa: PLC0415
+
+    cfg = _get_config()
+    mem = UserMemory(user_id=current_user["user_id"], data_root=_MemPath(cfg.DATA_ROOT))
+    mem.store_fact(body.fact, body.category)
+    return {"status": "ok"}
+
+
+@app.post("/api/memory/preferences", tags=["Memory"], status_code=201)
+async def store_preference(
+    body: MemoryPreferenceRequest,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> dict[str, str]:
+    """Store a preference for the current user."""
+    from pathlib import Path as _MemPath  # noqa: PLC0415
+    from mariana.tools.memory import UserMemory  # noqa: PLC0415
+
+    cfg = _get_config()
+    mem = UserMemory(user_id=current_user["user_id"], data_root=_MemPath(cfg.DATA_ROOT))
+    mem.store_preference(body.key, body.value)
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Routes — Skills
+# ---------------------------------------------------------------------------
+
+
+class CreateSkillRequest(BaseModel):
+    """Request body for creating a custom skill."""
+    name: str = Field(..., min_length=1, max_length=200)
+    description: str = Field(..., min_length=1, max_length=2000)
+    system_prompt: str = Field(..., min_length=1, max_length=10000)
+    trigger_keywords: list[str] = Field(..., min_length=1, max_length=20)
+
+
+class SkillResponse(BaseModel):
+    """Public representation of a skill."""
+    id: str
+    name: str
+    description: str
+    trigger_keywords: list[str]
+    category: str
+    owner_id: str | None = None
+
+
+@app.get("/api/skills", response_model=list[SkillResponse], tags=["Skills"])
+async def list_skills(
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> list[SkillResponse]:
+    """List all available skills (built-in + custom)."""
+    from pathlib import Path as _SkPath  # noqa: PLC0415
+    from mariana.tools.skills import SkillManager  # noqa: PLC0415
+
+    cfg = _get_config()
+    mgr = SkillManager(data_root=_SkPath(cfg.DATA_ROOT))
+    skills = mgr.list_skills(owner_id=current_user["user_id"])
+    return [
+        SkillResponse(
+            id=s.id,
+            name=s.name,
+            description=s.description,
+            trigger_keywords=s.trigger_keywords,
+            category=s.category,
+            owner_id=s.owner_id,
+        )
+        for s in skills
+    ]
+
+
+@app.post("/api/skills", response_model=SkillResponse, tags=["Skills"], status_code=201)
+async def create_skill(
+    body: CreateSkillRequest,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> SkillResponse:
+    """Create a custom skill."""
+    from pathlib import Path as _SkPath  # noqa: PLC0415
+    from mariana.tools.skills import SkillManager  # noqa: PLC0415
+
+    cfg = _get_config()
+    mgr = SkillManager(data_root=_SkPath(cfg.DATA_ROOT))
+    skill = mgr.create_skill(
+        name=body.name,
+        description=body.description,
+        system_prompt=body.system_prompt,
+        trigger_keywords=body.trigger_keywords,
+        owner_id=current_user["user_id"],
+    )
+    return SkillResponse(
+        id=skill.id,
+        name=skill.name,
+        description=skill.description,
+        trigger_keywords=skill.trigger_keywords,
+        category=skill.category,
+        owner_id=skill.owner_id,
+    )
+
+
+@app.delete("/api/skills/{skill_id}", tags=["Skills"])
+async def delete_skill(
+    skill_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> dict[str, str]:
+    """Delete a custom skill by ID."""
+    from pathlib import Path as _SkPath  # noqa: PLC0415
+    from mariana.tools.skills import SkillManager  # noqa: PLC0415
+
+    cfg = _get_config()
+    mgr = SkillManager(data_root=_SkPath(cfg.DATA_ROOT))
+
+    # Verify ownership: only custom skills owned by the user can be deleted
+    skill = mgr.get_skill(skill_id)
+    if skill is None:
+        raise HTTPException(status_code=404, detail=f"Skill {skill_id!r} not found")
+    if skill.category == "built-in":
+        raise HTTPException(status_code=403, detail="Cannot delete built-in skills")
+    if skill.owner_id and skill.owner_id != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized to delete this skill")
+
+    mgr.delete_skill(skill_id)
+    return {"status": "deleted"}
 
 
 # ---------------------------------------------------------------------------
