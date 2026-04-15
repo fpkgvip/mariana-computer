@@ -18,6 +18,7 @@ import Login from "./pages/Login";
 import Signup from "./pages/Signup";
 import ResetPassword from "./pages/ResetPassword";
 import Skills from "./pages/Skills";
+import InvestigationGraph from "./pages/InvestigationGraph";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -48,6 +49,8 @@ const App = () => (
             <Route path="/buy-credits" element={<Checkout />} />
             <Route path="/account" element={<Account />} />
             <Route path="/skills" element={<Skills />} />
+            <Route path="/graph" element={<InvestigationGraph />} />
+            <Route path="/graph/:taskId" element={<InvestigationGraph />} />
             <Route path="/admin" element={<Admin />} />
             <Route path="/login" element={<Login />} />
             <Route path="/signup" element={<Signup />} />
