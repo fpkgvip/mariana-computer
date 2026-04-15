@@ -407,11 +407,12 @@ async def _deduct_user_credits(
     user_id: str,
     cost_tracker: Any,
     config: Config,
+    reserved_credits: int = 0,
 ) -> None:
-    """Deduct credits from the user's Supabase profile after investigation.
+    """Settle the user's final credit balance after investigation.
 
-    Calculates tokens_to_deduct = int(cost_tracker.total_spent * 1.20 * 100)
-    (real cost + 20% markup, converted to tokens at $0.01/token).
+    If credits were reserved at submission time, only the delta versus the final
+    actual cost is applied here: refund unused credits or deduct any overage.
     """
     if not user_id:
         return
@@ -420,15 +421,20 @@ async def _deduct_user_credits(
         return
 
     total_with_markup = getattr(cost_tracker, "total_with_markup", cost_tracker.total_spent * 1.20)
-    tokens_to_deduct = int(total_with_markup * 100)
+    final_tokens = int(total_with_markup * 100)
+    delta_tokens = final_tokens - reserved_credits
 
-    if tokens_to_deduct <= 0:
-        logger.info("no_credits_to_deduct", user_id=user_id, total_spent=cost_tracker.total_spent)
+    if delta_tokens == 0:
+        logger.info(
+            "credit_settlement_noop",
+            user_id=user_id,
+            reserved_credits=reserved_credits,
+            final_tokens=final_tokens,
+        )
         return
 
     import httpx  # type: ignore[import]  # noqa: PLC0415
 
-    rpc_url = f"{config.SUPABASE_URL}/rest/v1/rpc/deduct_credits"
     headers = {
         "apikey": config.SUPABASE_SERVICE_KEY,
         "Authorization": f"Bearer {config.SUPABASE_SERVICE_KEY}",
@@ -436,67 +442,61 @@ async def _deduct_user_credits(
     }
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
+            if delta_tokens > 0:
+                rpc_url = f"{config.SUPABASE_URL}/rest/v1/rpc/deduct_credits"
+                resp = await client.post(
+                    rpc_url,
+                    json={"target_user_id": user_id, "amount": delta_tokens},
+                    headers=headers,
+                )
+                if resp.status_code == 200:
+                    logger.info(
+                        "credits_settled_by_extra_deduction",
+                        user_id=user_id,
+                        reserved_credits=reserved_credits,
+                        final_tokens=final_tokens,
+                        extra_deducted=delta_tokens,
+                    )
+                    return
+                logger.error(
+                    "credit_settlement_extra_deduction_failed",
+                    user_id=user_id,
+                    status=resp.status_code,
+                    reserved_credits=reserved_credits,
+                    final_tokens=final_tokens,
+                )
+                return
+
+            rpc_url = f"{config.SUPABASE_URL}/rest/v1/rpc/add_credits"
+            refund_tokens = abs(delta_tokens)
             resp = await client.post(
                 rpc_url,
-                json={"target_user_id": user_id, "amount": tokens_to_deduct},
+                json={"p_user_id": user_id, "p_credits": refund_tokens},
                 headers=headers,
             )
             if resp.status_code == 200:
                 logger.info(
-                    "credits_deducted",
+                    "credits_settled_by_refund",
                     user_id=user_id,
-                    tokens_deducted=tokens_to_deduct,
-                    real_cost_usd=cost_tracker.total_spent,
-                    with_markup_usd=total_with_markup,
+                    reserved_credits=reserved_credits,
+                    final_tokens=final_tokens,
+                    refunded=refund_tokens,
                 )
                 return
-
-            # Fallback: read-modify-PATCH
-            logger.warning(
-                "deduct_credits_rpc_unavailable",
+            logger.error(
+                "credit_settlement_refund_failed",
+                user_id=user_id,
                 status=resp.status_code,
-                fallback="read_modify_patch",
+                reserved_credits=reserved_credits,
+                final_tokens=final_tokens,
             )
-            profile_url = (
-                f"{config.SUPABASE_URL}/rest/v1/profiles"
-                f"?id=eq.{user_id}&select=tokens"
-            )
-            get_resp = await client.get(profile_url, headers=headers)
-            if get_resp.status_code != 200:
-                logger.error("supabase_get_profile_failed_for_deduct", user_id=user_id)
-                return
-            rows = get_resp.json()
-            if not rows:
-                logger.error("supabase_profile_not_found_for_deduct", user_id=user_id)
-                return
-            current_tokens = int(rows[0].get("tokens", 0) or 0)
-            new_tokens = max(0, current_tokens - tokens_to_deduct)
-            patch_url = f"{config.SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}"
-            patch_resp = await client.patch(
-                patch_url,
-                json={"tokens": new_tokens},
-                headers={**headers, "Prefer": "return=minimal"},
-            )
-            if patch_resp.status_code not in (200, 204):
-                logger.error(
-                    "supabase_deduct_credits_fallback_failed",
-                    user_id=user_id,
-                    status=patch_resp.status_code,
-                )
-            else:
-                logger.info(
-                    "credits_deducted_via_patch",
-                    user_id=user_id,
-                    old=current_tokens,
-                    deducted=tokens_to_deduct,
-                    new=new_tokens,
-                )
     except Exception as exc:
         logger.error(
-            "credit_deduction_failed",
+            "credit_settlement_failed",
             user_id=user_id,
             error=str(exc),
-            tokens_to_deduct=tokens_to_deduct,
+            reserved_credits=reserved_credits,
+            final_tokens=final_tokens,
         )
 
 
@@ -509,6 +509,7 @@ async def _run_single(
     user_id: str = "",
     task_id: str | None = None,
     tier: str = "standard",
+    reserved_credits: int = 0,
 ) -> int:
     """
     Run a single investigation and return exit code.
@@ -525,7 +526,11 @@ async def _run_single(
         status=TaskStatus.RUNNING,
         current_state=State.INIT,
         started_at=datetime.now(tz=timezone.utc),
-        metadata={"user_id": user_id, "tier": tier} if user_id else {"tier": tier},
+        metadata=(
+            {"user_id": user_id, "tier": tier, "reserved_credits": reserved_credits}
+            if user_id else
+            {"tier": tier, "reserved_credits": reserved_credits}
+        ),
     )
 
     await _insert_task(db, task)
@@ -556,14 +561,14 @@ async def _run_single(
             total_with_markup_usd=cost_tracker.total_with_markup,
             total_calls=cost_tracker.call_count,
         )
-        # Deduct credits from user's Supabase profile
-        await _deduct_user_credits(user_id, cost_tracker, config)
+        # Settle credits against the amount reserved at submission time
+        await _deduct_user_credits(user_id, cost_tracker, config, reserved_credits=reserved_credits)
         return 0
 
     except KeyboardInterrupt:
         logger.info("investigation_interrupted", task_id=task.id)
-        # Still deduct for work done before interruption
-        await _deduct_user_credits(user_id, cost_tracker, config)
+        # Still settle for work done before interruption
+        await _deduct_user_credits(user_id, cost_tracker, config, reserved_credits=reserved_credits)
         return 1
 
     except Exception as exc:
@@ -575,8 +580,8 @@ async def _run_single(
             exc_info=True,
         )
         await _mark_task_failed(db, task.id, f"{type(exc).__name__}: {exc}")
-        # Deduct credits even on failure — the cost was incurred
-        await _deduct_user_credits(user_id, cost_tracker, config)
+        # Settle credits even on failure — the cost was incurred
+        await _deduct_user_credits(user_id, cost_tracker, config, reserved_credits=reserved_credits)
         return 1
 
 
@@ -600,6 +605,7 @@ async def _run_single_guarded(
     task_id: str | None,
     task_file: Path,
     tier: str = "standard",
+    reserved_credits: int = 0,
 ) -> None:
     """Run a single investigation guarded by a concurrency semaphore.
 
@@ -622,6 +628,7 @@ async def _run_single_guarded(
             user_id=user_id,
             task_id=task_id,
             tier=tier,
+            reserved_credits=reserved_credits,
         )
         if exit_code == 0:
             task_file.rename(task_file.with_suffix(".done"))
@@ -680,6 +687,7 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
             user_id_r = resume_data.get("user_id", "")
             task_id_r = resume_data.get("id", "")
             tier_r = resume_data.get("tier", "standard")
+            reserved_credits_r = int(resume_data.get("reserved_credits", 0) or 0)
             if topic_r:
                 logger.info(
                     "daemon_resuming_interrupted",
@@ -700,6 +708,7 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
                         task_id=task_id_r or None,
                         task_file=rf,
                         tier=tier_r,
+                        reserved_credits=reserved_credits_r,
                     ),
                     name=f"resume-{task_id_r or rf.stem}",
                 )
@@ -751,6 +760,7 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
             user_id = task_data.get("user_id", "")
             file_task_id = task_data.get("id", "")
             file_tier = task_data.get("tier", "standard")
+            reserved_credits = int(task_data.get("reserved_credits", 0) or 0)
             # max_duration_hours: null/missing = unlimited (never kill prematurely)
             _max_dur = task_data.get("max_duration_hours")  # noqa: F841  (reserved for future use)
 
@@ -790,6 +800,7 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
                     task_id=file_task_id or None,
                     task_file=running_file,
                     tier=file_tier,
+                    reserved_credits=reserved_credits,
                 ),
                 name=f"investigation-{file_task_id or tf.stem}",
             )

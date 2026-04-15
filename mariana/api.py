@@ -37,6 +37,7 @@ import json as _json
 import os
 import re
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -547,11 +548,17 @@ async def _get_current_user_from_header_or_query(
     token: str | None = Query(None),
 ) -> dict[str, str]:
     """Authenticate from Authorization header or ``?token=`` query param."""
+    raw_token: str | None = None
     if authorization and authorization.startswith("Bearer "):
-        return await _get_current_user(authorization)
-    if token:
-        return await _authenticate_supabase_token(token.strip())
-    raise HTTPException(status_code=401, detail="Missing or invalid authorization credentials")
+        raw_token = authorization.split(" ", 1)[1].strip()
+    elif token:
+        raw_token = token.strip()
+
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing or invalid authorization credentials")
+
+    user = await _authenticate_supabase_token(raw_token)
+    return {**user, "access_token": raw_token}
 
 
 async def _require_investigation_owner(
@@ -753,66 +760,75 @@ async def start_investigation(
         else float(classification.estimated_credits) * _CREDIT_USD_RATE
     )
 
-    # ── Pre-flight credit balance check ───────────────────────────────────
+    # ── Reserve estimated credits up-front to prevent concurrent overspend ──
     # estimated_credits_needed = budget_usd * 120 (real cost → tokens at
     # $0.01/token, with 20% markup: budget * 100 * 1.20 = budget * 120)
     estimated_credits_needed = int(effective_budget_usd * 120)
-    user_tokens = await _supabase_get_user_tokens(current_user["user_id"], cfg)
-    if user_tokens is not None and user_tokens < estimated_credits_needed:
-        raise HTTPException(
-            status_code=402,
-            detail=(
-                f"Insufficient credits: you have {user_tokens} tokens but this "
-                f"investigation requires an estimated {estimated_credits_needed} tokens "
-                f"(budget ${effective_budget_usd:.2f} + 20% markup). "
-                "Please add credits or reduce the budget."
-            ),
-        )
+    reserved_credits = 0
+    if estimated_credits_needed > 0:
+        reserved = await _supabase_deduct_credits(current_user["user_id"], estimated_credits_needed, cfg)
+        if not reserved:
+            user_tokens = await _supabase_get_user_tokens(current_user["user_id"], cfg)
+            if user_tokens is None:
+                raise HTTPException(status_code=503, detail="Credit service unavailable")
+            if user_tokens < estimated_credits_needed:
+                raise HTTPException(
+                    status_code=402,
+                    detail=(
+                        f"Insufficient credits: you have {user_tokens} tokens but this "
+                        f"investigation requires an estimated {estimated_credits_needed} tokens "
+                        f"(budget ${effective_budget_usd:.2f} + 20% markup). "
+                        "Please add credits or reduce the budget."
+                    ),
+                )
+            raise HTTPException(status_code=503, detail="Credit reservation unavailable")
+        reserved_credits = estimated_credits_needed
 
-    # ── Move pending uploads to task directory ──────────────────────────────
-    uploaded_file_names: list[str] = []
-    if body.upload_session_uuid:
-        session_uuid = _validate_upload_session_uuid(body.upload_session_uuid)
-        pending_dir = Path(cfg.DATA_ROOT) / "uploads" / "pending" / session_uuid
-        if pending_dir.is_dir():
-            task_upload_dir = Path(cfg.DATA_ROOT) / "uploads" / task_id
-            task_upload_dir.mkdir(parents=True, exist_ok=True)
-            import shutil
-            for f in pending_dir.iterdir():
-                if f.is_file():
-                    dest = task_upload_dir / f.name
-                    shutil.move(str(f), str(dest))
-                    uploaded_file_names.append(f.name)
-            # Clean up empty pending directory
-            try:
-                pending_dir.rmdir()
-            except OSError:
-                pass
-            logger.info(
-                "pending_uploads_moved",
-                session_uuid=session_uuid,
-                task_id=task_id,
-                files=uploaded_file_names,
-            )
-
-    task_payload: dict[str, Any] = {
-        "id": task_id,
-        "topic": body.topic,
-        "budget_usd": effective_budget_usd,
-        "duration_hours": effective_duration_hours,
-        "max_duration_hours": None,  # null = unlimited; only set if user explicitly chooses a limit
-        "status": "PENDING",
-        "created_at": created_at,
-        # Adaptive-mode metadata
-        "tier": classification.tier,
-        "plan_approved": body.plan_approved,
-        "user_id": current_user["user_id"],
-        "estimated_credits": classification.estimated_credits,
-        "uploaded_files": uploaded_file_names,
-    }
-
-    inbox = Path(cfg.inbox_dir)
     try:
+        # ── Move pending uploads to task directory ──────────────────────────────
+        uploaded_file_names: list[str] = []
+        if body.upload_session_uuid:
+            session_uuid = _validate_upload_session_uuid(body.upload_session_uuid)
+            pending_dir = Path(cfg.DATA_ROOT) / "uploads" / "pending" / session_uuid
+            if pending_dir.is_dir():
+                task_upload_dir = Path(cfg.DATA_ROOT) / "uploads" / task_id
+                task_upload_dir.mkdir(parents=True, exist_ok=True)
+                import shutil
+                for f in pending_dir.iterdir():
+                    if f.is_file():
+                        dest = task_upload_dir / f.name
+                        shutil.move(str(f), str(dest))
+                        uploaded_file_names.append(f.name)
+                # Clean up empty pending directory
+                try:
+                    pending_dir.rmdir()
+                except OSError:
+                    pass
+                logger.info(
+                    "pending_uploads_moved",
+                    session_uuid=session_uuid,
+                    task_id=task_id,
+                    files=uploaded_file_names,
+                )
+
+        task_payload: dict[str, Any] = {
+            "id": task_id,
+            "topic": body.topic,
+            "budget_usd": effective_budget_usd,
+            "duration_hours": effective_duration_hours,
+            "max_duration_hours": None,  # null = unlimited; only set if user explicitly chooses a limit
+            "status": "PENDING",
+            "created_at": created_at,
+            # Adaptive-mode metadata
+            "tier": classification.tier,
+            "plan_approved": body.plan_approved,
+            "user_id": current_user["user_id"],
+            "estimated_credits": classification.estimated_credits,
+            "reserved_credits": reserved_credits,
+            "uploaded_files": uploaded_file_names,
+        }
+
+        inbox = Path(cfg.inbox_dir)
         inbox.mkdir(parents=True, exist_ok=True)
         task_file = inbox / f"{task_id}.task.json"
         task_file.write_text(_json.dumps(task_payload, indent=2), encoding="utf-8")
@@ -822,13 +838,24 @@ async def start_investigation(
             topic=body.topic[:80],
             tier=classification.tier,
             user_id=current_user["user_id"],
+            reserved_credits=reserved_credits,
         )
+    except HTTPException:
+        if reserved_credits > 0:
+            await _supabase_add_credits(current_user["user_id"], reserved_credits, cfg)
+        raise
     except OSError as exc:
+        if reserved_credits > 0:
+            await _supabase_add_credits(current_user["user_id"], reserved_credits, cfg)
         logger.error("task_write_failed", error=str(exc))
         raise HTTPException(
             status_code=500,
             detail=f"Failed to write task to inbox: {exc}",
         ) from exc
+    except Exception:
+        if reserved_credits > 0:
+            await _supabase_add_credits(current_user["user_id"], reserved_credits, cfg)
+        raise
 
     return StartInvestigationResponse(
         task_id=task_id,
@@ -1167,7 +1194,7 @@ async def stream_logs(
     request: Request,
     task_id: str,
     format: str | None = Query(None, description="Set to 'legacy' for plain text events"),
-    _: dict[str, str] = Depends(_require_investigation_owner_header_or_query),
+    auth_context: dict[str, str] = Depends(_require_investigation_owner_header_or_query),
 ) -> EventSourceResponse:
     """
     Subscribe to live log events for a running investigation.
@@ -1180,8 +1207,11 @@ async def stream_logs(
     """
 
     use_legacy = format == "legacy"
+    stream_token = auth_context.get("access_token", "")
+    auth_recheck_interval_seconds = 30.0
 
     async def _event_generator() -> AsyncIterator[dict[str, str]]:
+        last_auth_check = time.monotonic()
         if _redis is not None:
             # ── Redis pub/sub path ──────────────────────────────────────
             pubsub = _redis.pubsub()
@@ -1190,6 +1220,18 @@ async def stream_logs(
                 while True:
                     if await request.is_disconnected():
                         break
+                    if time.monotonic() - last_auth_check >= auth_recheck_interval_seconds:
+                        try:
+                            await _authenticate_supabase_token(stream_token)
+                        except HTTPException as exc:
+                            if exc.status_code == 401:
+                                yield {
+                                    "data": json.dumps({"error": "authentication_revoked"}),
+                                    "event": "error",
+                                }
+                                break
+                            raise
+                        last_auth_check = time.monotonic()
                     message = await pubsub.get_message(
                         ignore_subscribe_messages=True,
                         timeout=1.0,
@@ -1247,6 +1289,18 @@ async def stream_logs(
             while True:
                 if await request.is_disconnected():
                     break
+                if time.monotonic() - last_auth_check >= auth_recheck_interval_seconds:
+                    try:
+                        await _authenticate_supabase_token(stream_token)
+                    except HTTPException as exc:
+                        if exc.status_code == 401:
+                            yield {
+                                "data": json.dumps({"error": "authentication_revoked"}),
+                                "event": "error",
+                            }
+                            break
+                        raise
+                    last_auth_check = time.monotonic()
                 row = await db.fetchrow(
                     "SELECT status, current_state, total_spent_usd "
                     "FROM research_tasks WHERE id = $1",
@@ -1501,12 +1555,13 @@ async def download_investigation_file(
         raise HTTPException(status_code=403, detail="You do not own this investigation")
 
     files_dir = Path(cfg.DATA_ROOT) / "files" / task_id
+    files_root = files_dir.resolve()
     file_path = (files_dir / filename).resolve()
 
-    # Path traversal protection
-    data_root = Path(cfg.DATA_ROOT).resolve()
-    if not file_path.is_relative_to(data_root):
-        raise HTTPException(status_code=403, detail="Access denied: path outside data root")
+    # Path traversal protection — the requested file must stay inside this task's
+    # own artifact directory, not merely somewhere under DATA_ROOT.
+    if not file_path.is_relative_to(files_root):
+        raise HTTPException(status_code=403, detail="Access denied: path outside investigation files directory")
 
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail=f"File {filename!r} not found")
@@ -2064,8 +2119,18 @@ async def stripe_webhook(request: Request) -> JSONResponse:
         logger.error("stripe_webhook_parse_failed", error=str(exc))
         raise HTTPException(status_code=400, detail="Webhook parse error") from exc
 
+    event_id: str | None = event.get("id")
     event_type: str = event["type"]
-    log = logger.bind(event_type=event_type, event_id=event.get("id"))
+    log = logger.bind(event_type=event_type, event_id=event_id)
+
+    if not event_id:
+        raise HTTPException(status_code=400, detail="Webhook event missing id")
+
+    recorded = await _record_webhook_event_once(event_id, event_type)
+    if not recorded:
+        log.info("stripe_webhook_replay_ignored")
+        return JSONResponse(content={"status": "duplicate", "event_id": event_id})
+
     log.info("stripe_webhook_received")
 
     try:
@@ -2412,10 +2477,11 @@ async def _supabase_deduct_credits(
 ) -> bool:
     """Deduct credits from a user's Supabase profile via RPC.
 
-    Calls the ``deduct_credits`` RPC function. Falls back to
-    read-modify-PATCH if the function is unavailable.
+    Calls the ``deduct_credits`` RPC function.
 
-    Returns True on success, False on failure.
+    Returns True on success, False on failure. If the RPC is unavailable we do
+    not attempt a read-modify-write fallback, because that sequence is not
+    atomic and allows concurrent investigation submissions to overspend credits.
     """
     if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
         logger.warning("supabase_not_configured_skip_deduct")
@@ -2437,44 +2503,32 @@ async def _supabase_deduct_credits(
             logger.info("credits_deducted_via_rpc", user_id=user_id, amount=amount)
             return True
 
-        # Fallback: read current balance and PATCH
-        logger.warning(
-            "deduct_credits_rpc_unavailable",
-            status=resp.status_code,
-            fallback="read_modify_patch",
-        )
-        profile_url = f"{cfg.SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=tokens"
-        get_resp = await client.get(profile_url, headers=headers)
-        if get_resp.status_code != 200:
-            logger.error("supabase_get_profile_failed_for_deduct", user_id=user_id)
-            return False
-        rows = get_resp.json()
-        if not rows:
-            logger.error("supabase_profile_not_found_for_deduct", user_id=user_id)
-            return False
-        current_tokens: int = int(rows[0].get("tokens", 0) or 0)
-        new_tokens = max(0, current_tokens - amount)
-        patch_url = f"{cfg.SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}"
-        patch_resp = await client.patch(
-            patch_url,
-            json={"tokens": new_tokens},
-            headers={**headers, "Prefer": "return=minimal"},
-        )
-        if patch_resp.status_code not in (200, 204):
-            logger.error(
-                "supabase_deduct_credits_fallback_failed",
-                user_id=user_id,
-                status=patch_resp.status_code,
-            )
-            return False
-        logger.info(
-            "credits_deducted_via_patch",
+        logger.error(
+            "deduct_credits_rpc_required",
             user_id=user_id,
-            old=current_tokens,
-            deducted=amount,
-            new=new_tokens,
+            amount=amount,
+            status=resp.status_code,
         )
-        return True
+        return False
+
+
+async def _record_webhook_event_once(event_id: str, event_type: str) -> bool:
+    """Record a Stripe webhook event idempotently.
+
+    Returns ``True`` when this is the first time the event ID is seen and the
+    handler should proceed, or ``False`` when the event is a replay.
+    """
+    db = _get_db()
+    result = await db.execute(
+        """
+        INSERT INTO stripe_webhook_events (event_id, event_type, processed_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (event_id) DO NOTHING
+        """,
+        event_id,
+        event_type,
+    )
+    return result.split()[-1] == "1"
 
 
 async def _get_stripe_customer_id(

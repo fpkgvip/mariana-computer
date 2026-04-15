@@ -295,6 +295,14 @@ CREATE TABLE IF NOT EXISTS evaluation_results (
 
 CREATE INDEX IF NOT EXISTS idx_evaluation_results_task_id ON evaluation_results(task_id);
 CREATE INDEX IF NOT EXISTS idx_evaluation_results_branch_id ON evaluation_results(branch_id);
+
+CREATE TABLE IF NOT EXISTS stripe_webhook_events (
+    event_id     TEXT        PRIMARY KEY,
+    event_type   TEXT        NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_stripe_webhook_events_processed_at ON stripe_webhook_events(processed_at);
 """
 
 
