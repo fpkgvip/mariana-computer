@@ -26,13 +26,12 @@ export default function Signup() {
 
     setIsLoading(true);
     try {
-      await signup(email, name, password);
-      // BUG-R1-01: Navigate unconditionally after a non-throwing signup().
-      // Checking the `user` context value here is wrong — React state updates
-      // from AuthContext.setUser() are batched and the closure still holds the
-      // old (null) reference. If email confirmation is required, AuthContext
-      // will have left user=null and Chat.tsx will redirect back to /login.
-      navigate("/chat");
+      const confirmed = await signup(email, name, password);
+      // BUG-R2C-03: Only navigate to /chat when signup returned a live session
+      // (email confirmation disabled). When email confirmation is required,
+      // signup() returns false and the toast is already shown by AuthContext.
+      if (confirmed) navigate("/chat");
+      // else: stay on page — user must confirm email first
     } catch {
       // Error toast already shown by AuthContext.signup()
     } finally {

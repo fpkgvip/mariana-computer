@@ -17,6 +17,7 @@ interface Plan {
   credits: number;
   features: string[];
   highlighted?: boolean;
+  comingSoon?: boolean;
 }
 
 const plans: Plan[] = [
@@ -41,6 +42,7 @@ const plans: Plan[] = [
     name: "Enterprise",
     price: 3999,
     credits: 500000,
+    comingSoon: true,
     features: [
       "500,000 credits/month",
       "Everything in Individual",
@@ -112,6 +114,7 @@ export default function Pricing() {
       const token = session?.access_token;
       if (!token) {
         toast.error("Not authenticated", { description: "Please sign in first." });
+        setLoadingPlanId(null);
         navigate("/login");
         return;
       }
@@ -162,12 +165,20 @@ export default function Pricing() {
           {plans.map((plan, i) => (
             <ScrollReveal key={plan.id} delay={i * 100}>
               <div
-                className={`flex h-full flex-col rounded-lg p-8 shadow-sm ring-1 ${
+                className={`relative flex h-full flex-col rounded-lg p-8 shadow-sm ring-1 ${
                   plan.highlighted
                     ? "bg-primary/5 ring-primary/30"
                     : "bg-card ring-border"
-                }`}
+                } ${plan.comingSoon ? "opacity-75 pointer-events-none" : ""}`}
+                {...(plan.comingSoon ? { inert: "" as any } : {})}
               >
+                {plan.comingSoon && (
+                  <div className="absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-background/60 backdrop-blur-[2px]">
+                    <div className="rounded-full border border-accent/40 bg-accent/10 px-5 py-2">
+                      <span className="font-serif text-lg font-semibold text-accent">Coming Soon</span>
+                    </div>
+                  </div>
+                )}
                 {plan.highlighted && (
                   <p className="mb-3 inline-block self-start rounded-full bg-primary/10 px-3 py-0.5 text-[11px] font-medium text-primary">
                     Most popular
@@ -196,7 +207,13 @@ export default function Pricing() {
                 </ul>
 
                 <div className="mt-8">
-                  {plan.id === "enterprise" ? (
+                  {plan.comingSoon ? (
+                    <div
+                      className="flex w-full items-center justify-center gap-2 rounded-md border border-border px-4 py-3 text-sm font-medium text-muted-foreground cursor-not-allowed"
+                    >
+                      Coming Soon
+                    </div>
+                  ) : /* This branch activates when comingSoon is removed from Enterprise */ plan.id === "enterprise" ? (
                     <Link
                       to="/contact"
                       className="flex w-full items-center justify-center gap-2 rounded-md border border-border px-4 py-3 text-sm font-medium text-foreground transition-all hover:bg-secondary"

@@ -18,6 +18,7 @@ import {
   Zap,
   Brain,
   Trash2,
+  GitBranch,
 } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
@@ -501,10 +502,12 @@ export default function Chat() {
   /*  Timer management                                                */
   /* ---------------------------------------------------------------- */
 
-  const startTimer = useCallback(() => {
+  // BUG-FIX-09: Accept optional origin time so reconnects show correct elapsed
+  const startTimer = useCallback((fromTime?: string | number) => {
     if (timerRef.current) clearInterval(timerRef.current);
-    startTimeRef.current = Date.now();
-    setElapsedSeconds(0);
+    const origin = fromTime ? new Date(fromTime).getTime() : Date.now();
+    startTimeRef.current = origin;
+    setElapsedSeconds(Math.max(0, Math.floor((Date.now() - origin) / 1000)));
     timerRef.current = setInterval(() => {
       if (startTimeRef.current) {
         setElapsedSeconds(Math.floor((Date.now() - startTimeRef.current) / 1000));
@@ -518,6 +521,7 @@ export default function Chat() {
       timerRef.current = null;
     }
     startTimeRef.current = null;
+    setElapsedSeconds(0);
   }, []);
 
   /* ---------------------------------------------------------------- */
@@ -547,7 +551,7 @@ export default function Chat() {
   /*  Process structured SSE event into timeline step                 */
   /* ---------------------------------------------------------------- */
 
-  const processStructuredEvent = useCallback((event: StructuredEvent) => {
+  const processStructuredEvent = useCallback((event: StructuredEvent, taskId?: string) => {
     if (event.type === "step_complete" || event.type === "step_error") {
       // Update an existing step in-place
       setTimelineSteps((prev) => {
@@ -603,7 +607,7 @@ export default function Chat() {
           budget_usd: event.budget_usd,
         }),
         type: "status",
-        id: `cost-final-${Date.now()}`,
+        id: `cost-final-${taskId ?? Date.now()}`,
         _id: makeMessageId(),
       });
     }
@@ -808,22 +812,34 @@ export default function Chat() {
               "step_start", "step_complete", "step_error", "status_change",
               "file_attached", "cost_update", "hypothesis_update", "text",
             ].includes(eventType)) {
-              processStructuredEvent(parsed as StructuredEvent);
+              processStructuredEvent(parsed as StructuredEvent, taskId);
 
-              // BUG-D1-02 fix: The event_loop emits State.HALT.value = "HALT"
-              // (state machine enum) and State.REPORT_COMPLETE which transitions
-              // to HALT.  The DB uses TaskStatus.HALTED/COMPLETED.  Check both.
-              if (eventType === "status_change" && ["HALT", "HALTED", "COMPLETED"].includes(parsed.state as string)) {
-                updateInvestigationStatus(taskId, "COMPLETED");
-                appendMessage({
-                  role: "system",
-                  content: "Investigation complete. Reports are ready for download.",
-                  type: "status",
-                  id: `completed-${taskId}`,
-                  _id: makeMessageId(),
-                });
-                stopAllConnections();
-                refreshUser();
+              // BUG-FIX-07: Differentiate HALT (normal completion) from HALTED (abnormal)
+              if (eventType === "status_change") {
+                const state = parsed.state as string;
+                if (state === "HALT" || state === "COMPLETED") {
+                  updateInvestigationStatus(taskId, "COMPLETED");
+                  appendMessage({
+                    role: "system",
+                    content: "Investigation complete. Reports are ready for download.",
+                    type: "status",
+                    id: `completed-${taskId}`,
+                    _id: makeMessageId(),
+                  });
+                  stopAllConnections();
+                  refreshUser();
+                } else if (state === "HALTED") {
+                  updateInvestigationStatus(taskId, "HALTED");
+                  appendMessage({
+                    role: "system",
+                    content: "Investigation was halted. Some results may be incomplete.",
+                    type: "error",
+                    id: `halted-${taskId}`,
+                    _id: makeMessageId(),
+                  });
+                  stopAllConnections();
+                  refreshUser();
+                }
               }
               return;
             }
@@ -863,11 +879,11 @@ export default function Chat() {
               });
               stopAllConnections();
               refreshUser();
-            } else if (status === "FAILED") {
-              updateInvestigationStatus(taskId, "FAILED");
+            } else if (status === "FAILED" || status === "HALTED") {
+              updateInvestigationStatus(taskId, status as InvestigationStatus);
               appendMessage({
                 role: "assistant",
-                content: parsed.error || "The investigation failed.",
+                content: parsed.error || `The investigation ${status.toLowerCase()}.`,
                 type: "text",
                 _id: makeMessageId(),
               });
@@ -962,7 +978,15 @@ export default function Chat() {
               type: "error",
               _id: makeMessageId(),
             });
-          } catch {}
+            stopAllConnections();
+            refreshUser();
+          } catch {
+            // Not a server-named error — let es.onerror handle connection errors
+          }
+        });
+
+        es.addEventListener("ping", () => {
+          // keepalive — intentionally ignored
         });
 
         // BUG-002: hasFailedOver flag prevents multiple concurrent polling loops
@@ -1009,6 +1033,7 @@ export default function Chat() {
 
       // Stop any active connections
       stopAllConnections();
+      setElapsedSeconds(0);
 
       // Dismiss any pending plan when switching investigations
       setPendingPlan(null);
@@ -1042,9 +1067,15 @@ export default function Chat() {
         setIsSending(true);
         getAccessToken().then((token) => {
           if (token) {
-            startTimer();
+            startTimer(inv.created_at);
             startSSE(taskId, token);
+          } else {
+            setIsSending(false);
+            toast.error("Session expired", { description: "Please sign in again." });
+            navigate("/login");
           }
+        }).catch(() => {
+          setIsSending(false);
         });
       }
     },
@@ -1115,6 +1146,7 @@ export default function Chat() {
 
       if (classifyRes.status === 401) {
         toast.error("Session expired", { description: "Please sign in again." });
+        setIsClassifying(false);
         navigate("/login");
         return;
       }
@@ -1289,7 +1321,7 @@ export default function Chat() {
       setUploadSessionUuid(null);
 
       // Start timer and SSE
-      startTimer();
+      startTimer(newInvestigation.created_at);
       startSSE(taskId, token);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
@@ -1328,8 +1360,8 @@ export default function Chat() {
       return;
     }
 
-    await startInvestigation(topic, token, true);
-  }, [pendingPlan, startInvestigation, navigate]);
+    await startInvestigationRef.current(topic, token, true);
+  }, [pendingPlan, navigate]);
 
   /* ---------------------------------------------------------------- */
   /*  Cancel research plan                                            */
@@ -1344,6 +1376,8 @@ export default function Chat() {
     setUploadedFiles([]);
     setUploadSessionUuid(null);
     seenStatusIds.current.clear();
+    setIsSending(false);
+    setIsClassifying(false);
   }, []);
 
   /* ---------------------------------------------------------------- */
@@ -1447,7 +1481,7 @@ export default function Chat() {
                 messageStoreRef.current[activeTaskId] = [...messagesRef.current];
               }
               if (activeTaskId) {
-                timelineStoreRef.current[activeTaskId] = [...timelineSteps];
+                timelineStoreRef.current[activeTaskId] = [...timelineStepsRef.current];
               }
               stopAllConnections();
               setActiveTaskId(null);
@@ -1557,8 +1591,18 @@ export default function Chat() {
             </span>
           </div>
 
-          {/* Running indicator + elapsed timer */}
+          {/* Running indicator + elapsed timer + graph button */}
           <div className="flex items-center gap-3">
+            {activeTaskId && (
+              <Link
+                to={`/graph/${activeTaskId}`}
+                className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+                title="View Investigation Graph"
+              >
+                <GitBranch size={13} />
+                <span className="hidden sm:inline">Graph</span>
+              </Link>
+            )}
             {isRunning && isSending && (
               <div className="flex items-center gap-2 text-xs text-blue-400">
                 <span className="relative flex h-2 w-2">

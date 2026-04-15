@@ -44,7 +44,7 @@ export default function BuyCredits() {
             <p className="mt-2 text-sm text-muted-foreground">
               Current balance:{" "}
               <span className="font-medium text-foreground">
-                ${(user.tokens / 10).toFixed(2)}
+                {user.tokens.toLocaleString()} credits
               </span>
             </p>
           </ScrollReveal>

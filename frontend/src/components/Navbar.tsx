@@ -132,7 +132,7 @@ export function Navbar() {
                 Log in
               </Link>
               <Link
-                to="/chat"
+                to="/signup"
                 className="rounded-md bg-primary px-4 py-2 text-[13px] font-medium text-primary-foreground transition-all hover:bg-primary/90 hover:shadow-lg hover:shadow-primary/10"
               >
                 Try Mariana
@@ -198,7 +198,7 @@ export function Navbar() {
               <>
                 <Link to="/login" className="py-1 text-sm text-muted-foreground">Log in</Link>
                 <Link
-                  to="/chat"
+                  to="/signup"
                   className="mt-1 rounded-md bg-primary px-4 py-2.5 text-center text-sm font-medium text-primary-foreground"
                 >
                   Try Mariana

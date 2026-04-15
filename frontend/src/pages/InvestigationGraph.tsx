@@ -11,7 +11,7 @@ import {
 } from "react";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/lib/supabase";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { Link, Navigate, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   Plus,
   Link as LinkIcon,
@@ -176,41 +176,8 @@ function resolveId(ref: string | GraphNode): string {
 }
 
 /* ================================================================== */
-/*  Demo Data                                                         */
+/*  (Demo data removed — graph is per-investigation only)              */
 /* ================================================================== */
-
-function buildDemoData(): GraphData {
-  const nodes: GraphNode[] = [
-    { id: "d1", label: "John Mitchell", type: "person", notes: "Former CFO, resigned Q3 2024" },
-    { id: "d2", label: "Meridian Capital", type: "organization", notes: "Hedge fund under investigation" },
-    { id: "d3", label: "Sarah Chen", type: "person", notes: "Whistleblower, filed SEC complaint" },
-    { id: "d4", label: "SEC Filing 10-K", type: "document", notes: "Annual report with discrepancies" },
-    { id: "d5", label: "Board Meeting Jan 15", type: "event", notes: "Emergency session, no minutes filed" },
-    { id: "d6", label: "Insider Trading", type: "claim", notes: "Alleged trades 48h before announcement" },
-    { id: "d7", label: "bloomberg.com/article", type: "url", notes: "Breaking story on fund irregularities" },
-    { id: "d8", label: "Cayman Holdings LLC", type: "organization", notes: "Offshore entity, beneficial owner unclear" },
-    { id: "d9", label: "David Park", type: "person", notes: "External auditor, Deloitte" },
-    { id: "d10", label: "SMCI", type: "financial", notes: "$SMCI — Super Micro Computer Inc" },
-    { id: "d11", label: "Revenue +180% YoY", type: "data_point", notes: "Reported in Q2 2024 10-Q" },
-  ];
-
-  const edges: GraphEdge[] = [
-    { id: "e1", source: "d1", sourceId: "d1", target: "d2", targetId: "d2", label: "CFO of" },
-    { id: "e2", source: "d3", sourceId: "d3", target: "d2", targetId: "d2", label: "filed complaint against" },
-    { id: "e3", source: "d1", sourceId: "d1", target: "d6", targetId: "d6", label: "accused of" },
-    { id: "e4", source: "d4", sourceId: "d4", target: "d2", targetId: "d2", label: "filed by" },
-    { id: "e5", source: "d5", sourceId: "d5", target: "d2", targetId: "d2", label: "held at" },
-    { id: "e6", source: "d7", sourceId: "d7", target: "d6", targetId: "d6", label: "reports on" },
-    { id: "e7", source: "d2", sourceId: "d2", target: "d8", targetId: "d8", label: "controls" },
-    { id: "e8", source: "d9", sourceId: "d9", target: "d4", targetId: "d4", label: "audited" },
-    { id: "e9", source: "d1", sourceId: "d1", target: "d5", targetId: "d5", label: "attended" },
-    { id: "e10", source: "d3", sourceId: "d3", target: "d7", targetId: "d7", label: "source for" },
-    { id: "e11", source: "d10", sourceId: "d10", target: "d11", targetId: "d11", label: "reported" },
-    { id: "e12", source: "d4", sourceId: "d4", target: "d11", targetId: "d11", label: "contains" },
-  ];
-
-  return { nodes, edges };
-}
 
 /* ================================================================== */
 /*  Component                                                         */
@@ -218,6 +185,7 @@ function buildDemoData(): GraphData {
 
 export default function InvestigationGraph() {
   const { user } = useAuth();
+  const navigate = useNavigate();
   const params = useParams<{ taskId?: string }>();
   const [searchParams] = useSearchParams();
   const taskId = params.taskId ?? searchParams.get("task") ?? null;
@@ -247,6 +215,7 @@ export default function InvestigationGraph() {
   const [edgeLabelInput, setEdgeLabelInput] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
   const [investigationRunning, setInvestigationRunning] = useState(false);
+  const [graphError, setGraphError] = useState<string | null>(null);
 
   /* ---- Add panel form state ---- */
   const [newLabel, setNewLabel] = useState("");
@@ -265,18 +234,24 @@ export default function InvestigationGraph() {
   const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
   const clusterTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const isMountedRef = useRef(true);
+  // BUG-R2A-05: Track definitive errors so polling can bail out
+  const graphErrorRef = useRef<string | null>(null);
   const nodesRef = useRef<GraphNode[]>(nodes);
   const edgesRef = useRef<GraphEdge[]>(edges);
   // BUG-03: Drag behavior created once in init, stored in ref
   const dragBehaviorRef = useRef<d3.DragBehavior<SVGGElement, GraphNode, GraphNode | d3.SubjectPosition> | null>(null);
   // BUG-20: Ref so drag filter can read link mode without stale closure
   const linkModeRef = useRef(linkMode);
+  // BUG-R2A-02: Ref so D3 click handler reads linkSourceId without stale closure
+  const linkSourceIdRef = useRef<string | null>(linkSourceId);
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
 
   // Keep refs in sync
   nodesRef.current = nodes;
   edgesRef.current = edges;
   linkModeRef.current = linkMode;
+  linkSourceIdRef.current = linkSourceId;
 
   const selectedNode = useMemo(
     () => nodes.find((n) => n.id === selectedNodeId) ?? null,
@@ -284,16 +259,58 @@ export default function InvestigationGraph() {
   );
 
   /* ================================================================ */
-  /*  Initialize demo data if no taskId                               */
+  /*  No-taskId guard: redirect to chat                               */
+  /* ================================================================ */
+
+  // If no taskId is provided, this graph has nothing to show.
+
+  /* ================================================================ */
+  /*  Auth guard: redirect unauthenticated users to /login            */
   /* ================================================================ */
 
   useEffect(() => {
-    if (!taskId) {
-      const demo = buildDemoData();
-      setNodes(demo.nodes);
-      setEdges(demo.edges);
+    if (!user) navigate("/login", { replace: true });
+  }, [user, navigate]);
+
+  // BUG-R2A-01: Flip isMountedRef on unmount to prevent state updates after unmount
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  /* ================================================================ */
+  /*  Merge incoming graph data (from backend / AI)                   */
+  /* ================================================================ */
+
+  const mergeGraph = useCallback((incoming: GraphData): { addedNodes: number; addedEdges: number } => {
+    // BUG-FIX-01: Compute counts synchronously from refs to avoid stale values
+    const existingNodeIds = new Set(nodesRef.current.map((n) => n.id));
+    const incomingNodes = (incoming.nodes ?? []).filter((n) => !existingNodeIds.has(n.id));
+    const addedNodes = incomingNodes.length;
+
+    const existingEdgeIds = new Set(edgesRef.current.map((e) => e.id));
+    const existingPairs = new Set(
+      edgesRef.current.map((e) => `${resolveId(e.source)}|${resolveId(e.target)}`)
+    );
+    const normalizedEdges = (incoming.edges ?? []).map((e) => ({
+      ...e,
+      sourceId: e.sourceId ?? resolveId(e.source),
+      targetId: e.targetId ?? resolveId(e.target),
+    }));
+    const incomingEdges = normalizedEdges.filter(
+      (e) => !existingEdgeIds.has(e.id) && !existingPairs.has(`${e.sourceId}|${e.targetId}`)
+    );
+    const addedEdges = incomingEdges.length;
+
+    if (addedNodes > 0) {
+      setNodes((prev) => [...prev, ...incomingNodes]);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (addedEdges > 0) {
+      setEdges((prev) => [...prev, ...incomingEdges]);
+    }
+    return { addedNodes, addedEdges };
   }, []);
 
   /* ================================================================ */
@@ -308,17 +325,30 @@ export default function InvestigationGraph() {
       const res = await fetch(`${API_URL}/api/investigations/${taskId}/graph`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      if (!res.ok) return;
+      if (!isMountedRef.current) return;
+      if (!res.ok) {
+        // BUG-FIX-04: Distinguish definitive errors from transient ones
+        if (res.status === 404) {
+          setGraphError("Investigation not found. It may have been deleted.");
+          graphErrorRef.current = "Investigation not found. It may have been deleted.";
+        } else if (res.status === 403) {
+          setGraphError("You do not have access to this investigation.");
+          graphErrorRef.current = "You do not have access to this investigation.";
+        }
+        return;
+      }
+      if (!isMountedRef.current) return;
+      setGraphError(null);
+      graphErrorRef.current = null;
       const data: GraphData = await res.json();
-      // BUG-30: Keep fetchGraph guard consistent (both arrays required)
-      if (data.nodes && data.edges) {
+      if (!isMountedRef.current) return;
+      if (data.nodes || data.edges) {
         mergeGraph(data);
       }
     } catch {
       /* silently fail — network hiccups during polling are expected */
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskId]);
+  }, [taskId, mergeGraph]);
 
   const saveGraphToBackend = useCallback(async () => {
     if (!taskId) {
@@ -405,6 +435,7 @@ export default function InvestigationGraph() {
         },
         body: JSON.stringify(body),
       });
+      if (!isMountedRef.current) return;
       if (!res.ok) {
         toast.error("AI populate request failed");
         return;
@@ -422,44 +453,7 @@ export default function InvestigationGraph() {
     } finally {
       setAiLoading(false);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskId]);
-
-  /* ================================================================ */
-  /*  Merge incoming graph data (from backend / AI)                   */
-  /* ================================================================ */
-
-  const mergeGraph = useCallback((incoming: GraphData): { addedNodes: number; addedEdges: number } => {
-    let addedNodes = 0;
-    let addedEdges = 0;
-    setNodes((prev) => {
-      const existingIds = new Set(prev.map((n) => n.id));
-      const newNodes = (incoming.nodes ?? []).filter((n) => !existingIds.has(n.id));
-      addedNodes = newNodes.length;
-      if (newNodes.length === 0) return prev;
-      return [...prev, ...newNodes];
-    });
-    setEdges((prev) => {
-      const existingIds = new Set(prev.map((e) => e.id));
-      // BUG-09: Dedup by sourceId+targetId pair too
-      const existingPairs = new Set(
-        prev.map((e) => `${resolveId(e.source)}|${resolveId(e.target)}`)
-      );
-      // BUG-R3-03: Normalize sourceId/targetId for backend data that may omit them
-      const normalized = (incoming.edges ?? []).map((e) => ({
-        ...e,
-        sourceId: e.sourceId ?? resolveId(e.source),
-        targetId: e.targetId ?? resolveId(e.target),
-      }));
-      const newEdges = normalized.filter(
-        (e) => !existingIds.has(e.id) && !existingPairs.has(`${e.sourceId}|${e.targetId}`)
-      );
-      addedEdges = newEdges.length;
-      if (newEdges.length === 0) return prev;
-      return [...prev, ...newEdges];
-    });
-    return { addedNodes, addedEdges };
-  }, []);
+  }, [taskId, mergeGraph]);
 
   /* ================================================================ */
   /*  Poll backend when investigation is running                      */
@@ -479,6 +473,7 @@ export default function InvestigationGraph() {
         const res = await fetch(`${API_URL}/api/investigations/${taskId}`, {
           headers: { Authorization: `Bearer ${token}` },
         });
+        if (!isMountedRef.current) return;
         if (!res.ok || cancelled) return;
         const data = await res.json();
         const status = data.status ?? data.current_state ?? "";
@@ -491,6 +486,8 @@ export default function InvestigationGraph() {
 
     const interval = setInterval(() => {
       if (!cancelled) {
+        // BUG-R2A-05: Skip polling if a definitive error (404/403) has been received
+        if (graphErrorRef.current) return;
         fetchGraphFromBackend();
         checkStatus();
       }
@@ -622,14 +619,15 @@ export default function InvestigationGraph() {
       }
 
       // BUG-29: Typed as MouseEvent (not any)
+      // BUG-R2A-02: Use linkSourceIdRef.current to avoid stale closure
       nodeMerge.on("click", (event: MouseEvent, d: GraphNode) => {
-        if (linkModeRef.current && linkSourceId) {
+        if (linkModeRef.current && linkSourceIdRef.current) {
           // Complete link
-          if (d.id === linkSourceId) {
+          if (d.id === linkSourceIdRef.current) {
             toast.error("Cannot link a node to itself");
             return;
           }
-          setPendingEdge({ sourceId: linkSourceId, targetId: d.id });
+          setPendingEdge({ sourceId: linkSourceIdRef.current, targetId: d.id });
           setEdgeLabelInput("");
           setEdgeLabelModalOpen(true);
           setLinkMode(false);
@@ -672,7 +670,7 @@ export default function InvestigationGraph() {
       if (linkForce) linkForce.links(simLinks);
       if (reheat) sim.alpha(0.5).restart();
     },
-    [nodes, edges, selectedNodeId, searchTerm, filterType, linkSourceId]
+    [nodes, edges, selectedNodeId, searchTerm, filterType]
   );
 
   /* ---- Initialize D3 simulation ---- */
@@ -743,7 +741,9 @@ export default function InvestigationGraph() {
     dragBehaviorRef.current = drag;
 
     // BUG-01: Register tick ONCE; BUG-04: read live positions from sim nodes
+    // BUG-R2A-03: Guard against stale simulation firing after re-init
     simulation.on("tick", () => {
+      if (simulationRef.current !== simulation) return;
       const g = gRef.current;
       if (!g) return;
       const gSel = d3.select(g);
@@ -771,6 +771,7 @@ export default function InvestigationGraph() {
     });
 
     return () => {
+      simulation.on("tick", null); // BUG-R2A-03: detach tick before stopping
       simulation.stop();
       d3.select(svg).on(".zoom", null); // BUG-02/08
       d3.select(svg).on("click", null);
@@ -1066,6 +1067,10 @@ export default function InvestigationGraph() {
           }
           setNodes(validNodes);
           setEdges(validEdges);
+          // BUG-R2A-04: Stop any running simulation before D3 re-renders with new data
+          if (simulationRef.current) {
+            simulationRef.current.alpha(0).stop();
+          }
           toast.success(`Imported ${validNodes.length} nodes and ${validEdges.length} edges`);
         } catch {
           toast.error("Failed to parse JSON file");
@@ -1263,6 +1268,13 @@ export default function InvestigationGraph() {
   /*  Render                                                          */
   /* ================================================================ */
 
+  /* ================================================================ */
+  /*  No-taskId: redirect to /chat                                    */
+  /* ================================================================ */
+  if (!taskId) {
+    return <Navigate to="/chat" replace />;
+  }
+
   return (
     <div className="flex flex-col h-screen bg-background overflow-hidden">
       {/* ============================================================ */}
@@ -1436,6 +1448,7 @@ export default function InvestigationGraph() {
                     if (e.key === "Enter" && newLabel.trim()) {
                       addNode(newLabel, newType, newNotes);
                       setNewLabel("");
+                      setNewType("person");
                       setNewNotes("");
                     }
                     if (e.key === "Escape") {
@@ -1477,6 +1490,7 @@ export default function InvestigationGraph() {
                 onClick={() => {
                   addNode(newLabel, newType, newNotes);
                   setNewLabel("");
+                  setNewType("person");
                   setNewNotes("");
                 }}
                 disabled={!newLabel.trim()}
@@ -1564,8 +1578,22 @@ export default function InvestigationGraph() {
             <span>{edges.length} edge{edges.length !== 1 ? "s" : ""}</span>
           </div>
 
+          {/* Error state */}
+          {graphError && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+              <AlertTriangle className="w-12 h-12 text-red-400/60 mb-3" />
+              <p className="text-red-400 text-sm font-medium mb-1">{graphError}</p>
+              <Link
+                to="/chat"
+                className="pointer-events-auto text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground transition-colors"
+              >
+                Return to investigations
+              </Link>
+            </div>
+          )}
+
           {/* Empty state */}
-          {nodes.length === 0 && (
+          {nodes.length === 0 && !graphError && (
             <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
               <Brain className="w-12 h-12 text-muted-foreground/30 mb-3" />
               <p className="text-muted-foreground text-sm">No nodes yet. Press N to add one.</p>

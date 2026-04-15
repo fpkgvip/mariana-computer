@@ -19,6 +19,7 @@ interface PlanRow {
   features: string[] | null;
   sort_order: number;
   is_public: boolean;
+  coming_soon?: boolean;
 }
 
 export default function Checkout() {
@@ -41,7 +42,7 @@ export default function Checkout() {
     const loadPlans = async () => {
       const { data, error } = await supabase
         .from("plans")
-        .select("*")
+        .select("id, name, price_usd, credits_per_month, features, sort_order, is_public, coming_soon")
         .eq("is_public", true)
         .order("sort_order");
 
@@ -170,19 +171,25 @@ export default function Checkout() {
                       </ul>
                     )}
 
-                    <button
-                      onClick={() => handleSubscribe(plan.id)}
-                      disabled={loadingPlanId !== null}
-                      className="mt-6 flex w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition-all hover:bg-primary/90 disabled:opacity-60"
-                    >
-                      {loadingPlanId === plan.id ? (
-                        <Loader2 size={14} className="animate-spin" />
-                      ) : (
-                        <>
-                          Subscribe <ArrowRight size={14} />
-                        </>
-                      )}
-                    </button>
+                    {plan.coming_soon ? (
+                      <div className="mt-6 flex w-full items-center justify-center gap-2 rounded-md border border-border px-4 py-2.5 text-sm font-medium text-muted-foreground cursor-not-allowed">
+                        Coming Soon
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => handleSubscribe(plan.id)}
+                        disabled={loadingPlanId !== null}
+                        className="mt-6 flex w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition-all hover:bg-primary/90 disabled:opacity-60"
+                      >
+                        {loadingPlanId === plan.id ? (
+                          <Loader2 size={14} className="animate-spin" />
+                        ) : (
+                          <>
+                            Subscribe <ArrowRight size={14} />
+                          </>
+                        )}
+                      </button>
+                    )}
                   </div>
                 </ScrollReveal>
               ))}

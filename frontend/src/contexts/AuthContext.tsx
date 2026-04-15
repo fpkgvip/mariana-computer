@@ -36,7 +36,7 @@ interface ProfileRow {
 interface AuthContextType {
   user: User | null;
   login: (email: string, password: string) => Promise<void>;
-  signup: (email: string, name: string, password: string) => Promise<void>;
+  signup: (email: string, name: string, password: string) => Promise<boolean>;
   logout: () => Promise<void>;
   /** No-op stub kept for backward compatibility — guest access removed */
   skip: () => void;
@@ -98,7 +98,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return;
     }
     try {
-      const profile = await fetchProfile(session.user.id);
+      // Retry up to 3 times with 500ms delays — profile trigger may not have
+      // fired immediately after signup (BUG-R2C-11).
+      let profile: ProfileRow | null = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        profile = await fetchProfile(session.user.id);
+        if (profile) break;
+        await new Promise((r) => setTimeout(r, 500));
+      }
       setUser(buildUser(session, profile));
     } catch (err) {
       console.error("[AuthContext] syncSession error:", err);
@@ -162,7 +169,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     email: string,
     name: string,
     password: string
-  ): Promise<void> => {
+  ): Promise<boolean> => {
     const { data, error } = await supabase.auth.signUp({
       email,
       password,
@@ -174,22 +181,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       toast.error("Sign up failed", { description: error.message });
       throw error;
     }
-    // If email confirmation is disabled, session is available immediately
+    // If email confirmation is disabled, a session is returned immediately.
+    // Let onAuthStateChange / syncSession handle profile loading — no manual
+    // setUser call here to avoid the race condition (BUG-R2C-11).
     if (data.session) {
-      // Profile trigger may not have fired yet — retry up to 3 times
-      let profile: ProfileRow | null = null;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        profile = await fetchProfile(data.session.user.id);
-        if (profile) break;
-        await new Promise((r) => setTimeout(r, 500));
-      }
-      setUser(buildUser(data.session, profile));
-    } else {
-      // Email confirmation required — let the page handle the UI
-      toast.success("Check your email", {
-        description: "We've sent you a confirmation link to complete signup.",
-      });
+      return true;
     }
+    // Email confirmation required — notify the user and stay on the signup page.
+    toast.success("Check your email", {
+      description: "We've sent you a confirmation link to complete signup.",
+    });
+    return false;
   };
 
   // BUG-R2-12: Destructure the signOut result to log errors.
