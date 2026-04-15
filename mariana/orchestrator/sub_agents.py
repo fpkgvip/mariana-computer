@@ -42,7 +42,7 @@ class SubAgentRole(str, Enum):
 class SubAgentTask:
     """A single sub-agent work item."""
 
-    id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
     role: SubAgentRole = SubAgentRole.RESEARCHER
     objective: str = ""
     context: str = ""
@@ -160,7 +160,13 @@ class SubAgentManager:
                 return task
 
         results = await asyncio.gather(*[_run(t) for t in pending], return_exceptions=True)
-        return [r for r in results if isinstance(r, SubAgentTask)]
+        completed: list[SubAgentTask] = []
+        for r in results:
+            if isinstance(r, SubAgentTask):
+                completed.append(r)
+            elif isinstance(r, BaseException):
+                logger.error("sub_agent_gather_exception", error=str(r), type=type(r).__name__)
+        return completed
 
     def get_completed_context(self) -> str:
         """Aggregate results from all completed sub-agents into a context string."""
@@ -184,17 +190,20 @@ class SubAgentManager:
         from mariana.ai.session import spawn_model  # noqa: PLC0415
         from mariana.data.models import EvaluationOutput, TaskType  # noqa: PLC0415
 
-        system_prompt = _ROLE_PROMPTS.get(task.role, _ROLE_PROMPTS[SubAgentRole.RESEARCHER])
-        user_prompt = f"Objective: {task.objective}\n\nContext:\n{task.context}"
+        role_prompt = _ROLE_PROMPTS.get(task.role, _ROLE_PROMPTS[SubAgentRole.RESEARCHER])
+        # Frame the objective as a hypothesis for the EVALUATION schema.
+        # Include the role-specific instructions so the LLM understands its
+        # specialisation while still producing the required structured output.
+        hypothesis = f"[{task.role.value.upper()}] {role_prompt}\n\nObjective: {task.objective}"
 
         cost_before = self.cost_tracker.total_spent
         parsed_output, _session = await spawn_model(
             task_type=TaskType.EVALUATION,
             context={
                 "task_id": self.parent_task_id,
-                "hypothesis_id": "",
-                "hypothesis_statement": task.objective,
-                "compressed_findings": task.context,
+                "hypothesis_id": task.id,
+                "hypothesis_statement": hypothesis,
+                "compressed_findings": task.context or "No prior findings.",
                 "sources_searched": 0,
                 "prior_scores": [],
                 "budget_remaining": self.cost_tracker.budget_remaining,
@@ -206,7 +215,8 @@ class SubAgentManager:
             config=config,
         )
         task.cost_usd = self.cost_tracker.total_spent - cost_before
-        return str(parsed_output)
+        # Extract the substantive content from the evaluation output
+        return parsed_output.score_rationale
 
     async def _emit(self, message: str) -> None:
         """Emit a progress event to the parent investigation's Redis channel."""

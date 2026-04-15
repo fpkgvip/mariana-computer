@@ -59,7 +59,10 @@ async def generate_video(
         video_bytes = base64.b64decode(video_part["inlineData"]["data"])
     elif "fileData" in video_part:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            dl_resp = await client.get(video_part["fileData"]["fileUri"])
+            dl_resp = await client.get(
+                video_part["fileData"]["fileUri"],
+                headers={"x-goog-api-key": api_key},
+            )
             dl_resp.raise_for_status()
             video_bytes = dl_resp.content
     else:

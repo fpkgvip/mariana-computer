@@ -9,6 +9,7 @@ Dependencies: python-pptx, openpyxl, python-docx (listed in requirements.txt).
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import structlog
@@ -37,32 +38,36 @@ async def generate_pptx(
     Path
         The *output_path* after the file has been written.
     """
-    from pptx import Presentation  # noqa: PLC0415
-    from pptx.util import Inches, Pt  # noqa: PLC0415
+    def _build() -> Path:
+        from pptx import Presentation  # noqa: PLC0415
+        from pptx.util import Inches, Pt  # noqa: PLC0415
 
-    prs = Presentation()
-    prs.slide_width = Inches(13.333)
-    prs.slide_height = Inches(7.5)
+        prs = Presentation()
+        prs.slide_width = Inches(13.333)
+        prs.slide_height = Inches(7.5)
 
-    # Title slide
-    slide = prs.slides.add_slide(prs.slide_layouts[0])
-    slide.shapes.title.text = title
+        # Title slide
+        slide = prs.slides.add_slide(prs.slide_layouts[0])
+        slide.shapes.title.text = title
 
-    for slide_data in slides_data:
-        slide = prs.slides.add_slide(prs.slide_layouts[1])
-        slide.shapes.title.text = str(slide_data.get("title", ""))
-        body = slide.shapes.placeholders[1]
-        tf = body.text_frame
-        for point in slide_data.get("bullets", []):
-            p = tf.add_paragraph()
-            p.text = str(point)
-            p.font.size = Pt(18)
+        for slide_data in slides_data:
+            slide = prs.slides.add_slide(prs.slide_layouts[1])
+            slide.shapes.title.text = str(slide_data.get("title", ""))
+            if 1 in slide.shapes.placeholders:
+                body = slide.shapes.placeholders[1]
+                tf = body.text_frame
+                for point in slide_data.get("bullets", []):
+                    p = tf.add_paragraph()
+                    p.text = str(point)
+                    p.font.size = Pt(18)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    prs.save(str(output_path))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        prs.save(str(output_path))
+        return output_path
 
+    result = await asyncio.to_thread(_build)
     logger.info("pptx_generated", title=title, slides=len(slides_data), path=str(output_path))
-    return output_path
+    return result
 
 
 async def generate_xlsx(
@@ -87,23 +92,26 @@ async def generate_xlsx(
     Path
         The *output_path* after the file has been written.
     """
-    from openpyxl import Workbook  # noqa: PLC0415
+    def _build() -> Path:
+        from openpyxl import Workbook  # noqa: PLC0415
 
-    wb = Workbook()
-    first = True
-    for sheet_name, rows in sheets_data.items():
-        ws = wb.active if first else wb.create_sheet(sheet_name)
-        if first:
-            ws.title = sheet_name
-            first = False
-        for row in rows:
-            ws.append(row)
+        wb = Workbook()
+        first = True
+        for sheet_name, rows in sheets_data.items():
+            ws = wb.active if first else wb.create_sheet(sheet_name)
+            if first:
+                ws.title = sheet_name
+                first = False
+            for row in rows:
+                ws.append(row)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(str(output_path))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(str(output_path))
+        return output_path
 
+    result = await asyncio.to_thread(_build)
     logger.info("xlsx_generated", title=title, sheets=len(sheets_data), path=str(output_path))
-    return output_path
+    return result
 
 
 async def generate_docx(
@@ -132,26 +140,29 @@ async def generate_docx(
     Path
         The *output_path* after the file has been written.
     """
-    from docx import Document  # noqa: PLC0415
+    def _build() -> Path:
+        from docx import Document  # noqa: PLC0415
 
-    doc = Document()
-    doc.add_heading(title, 0)
+        doc = Document()
+        doc.add_heading(title, 0)
 
-    for section in sections:
-        heading = section.get("heading")
-        if heading:
-            level = int(section.get("level", 1))
-            doc.add_heading(str(heading), level=level)
-        text = section.get("text")
-        if text:
-            doc.add_paragraph(str(text))
-        bullets = section.get("bullets")
-        if bullets:
-            for bullet in bullets:
-                doc.add_paragraph(str(bullet), style="List Bullet")
+        for section in sections:
+            heading = section.get("heading")
+            if heading:
+                level = int(section.get("level", 1))
+                doc.add_heading(str(heading), level=level)
+            text = section.get("text")
+            if text:
+                doc.add_paragraph(str(text))
+            bullets = section.get("bullets")
+            if bullets:
+                for bullet in bullets:
+                    doc.add_paragraph(str(bullet), style="List Bullet")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    doc.save(str(output_path))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(str(output_path))
+        return output_path
 
+    result = await asyncio.to_thread(_build)
     logger.info("docx_generated", title=title, sections=len(sections), path=str(output_path))
-    return output_path
+    return result

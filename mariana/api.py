@@ -2679,6 +2679,50 @@ async def store_preference(
     return {"status": "ok"}
 
 
+class DeleteFactRequest(BaseModel):
+    """Request body for DELETE /api/memory/facts."""
+    fact: str = Field(..., min_length=1)
+
+
+class DeletePreferenceRequest(BaseModel):
+    """Request body for DELETE /api/memory/preferences."""
+    key: str = Field(..., min_length=1)
+
+
+@app.delete("/api/memory/facts", tags=["Memory"])
+async def delete_fact(
+    body: DeleteFactRequest,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> dict[str, str]:
+    """Delete a stored fact for the current user."""
+    from pathlib import Path as _MemPath  # noqa: PLC0415
+    from mariana.tools.memory import UserMemory  # noqa: PLC0415
+
+    cfg = _get_config()
+    mem = UserMemory(user_id=current_user["user_id"], data_root=_MemPath(cfg.DATA_ROOT))
+    found = mem.delete_fact(body.fact)
+    if not found:
+        raise HTTPException(status_code=404, detail="Fact not found")
+    return {"status": "ok"}
+
+
+@app.delete("/api/memory/preferences", tags=["Memory"])
+async def delete_preference(
+    body: DeletePreferenceRequest,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> dict[str, str]:
+    """Delete a stored preference for the current user."""
+    from pathlib import Path as _MemPath  # noqa: PLC0415
+    from mariana.tools.memory import UserMemory  # noqa: PLC0415
+
+    cfg = _get_config()
+    mem = UserMemory(user_id=current_user["user_id"], data_root=_MemPath(cfg.DATA_ROOT))
+    found = mem.delete_preference(body.key)
+    if not found:
+        raise HTTPException(status_code=404, detail="Preference not found")
+    return {"status": "ok"}
+
+
 # ---------------------------------------------------------------------------
 # Routes — Skills
 # ---------------------------------------------------------------------------

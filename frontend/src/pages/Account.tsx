@@ -78,8 +78,8 @@ export default function Account() {
         throw new Error(`HTTP ${res.status}: ${errText}`);
       }
 
-      const data: { url: string } = await res.json();
-      window.location.href = data.url;
+      const data: { portal_url: string } = await res.json();
+      window.location.href = data.portal_url;
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";
       toast.error("Could not open billing portal", { description: msg });

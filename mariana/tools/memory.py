@@ -82,6 +82,16 @@ class UserMemory:
             facts = [f for f in facts if f.get("category") == category]
         return [f["fact"] for f in facts]
 
+    def delete_fact(self, fact: str) -> bool:
+        """Remove a fact by its text content. Returns True if found and removed."""
+        facts: list[dict[str, str]] = self._data.get("facts", [])  # type: ignore[assignment]
+        original_len = len(facts)
+        self._data["facts"] = [f for f in facts if f["fact"] != fact]
+        if len(self._data["facts"]) < original_len:  # type: ignore[arg-type]
+            self._save()
+            return True
+        return False
+
     # ------------------------------------------------------------------
     # Preferences
     # ------------------------------------------------------------------
@@ -97,6 +107,16 @@ class UserMemory:
         """Return all preferences as a flat key→value mapping."""
         prefs: dict[str, dict[str, str]] = self._data.get("preferences", {})  # type: ignore[assignment]
         return {k: v["value"] for k, v in prefs.items()}
+
+    def delete_preference(self, key: str) -> bool:
+        """Remove a preference by key. Returns True if found and removed."""
+        prefs: dict[str, dict[str, str]] = self._data.get("preferences", {})  # type: ignore[assignment]
+        if key in prefs:
+            del prefs[key]
+            self._data["preferences"] = prefs
+            self._save()
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # History

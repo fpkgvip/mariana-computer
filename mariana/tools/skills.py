@@ -12,12 +12,30 @@ can also create custom skills that are persisted as JSON files under
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+# Regex to strip path-traversal characters from skill IDs/names
+_SAFE_ID_RE = re.compile(r"[^a-z0-9_-]")
+
+
+def _sanitize_skill_id(raw: str) -> str:
+    """Sanitize a skill ID to prevent path traversal."""
+    return _SAFE_ID_RE.sub("", raw.lower().replace(" ", "-"))
+
+
+def _safe_skill_path(base_dir: Path, skill_id: str) -> Path:
+    """Resolve a skill file path and verify it stays within base_dir."""
+    sanitized = _sanitize_skill_id(skill_id)
+    resolved = (base_dir / f"{sanitized}.json").resolve()
+    if not str(resolved).startswith(str(base_dir.resolve())):
+        raise ValueError(f"Invalid skill ID: path escapes skills directory")
+    return resolved
 
 
 @dataclass
@@ -166,8 +184,9 @@ class SkillManager:
         category: str = "user",
     ) -> Skill:
         """Create and persist a custom skill."""
+        safe_id = f"custom-{_sanitize_skill_id(name)}"
         skill = Skill(
-            id=f"custom-{name.lower().replace(' ', '-')}",
+            id=safe_id,
             name=name,
             description=description,
             system_prompt=system_prompt,
@@ -175,7 +194,7 @@ class SkillManager:
             category=category,
             owner_id=owner_id,
         )
-        skill_file = self.skills_dir / f"{skill.id}.json"
+        skill_file = _safe_skill_path(self.skills_dir, skill.id)
         skill_file.write_text(
             json.dumps(
                 {
@@ -196,7 +215,7 @@ class SkillManager:
 
     def delete_skill(self, skill_id: str) -> bool:
         """Delete a custom skill by ID. Returns True if deleted."""
-        f = self.skills_dir / f"{skill_id}.json"
+        f = _safe_skill_path(self.skills_dir, skill_id)
         if f.exists():
             f.unlink()
             return True
@@ -217,7 +236,7 @@ class SkillManager:
         return skills
 
     def _load_custom_skill(self, skill_id: str) -> Skill | None:
-        f = self.skills_dir / f"{skill_id}.json"
+        f = _safe_skill_path(self.skills_dir, skill_id)
         if f.exists():
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))

@@ -122,7 +122,11 @@ export default function Pricing() {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ plan_id: planId }),
+        body: JSON.stringify({
+          plan_id: planId,
+          success_url: `${window.location.origin}/chat?checkout=success`,
+          cancel_url: `${window.location.origin}/pricing?checkout=cancelled`,
+        }),
       });
 
       if (!res.ok) {
@@ -130,8 +134,8 @@ export default function Pricing() {
         throw new Error(`HTTP ${res.status}: ${errText}`);
       }
 
-      const data: { url: string } = await res.json();
-      window.location.href = data.url;
+      const data: { checkout_url: string; session_id: string } = await res.json();
+      window.location.href = data.checkout_url;
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";
       toast.error("Could not start checkout", { description: msg });

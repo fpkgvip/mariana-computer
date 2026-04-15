@@ -80,7 +80,10 @@ class PolygonConnector(BaseConnector):
         """
         url = f"{_BASE_URL}{path}"
         merged_params = self._auth_params(params)
-        cache_key = self._cache_key("polygon", url, str(sorted(merged_params.items())))
+        # Exclude API key from cache key to avoid key rotation causing cache storms
+        # and to prevent raw API keys from appearing in cache backend logs
+        cache_params = {k: v for k, v in sorted(merged_params.items()) if k != "apiKey"}
+        cache_key = self._cache_key("polygon", url, str(cache_params))
 
         cached = await self._cache_get(cache_key)
         if cached is not None:

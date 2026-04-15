@@ -75,8 +75,9 @@ interface InvestigationPollResponse {
 interface ClassifyResponse {
   tier: "instant" | "standard" | "deep";
   plan_summary: string;
-  estimated_duration: string;
+  estimated_duration_hours: number;
   estimated_credits: number;
+  requires_approval: boolean;
 }
 
 /** Pending research plan to show in the chat before approval */
@@ -84,7 +85,7 @@ interface ResearchPlan {
   topic: string;
   tier: ClassifyResponse["tier"];
   plan_summary: string;
-  estimated_duration: string;
+  estimated_duration_hours: number;
   estimated_credits: number;
 }
 
@@ -97,6 +98,16 @@ const API_URL = import.meta.env.VITE_API_URL ?? "";
 
 /** Generate a stable unique ID for message list keys */
 const makeMessageId = () => `msg-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+/** Format hours as a human-readable duration string */
+const formatDuration = (hours: number): string => {
+  if (hours < 1 / 60) return "< 1 min";
+  if (hours < 1) return `${Math.round(hours * 60)} min`;
+  if (hours === 1) return "1 hour";
+  if (hours < 24) return `${hours.toFixed(1).replace(/\.0$/, "")} hours`;
+  const days = hours / 24;
+  return `${days.toFixed(1).replace(/\.0$/, "")} days`;
+};
 
 const STATUS_COLORS: Record<InvestigationStatus, string> = {
   PENDING: "bg-yellow-500/20 text-yellow-400 ring-yellow-500/30",
@@ -113,6 +124,59 @@ const STATUS_COLORS: Record<InvestigationStatus, string> = {
 async function getAccessToken(): Promise<string | null> {
   const { data } = await supabase.auth.getSession();
   return data.session?.access_token ?? null;
+}
+
+/** Authenticated image — fetches via auth header and displays as blob URL */
+function AuthImage({ src, alt, className }: { src: string; alt: string; className?: string }) {
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    let url: string | null = null;
+    (async () => {
+      const token = await getAccessToken();
+      if (!token || cancelled) return;
+      try {
+        const res = await fetch(src, { headers: { Authorization: `Bearer ${token}` } });
+        if (!res.ok || cancelled) return;
+        const blob = await res.blob();
+        if (cancelled) return;
+        url = URL.createObjectURL(blob);
+        setBlobUrl(url);
+      } catch { /* silently fail */ }
+    })();
+    return () => { cancelled = true; if (url) URL.revokeObjectURL(url); };
+  }, [src]);
+  if (!blobUrl) return <div className={`animate-pulse bg-muted rounded ${className ?? ""}`} style={{ minHeight: 80 }} />;
+  return <img src={blobUrl} alt={alt} className={className} loading="lazy" />;
+}
+
+/** Authenticated video — fetches via auth header and displays as blob URL */
+function AuthVideo({ src, ext, className }: { src: string; ext: string; className?: string }) {
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    let url: string | null = null;
+    (async () => {
+      const token = await getAccessToken();
+      if (!token || cancelled) return;
+      try {
+        const res = await fetch(src, { headers: { Authorization: `Bearer ${token}` } });
+        if (!res.ok || cancelled) return;
+        const blob = await res.blob();
+        if (cancelled) return;
+        url = URL.createObjectURL(blob);
+        setBlobUrl(url);
+      } catch { /* silently fail */ }
+    })();
+    return () => { cancelled = true; if (url) URL.revokeObjectURL(url); };
+  }, [src]);
+  if (!blobUrl) return <div className={`animate-pulse bg-muted rounded ${className ?? ""}`} style={{ minHeight: 80 }} />;
+  return (
+    <video controls className={className} preload="metadata">
+      <source src={blobUrl} type={`video/${ext === "mov" ? "mp4" : ext}`} />
+      Your browser does not support video playback.
+    </video>
+  );
 }
 
 /**
@@ -1042,7 +1106,7 @@ export default function Chat() {
           topic,
           tier: classifyData.tier,
           plan_summary: classifyData.plan_summary,
-          estimated_duration: classifyData.estimated_duration,
+          estimated_duration_hours: classifyData.estimated_duration_hours,
           estimated_credits: classifyData.estimated_credits,
         });
       }
@@ -1569,11 +1633,10 @@ export default function Chat() {
                                 }
                                 className="block max-w-sm rounded-md overflow-hidden border border-border hover:ring-1 hover:ring-primary/30 transition-all cursor-pointer"
                               >
-                                <img
+                                <AuthImage
                                   src={fileUrl}
                                   alt={parsed.filename}
                                   className="max-h-64 w-auto object-contain bg-black/20"
-                                  loading="lazy"
                                 />
                               </button>
                               <p className="text-[10px] text-muted-foreground/50">{parsed.filename}</p>
@@ -1584,14 +1647,11 @@ export default function Chat() {
                         if (isVideo) {
                           return (
                             <div className="space-y-1 max-w-md">
-                              <video
-                                controls
+                              <AuthVideo
+                                src={fileUrl}
+                                ext={ext}
                                 className="w-full rounded-md border border-border"
-                                preload="metadata"
-                              >
-                                <source src={fileUrl} type={`video/${ext === "mov" ? "mp4" : ext}`} />
-                                Your browser does not support video playback.
-                              </video>
+                              />
                               <p className="text-[10px] text-muted-foreground/50">{parsed.filename}</p>
                             </div>
                           );
@@ -1722,7 +1782,7 @@ export default function Chat() {
                 <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
                   <span className="flex items-center gap-1">
                     <Clock size={11} />
-                    Estimated: ~{pendingPlan.estimated_duration}
+                    Estimated: ~{formatDuration(pendingPlan.estimated_duration_hours)}
                   </span>
                   <span>·</span>
                   <span>{pendingPlan.estimated_credits.toLocaleString()} credits</span>

@@ -463,10 +463,11 @@ def _apply_guards(
 
         if trigger == TransitionTrigger.BRANCH_SCORE_HIGH:
             # BUG-020: differentiate score7 ($20 grant) vs score8 ($50 grant)
-            _best_score = max(
-                (b.latest_score for b in active if b.latest_score is not None),
-                default=0.0,
-            )
+            scored = [b.latest_score for b in active if b.latest_score is not None]
+            if not scored:
+                # No branches have scores yet — skip the grant
+                return State.SEARCH, actions
+            _best_score = max(scored)
             _score_band = "score8" if _best_score >= 0.8 else "score7"
             actions.append(Action("GRANT_BUDGET", {"score_band": _score_band}))
             return State.DEEPEN, actions
@@ -480,10 +481,10 @@ def _apply_guards(
     if current_state == State.DEEPEN:
         if trigger == TransitionTrigger.BRANCH_SCORE_HIGH:
             # BUG-020: differentiate score7 vs score8
-            _best_score_d = max(
-                (b.latest_score for b in active if b.latest_score is not None),
-                default=0.0,
-            )
+            scored_d = [b.latest_score for b in active if b.latest_score is not None]
+            if not scored_d:
+                return State.SEARCH, actions
+            _best_score_d = max(scored_d)
             _score_band_d = "score8" if _best_score_d >= 0.8 else "score7"
             actions.append(Action("GRANT_BUDGET", {"score_band": _score_band_d}))
             return State.DEEPEN, actions

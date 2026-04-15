@@ -219,6 +219,10 @@ class SecEdgarConnector(BaseConnector):
         self._log.info("get_filing_text", url=url)
         if not url.startswith("https://"):
             raise ConnectorError(f"Invalid filing URL (must be https://): {url}")
+        from urllib.parse import urlparse  # noqa: PLC0415
+        parsed_host = urlparse(url).hostname or ""
+        if not parsed_host.endswith(".sec.gov"):
+            raise ConnectorError(f"Filing URL must be on *.sec.gov, got: {parsed_host}")
         try:
             return await self._edgar_get_text(url)
         except Exception as exc:

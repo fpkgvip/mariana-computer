@@ -79,7 +79,7 @@ class DispatchResponse(BaseModel):
 # Application
 # ---------------------------------------------------------------------------
 
-_STARTUP_TIME: datetime = datetime.now(tz=timezone.utc)
+_STARTUP_TIME: datetime | None = None
 
 # Module-level counters for monitoring.
 _SKIPPED_COUNT: int = 0
@@ -92,6 +92,12 @@ app = FastAPI(
     ),
     version="0.1.0",
 )
+
+
+@app.on_event("startup")
+async def _set_startup_time() -> None:
+    global _STARTUP_TIME
+    _STARTUP_TIME = datetime.now(tz=timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +127,7 @@ async def health() -> JSONResponse:
             "pool_size_target": int(os.getenv("BROWSER_POOL_SIZE", "5")),
             "uptime_seconds": int(
                 (datetime.now(tz=timezone.utc) - _STARTUP_TIME).total_seconds()
-            ),
+            ) if _STARTUP_TIME else 0,
             "note": (
                 "Prototype mode — using HTTP API connectors (httpx) instead of "
                 "Playwright browser automation.  Browser pool will be activated "
@@ -211,8 +217,8 @@ async def generic_exception_handler(request: Request, exc: Exception) -> JSONRes
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
             "status": "error",
-            "error": type(exc).__name__,
-            "detail": str(exc),
+            "error": "internal_server_error",
+            "detail": "An unexpected error occurred. Check server logs for details.",
         },
     )
 

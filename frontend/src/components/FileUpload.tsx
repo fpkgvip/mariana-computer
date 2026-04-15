@@ -121,7 +121,7 @@ export default function FileUpload({
       onFilesChange([...uploadedFiles, newFile]);
 
       const formData = new FormData();
-      formData.append("file", file);
+      formData.append("files", file);
       if (sessionUuid) {
         formData.append("session_uuid", sessionUuid);
       }

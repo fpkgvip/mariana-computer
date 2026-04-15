@@ -381,7 +381,8 @@ async def load_checkpoint_blob(snapshot_path: str) -> dict[str, Any]:
             f"Checkpoint snapshot not found: {snapshot_path!r}"
         )
 
-    raw = path.read_text(encoding="utf-8")
+    import asyncio as _aio  # noqa: PLC0415
+    raw = await _aio.to_thread(path.read_text, "utf-8")
     blob: dict[str, Any] = json.loads(raw)
 
     logger.debug(
