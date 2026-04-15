@@ -76,7 +76,14 @@ export default function Checkout() {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ plan_id: planId }),
+        // BUG-R2-S2-02: Must send success_url and cancel_url per API contract.
+        // Pricing.tsx sends both; Checkout.tsx was missing them, causing the backend
+        // to reject the request or use broken default redirect URLs.
+        body: JSON.stringify({
+          plan_id: planId,
+          success_url: `${window.location.origin}/chat?checkout=success`,
+          cancel_url: `${window.location.origin}/checkout?checkout=cancelled`,
+        }),
       });
 
       if (!res.ok) {
@@ -84,8 +91,11 @@ export default function Checkout() {
         throw new Error(`HTTP ${res.status}: ${errText}`);
       }
 
-      const data: { url: string } = await res.json();
-      window.location.href = data.url;
+      // BUG-R2-S2-01: Backend returns { checkout_url, session_id } — not { url }.
+      // Pricing.tsx already used the correct field; Checkout.tsx was using the wrong one,
+      // causing a redirect to "undefined" after successful checkout creation.
+      const data: { checkout_url: string; session_id: string } = await res.json();
+      window.location.href = data.checkout_url;
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";
       toast.error("Could not start checkout", { description: msg });

@@ -710,12 +710,17 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
         # Clean up completed tasks
         done_tasks = {t for t in active_tasks if t.done()}
         for t in done_tasks:
-            # Log any unexpected exceptions from completed tasks
-            if t.exception() is not None:
-                logger.error(
-                    "daemon_task_exception",
-                    error=str(t.exception()),
-                )
+            # BUG-S2-10 fix: t.exception() raises CancelledError if the task
+            # was cancelled, crashing the cleanup loop.  Guard with try/except.
+            try:
+                exc = t.exception()
+                if exc is not None:
+                    logger.error(
+                        "daemon_task_exception",
+                        error=str(exc),
+                    )
+            except asyncio.CancelledError:
+                logger.info("daemon_task_cancelled", task_name=t.get_name())
             active_tasks.discard(t)
 
         task_files = sorted(inbox.glob("*.task.json"))

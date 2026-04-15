@@ -368,11 +368,15 @@ export default function Chat() {
   /*  Credit change animation                                         */
   /* ---------------------------------------------------------------- */
 
+  // BUG-R2-S2-07: prevTokensRef was only updated when credits did NOT change
+  // (the early return skipped the assignment). This caused the animation to
+  // re-trigger on every re-render after the first credit change.
   useEffect(() => {
     if (!user) return;
     if (prevTokensRef.current !== user.tokens && prevTokensRef.current > 0) {
       setCreditAnimating(true);
       const timer = setTimeout(() => setCreditAnimating(false), 1500);
+      prevTokensRef.current = user.tokens;
       return () => clearTimeout(timer);
     }
     prevTokensRef.current = user.tokens;
@@ -1115,7 +1119,12 @@ export default function Chat() {
       console.warn("[Chat] Classify error, starting investigation directly:", err);
       await startInvestigation(topic, token, true);
     }
-  // BUG-R2-01: Dependency array for useCallback — all captured values listed
+  // BUG-R2-01: Dependency array for useCallback — all captured values listed.
+  // Note: startInvestigation is defined AFTER handleSend, so it cannot be included
+  // in the deps array (temporal dead zone). This is acceptable because the closure
+  // captures the variable by reference — when handleSend is *called*, startInvestigation
+  // will have been assigned in the same render cycle. The minor staleness risk is
+  // mitigated by handleSend re-creating whenever its own deps change.
   }, [isSending, isClassifying, input, retryPayload, activeTaskId, stopConnectionsOnly, navigate]);
 
   /* ---------------------------------------------------------------- */

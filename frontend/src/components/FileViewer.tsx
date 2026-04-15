@@ -173,8 +173,12 @@ function FileContent({ file, apiUrl }: { file: FileAttachment; apiUrl: string })
   const isVideo = ["mp4", "webm", "mov"].includes(ext);
   const isOffice = ["pptx", "xlsx", "docx"].includes(ext);
 
+  // BUG-R2-S2-08: The cleanup function captured `blobUrl` from the closure at setup
+  // time (always null), so blob URLs were never revoked — causing a memory leak for
+  // every file preview. Use a local variable to track the URL created in this effect.
   useEffect(() => {
     let cancelled = false;
+    let localBlobUrl: string | null = null;
 
     async function load() {
       setLoading(true);
@@ -208,7 +212,10 @@ function FileContent({ file, apiUrl }: { file: FileAttachment; apiUrl: string })
           if (!cancelled) setContent(text);
         } else {
           const blob = await res.blob();
-          if (!cancelled) setBlobUrl(URL.createObjectURL(blob));
+          if (!cancelled) {
+            localBlobUrl = URL.createObjectURL(blob);
+            setBlobUrl(localBlobUrl);
+          }
         }
       } catch (err) {
         if (!cancelled) {
@@ -223,7 +230,7 @@ function FileContent({ file, apiUrl }: { file: FileAttachment; apiUrl: string })
 
     return () => {
       cancelled = true;
-      if (blobUrl) URL.revokeObjectURL(blobUrl);
+      if (localBlobUrl) URL.revokeObjectURL(localBlobUrl);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [file.taskId, file.filename, apiUrl]);

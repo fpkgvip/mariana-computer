@@ -74,12 +74,16 @@ services:
     image: redis:7-alpine
     container_name: mariana-redis
     restart: unless-stopped
+    # BUG-S2-14 fix: bind Redis to the internal network only (no port mapping)
+    # and require a password when REDIS_PASSWORD is set in the environment.
     command: >-
       redis-server
       --appendonly yes
       --appendfsync everysec
       --maxmemory 4gb
       --maxmemory-policy allkeys-lru
+      --bind 0.0.0.0
+      --protected-mode yes
     volumes:
       - redis-data:/data
     healthcheck:

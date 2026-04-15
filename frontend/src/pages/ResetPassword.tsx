@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { supabase } from "@/lib/supabase";
 import { Input } from "@/components/ui/input";
@@ -28,10 +28,18 @@ export default function ResetPassword() {
   // every time PASSWORD_RECOVERY fired and set isReady=true, creating a leaked subscription.
   // The timeout callback uses a functional setter so it correctly handles the case where
   // isReady was already set to true before the timeout fires.
+  // BUG-R2-S2-05: The previous timeout handler checked `prev` (isError) instead of isReady.
+  // If PASSWORD_RECOVERY fires before 10s, clearTimeout prevents it. But if the timeout
+  // callback was already queued (race), it set isError=true even though isReady=true,
+  // showing both the form AND the error banner simultaneously.
+  // Fix: use a ref to track readiness so the timeout callback can check it synchronously.
+  const isReadyRef = useRef(false);
+
   useEffect(() => {
     const timeout = setTimeout(() => {
-      // Only set error if we haven't already transitioned to the ready state
-      setIsError((prev) => (prev ? prev : true));
+      if (!isReadyRef.current) {
+        setIsError(true);
+      }
     }, 10000);
 
     const {
@@ -39,6 +47,7 @@ export default function ResetPassword() {
     } = supabase.auth.onAuthStateChange((event) => {
       if (event === "PASSWORD_RECOVERY") {
         clearTimeout(timeout);
+        isReadyRef.current = true;
         setIsReady(true);
       }
     });

@@ -511,6 +511,12 @@ async def _get_current_user(
         # Restore padding stripped during JWT encoding
         payload_b64 += "=" * (4 - len(payload_b64) % 4)
         payload = _json.loads(base64.urlsafe_b64decode(payload_b64))
+        # BUG-S2-02 fix: check the "exp" claim so expired JWTs are rejected.
+        # Without this, a stolen token works indefinitely.
+        import time as _time  # noqa: PLC0415
+        exp = payload.get("exp")
+        if exp is not None and _time.time() > float(exp):
+            raise HTTPException(status_code=401, detail="Token has expired")
         user_id: str | None = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Token missing sub claim")
@@ -772,15 +778,23 @@ async def list_investigations(
     page: int = Query(1, ge=1, description="1-based page number"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
     status: str | None = Query(None, description="Filter by status (e.g. RUNNING)"),
+    current_user: dict[str, str] = Depends(_get_current_user),
 ) -> PaginatedTasksResponse:
-    """List all investigations, newest first, with optional status filter."""
+    """List investigations owned by the authenticated user.
+
+    BUG-S2-11 fix: Previously unauthenticated and returned ALL investigations.
+    Now requires auth and filters by user_id from the JWT.
+    Admin users see all investigations via /api/admin/investigations.
+    """
     db = _get_db()
     offset = (page - 1) * page_size
+    user_id = current_user["user_id"]
 
     if status:
         total: int = await db.fetchval(
-            "SELECT COUNT(*) FROM research_tasks WHERE status = $1",
+            "SELECT COUNT(*) FROM research_tasks WHERE status = $1 AND metadata->>'user_id' = $2",
             status.upper(),
+            user_id,
         )
         rows = await db.fetch(
             """
@@ -788,25 +802,31 @@ async def list_investigations(
                    total_spent_usd, ai_call_counter, created_at,
                    started_at, completed_at, output_pdf_path, output_docx_path
             FROM research_tasks
-            WHERE status = $1
+            WHERE status = $1 AND metadata->>'user_id' = $2
             ORDER BY created_at DESC
-            LIMIT $2 OFFSET $3
+            LIMIT $3 OFFSET $4
             """,
             status.upper(),
+            user_id,
             page_size,
             offset,
         )
     else:
-        total = await db.fetchval("SELECT COUNT(*) FROM research_tasks")
+        total = await db.fetchval(
+            "SELECT COUNT(*) FROM research_tasks WHERE metadata->>'user_id' = $1",
+            user_id,
+        )
         rows = await db.fetch(
             """
             SELECT id, topic, budget_usd, status, current_state,
                    total_spent_usd, ai_call_counter, created_at,
                    started_at, completed_at, output_pdf_path, output_docx_path
             FROM research_tasks
+            WHERE metadata->>'user_id' = $1
             ORDER BY created_at DESC
-            LIMIT $1 OFFSET $2
+            LIMIT $2 OFFSET $3
             """,
+            user_id,
             page_size,
             offset,
         )
@@ -824,14 +844,21 @@ async def list_investigations(
     response_model=TaskSummary,
     tags=["Investigations"],
 )
-async def get_investigation(task_id: str) -> TaskSummary:
-    """Retrieve full detail for a single investigation by its task_id."""
+async def get_investigation(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> TaskSummary:
+    """Retrieve full detail for a single investigation by its task_id.
+
+    BUG-S2-12 fix: Added auth — only the investigation owner or admin can view.
+    """
     db = _get_db()
     row = await db.fetchrow(
         """
         SELECT id, topic, budget_usd, status, current_state,
                total_spent_usd, ai_call_counter, created_at,
-               started_at, completed_at, output_pdf_path, output_docx_path
+               started_at, completed_at, output_pdf_path, output_docx_path,
+               metadata
         FROM research_tasks
         WHERE id = $1
         """,
@@ -839,6 +866,13 @@ async def get_investigation(task_id: str) -> TaskSummary:
     )
     if row is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+    # Verify ownership
+    metadata = row.get("metadata") or {}
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    task_user_id = metadata.get("user_id", "")
+    if task_user_id and task_user_id != current_user["user_id"] and current_user["user_id"] != ADMIN_USER_ID:
+        raise HTTPException(status_code=403, detail="You do not own this investigation")
     return _row_to_task_summary(row)
 
 
@@ -1850,17 +1884,17 @@ async def stripe_webhook(request: Request) -> JSONResponse:
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
 
-    # Verify webhook signature when the secret is configured
+    # BUG-S2-06 fix: Reject webhooks entirely when STRIPE_WEBHOOK_SECRET is
+    # not configured, instead of silently accepting unverified payloads.
+    # An attacker could forge webhook events to credit arbitrary accounts.
+    if not cfg.STRIPE_WEBHOOK_SECRET:
+        logger.error("stripe_webhook_secret_not_configured")
+        raise HTTPException(status_code=503, detail="Webhook signature verification not configured")
+
     try:
-        if cfg.STRIPE_WEBHOOK_SECRET:
-            event = _stripe.Webhook.construct_event(
-                payload, sig_header, cfg.STRIPE_WEBHOOK_SECRET
-            )
-        else:
-            # No webhook secret configured — parse but do not verify
-            event = _stripe.Event.construct_from(
-                _json.loads(payload), _stripe.api_key
-            )
+        event = _stripe.Webhook.construct_event(
+            payload, sig_header, cfg.STRIPE_WEBHOOK_SECRET
+        )
     except _stripe.SignatureVerificationError as exc:
         logger.warning("stripe_webhook_signature_invalid", error=str(exc))
         raise HTTPException(status_code=400, detail="Invalid webhook signature") from exc
@@ -2090,9 +2124,12 @@ async def _supabase_patch_profile_by_customer(
     cfg: AppConfig,
 ) -> None:
     """PATCH Supabase profile rows matching a stripe_customer_id."""
+    # BUG-S2-05 fix: URL-encode the customer ID to prevent query injection
+    # via crafted Stripe webhook payloads containing special characters.
+    from urllib.parse import quote as _url_quote  # noqa: PLC0415
     url = (
         f"{cfg.SUPABASE_URL}/rest/v1/profiles"
-        f"?stripe_customer_id=eq.{stripe_customer_id}"
+        f"?stripe_customer_id=eq.{_url_quote(stripe_customer_id, safe='')}"
     )
     headers = {
         "apikey": cfg.SUPABASE_SERVICE_KEY,
@@ -2578,10 +2615,14 @@ async def graceful_shutdown(
     termination via ``asyncio``.  Requires X-Admin-Key header matching
     ADMIN_SECRET_KEY config value.  Use with care in production.
     """
-    # BUG-009: Require admin key to prevent unauthenticated shutdown
+    # BUG-009 + BUG-S2-03: Require admin key to prevent unauthenticated shutdown.
+    # When ADMIN_SECRET_KEY is not configured, ALL shutdown requests are rejected
+    # (previously an empty key allowed anyone to shut down the server).
     cfg = _get_config()
     admin_key = getattr(cfg, "ADMIN_SECRET_KEY", "")
-    if admin_key and x_admin_key != admin_key:
+    if not admin_key:
+        raise HTTPException(status_code=403, detail="Shutdown endpoint disabled (ADMIN_SECRET_KEY not configured)")
+    if x_admin_key != admin_key:
         raise HTTPException(status_code=401, detail="Unauthorized")
     db: asyncpg.Pool | None = _db_pool
     if db is not None:

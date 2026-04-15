@@ -133,8 +133,11 @@ export default function Admin() {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data: AdminUser[] = await res.json();
-      setUsers(data);
+      // BUG-R2-S2-04: Backend returns paginated { items, total, page, page_size },
+      // not a bare array. Same pattern as fetchInvestigations.
+      const data = await res.json();
+      const items: AdminUser[] = Array.isArray(data) ? data : (data.items ?? []);
+      setUsers(items);
     } catch (err) {
       console.error("[Admin] Failed to fetch users:", err);
       toast.error("Could not load users");

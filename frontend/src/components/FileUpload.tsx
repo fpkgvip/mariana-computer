@@ -102,6 +102,15 @@ export default function FileUpload({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragCounterRef = useRef(0);
 
+  // BUG-R2-S2-09: The original implementation spread `uploadedFiles` from the closure
+  // to build the new array. When multiple files are uploaded concurrently (user selects
+  // 3 at once), each uploadFile call captures the same stale snapshot, so the second
+  // upload's onFilesChange([...staleFiles, file2]) overwrites file1, losing it.
+  // Fix: use a ref to always read the latest files, and use functional updates where
+  // possible. Also, XHR progress callbacks read from the ref.
+  const uploadedFilesRef = useRef(uploadedFiles);
+  uploadedFilesRef.current = uploadedFiles;
+
   const uploadFile = useCallback(
     async (file: globalThis.File) => {
       const token = await getAccessToken();
@@ -118,7 +127,7 @@ export default function FileUpload({
         progress: 0,
       };
 
-      onFilesChange([...uploadedFiles, newFile]);
+      onFilesChange([...uploadedFilesRef.current, newFile]);
 
       const formData = new FormData();
       formData.append("files", file);
@@ -133,9 +142,14 @@ export default function FileUpload({
           xhr.upload.addEventListener("progress", (e) => {
             if (e.lengthComputable) {
               const pct = Math.round((e.loaded / e.total) * 100);
-              onFilesChange(
-                [...uploadedFiles, { ...newFile, progress: pct }]
-              );
+              // Use ref to get latest files and update progress for this specific file
+              const current = uploadedFilesRef.current;
+              const idx = current.findIndex((f) => f.name === file.name && f.size === file.size);
+              if (idx >= 0) {
+                const updated = [...current];
+                updated[idx] = { ...updated[idx], progress: pct };
+                onFilesChange(updated);
+              }
             }
           });
 
@@ -154,7 +168,9 @@ export default function FileUpload({
           xhr.addEventListener("error", () => reject(new Error("Network error")));
           xhr.addEventListener("abort", () => reject(new Error("Upload cancelled")));
 
-          xhr.open("POST", `${apiUrl}/api/upload`);
+          // BUG-R2-S2-03: Endpoint is /api/uploads/pending, not /api/upload.
+          // The old URL returned 404, silently failing all file uploads.
+          xhr.open("POST", `${apiUrl}/api/uploads/pending`);
           xhr.setRequestHeader("Authorization", `Bearer ${token}`);
           xhr.send(formData);
         });
@@ -165,18 +181,27 @@ export default function FileUpload({
           onSessionUuid(result.session_uuid);
         }
 
-        // Mark as complete
-        onFilesChange([...uploadedFiles, { ...newFile, progress: 100 }]);
+        // Mark as complete using ref for latest state
+        const current = uploadedFilesRef.current;
+        const idx = current.findIndex((f) => f.name === file.name && f.size === file.size);
+        if (idx >= 0) {
+          const updated = [...current];
+          updated[idx] = { ...updated[idx], progress: 100 };
+          onFilesChange(updated);
+        }
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : "Upload failed";
-        onFilesChange([
-          ...uploadedFiles,
-          { ...newFile, progress: 0, error: errorMsg },
-        ]);
+        const current = uploadedFilesRef.current;
+        const idx = current.findIndex((f) => f.name === file.name && f.size === file.size);
+        if (idx >= 0) {
+          const updated = [...current];
+          updated[idx] = { ...updated[idx], progress: 0, error: errorMsg };
+          onFilesChange(updated);
+        }
         toast.error(`Failed to upload ${file.name}`, { description: errorMsg });
       }
     },
-    [uploadedFiles, sessionUuid, onFilesChange, onSessionUuid, apiUrl]
+    [sessionUuid, onFilesChange, onSessionUuid, apiUrl]
   );
 
   const handleFiles = useCallback(

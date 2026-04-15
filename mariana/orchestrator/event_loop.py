@@ -1843,6 +1843,12 @@ async def _check_user_credits(user_id: str, config: Any) -> int | None:
         return int(rows[0].get("tokens", 0) or 0)
 
 
+# BUG-S2-09 fix: hold references to fire-and-forget tasks to prevent GC from
+# silently dropping them before they complete.  Python's asyncio will log
+# "Task was destroyed but it is pending!" warnings otherwise.
+_background_tasks: set[Any] = set()
+
+
 def _emit_progress(redis_client: Any, task_id: str, event: dict[str, Any]) -> None:
     """Publish a structured progress event to the Redis logs channel.
 
@@ -1854,12 +1860,13 @@ def _emit_progress(redis_client: Any, task_id: str, event: dict[str, Any]) -> No
     import json as _json_emit  # noqa: PLC0415
 
     try:
-        # redis.asyncio publish returns a coroutine; we schedule it but
-        # don't await it to keep the helper synchronous-callable.
         import asyncio as _asyncio_emit  # noqa: PLC0415
         loop = _asyncio_emit.get_running_loop()
-        loop.create_task(
+        task = loop.create_task(
             redis_client.publish(f"logs:{task_id}", _json_emit.dumps(event))
         )
+        # Hold a strong reference until the task completes
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
     except Exception as exc:
         logger.debug("emit_progress_failed", task_id=task_id, error=str(exc))

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import {
   Search,
   BarChart3,
@@ -392,8 +392,11 @@ interface StepGroup {
   isActive: boolean;
 }
 
+// BUG-R2-S2-06: Was using useCallback(..., [steps])() — creating a memoized function
+// and immediately invoking it. useCallback is for memoizing function identity, not
+// computed values. Replaced with useMemo which correctly memoizes the computed result.
 function useGroupedSteps(steps: TimelineStep[]): StepGroup[] {
-  return useCallback(() => {
+  return useMemo(() => {
     const groups: StepGroup[] = [];
     let currentGroup: StepGroup | null = null;
 
@@ -437,7 +440,7 @@ function useGroupedSteps(steps: TimelineStep[]): StepGroup[] {
     }
 
     return groups;
-  }, [steps])();
+  }, [steps]);
 }
 
 function TimelineGroup({

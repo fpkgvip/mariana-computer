@@ -326,15 +326,16 @@ async def _persist_report_path(
                 task_id,
             )
 
-            # BUG-026 fix: specify the conflict column so PostgreSQL knows which
-            # unique constraint to check.  ON CONFLICT DO NOTHING without a target
-            # column is only valid when there is exactly one unique constraint.
+            # BUG-S2-01 fix: report_generations.task_id has no UNIQUE
+            # constraint (only an index), so ON CONFLICT (task_id) would
+            # raise a PostgreSQL error.  Remove the conflict clause — multiple
+            # report generations per task are valid (e.g. retries).  The
+            # primary key is an auto-generated UUID, so there is no conflict.
             await conn.execute(
                 """
                 INSERT INTO report_generations (
                     task_id, pdf_path, report_cost_usd, generated_at
                 ) VALUES ($1, $2, $3, NOW())
-                ON CONFLICT (task_id) DO NOTHING
                 """,
                 task_id,
                 pdf_path,
