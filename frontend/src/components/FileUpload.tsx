@@ -168,9 +168,10 @@ export default function FileUpload({
           xhr.addEventListener("error", () => reject(new Error("Network error")));
           xhr.addEventListener("abort", () => reject(new Error("Upload cancelled")));
 
-          // BUG-R2-S2-03: Endpoint is /api/uploads/pending, not /api/upload.
-          // The old URL returned 404, silently failing all file uploads.
-          xhr.open("POST", `${apiUrl}/api/uploads/pending`);
+          // BUG-R3-01: Endpoint is /api/upload — the backend defines the pending
+          // upload route at POST /api/upload (api.py line 1556), not /api/uploads/pending.
+          // The BUG-R2-S2-03 fix incorrectly changed this, breaking all file uploads.
+          xhr.open("POST", `${apiUrl}/api/upload`);
           xhr.setRequestHeader("Authorization", `Bearer ${token}`);
           xhr.send(formData);
         });

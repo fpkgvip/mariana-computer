@@ -881,7 +881,10 @@ async def get_investigation(
     response_model=KillTaskResponse,
     tags=["Investigations"],
 )
-async def kill_investigation(task_id: str) -> KillTaskResponse:
+async def kill_investigation(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> KillTaskResponse:
     """
     Request a running investigation to halt.
 
@@ -890,6 +893,20 @@ async def kill_investigation(task_id: str) -> KillTaskResponse:
     on its next loop iteration.
     """
     db = _get_db()
+
+    # BUG-S3-01 fix: Verify ownership before allowing kill.
+    row = await db.fetchrow(
+        "SELECT metadata FROM research_tasks WHERE id = $1",
+        task_id,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+    metadata = row.get("metadata") or {}
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    task_user_id = metadata.get("user_id", "")
+    if task_user_id and task_user_id != current_user["user_id"] and current_user["user_id"] != ADMIN_USER_ID:
+        raise HTTPException(status_code=403, detail="You do not own this investigation")
 
     # BUG-021: Atomic conditional UPDATE to avoid race condition
     result = await db.execute(

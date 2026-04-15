@@ -421,13 +421,16 @@ def _build_dynamic_context(task_type: TaskType, context: dict[str, Any]) -> str:
 # ── Individual context builders ───────────────────────────────────────────────
 
 def _ctx_hypothesis_generation(ctx: dict[str, Any]) -> str:
-    _require(ctx, "topic", "budget_usd")
+    _require(ctx, "topic")
     pivot = ctx.get("pivot_context", "")
     pivot_block = f"\nPIVOT CONTEXT (from prior research cycle):\n{pivot}" if pivot else ""
+    # BUG-S3-02 fix: the event loop passes "budget_remaining", not "budget_usd".
+    # Accept either key so the AI sees the actual remaining budget instead of $0.00.
+    budget = ctx.get("budget_usd") or ctx.get("budget_remaining", 0)
     return (
         f"TASK: HYPOTHESIS_GENERATION\n\n"
         f"Research topic:\n{ctx.get('topic', '[missing]')}\n\n"
-        f"Available budget: USD {ctx.get('budget_usd', 0):.2f}"
+        f"Available budget: USD {budget:.2f}"
         f"{pivot_block}\n\n"
         "Generate a ranked set of investigative hypotheses about this topic. "
         "Each hypothesis must be falsifiable, specific, and prioritised by "
