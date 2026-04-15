@@ -222,8 +222,14 @@ function renderMarkdown(text: string): string {
     // Italic — applied after bold so ** is already consumed
     .replace(/\*([^*\n]{1,200})\*/g, "<em>$1</em>")
     // Links — [text](url) with XSS-safe href check (only http/https)
+    // Use function replacement to escape quotes in URL and text, preventing attribute injection
     .replace(/\[([^\]]{1,200})\]\((https?:\/\/[^)]{1,500})\)/g,
-      '<a href="$2" target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-0.5 text-primary/80 hover:text-primary text-xs underline decoration-primary/30">$1<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="inline ml-0.5"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg></a>')
+      (_match: string, linkText: string, url: string) => {
+        // Escape double quotes and backticks in both URL and link text to prevent attribute breakout
+        const safeUrl = url.replace(/["'`]/g, (c) => `&#${c.charCodeAt(0)};`);
+        const safeText = linkText.replace(/["'`]/g, (c) => `&#${c.charCodeAt(0)};`);
+        return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-0.5 text-primary/80 hover:text-primary text-xs underline decoration-primary/30">${safeText}<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="inline ml-0.5"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg></a>`;
+      })
     // Newlines
     .replace(/\n/g, "<br />");
 
