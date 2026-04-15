@@ -282,6 +282,31 @@ async def run(
                 task.status = TaskStatus.HALTED
                 task.current_state = State.HALT
                 break
+
+            # --------------------------------------------------------- #
+            # 0.1  External kill check (every 5 iterations)
+            # --------------------------------------------------------- #
+            # BUG-D1-01 fix: The kill_investigation API sets status='HALTED'
+            # in the DB.  We poll for that every 5 iterations so the user's
+            # Stop button actually halts the investigation.
+            if iteration > 0 and iteration % 5 == 0:
+                try:
+                    _db_status = await db.fetchval(
+                        "SELECT status FROM research_tasks WHERE id = $1",
+                        task.id,
+                    )
+                    if _db_status == "HALTED":
+                        log.info("external_kill_detected", task_id=task.id)
+                        task.status = TaskStatus.HALTED
+                        task.current_state = State.HALT
+                        _emit_progress(redis_client, task.id, {
+                            "type": "text",
+                            "content": "Investigation stopped by user.",
+                        })
+                        break
+                except Exception as _kill_exc:  # noqa: BLE001
+                    log.debug("kill_check_failed", error=str(_kill_exc))
+
             iteration += 1
             log.debug(
                 "loop_iteration",
@@ -1832,9 +1857,22 @@ async def _persist_task(task: ResearchTask, db: Any) -> None:
 
     BUG-C1-02 fix: Added ``metadata`` to the UPDATE so skill/memory/sub-agent
     context set in ``handle_init`` is persisted and survives crash recovery.
+
+    BUG-D1-01 fix: Added ``AND status != 'HALTED'`` guard when the in-memory
+    status is not HALTED.  This prevents a mid-loop persist from overwriting
+    an externally-set HALTED (from the kill API) back to RUNNING.  When the
+    event loop itself sets HALTED (via kill check, budget exhaustion, or
+    shutdown), the guard passes because in-memory status is already HALTED.
     """
+    # If in-memory status is not HALTED/COMPLETED/FAILED, don't overwrite
+    # an externally-set terminal status in the DB.
+    if task.status == TaskStatus.RUNNING:
+        where_clause = "WHERE id = $12 AND status != 'HALTED'"
+    else:
+        where_clause = "WHERE id = $12"
+
     await db.execute(
-        """
+        f"""
         UPDATE research_tasks
         SET status = $1,
             current_state = $2,
@@ -1847,7 +1885,7 @@ async def _persist_task(task: ResearchTask, db: Any) -> None:
             output_pdf_path = $9,
             output_docx_path = $10,
             metadata = $11
-        WHERE id = $12
+        {where_clause}
         """,
         task.status.value,
         task.current_state.value,

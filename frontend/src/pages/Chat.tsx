@@ -798,9 +798,10 @@ export default function Chat() {
             ].includes(eventType)) {
               processStructuredEvent(parsed as StructuredEvent);
 
-              // BUG-C3-01 fix: Check for correct terminal states from backend.
-              // Backend emits "HALTED", "COMPLETED", or "FAILED" — not "HALT".
-              if (eventType === "status_change" && ["HALTED", "COMPLETED"].includes(parsed.state as string)) {
+              // BUG-D1-02 fix: The event_loop emits State.HALT.value = "HALT"
+              // (state machine enum) and State.REPORT_COMPLETE which transitions
+              // to HALT.  The DB uses TaskStatus.HALTED/COMPLETED.  Check both.
+              if (eventType === "status_change" && ["HALT", "HALTED", "COMPLETED"].includes(parsed.state as string)) {
                 updateInvestigationStatus(taskId, "COMPLETED");
                 appendMessage({
                   role: "system",
