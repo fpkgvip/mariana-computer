@@ -803,16 +803,28 @@ async def start_investigation(
             session_uuid = _validate_upload_session_uuid(body.upload_session_uuid)
             pending_dir = Path(cfg.DATA_ROOT) / "uploads" / "pending" / session_uuid
             if pending_dir.is_dir():
+                # Verify the upload session belongs to this user
+                owner_meta = pending_dir / ".owner"
+                if owner_meta.exists():
+                    session_owner = owner_meta.read_text(encoding="utf-8").strip()
+                    if session_owner != current_user["user_id"]:
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Upload session belongs to another user",
+                        )
                 task_upload_dir = Path(cfg.DATA_ROOT) / "uploads" / task_id
                 task_upload_dir.mkdir(parents=True, exist_ok=True)
                 import shutil
                 for f in pending_dir.iterdir():
-                    if f.is_file():
+                    if f.is_file() and f.name != ".owner":
                         dest = task_upload_dir / f.name
                         shutil.move(str(f), str(dest))
                         uploaded_file_names.append(f.name)
-                # Clean up empty pending directory
+                # Clean up pending directory (remove .owner metadata then dir)
                 try:
+                    owner_cleanup = pending_dir / ".owner"
+                    if owner_cleanup.exists():
+                        owner_cleanup.unlink()
                     pending_dir.rmdir()
                 except OSError:
                     pass
@@ -1394,9 +1406,10 @@ async def download_report_pdf(
         )
 
     if not resolved.is_file():
+        logger.warning("pdf_not_found", task_id=task_id, path=str(resolved))
         raise HTTPException(
             status_code=404,
-            detail=f"PDF file not found on disk: {pdf_path}",
+            detail="Report PDF file is not available. It may still be generating or was removed.",
         )
 
     filename = resolved.name
@@ -1450,9 +1463,10 @@ async def download_report_docx(
         )
 
     if not resolved.is_file():
+        logger.warning("docx_not_found", task_id=task_id, path=str(resolved))
         raise HTTPException(
             status_code=404,
-            detail=f"DOCX file not found on disk: {docx_path}",
+            detail="Report DOCX file is not available. It may still be generating or was removed.",
         )
 
     filename = resolved.name
@@ -1759,7 +1773,20 @@ async def upload_pending_files(
     pending_dir = Path(cfg.DATA_ROOT) / "uploads" / "pending" / normalized_session_uuid
     pending_dir.mkdir(parents=True, exist_ok=True)
 
-    existing_count = sum(1 for f in pending_dir.iterdir() if f.is_file())
+    # Bind upload session to the authenticated user via ownership metadata.
+    # If a different user tries to upload into this session, reject it.
+    owner_meta = pending_dir / ".owner"
+    if owner_meta.exists():
+        existing_owner = owner_meta.read_text(encoding="utf-8").strip()
+        if existing_owner != current_user["user_id"]:
+            raise HTTPException(
+                status_code=403,
+                detail="Upload session belongs to another user",
+            )
+    else:
+        owner_meta.write_text(current_user["user_id"], encoding="utf-8")
+
+    existing_count = sum(1 for f in pending_dir.iterdir() if f.is_file() and f.name != ".owner")
     if existing_count + len(files) > _UPLOAD_MAX_FILES_PER_INVESTIGATION:
         raise HTTPException(
             status_code=400,
@@ -3115,7 +3142,7 @@ async def delete_skill(
     if skill.owner_id and skill.owner_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized to delete this skill")
 
-    mgr.delete_skill(skill_id)
+    mgr.delete_skill(skill_id, owner_id=current_user["user_id"])
     return {"status": "deleted"}
 
 

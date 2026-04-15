@@ -321,6 +321,7 @@ async def _persist_report_path(
                        status          = 'COMPLETED',
                        completed_at    = NOW()
                  WHERE id = $2
+                   AND status != 'HALTED'
                 """,
                 pdf_path,
                 task_id,

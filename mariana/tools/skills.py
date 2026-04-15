@@ -183,7 +183,11 @@ class SkillManager:
         owner_id: str,
         category: str = "user",
     ) -> Skill:
-        """Create and persist a custom skill."""
+        """Create and persist a custom skill.
+
+        Skills are namespaced per owner to prevent cross-user overwrites.
+        Each owner's skills live under ``skills/{sanitized_owner_id}/``.
+        """
         safe_id = f"custom-{_sanitize_skill_id(name)}"
         skill = Skill(
             id=safe_id,
@@ -194,7 +198,8 @@ class SkillManager:
             category=category,
             owner_id=owner_id,
         )
-        skill_file = _safe_skill_path(self.skills_dir, skill.id)
+        owner_dir = self._owner_skills_dir(owner_id)
+        skill_file = _safe_skill_path(owner_dir, skill.id)
         skill_file.write_text(
             json.dumps(
                 {
@@ -213,8 +218,19 @@ class SkillManager:
         logger.info("skill_created", skill_id=skill.id, owner=owner_id)
         return skill
 
-    def delete_skill(self, skill_id: str) -> bool:
-        """Delete a custom skill by ID. Returns True if deleted."""
+    def delete_skill(self, skill_id: str, owner_id: str | None = None) -> bool:
+        """Delete a custom skill by ID. Returns True if deleted.
+
+        If *owner_id* is provided, only the owner's copy is deleted.
+        Falls back to legacy global path for backward compatibility.
+        """
+        if owner_id:
+            owner_dir = self._owner_skills_dir(owner_id)
+            f = _safe_skill_path(owner_dir, skill_id)
+            if f.exists():
+                f.unlink()
+                return True
+        # Legacy global fallback
         f = _safe_skill_path(self.skills_dir, skill_id)
         if f.exists():
             f.unlink()
@@ -225,8 +241,25 @@ class SkillManager:
     # Internal
     # ------------------------------------------------------------------
 
+    def _owner_skills_dir(self, owner_id: str) -> Path:
+        """Return per-owner skills directory, creating it if needed."""
+        sanitized_owner = _sanitize_skill_id(owner_id)
+        d = self.skills_dir / sanitized_owner
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
     def _load_custom_skills(self) -> list[Skill]:
         skills: list[Skill] = []
+        # Load from per-owner subdirectories
+        for owner_dir in self.skills_dir.iterdir():
+            if owner_dir.is_dir():
+                for f in owner_dir.glob("custom-*.json"):
+                    try:
+                        data = json.loads(f.read_text(encoding="utf-8"))
+                        skills.append(Skill(**data))
+                    except Exception:
+                        pass
+        # Legacy: also load any global-level skill files (migration compat)
         for f in self.skills_dir.glob("custom-*.json"):
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))
@@ -236,6 +269,17 @@ class SkillManager:
         return skills
 
     def _load_custom_skill(self, skill_id: str) -> Skill | None:
+        # Search per-owner directories first
+        for owner_dir in self.skills_dir.iterdir():
+            if owner_dir.is_dir():
+                f = _safe_skill_path(owner_dir, skill_id)
+                if f.exists():
+                    try:
+                        data = json.loads(f.read_text(encoding="utf-8"))
+                        return Skill(**data)
+                    except Exception:
+                        return None
+        # Legacy global fallback
         f = _safe_skill_path(self.skills_dir, skill_id)
         if f.exists():
             try:

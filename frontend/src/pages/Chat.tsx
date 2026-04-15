@@ -730,15 +730,15 @@ export default function Chat() {
             // BUG-018: Refresh credit balance after investigation completes
             refreshUser();
           } else if (data.status === "FAILED" || data.status === "HALTED") {
-            updateInvestigationStatus(taskId, "FAILED");
-            const errMsg = data.error ?? "The investigation failed. Please try again.";
+            updateInvestigationStatus(taskId, data.status as InvestigationStatus);
+            const errMsg = data.error ?? `The investigation ${data.status.toLowerCase()}. Please try again.`;
             appendMessage({
               role: "assistant",
               content: errMsg,
               type: "text",
               _id: makeMessageId(),
             });
-            toast.error("Investigation failed", { description: errMsg });
+            toast.error(`Investigation ${data.status.toLowerCase()}`, { description: errMsg });
             stopAllConnections();
             // BUG-018: Refresh credit balance after investigation completes
             refreshUser();
@@ -897,10 +897,10 @@ export default function Chat() {
               stopAllConnections();
               refreshUser();
             } else if (finalStatus === "FAILED" || finalStatus === "HALTED") {
-              updateInvestigationStatus(taskId, "FAILED");
+              updateInvestigationStatus(taskId, finalStatus as InvestigationStatus);
               appendMessage({
                 role: "assistant",
-                content: parsed.error || `Investigation ${finalStatus}.`,
+                content: parsed.error || `Investigation ${finalStatus.toLowerCase()}.`,
                 type: "text",
                 _id: makeMessageId(),
               });

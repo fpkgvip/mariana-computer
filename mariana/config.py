@@ -80,7 +80,7 @@ class AppConfig:
     # ------------------------------------------------------------------
     DIMINISHING_NOVELTY_THRESHOLD: float = 0.10
     DIMINISHING_NEW_SOURCES_THRESHOLD: int = 3
-    DIMINISHING_SCORE_DELTA_THRESHOLD: float = 1.0
+    DIMINISHING_SCORE_DELTA_THRESHOLD: float = 0.1
     DIMINISHING_FLAGS_HALT: int = 3
 
     # ------------------------------------------------------------------
