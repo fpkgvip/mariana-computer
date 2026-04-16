@@ -20,6 +20,7 @@ import {
   Trash2,
   GitBranch,
   Square,
+  LogOut,
 } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
@@ -300,7 +301,7 @@ function formatElapsed(seconds: number): string {
 const INITIAL_QUALITY_TIER = "balanced";
 
 export default function Chat() {
-  const { user, refreshUser } = useAuth();
+  const { user, refreshUser, logout } = useAuth();
   const navigate = useNavigate();
 
   // Messages for the currently viewed investigation
@@ -492,7 +493,7 @@ export default function Chat() {
   }, []);
 
   /* ---------------------------------------------------------------- */
-  /*  Load investigations from Supabase on mount                      */
+  /*  Load investigations from backend API (source of truth)          */
   /* ---------------------------------------------------------------- */
 
   // BUG-R15-02: Depend on user.id (stable) not user (new object on every refreshUser())
@@ -500,7 +501,62 @@ export default function Chat() {
   useEffect(() => {
     if (!userId) return;
     const loadInvestigations = async () => {
-      // BUG-013: Always filter by user_id as defense-in-depth (don't rely solely on RLS)
+      // BUG-011 fix: Use the backend API as the source of truth for investigation
+      // status. Previously loaded from Supabase which could have stale PENDING
+      // statuses if the user closed the tab before the investigation completed.
+      try {
+        const session = await supabase.auth.getSession();
+        const token = session.data.session?.access_token;
+        if (!token) throw new Error("No auth token");
+        const res = await fetch(`${API_URL}/api/investigations`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
+        const items = json.items ?? json;
+        if (Array.isArray(items)) {
+          // Map backend fields to frontend Investigation shape
+          const mapped = items.map((inv: Record<string, unknown>) => ({
+            task_id: inv.id ?? inv.task_id,
+            topic: inv.topic,
+            status: inv.status,
+            created_at: inv.created_at,
+            duration_hours: inv.duration_hours ?? 0,
+            budget_usd: inv.budget_usd ?? 0,
+            output_pdf_path: inv.output_pdf_path ?? null,
+            output_docx_path: inv.output_docx_path ?? null,
+          }));
+          setInvestigations(mapped as Investigation[]);
+          // Also sync statuses back to Supabase for consistency
+          for (const inv of mapped) {
+            if (inv.status !== "PENDING") {
+              supabase
+                .from("investigations")
+                .upsert(
+                  {
+                    task_id: inv.task_id,
+                    topic: inv.topic,
+                    status: inv.status,
+                    user_id: userId,
+                    budget_usd: inv.budget_usd,
+                    duration_hours: inv.duration_hours,
+                    output_pdf_path: inv.output_pdf_path,
+                    output_docx_path: inv.output_docx_path,
+                  },
+                  { onConflict: "task_id" }
+                )
+                .then(({ error }) => {
+                  if (error) console.warn("[Chat] Supabase sync error:", error.message);
+                })
+                .catch(() => {});
+            }
+          }
+          return;
+        }
+      } catch (err) {
+        console.warn("[Chat] Backend API unavailable, falling back to Supabase:", err);
+      }
+      // Fallback: load from Supabase if backend API is unavailable
       const { data, error } = await supabase
         .from("investigations")
         .select("task_id, topic, status, created_at, duration_hours, budget_usd, output_pdf_path, output_docx_path")
@@ -1806,14 +1862,24 @@ export default function Chat() {
               </span>{" "}
               credits
             </div>
-            <button
-              onClick={() => { setMemoryOpen(true); loadMemory(); }}
-              className="rounded-md p-1.5 text-muted-foreground/50 hover:text-primary hover:bg-secondary/50 transition-colors"
-              title="Memory"
-              aria-label="Open memory panel"
-            >
-              <Brain size={14} />
-            </button>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => { setMemoryOpen(true); loadMemory(); }}
+                className="rounded-md p-1.5 text-muted-foreground/50 hover:text-primary hover:bg-secondary/50 transition-colors"
+                title="Memory"
+                aria-label="Open memory panel"
+              >
+                <Brain size={14} />
+              </button>
+              <button
+                onClick={async () => { await logout(); navigate("/"); }}
+                className="rounded-md p-1.5 text-muted-foreground/50 hover:text-red-500 hover:bg-secondary/50 transition-colors"
+                title="Sign out"
+                aria-label="Sign out"
+              >
+                <LogOut size={14} />
+              </button>
+            </div>
           </div>
           <p className="mt-1 text-[10px] text-muted-foreground">
             {user.name} · {user.email}
