@@ -869,7 +869,7 @@ export default function Chat() {
               role: "system",
               content: `Rate limited. Retrying in ${retryAfter} seconds...`,
               type: "status",
-              id: `rate-limit-${Date.now()}`,
+              id: `rate-limit-${taskId}`,
               _id: makeMessageId(),
             });
             return;
@@ -1001,7 +1001,11 @@ export default function Chat() {
               if (eventType === "status_change") {
                 const state = parsed.state as string;
                 if (state === "HALT" || state === "COMPLETED") {
-                  updateInvestigationStatus(taskId, "COMPLETED");
+                  // BUG-R14-02: Forward output paths from SSE payload if available
+                  updateInvestigationStatus(taskId, "COMPLETED", {
+                    output_pdf_path: parsed.output_pdf_path as string | null | undefined,
+                    output_docx_path: parsed.output_docx_path as string | null | undefined,
+                  });
                   appendMessage({
                     role: "system",
                     content: "Investigation complete. Reports are ready for download.",
@@ -1044,7 +1048,11 @@ export default function Chat() {
             }
 
             if (status === "COMPLETED") {
-              updateInvestigationStatus(taskId, "COMPLETED");
+              // BUG-R14-05: Forward output paths from legacy SSE payload if available
+              updateInvestigationStatus(taskId, "COMPLETED", {
+                output_pdf_path: parsed.output_pdf_path as string | null | undefined,
+                output_docx_path: parsed.output_docx_path as string | null | undefined,
+              });
               if (parsed.findings) {
                 appendMessage({
                   role: "assistant",
@@ -1100,7 +1108,11 @@ export default function Chat() {
             const parsed = JSON.parse(event.data);
             const finalStatus = (parsed.final_status || parsed.status) as InvestigationStatus;
             if (finalStatus === "COMPLETED") {
-              updateInvestigationStatus(taskId, "COMPLETED");
+              // BUG-R14-03: Forward output paths from done event payload if available
+              updateInvestigationStatus(taskId, "COMPLETED", {
+                output_pdf_path: parsed.output_pdf_path as string | null | undefined,
+                output_docx_path: parsed.output_docx_path as string | null | undefined,
+              });
               appendMessage({
                 role: "system",
                 content: "Investigation complete. Reports are ready for download.",
@@ -1457,7 +1469,7 @@ export default function Chat() {
           role: "system",
           content: msg,
           type: "error",
-          id: `credits-${Date.now()}`,
+          id: `credits-insufficient`,
           _id: makeMessageId(),
         });
         return;
@@ -1471,7 +1483,7 @@ export default function Chat() {
           role: "system",
           content: `Rate limited. Please retry in ${retryAfter} seconds.`,
           type: "error",
-          id: `rate-limit-${Date.now()}`,
+          id: `rate-limit-submit`,
           _id: makeMessageId(),
         });
         return;

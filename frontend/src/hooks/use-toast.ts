@@ -174,7 +174,9 @@ function useToast() {
         listeners.splice(index, 1);
       }
     };
-  }, [state]);
+  // BUG-R14-01: setState is a stable reference — no need to re-subscribe on state changes
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return {
     ...state,
