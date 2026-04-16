@@ -495,14 +495,16 @@ export default function Chat() {
   /*  Load investigations from Supabase on mount                      */
   /* ---------------------------------------------------------------- */
 
+  // BUG-R15-02: Depend on user.id (stable) not user (new object on every refreshUser())
+  const userId = user?.id;
   useEffect(() => {
-    if (!user) return;
+    if (!userId) return;
     const loadInvestigations = async () => {
       // BUG-013: Always filter by user_id as defense-in-depth (don't rely solely on RLS)
       const { data, error } = await supabase
         .from("investigations")
         .select("task_id, topic, status, created_at, duration_hours, budget_usd, output_pdf_path, output_docx_path")
-        .eq("user_id", user.id)
+        .eq("user_id", userId)
         .order("created_at", { ascending: false });
       if (error) {
         console.error("[Chat] Failed to load investigations:", error.message);
@@ -512,7 +514,7 @@ export default function Chat() {
       setInvestigations((data as Investigation[]) ?? []);
     };
     loadInvestigations();
-  }, [user]);
+  }, [userId]);
 
   /* ---------------------------------------------------------------- */
   /*  Auto-scroll on new messages                                     */
@@ -764,7 +766,9 @@ export default function Chat() {
         .eq("task_id", taskId)
         .then(({ error }) => {
           if (error) console.error("[Chat] Failed to update investigation status:", error.message);
-        });
+        })
+        // BUG-R15-03: Catch network-level rejections to prevent unhandled promise rejection
+        .catch((err) => console.error("[Chat] Failed to update investigation status (network):", err));
 
       // BUG-R13-01: When completing, re-fetch output paths from Supabase so the
       // DOCX download button is correctly enabled even when the SSE event didn't
@@ -1526,7 +1530,9 @@ export default function Chat() {
           })
           .then(({ error }) => {
             if (error) console.error("[Chat] Failed to persist investigation:", error.message);
-          });
+          })
+          // BUG-R15-03: Catch network-level rejections to prevent unhandled promise rejection
+          .catch((err) => console.error("[Chat] Failed to persist investigation (network):", err));
       }
 
       appendMessage({

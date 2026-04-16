@@ -22,7 +22,13 @@ export default class AppErrorBoundary extends Component<
 
   private readonly handleUnhandledRejection = (event: PromiseRejectionEvent): void => {
     console.error("[AppErrorBoundary] Unhandled promise rejection:", event.reason);
-    this.setState({ hasError: true });
+    // BUG-R15-01: Only crash the UI for genuine logic errors (TypeError, ReferenceError,
+    // SyntaxError). Network failures, AbortErrors, and other transient rejections from
+    // fire-and-forget Supabase calls should NOT nuke the entire UI.
+    const reason = event.reason;
+    if (reason instanceof TypeError || reason instanceof ReferenceError || reason instanceof SyntaxError) {
+      this.setState({ hasError: true });
+    }
   };
 
   static getDerivedStateFromError(): AppErrorBoundaryState {
