@@ -32,7 +32,7 @@ const plans: Plan[] = [
       "Full access to Mariana Computer",
       "Instant, standard, and deep investigations",
       "All built-in research skills",
-      "PDF, Word, and Excel report downloads",
+      "PDF report downloads",
       "File uploads and attachments",
       "Priority support",
     ],
@@ -170,7 +170,7 @@ export default function Pricing() {
                     ? "bg-primary/5 ring-primary/30"
                     : "bg-card ring-border"
                 } ${plan.comingSoon ? "opacity-75 pointer-events-none" : ""}`}
-                {...(plan.comingSoon ? { inert: "" as any } : {})}
+                aria-disabled={plan.comingSoon}
               >
                 {plan.comingSoon && (
                   <div className="absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-background/60 backdrop-blur-[2px]">

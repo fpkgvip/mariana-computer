@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { useAuth } from "@/contexts/AuthContext";
 import { Link, useNavigate } from "react-router-dom";
 import {
@@ -19,6 +19,7 @@ import {
   Brain,
   Trash2,
   GitBranch,
+  Square,
 } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
@@ -51,6 +52,8 @@ interface Investigation {
   created_at: string;
   duration_hours: number;
   budget_usd: number;
+  output_pdf_path?: string | null;
+  output_docx_path?: string | null;
 }
 
 /** POST /api/investigations response */
@@ -294,6 +297,8 @@ function formatElapsed(seconds: number): string {
 /*  Component                                                         */
 /* ------------------------------------------------------------------ */
 
+const INITIAL_QUALITY_TIER = "balanced";
+
 export default function Chat() {
   const { user, refreshUser } = useAuth();
   const navigate = useNavigate();
@@ -308,10 +313,19 @@ export default function Chat() {
 
   // Pending research plan awaiting user approval
   const [pendingPlan, setPendingPlan] = useState<ResearchPlan | null>(null);
+  const [selectedTier, setSelectedTier] = useState<string>(INITIAL_QUALITY_TIER);
+  const [continuousMode, setContinuousMode] = useState(false);
+  const [dontKillBranches, setDontKillBranches] = useState(false);
+  const [userFlowInstructions, setUserFlowInstructions] = useState("");
+  // Stop button guard — prevents multiple concurrent stop requests
+  const [isStopping, setIsStopping] = useState(false);
 
   // Investigation management
   const [investigations, setInvestigations] = useState<Investigation[]>([]);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  const activeTaskIdRef = useRef<string | null>(activeTaskId);
+  activeTaskIdRef.current = activeTaskId;
+  const connectedTaskIdRef = useRef<string | null>(null);
 
   // Timer state — elapsed time only
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -382,16 +396,18 @@ export default function Chat() {
   // BUG-R2-S2-07: prevTokensRef was only updated when credits did NOT change
   // (the early return skipped the assignment). This caused the animation to
   // re-trigger on every re-render after the first credit change.
+  const currentTokenCount = user?.tokens;
+
   useEffect(() => {
-    if (!user) return;
-    if (prevTokensRef.current !== user.tokens && prevTokensRef.current > 0) {
+    if (currentTokenCount == null) return;
+    if (prevTokensRef.current !== currentTokenCount && prevTokensRef.current > 0) {
       setCreditAnimating(true);
       const timer = setTimeout(() => setCreditAnimating(false), 1500);
-      prevTokensRef.current = user.tokens;
+      prevTokensRef.current = currentTokenCount;
       return () => clearTimeout(timer);
     }
-    prevTokensRef.current = user.tokens;
-  }, [user?.tokens]);
+    prevTokensRef.current = currentTokenCount;
+  }, [currentTokenCount]);
 
   /* ---------------------------------------------------------------- */
   /*  Memory panel helpers                                            */
@@ -401,17 +417,23 @@ export default function Chat() {
     setMemoryLoading(true);
     try {
       const token = await getAccessToken();
-      if (!token) return;
+      if (!token) {
+        toast.error("Session expired", { description: "Please sign in again." });
+        return;
+      }
       const res = await fetch(`${API_URL}/api/memory`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      if (res.ok) {
-        const data = await res.json();
-        setMemoryFacts(data.facts || []);
-        setMemoryPrefs(data.preferences || {});
+      if (!res.ok) {
+        const errorText = await res.text().catch(() => res.statusText);
+        throw new Error(errorText || `HTTP ${res.status}`);
       }
-    } catch {
-      // Memory API may not exist yet — silently ignore
+      const data = await res.json();
+      setMemoryFacts(data.facts || []);
+      setMemoryPrefs(data.preferences || {});
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      toast.error("Failed to load memory", { description: message });
     } finally {
       setMemoryLoading(false);
     }
@@ -420,36 +442,52 @@ export default function Chat() {
   const deleteMemoryFact = useCallback(async (fact: string) => {
     try {
       const token = await getAccessToken();
-      if (!token) return;
-      await fetch(`${API_URL}/api/memory/facts`, {
+      if (!token) {
+        toast.error("Session expired", { description: "Please sign in again." });
+        return;
+      }
+      const res = await fetch(`${API_URL}/api/memory/facts`, {
         method: "DELETE",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ fact }),
       });
+      if (!res.ok) {
+        const errorText = await res.text().catch(() => res.statusText);
+        throw new Error(errorText || `HTTP ${res.status}`);
+      }
       setMemoryFacts((prev) => prev.filter((f) => f.fact !== fact));
       toast.success("Memory entry deleted");
-    } catch {
-      toast.error("Failed to delete memory entry");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      toast.error("Failed to delete memory entry", { description: message });
     }
   }, []);
 
   const deleteMemoryPref = useCallback(async (key: string) => {
     try {
       const token = await getAccessToken();
-      if (!token) return;
-      await fetch(`${API_URL}/api/memory/preferences`, {
+      if (!token) {
+        toast.error("Session expired", { description: "Please sign in again." });
+        return;
+      }
+      const res = await fetch(`${API_URL}/api/memory/preferences`, {
         method: "DELETE",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify({ key }),
       });
+      if (!res.ok) {
+        const errorText = await res.text().catch(() => res.statusText);
+        throw new Error(errorText || `HTTP ${res.status}`);
+      }
       setMemoryPrefs((prev) => {
         const next = { ...prev };
         delete next[key];
         return next;
       });
       toast.success("Preference deleted");
-    } catch {
-      toast.error("Failed to delete preference");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      toast.error("Failed to delete preference", { description: message });
     }
   }, []);
 
@@ -463,7 +501,7 @@ export default function Chat() {
       // BUG-013: Always filter by user_id as defense-in-depth (don't rely solely on RLS)
       const { data, error } = await supabase
         .from("investigations")
-        .select("task_id, topic, status, created_at, duration_hours, budget_usd")
+        .select("task_id, topic, status, created_at, duration_hours, budget_usd, output_pdf_path, output_docx_path")
         .eq("user_id", user.id)
         .order("created_at", { ascending: false });
       if (error) {
@@ -471,9 +509,7 @@ export default function Chat() {
         toast.error("Failed to load investigations", { description: error.message });
         return;
       }
-      if (data && data.length > 0) {
-        setInvestigations(data as Investigation[]);
-      }
+      setInvestigations((data as Investigation[]) ?? []);
     };
     loadInvestigations();
   }, [user]);
@@ -552,6 +588,10 @@ export default function Chat() {
   /* ---------------------------------------------------------------- */
 
   const processStructuredEvent = useCallback((event: StructuredEvent, taskId?: string) => {
+    if (taskId && activeTaskIdRef.current !== taskId) {
+      return;
+    }
+
     if (event.type === "step_complete" || event.type === "step_error") {
       // Update an existing step in-place
       setTimelineSteps((prev) => {
@@ -579,7 +619,9 @@ export default function Chat() {
       });
     }
 
-    // For file_attached events, also add a message so it shows in the chat
+    // For file_attached events, also add a message so it shows in the chat.
+    // BUG-F2-05: Store the backend-provided url field if present so the renderer
+    // can prefer it over the constructed API path (forward-compat with CDN URLs).
     if (event.type === "file_attached" && event.filename) {
       appendMessage({
         role: "system",
@@ -588,16 +630,106 @@ export default function Chat() {
           filename: event.filename,
           size: event.size ?? 0,
           mime: event.mime,
+          url: event.url ?? null,
         }),
         type: "status",
-        id: `file-${event.filename}`,
+        id: `file-${event.filename}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         _id: makeMessageId(),
       });
     }
 
-    // For cost_update events at investigation completion, show credit summary
+    // graph_update events — acknowledge with a timeline status entry.
+    // The InvestigationGraph page polls /graph independently so no state merge needed here.
+    if (event.type === "graph_update") {
+      const nodeCount = Array.isArray(event.nodes)
+        ? event.nodes.length
+        : null;
+      appendMessage({
+        role: "system",
+        content: nodeCount != null
+          ? `Knowledge graph updated: ${nodeCount} node${nodeCount !== 1 ? "s" : ""}`
+          : "Knowledge graph updated.",
+        type: "status",
+        id: `graph-update-${Date.now()}`,
+        _id: makeMessageId(),
+      });
+    }
+
+    // For text events that carry actual content (non-subagent), also append to chat
+    // so the user sees the assistant's findings in the message stream.
+    // SubAgent announcements are timeline-only (they are operational noise, not findings).
+    if (event.type === "text") {
+      const textContent = event.content || event.message || "";
+      const isSubAgent = textContent.startsWith("[SubAgent]");
+      if (!isSubAgent && textContent.trim()) {
+        appendMessage({
+          role: "assistant",
+          content: textContent,
+          type: "text",
+          _id: makeMessageId(),
+        });
+      }
+    }
+
+    // BUG-F2-01: Handle warning events — show inline in chat as a caution message.
+    if (event.type === "warning") {
+      const warnMsg = event.message || "";
+      if (warnMsg.trim()) {
+        appendMessage({
+          role: "system",
+          content: `⚠️ ${warnMsg}`,
+          type: "status",
+          // BUG-F4-01: Use content-based id so identical warnings are deduplicated
+          // on SSE reconnect. Date.now() produces a unique id on every call, making
+          // seenStatusIds dedup ineffective and flooding the chat when the stream
+          // reconnects and re-emits previously seen warning events.
+          id: `warning-${warnMsg}`,
+          _id: makeMessageId(),
+        });
+      }
+    }
+
+    // BUG-F2-01: Handle branch_update events — show a brief status line.
+    if (event.type === "branch_update") {
+      const branchId = event.branch_id ?? "";
+      const branchStatus = event.status ?? "";
+      if (branchId || branchStatus) {
+        appendMessage({
+          role: "system",
+          content: `Branch${branchId ? ` ${branchId}` : ""}: ${branchStatus || "updated"}.`,
+          type: "status",
+          id: `branch-${branchId}-${branchStatus}`,
+          _id: makeMessageId(),
+        });
+      }
+    }
+
+    // BUG-F2-01: Handle checkpoint events — show summary in chat.
+    if (event.type === "checkpoint") {
+      const summary = event.summary ?? "";
+      const sourcesCount = event.sources_count;
+      const detail = [
+        summary,
+        sourcesCount != null ? `${sourcesCount} source${sourcesCount !== 1 ? "s" : ""}` : null,
+      ].filter(Boolean).join(" · ");
+      if (detail) {
+        appendMessage({
+          role: "system",
+          content: `Checkpoint: ${detail}`,
+          type: "status",
+          // BUG-F4-02: Use content-based id so identical checkpoint messages are
+          // deduplicated on SSE reconnect. Same root cause as BUG-F4-01.
+          id: `checkpoint-${detail}`,
+          _id: makeMessageId(),
+        });
+      }
+    }
+
+    // For cost_update events at investigation completion, show credit summary.
+    // spent_usd already includes the 20% markup per the backend spec;
+    // credits are 100 credits per USD so we do NOT multiply by 1.20 again.
     if (event.type === "cost_update" && event.spent_usd != null) {
-      const creditsUsed = Math.round(event.spent_usd * 1.20 * 100);
+      const creditsUsed = Math.round(event.spent_usd * 100);
       appendMessage({
         role: "system",
         content: JSON.stringify({
@@ -618,9 +750,13 @@ export default function Chat() {
   /* ---------------------------------------------------------------- */
 
   const updateInvestigationStatus = useCallback(
-    async (taskId: string, status: InvestigationStatus) => {
+    async (
+      taskId: string,
+      status: InvestigationStatus,
+      extra?: { output_pdf_path?: string | null; output_docx_path?: string | null },
+    ) => {
       setInvestigations((prev) =>
-        prev.map((inv) => (inv.task_id === taskId ? { ...inv, status } : inv))
+        prev.map((inv) => (inv.task_id === taskId ? { ...inv, status, ...extra } : inv))
       );
       await supabase
         .from("investigations")
@@ -629,6 +765,26 @@ export default function Chat() {
         .then(({ error }) => {
           if (error) console.error("[Chat] Failed to update investigation status:", error.message);
         });
+
+      // BUG-R13-01: When completing, re-fetch output paths from Supabase so the
+      // DOCX download button is correctly enabled even when the SSE event didn't
+      // carry the paths (only the poll response does).
+      if (status === "COMPLETED" && !extra?.output_docx_path) {
+        const { data: row } = await supabase
+          .from("investigations")
+          .select("output_pdf_path, output_docx_path")
+          .eq("task_id", taskId)
+          .single();
+        if (row && (row.output_pdf_path || row.output_docx_path)) {
+          setInvestigations((prev) =>
+            prev.map((inv) =>
+              inv.task_id === taskId
+                ? { ...inv, output_pdf_path: row.output_pdf_path, output_docx_path: row.output_docx_path }
+                : inv
+            )
+          );
+        }
+      }
     },
     []
   );
@@ -643,6 +799,7 @@ export default function Chat() {
    * isSending is set to false then immediately back to true.
    */
   const stopConnectionsOnly = useCallback(() => {
+    connectedTaskIdRef.current = null;
     if (pollIntervalRef.current) {
       clearInterval(pollIntervalRef.current);
       pollIntervalRef.current = null;
@@ -657,6 +814,12 @@ export default function Chat() {
   const stopAllConnections = useCallback(() => {
     stopConnectionsOnly();
     setIsSending(false);
+    // BUG-F3-02: Reset isStopping when stopping all connections (e.g. on investigation
+    // switch). Without this, the Stop button on the new investigation would briefly
+    // appear stuck in "Stopping..." / disabled state if the user switched while a
+    // stop request was in-flight. The fetch's `finally` block would eventually correct
+    // it, but resetting here makes the transition instant and avoids the visual glitch.
+    setIsStopping(false);
   }, [stopConnectionsOnly]);
 
   /* ---------------------------------------------------------------- */
@@ -665,7 +828,15 @@ export default function Chat() {
 
   const startPolling = useCallback(
     (taskId: string, _initialToken: string) => {
+      connectedTaskIdRef.current = taskId;
       const poll = async () => {
+        if (connectedTaskIdRef.current !== taskId || activeTaskIdRef.current !== taskId) {
+          if (pollIntervalRef.current) {
+            clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
+          }
+          return;
+        }
         try {
           // BUG-R1-02: Get a fresh token on every poll tick instead of reusing
           // the captured string. The initial token expires after ~1 hour;
@@ -725,7 +896,10 @@ export default function Chat() {
           }
 
           if (data.status === "COMPLETED") {
-            updateInvestigationStatus(taskId, "COMPLETED");
+            updateInvestigationStatus(taskId, "COMPLETED", {
+              output_pdf_path: data.output_pdf_path,
+              output_docx_path: data.output_docx_path,
+            });
             // BUG-R2-02: Backend has no "findings" field in TaskSummary.
             // Report content is available only via the download endpoints.
             // Show a completion message and let the download buttons handle retrieval.
@@ -770,6 +944,7 @@ export default function Chat() {
 
   const startSSE = useCallback(
     async (taskId: string, token: string) => {
+      connectedTaskIdRef.current = taskId;
       // SEC-E3-R1-01: Mint a short-lived stream token instead of exposing
       // the full JWT in the SSE query string. The stream token is HMAC-signed,
       // bound to this specific task, and expires in 2 minutes.
@@ -803,6 +978,9 @@ export default function Chat() {
         // real-time progress events (text, status_change, step_start, etc.) from
         // the primary Redis path were dropped.
         const handleLogEvent = (event: MessageEvent) => {
+          if (connectedTaskIdRef.current !== taskId || activeTaskIdRef.current !== taskId) {
+            return;
+          }
           try {
             const parsed = JSON.parse(event.data);
 
@@ -811,6 +989,11 @@ export default function Chat() {
             if (eventType && [
               "step_start", "step_complete", "step_error", "status_change",
               "file_attached", "cost_update", "hypothesis_update", "text",
+              "graph_update",
+              // BUG-F2-01: branch_update, checkpoint, and warning were missing —
+              // they fell through to the legacy handler which rendered raw JSON
+              // as a status message instead of routing through processStructuredEvent.
+              "branch_update", "checkpoint", "warning",
             ].includes(eventType)) {
               processStructuredEvent(parsed as StructuredEvent, taskId);
 
@@ -910,6 +1093,9 @@ export default function Chat() {
         // The backend also emits: "done", "ping", "state_change", "error".
 
         es.addEventListener("done", (event: MessageEvent) => {
+          if (connectedTaskIdRef.current !== taskId || activeTaskIdRef.current !== taskId) {
+            return;
+          }
           try {
             const parsed = JSON.parse(event.data);
             const finalStatus = (parsed.final_status || parsed.status) as InvestigationStatus;
@@ -951,6 +1137,9 @@ export default function Chat() {
         });
 
         es.addEventListener("state_change", (event: MessageEvent) => {
+          if (connectedTaskIdRef.current !== taskId || activeTaskIdRef.current !== taskId) {
+            return;
+          }
           try {
             const parsed = JSON.parse(event.data);
             if (parsed.status) updateInvestigationStatus(taskId, parsed.status as InvestigationStatus);
@@ -964,11 +1153,16 @@ export default function Chat() {
                 _id: makeMessageId(),
               });
             }
-          } catch {}
+          } catch {
+            // Ignore malformed state_change payloads and keep the stream alive.
+          }
         });
 
         // Named "error" event from the server (distinct from connection errors via es.onerror)
         es.addEventListener("error", (event: MessageEvent) => {
+          if (connectedTaskIdRef.current !== taskId || activeTaskIdRef.current !== taskId) {
+            return;
+          }
           try {
             const parsed = JSON.parse(event.data);
             const errMsg = parsed.error || parsed.message || "Stream error";
@@ -991,6 +1185,9 @@ export default function Chat() {
 
         // BUG-002: hasFailedOver flag prevents multiple concurrent polling loops
         es.onerror = async () => {
+          if (connectedTaskIdRef.current !== taskId || activeTaskIdRef.current !== taskId) {
+            return;
+          }
           if (hasFailedOver) return;
           hasFailedOver = true;
           console.warn("[Chat] SSE connection error, falling back to polling.");
@@ -999,9 +1196,16 @@ export default function Chat() {
           // BUG-R1-02: Fetch fresh token for polling fallover — the SSE token
           // may have been created some time ago and could be near expiry.
           const freshToken = await getAccessToken();
+          if (!freshToken) {
+            // Token refresh failed — session expired
+            stopAllConnections();
+            toast.error("Session expired", { description: "Please sign in again." });
+            navigate("/login");
+            return;
+          }
           // BUG-R2-17: Guard against starting a polling loop if the component
           // unmounted during the async getAccessToken() call.
-          if (freshToken && pollIntervalRef.current === null) {
+          if (pollIntervalRef.current === null) {
             startPolling(taskId, freshToken);
           }
         };
@@ -1011,7 +1215,7 @@ export default function Chat() {
         startPolling(taskId, token);
       }
     },
-    [appendMessage, processStructuredEvent, refreshUser, startPolling, stopAllConnections, updateInvestigationStatus]
+    [appendMessage, navigate, processStructuredEvent, refreshUser, startPolling, stopAllConnections, updateInvestigationStatus]
   );
 
   /* ---------------------------------------------------------------- */
@@ -1066,6 +1270,9 @@ export default function Chat() {
       if (inv && (inv.status === "RUNNING" || inv.status === "PENDING")) {
         setIsSending(true);
         getAccessToken().then((token) => {
+          if (activeTaskIdRef.current !== taskId) {
+            return;
+          }
           if (token) {
             startTimer(inv.created_at);
             startSSE(taskId, token);
@@ -1080,8 +1287,7 @@ export default function Chat() {
       }
     },
     // messages and timelineSteps removed from deps — using refs instead
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [activeTaskId, investigations, stopAllConnections, startSSE, startTimer]
+    [activeTaskId, investigations, navigate, stopAllConnections, startSSE, startTimer]
   );
 
   /* ---------------------------------------------------------------- */
@@ -1182,7 +1388,6 @@ export default function Chat() {
     }
   // BUG-C3-06 fix: startInvestigation accessed via startInvestigationRef.current
   // so handleSend always calls the latest version (avoids stale uploadSessionUuid).
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isSending, isClassifying, input, retryPayload, activeTaskId, stopConnectionsOnly, navigate]);
 
   /* ---------------------------------------------------------------- */
@@ -1212,6 +1417,10 @@ export default function Chat() {
       const requestBody: Record<string, unknown> = {
         topic,
         plan_approved: planApproved,
+        quality_tier: selectedTier,
+        continuous_mode: continuousMode,
+        dont_kill_branches: dontKillBranches,
+        user_flow_instructions: userFlowInstructions,
       };
       if (uploadSessionUuid) {
         requestBody.upload_session_uuid = uploadSessionUuid;
@@ -1336,7 +1545,7 @@ export default function Chat() {
       });
       setIsSending(false);
     }
-  }, [user, uploadSessionUuid, appendMessage, startTimer, startSSE, navigate]);
+  }, [user, selectedTier, continuousMode, dontKillBranches, userFlowInstructions, uploadSessionUuid, appendMessage, startTimer, startSSE, navigate]);
 
   // BUG-C3-06 fix: Ref to hold the latest startInvestigation so handleSend
   // (defined before startInvestigation) always calls the current version,
@@ -1349,19 +1558,29 @@ export default function Chat() {
   /* ---------------------------------------------------------------- */
 
   const handleApprovePlan = useCallback(async () => {
-    if (!pendingPlan) return;
-    const { topic } = pendingPlan;
-    setPendingPlan(null);
+    if (!pendingPlan || isClassifying || isSending) return;
+    // BUG-F3-01: Guard against rapid double-clicks. React batches state updates,
+    // so `setPendingPlan(null)` is NOT synchronously visible to a second click
+    // that fires before re-render. Setting isClassifying=true here gives us a
+    // synchronous-in-the-next-tick guard AND lets the Approve button's `disabled`
+    // prop block the second click at the UI layer.
+    setIsClassifying(true);
+    const planToApprove = pendingPlan;
 
-    const token = await getAccessToken();
-    if (!token) {
-      toast.error("Not authenticated", { description: "Please sign in again." });
-      navigate("/login");
-      return;
+    try {
+      const token = await getAccessToken();
+      if (!token) {
+        toast.error("Not authenticated", { description: "Please sign in again." });
+        navigate("/login");
+        return;
+      }
+
+      setPendingPlan(null);
+      await startInvestigationRef.current(planToApprove.topic, token, true);
+    } finally {
+      setIsClassifying(false);
     }
-
-    await startInvestigationRef.current(topic, token, true);
-  }, [pendingPlan, navigate]);
+  }, [pendingPlan, isClassifying, isSending, navigate]);
 
   /* ---------------------------------------------------------------- */
   /*  Cancel research plan                                            */
@@ -1378,6 +1597,11 @@ export default function Chat() {
     seenStatusIds.current.clear();
     setIsSending(false);
     setIsClassifying(false);
+    setIsStopping(false); // BUG-F3-02: also clear stop guard on cancel
+    setSelectedTier(INITIAL_QUALITY_TIER);
+    setContinuousMode(false);
+    setDontKillBranches(false);
+    setUserFlowInstructions("");
   }, []);
 
   /* ---------------------------------------------------------------- */
@@ -1439,6 +1663,14 @@ export default function Chat() {
   const activeInvestigation = investigations.find((i) => i.task_id === activeTaskId);
   const isRunning = activeInvestigation?.status === "RUNNING" || activeInvestigation?.status === "PENDING";
   const isCompleted = activeInvestigation?.status === "COMPLETED";
+  const latestAnnouncement = useMemo(() => {
+    const lastNonUserMessage = [...messages].reverse().find((msg) => msg.role !== "user");
+    if (lastNonUserMessage?.content) return lastNonUserMessage.content;
+    if (pendingPlan) return "Research plan ready for review.";
+    if (isClassifying) return "Analyzing your question.";
+    if (isSending) return "Mariana is researching.";
+    return "";
+  }, [messages, pendingPlan, isClassifying, isSending]);
 
   if (!user) return null;
 
@@ -1488,6 +1720,10 @@ export default function Chat() {
               setMessages([]);
               setTimelineSteps([]);
               setPendingPlan(null);
+              setSelectedTier(INITIAL_QUALITY_TIER);
+              setContinuousMode(false);
+              setDontKillBranches(false);
+              setUserFlowInstructions("");
               setUploadedFiles([]);
               setUploadSessionUuid(null);
               seenStatusIds.current.clear();
@@ -1556,6 +1792,7 @@ export default function Chat() {
               onClick={() => { setMemoryOpen(true); loadMemory(); }}
               className="rounded-md p-1.5 text-muted-foreground/50 hover:text-primary hover:bg-secondary/50 transition-colors"
               title="Memory"
+              aria-label="Open memory panel"
             >
               <Brain size={14} />
             </button>
@@ -1598,6 +1835,7 @@ export default function Chat() {
                 to={`/graph/${activeTaskId}`}
                 className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
                 title="View Investigation Graph"
+                aria-label="View investigation graph"
               >
                 <GitBranch size={13} />
                 <span className="hidden sm:inline">Graph</span>
@@ -1626,10 +1864,13 @@ export default function Chat() {
           ref={messagesContainerRef}
           className="flex-1 overflow-y-auto px-4 py-6 sm:px-6"
         >
+          <div className="sr-only" aria-live="polite" aria-atomic="true">
+            {latestAnnouncement}
+          </div>
           <div className="mx-auto max-w-2xl space-y-4">
             {/* Zero credits banner */}
             {user.tokens <= 0 && (
-              <div className="rounded-lg border border-red-500/30 bg-red-500/5 px-4 py-3">
+              <div className="rounded-lg border border-red-500/30 bg-red-500/5 px-4 py-3" role="alert">
                 <div className="flex items-center gap-2">
                   <AlertTriangle size={14} className="shrink-0 text-red-400" />
                   <span className="text-sm font-medium text-red-400">
@@ -1647,7 +1888,7 @@ export default function Chat() {
 
             {/* Low credits warning */}
             {user.tokens > 0 && user.tokens < 1000 && (
-              <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2">
+              <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2" role="status" aria-live="polite">
                 <div className="flex items-center gap-2 text-xs text-amber-400">
                   <AlertTriangle size={12} className="shrink-0" />
                   <span>Low credits: {user.tokens.toLocaleString()} remaining</span>
@@ -1702,7 +1943,12 @@ export default function Chat() {
                         const ext = (parsed.filename as string).split(".").pop()?.toLowerCase() || "";
                         const isImage = ["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(ext);
                         const isVideo = ["mp4", "webm", "mov"].includes(ext);
-                        const fileUrl = `${API_URL}/api/investigations/${activeTaskId || ""}/files/${encodeURIComponent(parsed.filename)}`;
+                        // BUG-F2-05: Prefer backend-provided URL (e.g. CDN path) over
+                        // constructed API path. Fall back to the constructed path when
+                        // the url field is absent or null.
+                        const fileUrl = parsed.url
+                          ? String(parsed.url)
+                          : `${API_URL}/api/investigations/${activeTaskId || ""}/files/${encodeURIComponent(parsed.filename)}`;
 
                         if (isImage) {
                           return (
@@ -1717,6 +1963,7 @@ export default function Chat() {
                                   })
                                 }
                                 className="block max-w-sm rounded-md overflow-hidden border border-border hover:ring-1 hover:ring-primary/30 transition-all cursor-pointer"
+                                aria-label={`Open attached image ${parsed.filename}`}
                               >
                                 <AuthImage
                                   src={fileUrl}
@@ -1764,7 +2011,7 @@ export default function Chat() {
                               {Number(parsed.credits_used).toLocaleString()} credits used
                             </span>
                             {" "}
-                            (${Number(parsed.spent_usd).toFixed(2)} + 20% markup)
+                            (${Number(parsed.spent_usd).toFixed(2)} incl. fees)
                           </div>
                         );
                       }
@@ -1872,10 +2119,66 @@ export default function Chat() {
                   <span>·</span>
                   <span>{pendingPlan.estimated_credits.toLocaleString()} credits</span>
                 </div>
+                {/* Quality Tier & Loop Controls */}
+                <div className="mt-4 flex flex-wrap items-center gap-4">
+                  <div className="flex items-center gap-2">
+                    <label className="text-[10px] font-medium uppercase tracking-[0.15em] text-muted-foreground">
+                      Quality
+                    </label>
+                    <select
+                      value={selectedTier}
+                      onChange={(e) => setSelectedTier(e.target.value)}
+                      className="rounded-md border border-border bg-background px-2.5 py-1.5 text-xs text-foreground outline-none focus:ring-1 focus:ring-accent/50"
+                    >
+                      <option value="economy">Economy</option>
+                      <option value="balanced">Balanced</option>
+                      <option value="high">High</option>
+                      <option value="maximum">Maximum</option>
+                    </select>
+                  </div>
+                  <label className="flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={continuousMode}
+                      onChange={(e) => setContinuousMode(e.target.checked)}
+                      className="h-3.5 w-3.5 rounded border-border text-accent focus:ring-accent/50"
+                    />
+                    <span className="text-[10px] font-medium uppercase tracking-[0.15em] text-muted-foreground">
+                      Continuous Mode
+                    </span>
+                  </label>
+                  {/* BUG-F2-02: dont_kill_branches was never exposed in the UI */}
+                  <label className="flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={dontKillBranches}
+                      onChange={(e) => setDontKillBranches(e.target.checked)}
+                      className="h-3.5 w-3.5 rounded border-border text-accent focus:ring-accent/50"
+                    />
+                    <span className="text-[10px] font-medium uppercase tracking-[0.15em] text-muted-foreground">
+                      Keep All Branches
+                    </span>
+                  </label>
+                </div>
+                {/* BUG-F2-02: user_flow_instructions was never exposed in the UI */}
+                <div className="mt-3">
+                  <label className="block text-[10px] font-medium uppercase tracking-[0.15em] text-muted-foreground mb-1.5">
+                    Flow Instructions <span className="normal-case text-muted-foreground/60">(optional)</span>
+                  </label>
+                  <textarea
+                    value={userFlowInstructions}
+                    onChange={(e) => setUserFlowInstructions(e.target.value)}
+                    placeholder="Add any custom instructions for how Mariana should conduct this investigation..."
+                    rows={2}
+                    className="w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-xs text-foreground placeholder:text-muted-foreground/40 outline-none focus:ring-1 focus:ring-accent/50 resize-none"
+                  />
+                </div>
                 <div className="mt-4 flex flex-wrap gap-2">
                   <button
                     onClick={handleApprovePlan}
-                    className="inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                    // BUG-F3-01: disabled prevents double-approval at the UI layer
+                    disabled={isSending || isClassifying}
+                    className="inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-60 disabled:cursor-not-allowed"
                   >
                     <CheckCircle size={13} />
                     Approve &amp; Start
@@ -1904,9 +2207,48 @@ export default function Chat() {
             {/* Loading indicator while investigation is running */}
             {isSending && (
               <div className="border-l-2 border-blue-500/40 pl-4 py-2">
-                <div className="flex items-center gap-2 text-xs text-blue-400">
-                  <Loader2 size={12} className="animate-spin" />
-                  <span>Mariana is researching...</span>
+                <div className="flex items-center gap-3 text-xs">
+                  <div className="flex items-center gap-2 text-blue-400">
+                    <Loader2 size={12} className="animate-spin" />
+                    <span>Mariana is researching...</span>
+                  </div>
+                  {activeTaskId && (
+                    // BUG-F2-03: Added isStopping guard to prevent multiple concurrent
+                    // POST /stop requests from rapid clicks. The button is disabled and
+                    // shows a spinner while the stop request is in-flight.
+                    <button
+                      onClick={async () => {
+                        if (isStopping) return;
+                        const token = await getAccessToken();
+                        if (!token || !activeTaskId) return;
+                        setIsStopping(true);
+                        try {
+                          const res = await fetch(`${API_URL}/api/investigations/${activeTaskId}/stop`, {
+                            method: "POST",
+                            headers: { Authorization: `Bearer ${token}` },
+                          });
+                          if (!res.ok) {
+                            const errText = await res.text().catch(() => res.statusText);
+                            throw new Error(`HTTP ${res.status}: ${errText}`);
+                          }
+                          toast.info("Stop requested", { description: "Investigation will stop after the current cycle." });
+                        } catch {
+                          toast.error("Failed to stop investigation");
+                        } finally {
+                          setIsStopping(false);
+                        }
+                      }}
+                      disabled={isStopping}
+                      className="inline-flex items-center gap-1 rounded-md border border-red-300/50 px-2.5 py-1 text-[10px] font-medium text-red-400 transition-colors hover:bg-red-500/10 hover:text-red-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {isStopping ? (
+                        <Loader2 size={10} className="animate-spin" />
+                      ) : (
+                        <Square size={10} />
+                      )}
+                      {isStopping ? "Stopping..." : "Stop"}
+                    </button>
+                  )}
                 </div>
               </div>
             )}
@@ -1929,13 +2271,15 @@ export default function Chat() {
                     <Download size={12} />
                     Download PDF Report
                   </button>
-                  <button
-                    onClick={() => handleDownload("docx")}
-                    className="inline-flex items-center gap-1.5 rounded-md border border-green-600/50 px-3 py-1.5 text-xs font-medium text-green-400 hover:bg-green-600/10 transition-colors"
-                  >
-                    <Download size={12} />
-                    Download Word Report
-                  </button>
+                  {activeInvestigation?.output_docx_path && (
+                    <button
+                      onClick={() => handleDownload("docx")}
+                      className="inline-flex items-center gap-1.5 rounded-md border border-green-600/50 px-3 py-1.5 text-xs font-medium text-green-400 hover:bg-green-600/10 transition-colors"
+                    >
+                      <Download size={12} />
+                      Download Word Report
+                    </button>
+                  )}
                 </div>
               </div>
             )}
@@ -1976,6 +2320,7 @@ export default function Chat() {
                 placeholder={user.tokens <= 0 ? "Add credits to continue..." : "Ask Mariana anything..."}
                 className="min-w-0 flex-1 rounded-md border border-border bg-card px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary/20 sm:px-4"
                 disabled={isSending || isClassifying || user.tokens <= 0}
+                aria-label="Ask Mariana a question"
               />
               <button
                 type="submit"
@@ -1994,15 +2339,21 @@ export default function Chat() {
       {memoryOpen && (
         <>
           <div className="fixed inset-0 z-50 bg-black/50" onClick={() => setMemoryOpen(false)} />
-          <div className="fixed inset-y-0 right-0 z-50 flex w-full max-w-sm flex-col border-l border-border bg-card shadow-2xl animate-slide-in-right">
+          <div
+            className="fixed inset-y-0 right-0 z-50 flex w-full max-w-sm flex-col border-l border-border bg-card shadow-2xl animate-slide-in-right"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="memory-panel-title"
+          >
             <div className="flex items-center justify-between border-b border-border px-4 py-3">
               <div className="flex items-center gap-2">
                 <Brain size={16} className="text-primary" />
-                <span className="text-sm font-medium text-foreground">Memory</span>
+                <span id="memory-panel-title" className="text-sm font-medium text-foreground">Memory</span>
               </div>
               <button
                 onClick={() => setMemoryOpen(false)}
                 className="rounded-md p-1.5 text-muted-foreground hover:bg-secondary transition-colors"
+                aria-label="Close memory panel"
               >
                 <X size={16} />
               </button>
@@ -2033,6 +2384,7 @@ export default function Chat() {
                               onClick={() => deleteMemoryFact(f.fact)}
                               className="shrink-0 mt-0.5 opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-300 transition-opacity"
                               title="Delete"
+                              aria-label={`Delete stored fact: ${f.fact}`}
                             >
                               <Trash2 size={11} />
                             </button>
@@ -2064,6 +2416,7 @@ export default function Chat() {
                               onClick={() => deleteMemoryPref(key)}
                               className="shrink-0 mt-0.5 opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-300 transition-opacity"
                               title="Delete"
+                              aria-label={`Delete preference ${key}`}
                             >
                               <Trash2 size={11} />
                             </button>

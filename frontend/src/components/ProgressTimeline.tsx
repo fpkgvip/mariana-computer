@@ -28,6 +28,12 @@ export interface TimelineStep {
     | "file_attached"
     | "cost_update"
     | "hypothesis_update"
+    // BUG-F2-04: branch_update, checkpoint, and warning were missing from the
+    // type union — TypeScript would accept them as string literals but
+    // they're now explicit for type safety throughout the component.
+    | "branch_update"
+    | "checkpoint"
+    | "warning"
     | "text";
   label: string;
   icon?: string;
@@ -47,14 +53,28 @@ export interface StructuredEvent {
   state?: string;
   duration_ms?: number;
   filename?: string;
+  /** BUG-F2-05: file_attached spec includes a url field from the backend */
+  url?: string;
   size?: number;
   mime?: string;
   spent_usd?: number;
   budget_usd?: number;
+  raw_spent_usd?: number;
   id?: string;
   text?: string;
   status?: string;
+  score?: number;
   content?: string;
+  /** graph_update event — new or updated graph snapshot */
+  nodes?: unknown[];
+  edges?: unknown[];
+  /** hypothesis_update fields */
+  hypothesis_id?: string;
+  /** branch_update fields */
+  branch_id?: string;
+  /** checkpoint fields */
+  summary?: string;
+  sources_count?: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -108,6 +128,16 @@ function stateToIcon(state: string): string {
   if (lower.includes("tribunal") || lower.includes("skeptic")) return "analyze";
   if (lower.includes("checkpoint") || lower.includes("pivot")) return "code";
   return "search";
+}
+
+function makeEventInstanceId(prefix: string, ...parts: Array<string | number | undefined>): string {
+  const stableParts = parts
+    .filter((part): part is string | number => part !== undefined && part !== "")
+    .map((part) => String(part).replace(/[^a-zA-Z0-9_-]+/g, "-"))
+    .join("-");
+  return `${prefix}${stableParts ? `-${stableParts}` : ""}-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -172,7 +202,7 @@ export function parseStructuredEvent(event: StructuredEvent, existingSteps: Time
 
     case "status_change":
       return {
-        id: `state-${event.state || Date.now()}`,
+        id: makeEventInstanceId("state", event.state),
         type: "status_change",
         label: event.message || `State: ${event.state || "Unknown"}`,
         icon: stateToIcon(event.state || ""),
@@ -182,7 +212,7 @@ export function parseStructuredEvent(event: StructuredEvent, existingSteps: Time
 
     case "file_attached":
       return {
-        id: `file-${event.filename || Date.now()}`,
+        id: makeEventInstanceId("file", event.filename),
         type: "file_attached",
         label: event.filename || "File attached",
         icon: "attachment",
@@ -193,7 +223,7 @@ export function parseStructuredEvent(event: StructuredEvent, existingSteps: Time
 
     case "cost_update":
       return {
-        id: `cost-${Date.now()}`,
+        id: makeEventInstanceId("cost", event.spent_usd, event.budget_usd),
         type: "cost_update",
         label: `Cost: $${(event.spent_usd ?? 0).toFixed(2)} / $${(event.budget_usd ?? 0).toFixed(2)}`,
         icon: "cost",
@@ -203,7 +233,7 @@ export function parseStructuredEvent(event: StructuredEvent, existingSteps: Time
 
     case "hypothesis_update":
       return {
-        id: event.id || `hyp-${Date.now()}`,
+        id: makeEventInstanceId("hyp", event.id ?? event.hypothesis_id, event.status),
         type: "hypothesis_update",
         label: event.text || "Hypothesis updated",
         icon: "hypothesis",
@@ -216,7 +246,7 @@ export function parseStructuredEvent(event: StructuredEvent, existingSteps: Time
       const textContent = event.content || event.message || "";
       const isSubAgent = textContent.startsWith("[SubAgent]");
       return {
-        id: `text-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        id: makeEventInstanceId("text", isSubAgent ? "subagent" : "message"),
         type: "text",
         label: isSubAgent ? textContent.replace("[SubAgent] ", "") : textContent,
         icon: isSubAgent ? "subagent" : undefined,
@@ -227,6 +257,50 @@ export function parseStructuredEvent(event: StructuredEvent, existingSteps: Time
         timestamp: Date.now(),
       };
     }
+
+    // BUG-F2-04: branch_update, checkpoint, and warning were never handled —
+    // parseStructuredEvent returned null for all three, silently dropping them
+    // from the timeline entirely.
+    case "branch_update": {
+      const branchLabel = event.branch_id
+        ? `Branch ${event.branch_id}: ${event.status ?? "updated"}`
+        : `Branch ${event.status ?? "updated"}`;
+      const branchStatus = event.status === "failed" ? "error" as const : "complete" as const;
+      return {
+        id: makeEventInstanceId("branch", event.branch_id ?? "unknown", event.status ?? "updated", event.score ?? "na"),
+        type: "branch_update",
+        label: branchLabel,
+        icon: "subagent",
+        status: branchStatus,
+        detail: event.score != null ? `Score: ${event.score}` : undefined,
+        timestamp: Date.now(),
+      };
+    }
+
+    case "checkpoint": {
+      const cpDetail = event.sources_count != null
+        ? `${event.sources_count} source${event.sources_count !== 1 ? "s" : ""} reviewed`
+        : undefined;
+      return {
+        id: makeEventInstanceId("checkpoint", event.summary, event.sources_count),
+        type: "checkpoint",
+        label: event.summary || "Checkpoint",
+        icon: "check",
+        status: "complete" as const,
+        detail: cpDetail,
+        timestamp: Date.now(),
+      };
+    }
+
+    case "warning":
+      return {
+        id: makeEventInstanceId("warning", event.message),
+        type: "warning",
+        label: event.message || "Warning",
+        icon: "alert",
+        status: "error" as const, // render as amber/error indicator
+        timestamp: Date.now(),
+      };
 
     default:
       return null;
@@ -376,7 +450,7 @@ export default function ProgressTimeline({ steps, onFileClick }: ProgressTimelin
   return (
     <div className="space-y-1">
       {groups.map((group) => (
-        <TimelineGroup key={group.label} group={group} onFileClick={onFileClick} />
+        <TimelineGroup key={group.id} group={group} onFileClick={onFileClick} />
       ))}
     </div>
   );
@@ -387,60 +461,109 @@ export default function ProgressTimeline({ steps, onFileClick }: ProgressTimelin
 /* ------------------------------------------------------------------ */
 
 interface StepGroup {
+  id: string;
   label: string;
   steps: TimelineStep[];
   isActive: boolean;
 }
 
+function getGroupId(label: string, steps: TimelineStep[], index: number): string {
+  const firstStep = steps[0];
+  return `${firstStep?.id ?? label}-${index}`;
+}
+
+function makeStepGroup(label: string, steps: TimelineStep[], isActive: boolean, index: number): StepGroup {
+  return {
+    id: getGroupId(label, steps, index),
+    label,
+    steps,
+    isActive,
+  };
+}
+
+function finalizeGroup(group: Omit<StepGroup, "id">, index: number): StepGroup {
+  return makeStepGroup(group.label, group.steps, group.isActive, index);
+}
+
+function createEmptyGroup(label: string): Omit<StepGroup, "id"> {
+  return {
+    label,
+    steps: [],
+    isActive: false,
+  };
+}
+
+function createStatusGroup(step: TimelineStep): Omit<StepGroup, "id"> {
+  return {
+    label: step.label,
+    steps: [step],
+    isActive: step.status === "running",
+  };
+}
+
+function getFallbackGroup(steps: TimelineStep[]): StepGroup {
+  return makeStepGroup(
+    "Progress",
+    [...steps],
+    steps.some((s) => s.status === "running"),
+    0
+  );
+}
+
+function pushCurrentGroup(groups: StepGroup[], currentGroup: Omit<StepGroup, "id"> | null): void {
+  if (!currentGroup || currentGroup.steps.length === 0) return;
+  groups.push(finalizeGroup(currentGroup, groups.length));
+}
+
+function ensureCurrentGroup(currentGroup: Omit<StepGroup, "id"> | null): Omit<StepGroup, "id"> {
+  return currentGroup ?? createEmptyGroup("Investigation");
+}
+
+function addStepToGroup(
+  currentGroup: Omit<StepGroup, "id"> | null,
+  step: TimelineStep
+): Omit<StepGroup, "id"> {
+  const nextGroup = ensureCurrentGroup(currentGroup);
+  nextGroup.steps.push(step);
+  if (step.status === "running") {
+    nextGroup.isActive = true;
+  }
+  return nextGroup;
+}
+
+function buildStepGroups(steps: TimelineStep[]): StepGroup[] {
+  const groups: StepGroup[] = [];
+  let currentGroup: Omit<StepGroup, "id"> | null = null;
+
+  for (const step of steps) {
+    if (step.type === "status_change") {
+      pushCurrentGroup(groups, currentGroup);
+      currentGroup = createStatusGroup(step);
+    } else {
+      currentGroup = addStepToGroup(currentGroup, step);
+    }
+  }
+
+  pushCurrentGroup(groups, currentGroup);
+
+  if (groups.length === 0 && steps.length > 0) {
+    groups.push(getFallbackGroup(steps));
+  }
+
+  return groups;
+}
+
+// BUG-R7-05: Group keys were based only on group.label, so repeated status labels
+// (for example, the same state reported more than once during reconnects or long
+// investigations) caused duplicate React keys. React could then reuse the wrong
+// TimelineGroup instance and leak collapsed/expanded UI state across distinct groups.
+// Groups now get stable ids derived from their first step id, with an index fallback.
+
 // BUG-R2-S2-06: Was using useCallback(..., [steps])() — creating a memoized function
 // and immediately invoking it. useCallback is for memoizing function identity, not
 // computed values. Replaced with useMemo which correctly memoizes the computed result.
 function useGroupedSteps(steps: TimelineStep[]): StepGroup[] {
-  return useMemo(() => {
-    const groups: StepGroup[] = [];
-    let currentGroup: StepGroup | null = null;
-
-    for (const step of steps) {
-      if (step.type === "status_change") {
-        // Status changes create new groups
-        if (currentGroup && currentGroup.steps.length > 0) {
-          groups.push(currentGroup);
-        }
-        currentGroup = {
-          label: step.label,
-          steps: [step],
-          isActive: step.status === "running",
-        };
-      } else {
-        if (!currentGroup) {
-          currentGroup = {
-            label: "Investigation",
-            steps: [],
-            isActive: false,
-          };
-        }
-        currentGroup.steps.push(step);
-        if (step.status === "running") {
-          currentGroup.isActive = true;
-        }
-      }
-    }
-
-    if (currentGroup && currentGroup.steps.length > 0) {
-      groups.push(currentGroup);
-    }
-
-    // If no groups were created, show all steps in one flat group
-    if (groups.length === 0 && steps.length > 0) {
-      groups.push({
-        label: "Progress",
-        steps: [...steps],
-        isActive: steps.some((s) => s.status === "running"),
-      });
-    }
-
-    return groups;
-  }, [steps]);
+  return useMemo(() => buildStepGroups(steps), [steps]);
 }
 
 function TimelineGroup({

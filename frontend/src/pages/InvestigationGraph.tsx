@@ -62,6 +62,13 @@ interface GraphNode {
   label: string;
   type: NodeType;
   notes: string;
+  /**
+   * Backend graph APIs persist rich node text in `description`; keep it optional
+   * here so we can normalize it into `notes` on read while preserving editor UX.
+   */
+  description?: string;
+  metadata?: Record<string, unknown>;
+  source?: string;
   x?: number;
   y?: number;
   fx?: number | null;
@@ -143,6 +150,22 @@ const ALL_NODE_TYPES: NodeType[] = [
   "data_point",
 ];
 
+const BACKEND_NODE_TYPE_MAP: Record<string, NodeType> = {
+  finding: "claim",
+  hypothesis: "claim",
+  source: "url",
+  branch: "data_point",
+  entity: "document",
+};
+
+function normalizeNodeType(type: string | null | undefined): NodeType {
+  const normalized = (type ?? "").trim().toLowerCase();
+  if ((ALL_NODE_TYPES as string[]).includes(normalized)) {
+    return normalized as NodeType;
+  }
+  return BACKEND_NODE_TYPE_MAP[normalized] ?? "document";
+}
+
 const NODE_ICON_GLYPHS: Record<NodeType, string> = {
   person: "\u{1F464}",
   organization: "\u{1F3E2}",
@@ -161,9 +184,18 @@ const POLL_INTERVAL_MS = 10_000;
 /*  Helpers                                                           */
 /* ================================================================== */
 
-// BUG-25: Use crypto.randomUUID() for guaranteed uniqueness
-const uid = () => crypto.randomUUID();
-const eid = () => crypto.randomUUID();
+// BUG-25 / BUG-R7-03: Prefer crypto.randomUUID() when available, but older
+// browsers may not implement it. Fall back to a time+random id so graph editing
+// still works instead of throwing at runtime on first add/link action.
+function makeClientId(prefix: string): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+const uid = () => makeClientId("node");
+const eid = () => makeClientId("edge");
 
 async function getAccessToken(): Promise<string | null> {
   const { data } = await supabase.auth.getSession();
@@ -173,6 +205,24 @@ async function getAccessToken(): Promise<string | null> {
 /** Resolve edge source/target to an id string regardless of D3 mutation. */
 function resolveId(ref: string | GraphNode): string {
   return typeof ref === "string" ? ref : ref.id;
+}
+
+function normalizeGraphData(data: GraphData): GraphData {
+  const nodes = (data.nodes ?? []).map((node) => ({
+    ...node,
+    type: normalizeNodeType(node.type),
+    notes: node.notes ?? node.description ?? "",
+  }));
+
+  const edges = (data.edges ?? []).map((edge) => ({
+    ...edge,
+    sourceId: edge.sourceId ?? resolveId(edge.source),
+    targetId: edge.targetId ?? resolveId(edge.target),
+    source: edge.sourceId ?? resolveId(edge.source),
+    target: edge.targetId ?? resolveId(edge.target),
+  }));
+
+  return { nodes, edges };
 }
 
 /* ================================================================== */
@@ -216,6 +266,7 @@ export default function InvestigationGraph() {
   const [aiLoading, setAiLoading] = useState(false);
   const [investigationRunning, setInvestigationRunning] = useState(false);
   const [graphError, setGraphError] = useState<string | null>(null);
+  const [graphStatusMessage, setGraphStatusMessage] = useState("");
 
   /* ---- Add panel form state ---- */
   const [newLabel, setNewLabel] = useState("");
@@ -269,7 +320,10 @@ export default function InvestigationGraph() {
   /* ================================================================ */
 
   useEffect(() => {
-    if (!user) navigate("/login", { replace: true });
+    if (!user) {
+      const timer = setTimeout(() => navigate("/login", { replace: true }), 500);
+      return () => clearTimeout(timer);
+    }
   }, [user, navigate]);
 
   // BUG-R2A-01: Flip isMountedRef on unmount to prevent state updates after unmount
@@ -334,6 +388,13 @@ export default function InvestigationGraph() {
         } else if (res.status === 403) {
           setGraphError("You do not have access to this investigation.");
           graphErrorRef.current = "You do not have access to this investigation.";
+        } else if (res.status === 401) {
+          // Session expired — redirect to login
+          navigate("/login");
+        } else {
+          // Server error — surface to user
+          setGraphError(`Failed to load graph (HTTP ${res.status}). Retrying...`);
+          graphErrorRef.current = `Failed to load graph (HTTP ${res.status}). Retrying...`;
         }
         return;
       }
@@ -342,13 +403,17 @@ export default function InvestigationGraph() {
       graphErrorRef.current = null;
       const data: GraphData = await res.json();
       if (!isMountedRef.current) return;
-      if (data.nodes || data.edges) {
-        mergeGraph(data);
-      }
+      const normalized = normalizeGraphData(data);
+      setNodes(normalized.nodes);
+      setEdges(normalized.edges);
     } catch {
-      /* silently fail — network hiccups during polling are expected */
+      // Network hiccup — surface error but don't crash
+      if (isMountedRef.current) {
+        setGraphError("Network error loading graph. Retrying...");
+        graphErrorRef.current = "Network error loading graph. Retrying...";
+      }
     }
-  }, [taskId, mergeGraph]);
+  }, [taskId, navigate]);
 
   const saveGraphToBackend = useCallback(async () => {
     if (!taskId) {
@@ -367,6 +432,7 @@ export default function InvestigationGraph() {
           label: n.label,
           type: n.type,
           notes: n.notes,
+          description: n.notes,
           x: n.x,
           y: n.y,
           fx: n.fx ?? null,
@@ -382,7 +448,7 @@ export default function InvestigationGraph() {
         })),
       };
       const res = await fetch(`${API_URL}/api/investigations/${taskId}/graph`, {
-        method: "PATCH",
+        method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
@@ -417,6 +483,7 @@ export default function InvestigationGraph() {
           label: n.label,
           type: n.type,
           notes: n.notes,
+          description: n.notes,
         })),
         edges: edgesRef.current.map((e) => ({
           id: e.id,
@@ -441,9 +508,10 @@ export default function InvestigationGraph() {
         return;
       }
       const data: GraphData = await res.json();
+      const normalized = normalizeGraphData(data);
       // BUG-30: aiPopulate guard allows either nodes or edges (AI may return only one)
-      if (data.nodes || data.edges) {
-        const { addedNodes, addedEdges } = mergeGraph(data);
+      if (normalized.nodes || normalized.edges) {
+        const { addedNodes, addedEdges } = mergeGraph(normalized);
         toast.success(
           `AI added ${addedNodes} nodes and ${addedEdges} edges`
         );
@@ -460,6 +528,19 @@ export default function InvestigationGraph() {
   /* ================================================================ */
 
   useEffect(() => {
+    setNodes([]);
+    setEdges([]);
+    setSelectedNodeId(null);
+    setSidebarOpen(false);
+    setSearchTerm("");
+    setFilterType("all");
+    setLinkMode(false);
+    setLinkSourceId(null);
+    setContextMenu({ visible: false, x: 0, y: 0, nodeId: null });
+    setGraphError(null);
+    graphErrorRef.current = null;
+    setGraphStatusMessage(taskId ? `Loading graph for investigation ${taskId.slice(0, 8)}.` : "");
+    setInvestigationRunning(false);
     if (!taskId) return;
     // Initial fetch
     fetchGraphFromBackend();
@@ -468,26 +549,37 @@ export default function InvestigationGraph() {
     let cancelled = false;
     const checkStatus = async () => {
       const token = await getAccessToken();
-      if (!token || cancelled) return;
+      if (!token || cancelled) {
+        if (!token && isMountedRef.current) navigate("/login");
+        return;
+      }
       try {
         const res = await fetch(`${API_URL}/api/investigations/${taskId}`, {
           headers: { Authorization: `Bearer ${token}` },
         });
-        if (!isMountedRef.current) return;
-        if (!res.ok || cancelled) return;
+        if (!isMountedRef.current || cancelled) return;
+        if (res.status === 401) {
+          navigate("/login");
+          return;
+        }
+        if (!res.ok) return; // transient error — retry next cycle
         const data = await res.json();
-        const status = data.status ?? data.current_state ?? "";
-        setInvestigationRunning(status === "RUNNING");
+        setGraphStatusMessage(`Investigation status: ${String(data.status ?? "unknown")}`);
+        // BUG-F2-06: data.status is the canonical InvestigationStatus field
+        const status = (data.status as string) ?? "";
+        setInvestigationRunning(status === "RUNNING" || status === "PENDING");
       } catch {
-        /* ignore */
+        // Network hiccup — retry next cycle
       }
     };
     checkStatus();
 
     const interval = setInterval(() => {
       if (!cancelled) {
-        // BUG-R2A-05: Skip polling if a definitive error (404/403) has been received
-        if (graphErrorRef.current) return;
+        // Only stop polling on definitive terminal errors (404/403).
+        // Transient errors (5xx, network) contain "Retrying" and should not block.
+        const err = graphErrorRef.current;
+        if (err && !err.includes("Retrying")) return;
         fetchGraphFromBackend();
         checkStatus();
       }
@@ -1007,6 +1099,7 @@ export default function InvestigationGraph() {
         label: n.label,
         type: n.type,
         notes: n.notes,
+        description: n.notes,
         x: n.x,
         y: n.y,
         fx: n.fx ?? null,
@@ -1029,7 +1122,7 @@ export default function InvestigationGraph() {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 100);
     toast.success("Graph exported");
   }, [taskId]);
 
@@ -1046,10 +1139,17 @@ export default function InvestigationGraph() {
             return;
           }
           // BUG-14: Validate node types and edge references
-          const validTypes = new Set<string>(ALL_NODE_TYPES);
-          const validNodes = (data.nodes as GraphNode[]).filter(
-            (n) => n.id && n.label && validTypes.has(n.type)
-          );
+          const validNodes = (data.nodes as GraphNode[])
+          .filter((n) => n.id && n.label)
+          // BUG-F3-03: Normalize notes to empty string — imported JSON may omit this
+          // field entirely. Without normalization, setEditNotes(node.notes) would
+          // set a controlled textarea's value to undefined, producing a React
+          // "switching from uncontrolled to controlled" warning and unexpected UI.
+          .map((n) => ({
+            ...n,
+            type: normalizeNodeType(n.type),
+            notes: n.notes ?? n.description ?? "",
+          }));
           const nodeIds = new Set(validNodes.map((n) => n.id));
           // BUG-R3-03: Normalize sourceId/targetId (imported JSON may use source/target strings)
           const normalizedEdges = (data.edges as GraphEdge[]).map((e) => ({
@@ -1317,11 +1417,13 @@ export default function InvestigationGraph() {
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               className="pl-8 pr-3 py-1.5 text-sm border border-border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-ring/30 w-48"
+              aria-label="Search graph nodes"
             />
             {searchTerm && (
               <button
                 className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                 onClick={() => setSearchTerm("")}
+                aria-label="Clear search"
               >
                 <X className="w-3.5 h-3.5" />
               </button>
@@ -1333,6 +1435,7 @@ export default function InvestigationGraph() {
               value={filterType}
               onChange={(e) => setFilterType(e.target.value as NodeType | "all")}
               className="pl-8 pr-8 py-1.5 text-sm border border-border rounded-md bg-background appearance-none focus:outline-none focus:ring-2 focus:ring-ring/30"
+              aria-label="Filter nodes by type"
             >
               <option value="all">All types</option>
               {ALL_NODE_TYPES.map((t) => (
@@ -1422,15 +1525,21 @@ export default function InvestigationGraph() {
         {/*  Add Node Panel (overlay on left)                          */}
         {/* ========================================================== */}
         {addPanelOpen && (
-          <div className="absolute top-0 left-12 z-20 w-72 bg-card border-r border-b border-border shadow-lg rounded-br-lg p-4">
+          <div
+            className="absolute top-0 left-12 z-20 w-72 bg-card border-r border-b border-border shadow-lg rounded-br-lg p-4"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="add-node-title"
+          >
             <div className="flex items-center justify-between mb-3">
               <h3
+                id="add-node-title"
                 className="text-sm font-semibold text-foreground"
                 style={{ fontFamily: "'Playfair Display', Georgia, serif" }}
               >
                 Add Node
               </h3>
-              <button onClick={() => setAddPanelOpen(false)} className="text-muted-foreground hover:text-foreground">
+              <button onClick={() => setAddPanelOpen(false)} className="text-muted-foreground hover:text-foreground" aria-label="Close add node panel">
                 <X className="w-4 h-4" />
               </button>
             </div>
@@ -1506,10 +1615,15 @@ export default function InvestigationGraph() {
         {/*  SVG Canvas                                                */}
         {/* ========================================================== */}
         <div className="flex-1 relative overflow-hidden">
+          <div className="sr-only" aria-live="polite" aria-atomic="true">
+            {graphStatusMessage}
+          </div>
           <svg
             ref={svgRef}
             className="w-full h-full"
             style={{ background: "#FAF8F5" }}
+            role="img"
+            aria-label="Investigation relationship graph"
           >
             <g ref={gRef} />
           </svg>
@@ -1525,6 +1639,7 @@ export default function InvestigationGraph() {
                   setLinkSourceId(null);
                 }}
                 className="ml-1 hover:bg-white/20 rounded p-0.5"
+                aria-label="Cancel link mode"
               >
                 <X className="w-3.5 h-3.5" />
               </button>
@@ -1580,7 +1695,7 @@ export default function InvestigationGraph() {
 
           {/* Error state */}
           {graphError && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+            <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none" role="alert" aria-live="assertive">
               <AlertTriangle className="w-12 h-12 text-red-400/60 mb-3" />
               <p className="text-red-400 text-sm font-medium mb-1">{graphError}</p>
               <Link
@@ -1614,7 +1729,7 @@ export default function InvestigationGraph() {
               >
                 Node Details
               </h3>
-              <button onClick={closeSidebar} className="text-muted-foreground hover:text-foreground">
+              <button onClick={closeSidebar} className="text-muted-foreground hover:text-foreground" aria-label="Close node details">
                 <X className="w-4 h-4" />
               </button>
             </div>
@@ -1700,8 +1815,12 @@ export default function InvestigationGraph() {
           <div
             className="bg-card rounded-xl border border-border shadow-2xl w-full max-w-md p-6"
             onClick={(e: ReactMouseEvent) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="edit-node-title"
           >
             <h3
+              id="edit-node-title"
               className="text-lg font-semibold text-foreground mb-4"
               style={{ fontFamily: "'Playfair Display', Georgia, serif" }}
             >
@@ -1799,8 +1918,12 @@ export default function InvestigationGraph() {
           <div
             className="bg-card rounded-xl border border-border shadow-2xl w-full max-w-sm p-6"
             onClick={(e: ReactMouseEvent) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="create-link-title"
           >
             <h3
+              id="create-link-title"
               className="text-lg font-semibold text-foreground mb-1"
               style={{ fontFamily: "'Playfair Display', Georgia, serif" }}
             >
@@ -1895,6 +2018,7 @@ function ToolbarButton({
       onClick={onClick}
       disabled={disabled}
       title={label}
+      aria-label={label}
       className={`
         w-9 h-9 flex items-center justify-center rounded-lg transition-colors
         ${disabled ? "opacity-40 cursor-not-allowed" : ""}
