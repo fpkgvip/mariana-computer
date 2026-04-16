@@ -48,7 +48,7 @@ from typing import Any
 import httpx
 from pydantic import BaseModel
 
-from mariana.data.models import AISession, ModelID, TaskType
+from mariana.data.models import AISession, ModelID, QualityTier, TaskType
 from mariana.config import AppConfig, load_config
 from mariana.ai.router import ModelConfig, get_model_config
 from mariana.ai.prompt_builder import build_messages
@@ -217,6 +217,24 @@ _MODEL_PRICING: dict[ModelID, dict[str, float]] = {
         "cache_write_per_mtok": 0.0,
         "cache_read_per_mtok": 0.075,  # OpenAI automatic prompt cache
     },
+    ModelID.GEMINI_31_PRO: {
+        "input_per_mtok": 1.25,
+        "output_per_mtok": 10.00,
+        "cache_write_per_mtok": 0.0,
+        "cache_read_per_mtok": 0.0,
+    },
+    ModelID.GPT5: {
+        "input_per_mtok": 2.00,
+        "output_per_mtok": 8.00,
+        "cache_write_per_mtok": 0.0,
+        "cache_read_per_mtok": 1.00,
+    },
+    ModelID.GPT54_MINI: {
+        "input_per_mtok": 0.30,
+        "output_per_mtok": 1.20,
+        "cache_write_per_mtok": 0.0,
+        "cache_read_per_mtok": 0.15,
+    },
 }
 
 # ─── Retry configuration ─────────────────────────────────────────────────────
@@ -319,6 +337,17 @@ def _compute_cost(
 # ─── LLM Gateway HTTP client ──────────────────────────────────────────────────
 
 
+# Models that support OpenAI-style JSON output mode (response_format)
+# BUG-010 fix: DeepSeek via LLM Gateway supports json_object mode.
+_JSON_MODE_MODELS: frozenset[ModelID] = frozenset({
+    ModelID.GPT4O_MINI,
+    ModelID.GPT5,
+    ModelID.GPT54_MINI,
+    ModelID.DEEPSEEK_CHAT,
+    ModelID.DEEPSEEK_REASONER,
+})
+
+
 def _build_request_body(
     messages: list[dict[str, Any]],
     model_config: ModelConfig,
@@ -327,18 +356,18 @@ def _build_request_body(
     """
     Build the OpenAI-compatible request body for the LLM Gateway.
 
-    We always include ``response_format={"type": "json_object"}`` — this
-    instructs supporting models to return valid JSON.  The gateway should
-    pass this through for models that support it and silently strip it for
-    models that do not.
+    Includes ``response_format={"type": "json_object"}`` only for models that
+    support it (GPT family).  Claude and DeepSeek models reject this param
+    with HTTP 400, so we rely on prompt-based JSON instructions instead.
     """
     body: dict[str, Any] = {
         "model": model_config.model_id.value,
         "messages": messages,
         "temperature": model_config.temperature,
         "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"},
     }
+    if model_config.model_id in _JSON_MODE_MODELS:
+        body["response_format"] = {"type": "json_object"}
     return body
 
 
@@ -659,6 +688,7 @@ async def spawn_model(
     db: Any = None,  # asyncpg.Pool
     cost_tracker: Any = None,  # CostTracker instance
     config: AppConfig | None = None,
+    quality_tier: str | None = None,
 ) -> tuple[BaseModel, AISession]:
     """
     Single entry point for ALL AI calls in the Mariana system.
@@ -684,6 +714,9 @@ async def spawn_model(
         cost_tracker: Optional CostTracker instance.  If provided, budget
             caps are enforced and costs are recorded.
         config: AppConfig instance.  If None, ``load_config()`` is called.
+        quality_tier: Optional string matching a ``QualityTier`` enum value.
+            When provided, overrides the static routing table's model selection
+            (unless a runtime MODEL_OVERRIDE env var is set).
 
     Returns:
         A 2-tuple ``(parsed_output, session)`` where:
@@ -707,7 +740,16 @@ async def spawn_model(
     _check_budget(cost_tracker, branch_id)
 
     # ── Step 1: model routing ─────────────────────────────────────────────────
-    model_cfg: ModelConfig = await get_model_config(task_type, config)
+    resolved_tier: QualityTier | None = None
+    if quality_tier is not None:
+        try:
+            resolved_tier = QualityTier(quality_tier)
+        except ValueError:
+            logger.warning(
+                "Invalid quality_tier value '%s'; ignoring and using routing table.",
+                quality_tier,
+            )
+    model_cfg: ModelConfig = await get_model_config(task_type, config, quality_tier=resolved_tier)
 
     # BUG-005 fix: use None as sentinel instead of the magic value 4096.
     # A caller that genuinely wants 4096 tokens for a task whose routing table
@@ -748,6 +790,7 @@ async def spawn_model(
 
     raw_content = _extract_response_content(response_json)
     usage = _extract_usage(response_json)
+    final_model_id = model_cfg.model_id
 
     # ── Step 3b: refusal detection & multi-agent reframe ──────────────────────
     if _is_refusal(raw_content):
@@ -775,6 +818,7 @@ async def spawn_model(
         fallback_chain = _get_reframe_model_chain(model_cfg.model_id)
         best_response = raw_content
         best_response_len = len(raw_content)
+        best_response_model_id = final_model_id
 
         for retry_idx, fallback_model_id in enumerate(fallback_chain):
             if retry_idx >= _REFUSAL_MAX_RETRIES:
@@ -811,6 +855,7 @@ async def spawn_model(
 
                 if not _is_refusal(reframe_content):
                     raw_content = reframe_content
+                    final_model_id = fallback_model_id
                     logger.info(
                         "refusal_reframe_success: model=%s",
                         fallback_model_id.value,
@@ -821,7 +866,8 @@ async def spawn_model(
                 if len(reframe_content) > best_response_len:
                     best_response = reframe_content
                     best_response_len = len(reframe_content)
-            except (ModelCallError, Exception) as exc:  # noqa: BLE001
+                    best_response_model_id = fallback_model_id
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "refusal_reframe_failed: model=%s error=%s",
                     fallback_model_id.value,
@@ -832,6 +878,7 @@ async def spawn_model(
             # All retries exhausted — use the best (longest) response
             if best_response_len > len(raw_content):
                 raw_content = best_response
+                final_model_id = best_response_model_id
             logger.warning(
                 "refusal_all_reframes_exhausted: using best response (len=%d)",
                 len(raw_content),
@@ -878,7 +925,7 @@ async def spawn_model(
 
     # ── Step 5: compute cost ──────────────────────────────────────────────────
     cost_usd = _compute_cost(
-        model_id=model_cfg.model_id,
+        model_id=final_model_id,
         input_tokens=usage["prompt_tokens"],
         output_tokens=usage["completion_tokens"],
         cache_creation_tokens=usage["cache_creation_tokens"],
@@ -893,7 +940,7 @@ async def spawn_model(
         task_id=context.get("task_id", "unknown"),
         branch_id=branch_id,
         task_type=task_type,
-        model_used=model_cfg.model_id,
+        model_used=final_model_id,
         input_tokens=usage["prompt_tokens"],
         output_tokens=usage["completion_tokens"],
         cache_creation_tokens=usage["cache_creation_tokens"],
@@ -910,7 +957,7 @@ async def spawn_model(
         "spawn_model complete: task=%s model=%s tokens_in=%d tokens_out=%d "
         "cost=$%.6f duration=%dms",
         task_type.value,
-        model_cfg.model_id.value,
+        final_model_id.value,
         session.input_tokens,
         session.output_tokens,
         session.cost_usd,

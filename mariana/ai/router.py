@@ -25,7 +25,7 @@ import httpx
 # These are resolved at import time only when the package is installed.
 # During parallel builds the sibling modules may not exist yet — callers are
 # responsible for ensuring the full package is present before calling.
-from mariana.data.models import ModelID, TaskType
+from mariana.data.models import ModelID, QualityTier, TaskType
 from mariana.config import AppConfig
 
 logger = logging.getLogger(__name__)
@@ -144,6 +144,61 @@ ROUTING_TABLE: dict[TaskType, ModelConfig] = {
     ),
 }
 
+# ─── Quality-tier routing ────────────────────────────────────────────────────
+
+# Quality tier → model mapping per task category.
+# Categories: orchestrator, research, analysis, writing, cheap
+_TIER_ROUTING: dict[QualityTier, dict[str, ModelID]] = {
+    QualityTier.MAXIMUM: {
+        "orchestrator": ModelID.OPUS_46,
+        "research": ModelID.OPUS_46,
+        "analysis": ModelID.OPUS_46,
+        "writing": ModelID.OPUS_46,
+        "cheap": ModelID.SONNET_46,
+    },
+    QualityTier.HIGH: {
+        "orchestrator": ModelID.GEMINI_31_PRO,
+        "research": ModelID.OPUS_46,
+        "analysis": ModelID.GEMINI_31_PRO,
+        "writing": ModelID.SONNET_46,
+        "cheap": ModelID.HAIKU_45,
+    },
+    QualityTier.BALANCED: {
+        "orchestrator": ModelID.SONNET_46,
+        "research": ModelID.SONNET_46,
+        "analysis": ModelID.DEEPSEEK_CHAT,
+        "writing": ModelID.SONNET_46,
+        "cheap": ModelID.DEEPSEEK_CHAT,
+    },
+    QualityTier.ECONOMY: {
+        "orchestrator": ModelID.DEEPSEEK_CHAT,
+        "research": ModelID.DEEPSEEK_CHAT,
+        "analysis": ModelID.DEEPSEEK_CHAT,
+        "writing": ModelID.GPT4O_MINI,
+        "cheap": ModelID.GPT4O_MINI,
+    },
+}
+
+# Map TaskType → category string for tier routing.
+_TASK_CATEGORY: dict[TaskType, str] = {
+    TaskType.RESEARCH_ARCHITECTURE: "orchestrator",
+    TaskType.HYPOTHESIS_GENERATION: "orchestrator",
+    TaskType.EVIDENCE_EXTRACTION: "research",
+    TaskType.EVALUATION: "analysis",
+    TaskType.TRANSLATION: "cheap",
+    TaskType.SUMMARIZATION: "writing",
+    TaskType.COMPRESSION: "cheap",
+    TaskType.TRIBUNAL_PLAINTIFF: "analysis",
+    TaskType.TRIBUNAL_DEFENDANT: "analysis",
+    TaskType.TRIBUNAL_REBUTTAL: "analysis",
+    TaskType.TRIBUNAL_COUNTER: "analysis",
+    TaskType.TRIBUNAL_JUDGE: "orchestrator",
+    TaskType.SKEPTIC_QUESTIONS: "orchestrator",
+    TaskType.REPORT_DRAFT: "writing",
+    TaskType.REPORT_FINAL_EDIT: "writing",
+    TaskType.WATCHDOG: "cheap",
+}
+
 # Used when DeepSeek is unhealthy and the originally routed model is DeepSeek.
 FALLBACK_CHEAP = ModelConfig(
     model_id=ModelID.GPT4O_MINI,
@@ -189,15 +244,16 @@ class DeepSeekHealthCache:
         healthy = await cache.is_healthy(api_key="sk-…")
     """
 
-    _PING_URL: str = "https://api.deepseek.com/chat/completions"
+    # BUG-010 fix: route health probe through LLM Gateway (same endpoint
+    # used for all model calls) instead of direct DeepSeek API.
     _PING_TIMEOUT_SECONDS: float = 10.0
 
     def __init__(self) -> None:
         self._state = _HealthState()
 
-    async def is_healthy(self, api_key: str) -> bool:
+    async def is_healthy(self, api_key: str, gateway_base_url: str = "", gateway_api_key: str = "") -> bool:
         """
-        Return True if the DeepSeek API is reachable and responding.
+        Return True if DeepSeek is reachable via the LLM Gateway.
 
         Performs a minimal single-token ping no more than once every 5 minutes.
         The lock prevents duplicate concurrent pings.
@@ -215,46 +271,45 @@ class DeepSeekHealthCache:
                 return self._state.healthy
 
             logger.info("DeepSeek health probe — cache expired (age=%.1fs), pinging…", age)
-            result = await self._ping(api_key)
+            result = await self._ping(gateway_base_url, gateway_api_key)
             self._state.healthy = result
             self._state.last_checked_at = time.monotonic()
             logger.info("DeepSeek health probe result: healthy=%s", result)
             return result
 
-    async def _ping(self, api_key: str) -> bool:
+    async def _ping(self, gateway_base_url: str, gateway_api_key: str) -> bool:
         """
-        Send a minimal chat completion request and check the HTTP status.
+        Send a minimal chat completion request through LLM Gateway.
 
         We ask for exactly 1 token so the cost is negligible.
         Any 2xx response counts as healthy; timeouts or 5xx = unhealthy.
         """
+        url = f"{gateway_base_url.rstrip('/')}/chat/completions"
         payload = {
-            "model": "deepseek-chat",
+            "model": "deepseek-v3.2",
             "messages": [{"role": "user", "content": "ping"}],
             "max_tokens": 1,
         }
         headers = {
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {gateway_api_key}",
             "Content-Type": "application/json",
         }
         try:
-            # BUG-002 fix: check response.status_code INSIDE the async-with block
-            # so any future streaming/body access is still valid.
             async with httpx.AsyncClient(timeout=self._PING_TIMEOUT_SECONDS) as client:
                 response = await client.post(
-                    self._PING_URL,
+                    url,
                     json=payload,
                     headers=headers,
                 )
                 if 200 <= response.status_code < 300:
                     return True
                 logger.warning(
-                    "DeepSeek health ping returned HTTP %s (not 2xx — treating as unhealthy)",
+                    "DeepSeek health ping via gateway returned HTTP %s (not 2xx — treating as unhealthy)",
                     response.status_code,
                 )
                 return False
         except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
-            logger.warning("DeepSeek health ping failed: %s", exc)
+            logger.warning("DeepSeek health ping via gateway failed: %s", exc)
             return False
 
 
@@ -267,19 +322,24 @@ _deepseek_health_cache = DeepSeekHealthCache()
 async def get_model_config(
     task_type: TaskType,
     config: AppConfig,
+    quality_tier: QualityTier | None = None,
 ) -> ModelConfig:
     """
     Resolve the ModelConfig for *task_type*, applying:
 
     1. Runtime override from ``config`` (env var ``MODEL_OVERRIDE_{TASK_TYPE}``).
-    2. ROUTING_TABLE lookup.
-    3. DeepSeek health gate: if the routed model is a DeepSeek variant and
+    2. Quality-tier routing (if *quality_tier* is provided and no runtime override).
+    3. ROUTING_TABLE lookup (static fallback when no tier is specified).
+    4. DeepSeek health gate: if the routed model is a DeepSeek variant and
        the health probe reports unhealthy, downgrade to ``FALLBACK_CHEAP``.
 
     Args:
         task_type: The AI task being performed.
         config: Loaded AppConfig. Must expose any ``MODEL_OVERRIDE_*`` fields
                 and ``DEEPSEEK_API_KEY``.
+        quality_tier: Optional user-selected quality tier.  When provided and
+                      no runtime override exists, model selection follows
+                      ``_TIER_ROUTING`` instead of the static ROUTING_TABLE.
 
     Returns:
         A frozen :class:`ModelConfig` ready for use by ``session.spawn_model()``.
@@ -315,23 +375,55 @@ async def get_model_config(
             )
             return resolved
 
-    # ── Step 2: routing table lookup ──────────────────────────────────────────
-    resolved = ROUTING_TABLE.get(task_type)
-    if resolved is None:
-        logger.warning(
-            "No routing entry for task_type=%s; using FALLBACK_CHEAP.", task_type.value
-        )
-        return FALLBACK_CHEAP
-
-    # ── Step 3: DeepSeek health gate ─────────────────────────────────────────
-    if resolved.model_id in (ModelID.DEEPSEEK_CHAT, ModelID.DEEPSEEK_REASONER):
-        api_key = getattr(config, "DEEPSEEK_API_KEY", "") or ""
-        if api_key:
-            healthy = await _deepseek_health_cache.is_healthy(api_key)
+    # ── Step 2: quality-tier routing (when tier is provided) ──────────────────
+    if quality_tier is not None:
+        category = _TASK_CATEGORY.get(task_type)
+        if category is not None:
+            tier_model_id = _TIER_ROUTING[quality_tier][category]
+            # Use the ROUTING_TABLE entry for non-model config (max_tokens, temperature,
+            # use_batch); only the model_id is replaced by the tier selection.
+            base = ROUTING_TABLE.get(task_type, FALLBACK_CHEAP)
+            resolved = ModelConfig(
+                model_id=tier_model_id,
+                max_tokens=base.max_tokens,
+                temperature=base.temperature,
+                use_batch=base.use_batch,
+            )
+            logger.info(
+                "Quality-tier routing applied: task=%s tier=%s model=%s",
+                task_type.value,
+                quality_tier.value,
+                tier_model_id.value,
+            )
         else:
-            # No API key configured — treat as unhealthy to avoid 401 failures.
             logger.warning(
-                "DEEPSEEK_API_KEY not set; treating DeepSeek as unhealthy for task=%s.",
+                "No category mapping for task_type=%s; falling back to ROUTING_TABLE.",
+                task_type.value,
+            )
+            resolved = ROUTING_TABLE.get(task_type, FALLBACK_CHEAP)
+    else:
+        # ── Step 3: static routing table lookup ───────────────────────────────
+        resolved = ROUTING_TABLE.get(task_type)
+        if resolved is None:
+            logger.warning(
+                "No routing entry for task_type=%s; using FALLBACK_CHEAP.", task_type.value
+            )
+            return FALLBACK_CHEAP
+
+    # ── Step 4: DeepSeek health gate (via LLM Gateway) ────────────────────────
+    if resolved.model_id in (ModelID.DEEPSEEK_CHAT, ModelID.DEEPSEEK_REASONER):
+        gateway_base = getattr(config, "LLM_GATEWAY_BASE_URL", "") or ""
+        gateway_key = getattr(config, "LLM_GATEWAY_API_KEY", "") or ""
+        if gateway_base and gateway_key:
+            healthy = await _deepseek_health_cache.is_healthy(
+                api_key="",  # unused now
+                gateway_base_url=gateway_base,
+                gateway_api_key=gateway_key,
+            )
+        else:
+            # No LLM Gateway configured — treat as unhealthy.
+            logger.warning(
+                "LLM_GATEWAY not configured; treating DeepSeek as unhealthy for task=%s.",
                 task_type.value,
             )
             healthy = False

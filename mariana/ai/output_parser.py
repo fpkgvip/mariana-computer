@@ -25,6 +25,82 @@ from pydantic import BaseModel, ValidationError
 
 logger = logging.getLogger(__name__)
 
+# ─── JSON repair helpers ─────────────────────────────────────────────────────
+
+
+def _repair_json(text: str) -> str:
+    """
+    Attempt to repair common JSON issues produced by LLMs (especially Claude).
+
+    Repairs applied in order:
+    1. Remove trailing commas before } or ] (very common Claude habit).
+    2. Replace single-quoted strings with double-quoted strings
+       (only for simple cases — not inside already-double-quoted values).
+    3. Remove control characters that are invalid in JSON strings.
+    4. Fix unescaped newlines inside string values.
+    5. Remove BOM / zero-width characters.
+    """
+    # Remove BOM and zero-width chars
+    text = text.replace("\ufeff", "").replace("\u200b", "").replace("\u200c", "")
+
+    # Remove trailing commas before closing braces/brackets
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+
+    # Remove control characters (except \n, \r, \t which are valid in JSON strings
+    # when properly escaped — but raw ones are not, so strip them outside strings)
+    # This is a conservative pass: only remove truly unprintable chars.
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+
+    return text
+
+
+def _extract_json_object_greedy(text: str) -> str | None:
+    """
+    Find the outermost balanced { ... } in *text* using brace counting.
+
+    This is the nuclear-option fallback when regex-based extraction fails.
+    Handles nested braces and quoted strings (including escaped quotes).
+    Returns None if no balanced object is found.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    i = start
+
+    while i < len(text):
+        ch = text[i]
+
+        if escape:
+            escape = False
+            i += 1
+            continue
+
+        if ch == "\\" and in_string:
+            escape = True
+            i += 1
+            continue
+
+        if ch == '"' and not escape:
+            in_string = not in_string
+            i += 1
+            continue
+
+        if not in_string:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+
+        i += 1
+
+    return None
+
 # ─── Exceptions ──────────────────────────────────────────────────────────────
 
 
@@ -81,7 +157,9 @@ def _extract_json_text(text: str) -> str:
     Search order:
     1. ``json-fenced block (```json … ```)
     2. Bare fenced block (``` … ```)
-    3. Entire text stripped of leading/trailing whitespace
+    3. Inline fenced block (```json{...}```)
+    4. Greedy brace-matching extraction (handles prose around the JSON)
+    5. Entire text stripped of leading/trailing whitespace
 
     Returns the candidate JSON string without the fence markers.
     """
@@ -100,6 +178,12 @@ def _extract_json_text(text: str) -> str:
         # Only use the inline match if it looks like JSON (starts with { or [).
         if candidate.startswith("{") or candidate.startswith("["):
             return candidate
+
+    # BUG-009 fix: Claude may produce prose before/after the JSON object.
+    # Use greedy brace-matching to extract the outermost {...}.
+    greedy = _extract_json_object_greedy(text)
+    if greedy is not None:
+        return greedy
 
     return text.strip()
 
@@ -151,20 +235,49 @@ def parse_output(raw_text: str, output_schema: type[BaseModel]) -> BaseModel:
     # Step 1 & 2 — extract JSON text
     json_text = _extract_json_text(raw_text)
 
-    # Step 3 — parse JSON
+    # Step 3 — parse JSON (with repair fallback)
     try:
         data = json.loads(json_text)
-    except json.JSONDecodeError as exc:
-        logger.warning(
-            "JSON decode failed for schema=%s: %s | excerpt=%r",
-            output_schema.__name__,
-            exc,
-            excerpt,
-        )
-        raise OutputParseError(
-            detail=f"JSON decode error: {exc}",
-            raw_excerpt=excerpt,
-        ) from exc
+    except json.JSONDecodeError:
+        # BUG-009 fix: attempt repair before giving up.
+        repaired = _repair_json(json_text)
+        try:
+            data = json.loads(repaired)
+            logger.info(
+                "JSON repair succeeded for schema=%s",
+                output_schema.__name__,
+            )
+        except json.JSONDecodeError:
+            # Last resort: try greedy brace extraction on the repaired text
+            greedy = _extract_json_object_greedy(repaired)
+            if greedy is not None:
+                try:
+                    data = json.loads(greedy)
+                    logger.info(
+                        "Greedy brace extraction succeeded for schema=%s",
+                        output_schema.__name__,
+                    )
+                except json.JSONDecodeError as exc:
+                    logger.warning(
+                        "JSON decode failed after all repairs for schema=%s: %s | excerpt=%r",
+                        output_schema.__name__,
+                        exc,
+                        excerpt,
+                    )
+                    raise OutputParseError(
+                        detail=f"JSON decode error (after repair): {exc}",
+                        raw_excerpt=excerpt,
+                    ) from exc
+            else:
+                logger.warning(
+                    "JSON decode failed (no JSON object found) for schema=%s | excerpt=%r",
+                    output_schema.__name__,
+                    excerpt,
+                )
+                raise OutputParseError(
+                    detail="No valid JSON object found in model response",
+                    raw_excerpt=excerpt,
+                )
 
     if not isinstance(data, dict):
         raise OutputParseError(

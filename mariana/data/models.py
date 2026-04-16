@@ -106,8 +106,20 @@ class ModelID(str, Enum):
     SONNET_46 = "claude-sonnet-4-6"
     HAIKU_45 = "claude-haiku-4-5"
     GPT4O_MINI = "gpt-4o-mini"
-    DEEPSEEK_CHAT = "deepseek-chat"
-    DEEPSEEK_REASONER = "deepseek-reasoner"
+    DEEPSEEK_CHAT = "deepseek-v3.2"
+    DEEPSEEK_REASONER = "deepseek-r1-0528"
+    GEMINI_31_PRO = "gemini-3.1-pro-preview"
+    GPT5 = "gpt-5"
+    GPT54_MINI = "gpt-5.4-mini"
+
+
+class QualityTier(str, Enum):
+    """User-selected model quality tier."""
+
+    MAXIMUM = "maximum"    # Opus for everything
+    HIGH = "high"          # Gemini 3.1 Pro + Opus for critical
+    BALANCED = "balanced"  # Sonnet + DeepSeek blend (default)
+    ECONOMY = "economy"    # DeepSeek + GPT-4o-mini for everything
 
 
 class TribunalVerdict(str, Enum):
