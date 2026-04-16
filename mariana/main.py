@@ -416,7 +416,8 @@ async def _deduct_user_credits(
     """
     if not user_id:
         return
-    if not getattr(config, "SUPABASE_URL", "") or not getattr(config, "SUPABASE_SERVICE_KEY", ""):
+    _api_key = getattr(config, "SUPABASE_SERVICE_KEY", "") or getattr(config, "SUPABASE_ANON_KEY", "")
+    if not getattr(config, "SUPABASE_URL", "") or not _api_key:
         logger.warning("supabase_not_configured_skip_credit_deduction")
         return
 
@@ -436,8 +437,8 @@ async def _deduct_user_credits(
     import httpx  # type: ignore[import]  # noqa: PLC0415
 
     headers = {
-        "apikey": config.SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {config.SUPABASE_SERVICE_KEY}",
+        "apikey": _api_key,
+        "Authorization": f"Bearer {_api_key}",
         "Content-Type": "application/json",
     }
     try:
@@ -449,7 +450,7 @@ async def _deduct_user_credits(
                     json={"target_user_id": user_id, "amount": delta_tokens},
                     headers=headers,
                 )
-                if resp.status_code == 200:
+                if resp.status_code in (200, 204):
                     logger.info(
                         "credits_settled_by_extra_deduction",
                         user_id=user_id,
@@ -474,7 +475,7 @@ async def _deduct_user_credits(
                 json={"p_user_id": user_id, "p_credits": refund_tokens},
                 headers=headers,
             )
-            if resp.status_code == 200:
+            if resp.status_code in (200, 204):
                 logger.info(
                     "credits_settled_by_refund",
                     user_id=user_id,
@@ -510,6 +511,10 @@ async def _run_single(
     task_id: str | None = None,
     tier: str = "standard",
     reserved_credits: int = 0,
+    quality_tier: str = "balanced",
+    user_flow_instructions: str = "",
+    continuous_mode: bool = False,
+    dont_kill_branches: bool = False,
 ) -> int:
     """
     Run a single investigation and return exit code.
@@ -519,6 +524,16 @@ async def _run_single(
     """
     from mariana.orchestrator.cost_tracker import CostTracker  # noqa: PLC0415
 
+    task_metadata: dict = {"tier": tier, "reserved_credits": reserved_credits}
+    if user_id:
+        task_metadata["user_id"] = user_id
+    if quality_tier:
+        task_metadata["quality_tier"] = quality_tier
+    if user_flow_instructions:
+        task_metadata["user_flow_instructions"] = user_flow_instructions
+    task_metadata["continuous_mode"] = continuous_mode
+    task_metadata["dont_kill_branches"] = dont_kill_branches
+
     task = ResearchTask(
         id=task_id or str(uuid.uuid4()),
         topic=topic,
@@ -526,11 +541,7 @@ async def _run_single(
         status=TaskStatus.RUNNING,
         current_state=State.INIT,
         started_at=datetime.now(tz=timezone.utc),
-        metadata=(
-            {"user_id": user_id, "tier": tier, "reserved_credits": reserved_credits}
-            if user_id else
-            {"tier": tier, "reserved_credits": reserved_credits}
-        ),
+        metadata=task_metadata,
     )
 
     await _insert_task(db, task)
@@ -542,7 +553,11 @@ async def _run_single(
         user_id=user_id or "none",
     )
 
-    cost_tracker = CostTracker(task_id=task.id, task_budget=task.budget_usd)
+    cost_tracker = CostTracker(
+        task_id=task.id,
+        task_budget=task.budget_usd,
+        branch_hard_cap=getattr(config, "BUDGET_BRANCH_HARD_CAP", 75.0),
+    )
 
     try:
         from mariana.orchestrator.event_loop import run as run_investigation  # noqa: PLC0415
@@ -594,6 +609,73 @@ _MAX_CONCURRENT_INVESTIGATIONS: int = 4
 """Maximum number of investigations that can run concurrently in daemon mode."""
 
 
+def _normalize_daemon_task_payload(task_data: Any) -> dict[str, Any]:
+    """Validate and normalize daemon task-file payloads.
+
+    Raises ``ValueError`` when the payload is malformed so callers can rename the
+    offending file to ``.error`` without crashing the daemon loop.
+    """
+    if not isinstance(task_data, dict):
+        raise ValueError("Task payload must be a JSON object")
+
+    raw_topic = task_data.get("topic", "")
+    if not isinstance(raw_topic, str):
+        raise ValueError("Task payload field 'topic' must be a string")
+    topic = raw_topic.strip()
+    if not topic:
+        raise ValueError("Task payload field 'topic' must not be empty")
+
+    raw_budget = task_data.get("budget_usd", task_data.get("budget", 50.0))
+    try:
+        budget = float(raw_budget)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Task payload field 'budget_usd' must be numeric") from exc
+
+    raw_reserved_credits = task_data.get("reserved_credits", 0) or 0
+    try:
+        reserved_credits = int(raw_reserved_credits)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Task payload field 'reserved_credits' must be an integer") from exc
+
+    user_id = task_data.get("user_id", "")
+    if user_id is None:
+        user_id = ""
+    elif not isinstance(user_id, str):
+        raise ValueError("Task payload field 'user_id' must be a string")
+
+    task_id = task_data.get("id", "")
+    if task_id is None:
+        task_id = ""
+    elif not isinstance(task_id, str):
+        raise ValueError("Task payload field 'id' must be a string")
+
+    tier = task_data.get("tier", "standard") or "standard"
+    if not isinstance(tier, str):
+        raise ValueError("Task payload field 'tier' must be a string")
+
+    quality_tier = task_data.get("quality_tier", "balanced") or "balanced"
+    if not isinstance(quality_tier, str):
+        raise ValueError("Task payload field 'quality_tier' must be a string")
+
+    user_flow_instructions = task_data.get("user_flow_instructions", "") or ""
+    if not isinstance(user_flow_instructions, str):
+        raise ValueError("Task payload field 'user_flow_instructions' must be a string")
+
+    return {
+        "topic": topic,
+        "budget": budget,
+        "user_id": user_id,
+        "task_id": task_id,
+        "tier": tier,
+        "reserved_credits": reserved_credits,
+        "quality_tier": quality_tier,
+        "user_flow_instructions": user_flow_instructions,
+        "continuous_mode": bool(task_data.get("continuous_mode", False)),
+        "dont_kill_branches": bool(task_data.get("dont_kill_branches", False)),
+        "max_duration_hours": task_data.get("max_duration_hours"),
+    }
+
+
 async def _run_single_guarded(
     semaphore: asyncio.Semaphore,
     config: Config,
@@ -606,6 +688,10 @@ async def _run_single_guarded(
     task_file: Path,
     tier: str = "standard",
     reserved_credits: int = 0,
+    quality_tier: str = "balanced",
+    user_flow_instructions: str = "",
+    continuous_mode: bool = False,
+    dont_kill_branches: bool = False,
 ) -> None:
     """Run a single investigation guarded by a concurrency semaphore.
 
@@ -629,6 +715,10 @@ async def _run_single_guarded(
             task_id=task_id,
             tier=tier,
             reserved_credits=reserved_credits,
+            quality_tier=quality_tier,
+            user_flow_instructions=user_flow_instructions,
+            continuous_mode=continuous_mode,
+            dont_kill_branches=dont_kill_branches,
         )
         if exit_code == 0:
             task_file.rename(task_file.with_suffix(".done"))
@@ -680,42 +770,60 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
     running_files = sorted(inbox.glob("*.running"))
     for rf in running_files:
         try:
-            raw_resume = rf.read_text(encoding="utf-8")
+            resume_claim = rf.with_suffix(".resuming")
+            try:
+                rf.rename(resume_claim)
+            except FileNotFoundError:
+                logger.warning("daemon_resume_already_claimed", file=rf.name)
+                continue
+
+            raw_resume = resume_claim.read_text(encoding="utf-8")
             resume_data = json.loads(raw_resume)
-            topic_r = resume_data.get("topic", "").strip()
-            budget_r = float(resume_data.get("budget_usd", resume_data.get("budget", 50.0)))
-            user_id_r = resume_data.get("user_id", "")
-            task_id_r = resume_data.get("id", "")
-            tier_r = resume_data.get("tier", "standard")
-            reserved_credits_r = int(resume_data.get("reserved_credits", 0) or 0)
-            if topic_r:
-                logger.info(
-                    "daemon_resuming_interrupted",
-                    file=rf.name,
-                    task_id=task_id_r,
-                    topic=topic_r[:60],
-                )
-                budget_r = max(1.0, min(budget_r, config.BUDGET_TASK_HARD_CAP))
-                task = asyncio.create_task(
-                    _run_single_guarded(
-                        semaphore=semaphore,
-                        config=config,
-                        db=db,
-                        redis_client=redis_client,
-                        topic=topic_r,
-                        budget=budget_r,
-                        user_id=user_id_r,
-                        task_id=task_id_r or None,
-                        task_file=rf,
-                        tier=tier_r,
-                        reserved_credits=reserved_credits_r,
-                    ),
-                    name=f"resume-{task_id_r or rf.stem}",
-                )
-                active_tasks.add(task)
+            normalized_resume = _normalize_daemon_task_payload(resume_data)
+            topic_r = normalized_resume["topic"]
+            budget_r = max(1.0, min(normalized_resume["budget"], config.BUDGET_TASK_HARD_CAP))
+            user_id_r = normalized_resume["user_id"]
+            task_id_r = normalized_resume["task_id"]
+            tier_r = normalized_resume["tier"]
+            reserved_credits_r = normalized_resume["reserved_credits"]
+            quality_tier_r = normalized_resume["quality_tier"]
+            user_flow_instructions_r = normalized_resume["user_flow_instructions"]
+            continuous_mode_r = normalized_resume["continuous_mode"]
+            dont_kill_branches_r = normalized_resume["dont_kill_branches"]
+            logger.info(
+                "daemon_resuming_interrupted",
+                file=rf.name,
+                task_id=task_id_r,
+                topic=topic_r[:60],
+            )
+            task = asyncio.create_task(
+                _run_single_guarded(
+                    semaphore=semaphore,
+                    config=config,
+                    db=db,
+                    redis_client=redis_client,
+                    topic=topic_r,
+                    budget=budget_r,
+                    user_id=user_id_r,
+                    task_id=task_id_r or None,
+                    task_file=resume_claim,
+                    tier=tier_r,
+                    reserved_credits=reserved_credits_r,
+                    quality_tier=quality_tier_r,
+                    user_flow_instructions=user_flow_instructions_r,
+                    continuous_mode=continuous_mode_r,
+                    dont_kill_branches=dont_kill_branches_r,
+                ),
+                name=f"resume-{task_id_r or rf.stem}",
+            )
+            active_tasks.add(task)
         except Exception as exc:
             logger.error("daemon_resume_failed", file=rf.name, error=str(exc))
-            rf.rename(rf.with_suffix(".error"))
+            failed_resume_path = locals().get("resume_claim", rf)
+            try:
+                failed_resume_path.rename(failed_resume_path.with_suffix(".error"))
+            except FileNotFoundError:
+                logger.warning("daemon_resume_error_file_missing", file=rf.name)
 
     if running_files:
         logger.info("daemon_resumed_tasks", count=len(active_tasks))
@@ -755,25 +863,30 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
                 tf.rename(tf.with_suffix(".error"))
                 continue
 
-            topic = task_data.get("topic", "").strip()
-            budget = float(task_data.get("budget_usd", task_data.get("budget", 50.0)))
-            user_id = task_data.get("user_id", "")
-            file_task_id = task_data.get("id", "")
-            file_tier = task_data.get("tier", "standard")
-            reserved_credits = int(task_data.get("reserved_credits", 0) or 0)
-            # max_duration_hours: null/missing = unlimited (never kill prematurely)
-            _max_dur = task_data.get("max_duration_hours")  # noqa: F841  (reserved for future use)
-
-            if not topic:
+            try:
+                normalized_task = _normalize_daemon_task_payload(task_data)
+            except ValueError as exc:
                 logger.warning(
-                    "daemon_empty_topic",
+                    "daemon_invalid_task_payload",
                     file=str(tf),
-                    message="Task file has no 'topic' field; skipping.",
+                    error=str(exc),
                 )
                 tf.rename(tf.with_suffix(".error"))
                 continue
 
-            budget = max(1.0, min(budget, config.BUDGET_TASK_HARD_CAP))
+            topic = normalized_task["topic"]
+            budget = max(1.0, min(normalized_task["budget"], config.BUDGET_TASK_HARD_CAP))
+            user_id = normalized_task["user_id"]
+            file_task_id = normalized_task["task_id"]
+            file_tier = normalized_task["tier"]
+            reserved_credits = normalized_task["reserved_credits"]
+            # max_duration_hours: null/missing = unlimited (never kill prematurely)
+            _max_dur = normalized_task["max_duration_hours"]  # noqa: F841  (reserved for future use)
+            # User flow control fields
+            file_quality_tier = normalized_task["quality_tier"]
+            file_user_flow_instructions = normalized_task["user_flow_instructions"]
+            file_continuous_mode = normalized_task["continuous_mode"]
+            file_dont_kill_branches = normalized_task["dont_kill_branches"]
             logger.info(
                 "daemon_picked_task",
                 file=tf.name,
@@ -807,6 +920,10 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
                     task_file=running_file,
                     tier=file_tier,
                     reserved_credits=reserved_credits,
+                    quality_tier=file_quality_tier,
+                    user_flow_instructions=file_user_flow_instructions,
+                    continuous_mode=file_continuous_mode,
+                    dont_kill_branches=file_dont_kill_branches,
                 ),
                 name=f"investigation-{file_task_id or tf.stem}",
             )

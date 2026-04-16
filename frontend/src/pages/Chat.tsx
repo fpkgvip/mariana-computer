@@ -1914,7 +1914,8 @@ export default function Chat() {
 
           {/* Running indicator + elapsed timer + graph button */}
           <div className="flex items-center gap-3">
-            {activeTaskId && (
+            {/* BUG-018 fix: hide Graph button for quick/instant tier (budget ≤ $0.20) — they have 0 nodes */}
+            {activeTaskId && activeInvestigation && activeInvestigation.budget_usd > 0.20 && (
               <Link
                 to={`/graph/${activeTaskId}`}
                 className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"

@@ -43,7 +43,9 @@ from mariana.data.models import (
     EvidenceType,
     EvaluationOutput,
     Finding,
+    Hypothesis,
     HypothesisGenerationOutput,
+    HypothesisStatus,
     ReportDraftOutput,
     ResearchArchitectureOutput,
     ResearchTask,
@@ -59,8 +61,11 @@ from mariana.data.models import (
     QuestionClassification,
     QuestionSeverity,
 )
+from mariana.orchestrator import graph_writer
 from mariana.data.db import _row_to_dict
 from mariana.orchestrator import checkpoint as checkpoint_module
+from mariana.orchestrator import rotation
+from mariana.orchestrator.rotation import OrchestratorContext
 from mariana.orchestrator.branch_manager import (
     create_branch,
     get_active_branches,
@@ -99,8 +104,64 @@ _SCORE_MED_THRESHOLD: float = 0.4    # maps to BRANCH_SCORE_MEDIUM trigger (0–
 
 
 # ===========================================================================
+# Helper: manual stop check for continuous mode
+# ===========================================================================
+
+
+def _augment_context_from_task(base: dict[str, Any], task: ResearchTask) -> dict[str, Any]:
+    """Augment a spawn_model context dict with user-flow fields from task metadata.
+
+    This is the module-level equivalent of the ``_build_context`` closure in
+    :func:`run`.  Use it inside handler functions (handle_search, handle_evaluate,
+    etc.) which are defined outside ``run`` and cannot access the closure.
+
+    Injects:
+    - ``user_flow_instructions`` if present and non-empty in task.metadata.
+    - ``quality_tier`` if present and not the default 'balanced'.
+
+    Args:
+        base: The base context dict to augment (mutated in place and returned).
+        task: The current ResearchTask whose metadata is the source of truth.
+
+    Returns:
+        The augmented context dict (same object as ``base``).
+    """
+    meta = task.metadata or {}
+    user_flow_instructions: str = meta.get("user_flow_instructions", "") or ""
+    quality_tier: str = meta.get("quality_tier", "balanced") or "balanced"
+    if user_flow_instructions:
+        base["user_flow_instructions"] = user_flow_instructions
+    if quality_tier and quality_tier != "balanced":
+        base["quality_tier"] = quality_tier
+    return base
+
+
+async def _check_manual_stop(redis_client: Any, task_id: str) -> bool:
+    """Check if the user has requested a manual stop for this task.
+
+    Used by continuous mode to decide whether to restart or terminate.
+    Reads the Redis key ``stop:{task_id}`` set by the /stop endpoint.
+
+    Args:
+        redis_client: aioredis client, or None if Redis is unavailable.
+        task_id:      The task to check.
+
+    Returns:
+        True if a manual stop has been requested, False otherwise.
+    """
+    if redis_client is None:
+        return False
+    try:
+        val = await redis_client.get(f"stop:{task_id}")
+        return val is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ===========================================================================
 # Entry point
 # ===========================================================================
+
 
 
 async def run(
@@ -153,9 +214,43 @@ async def run(
     })
 
     # ------------------------------------------------------------------
+    # Read user-defined flow control settings from task metadata
+    # These are written by the API from StartInvestigationRequest fields.
+    # ------------------------------------------------------------------
+    _task_meta = task.metadata or {}
+    tier = _task_meta.get("tier", "standard")
+    quality_tier: str = _task_meta.get("quality_tier", "balanced") or "balanced"
+    user_flow_instructions: str = _task_meta.get("user_flow_instructions", "") or ""
+    continuous_mode: bool = bool(_task_meta.get("continuous_mode", False))
+    # dont_kill_branches is threaded via ResearchSessionData (built per iteration)
+
+    if user_flow_instructions:
+        log.info(
+            "user_flow_instructions_active",
+            length=len(user_flow_instructions),
+        )
+    if continuous_mode:
+        log.info("continuous_mode_active", task_id=task.id)
+
+    def _build_context(base: dict[str, Any]) -> dict[str, Any]:
+        """Augment a spawn_model context dict with user flow instructions.
+
+        Defined as a closure over ``user_flow_instructions`` and
+        ``quality_tier`` so every spawn_model call inside run() picks
+        them up automatically.
+
+        For handlers that are standalone module-level functions, use
+        :func:`_augment_context_from_task` instead.
+        """
+        if user_flow_instructions:
+            base["user_flow_instructions"] = user_flow_instructions
+        if quality_tier and quality_tier != "balanced":
+            base["quality_tier"] = quality_tier
+        return base
+
+    # ------------------------------------------------------------------
     # Fast path for instant / quick tiers
     # ------------------------------------------------------------------
-    tier = (task.metadata or {}).get("tier", "standard")
     if tier in ("instant", "quick"):
         log.info("fast_path_tier", tier=tier)
         _emit_progress(redis_client, task.id, {
@@ -175,17 +270,18 @@ async def run(
             )
             fast_output, fast_session = await _fast_spawn(
                 task_type=TaskType.HYPOTHESIS_GENERATION,
-                context={
+                context=_build_context({
                     "task_id": task.id,
                     "topic": task.topic,
                     "budget_remaining": cost_tracker.budget_remaining,
                     "system_override": system_prompt,
-                },
+                }),
                 output_schema=HypothesisGenerationOutput,
                 branch_id=None,
                 db=db,
                 cost_tracker=cost_tracker,
                 config=config,
+                quality_tier=(task.metadata or {}).get("quality_tier"),
             )
             task.ai_call_counter += 1
 
@@ -320,10 +416,15 @@ async def run(
             # --------------------------------------------------------- #
             if iteration % 50 == 0:
                 user_id = getattr(task, "metadata", {}).get("user_id", "")
-                if user_id and getattr(config, "SUPABASE_URL", "") and getattr(config, "SUPABASE_SERVICE_KEY", ""):
+                _sb_key = getattr(config, "SUPABASE_SERVICE_KEY", "") or getattr(config, "SUPABASE_ANON_KEY", "")
+                if user_id and getattr(config, "SUPABASE_URL", "") and _sb_key:
                     try:
                         remaining_tokens = await _check_user_credits(user_id, config)
-                        if remaining_tokens is not None and remaining_tokens <= 0:
+                        # Account for credits already reserved for this task;
+                        # the reservation was deducted up-front at submission.
+                        reserved = int((task.metadata or {}).get("reserved_credits", 0))
+                        effective_balance = (remaining_tokens or 0) + reserved
+                        if remaining_tokens is not None and effective_balance <= 0:
                             log.warning("user_credits_exhausted", user_id=user_id)
                             _emit_progress(redis_client, task.id, {
                                 "type": "text",
@@ -397,7 +498,18 @@ async def run(
             # --------------------------------------------------------- #
             # 5. Advance state + persist
             # --------------------------------------------------------- #
+            # Orchestrator rotation: capture handoff context on every state
+            # change so the next fresh LLM call has full situational awareness
+            # without depending on conversation history.
+            _prev_state = task.current_state
             task.current_state = next_state
+            if next_state != _prev_state:
+                await _write_handoff_context(
+                    task=task,
+                    cost_tracker=cost_tracker,
+                    phase_name=_prev_state.value,
+                    db=db,
+                )
             _sync_cost(task, cost_tracker)  # BUG-R3-01: sync cost fields before every persist
             await _persist_task(task, db)
 
@@ -409,9 +521,56 @@ async def run(
             })
             _emit_progress(redis_client, task.id, {
                 "type": "cost_update",
-                "spent_usd": round(cost_tracker.total_spent, 4),
+                # Use total_with_markup (raw cost × 1.20) so the frontend shows
+                # the credit-equivalent amount the user is actually charged.
+                "spent_usd": round(cost_tracker.total_with_markup, 4),
                 "budget_usd": cost_tracker.task_budget,
+                "raw_spent_usd": round(cost_tracker.total_spent, 4),
             })
+
+            # --------------------------------------------------------- #
+            # 6. Continuous mode: restart instead of halting
+            # --------------------------------------------------------- #
+            if (
+                task.current_state == State.HALT
+                and continuous_mode
+                and task.status not in (TaskStatus.HALTED, TaskStatus.FAILED)
+                and not cost_tracker.is_exhausted
+            ):
+                # Check whether the user has explicitly requested a stop
+                _manual_stop = await _check_manual_stop(redis_client, task.id)
+                if not _manual_stop and not (shutdown_flag is not None and shutdown_flag.is_set()):
+                    log.info(
+                        "continuous_mode_restarting",
+                        task_id=task.id,
+                        iteration=iteration,
+                        total_spent=cost_tracker.total_spent,
+                    )
+                    _emit_progress(redis_client, task.id, {
+                        "type": "status_change",
+                        "state": "INIT",
+                        "message": "Continuous mode: restarting research loop from INIT...",
+                    })
+                    # BUG-D1-04 fix: reset to INIT so fresh hypotheses and architecture
+                    # are generated on each continuous-mode pass.  Resetting to SEARCH
+                    # skipped handle_init entirely, leaving stale hypotheses from the
+                    # previous cycle as the sole research targets indefinitely.
+                    # BUG-R5-03 fix: tag the restart so handle_init() retires prior
+                    # ACTIVE branches / hypotheses before generating a fresh cycle.
+                    task.metadata = {**(task.metadata or {}), "_init_reset_mode": "continuous_restart"}
+                    task.current_state = State.INIT
+                    task.status = TaskStatus.RUNNING
+                    iteration = 0  # reset iteration counter
+                    _sync_cost(task, cost_tracker)
+                    await _persist_task(task, db)
+                    await asyncio.sleep(0)
+                    continue
+                else:
+                    log.info(
+                        "continuous_mode_stopped",
+                        task_id=task.id,
+                        manual_stop=_manual_stop,
+                    )
 
             # Allow other coroutines to run (cooperative multitasking)
             await asyncio.sleep(0)
@@ -748,6 +907,63 @@ async def handle_init(
     """
     log = logger.bind(task_id=task.id, handler="init")
 
+    # BUG-R5-03 fix: pivots and continuous-mode restarts intentionally enter
+    # handle_init() again to generate a fresh research cycle.  Without retiring
+    # the prior ACTIVE branches / hypotheses first, every restart silently
+    # accumulates duplicate root hypotheses and duplicate active branches.
+    _init_reset_mode = (task.metadata or {}).pop("_init_reset_mode", None)
+    _should_reset_existing = (
+        task.current_state == State.PIVOT
+        or _init_reset_mode == "continuous_restart"
+    )
+    if _should_reset_existing:
+        _reset_reason = (
+            "pivot_refresh"
+            if task.current_state == State.PIVOT
+            else "continuous_restart_refresh"
+        )
+        async with db.acquire() as _reset_conn:
+            async with _reset_conn.transaction():
+                await _reset_conn.execute(
+                    """
+                    UPDATE branches
+                       SET status = $1,
+                           kill_reason = COALESCE(kill_reason, $2),
+                           updated_at = NOW()
+                     WHERE task_id = $3 AND status = 'ACTIVE'
+                    """,
+                    BranchStatus.EXHAUSTED.value,
+                    _reset_reason,
+                    task.id,
+                )
+                await _reset_conn.execute(
+                    """
+                    UPDATE hypotheses
+                       SET status = $1,
+                           updated_at = NOW()
+                     WHERE task_id = $2 AND status = 'ACTIVE'
+                    """,
+                    HypothesisStatus.EXHAUSTED.value,
+                    task.id,
+                )
+        log.info("init_reset_existing_cycle", mode=_reset_reason)
+
+    # ── Rotation handoff: inject prior orchestrator context into this fresh ──
+    # context window so a newly rotated orchestrator has full situational
+    # awareness without access to the previous conversation history.
+    # BUG-D2-03 fix: read_handoff / build_rotation_prompt were never called
+    # on the reading side — handoffs were written but never consumed.
+    _prior_ctx = await rotation.read_handoff(db, task.id, "INIT")
+    _rotation_injection: str = ""
+    if _prior_ctx:
+        from mariana.orchestrator.rotation import build_rotation_prompt  # noqa: PLC0415
+        _rotation_injection = build_rotation_prompt(_prior_ctx)
+        log.info(
+            "rotation_handoff_loaded",
+            prior_phase=_prior_ctx.phase,
+            findings=len(_prior_ctx.key_findings),
+        )
+
     # ── Step 1: Research Architecture ─────────────────────────────────────
     log.info("generating_research_architecture")
     _emit_progress(redis_client, task.id, {
@@ -756,19 +972,24 @@ async def handle_init(
         "message": "Analyzing topic and designing research architecture...",
     })
 
+    _arch_context: dict[str, Any] = {
+        "task_id": task.id,
+        "topic": task.topic,
+        "budget_remaining": cost_tracker.budget_remaining,
+        "budget_usd": task.budget_usd,
+    }
+    if _rotation_injection:
+        _arch_context["rotation_handoff"] = _rotation_injection
+
     arch_output, arch_session = await spawn_model(
         task_type=TaskType.RESEARCH_ARCHITECTURE,
-        context={
-            "task_id": task.id,
-            "topic": task.topic,
-            "budget_remaining": cost_tracker.budget_remaining,
-            "budget_usd": task.budget_usd,
-        },
+        context=_augment_context_from_task(_arch_context, task),
         output_schema=ResearchArchitectureOutput,
         branch_id=None,
         db=db,
         cost_tracker=cost_tracker,
         config=config,
+        quality_tier=(task.metadata or {}).get("quality_tier"),
     )
     task.ai_call_counter += 1
 
@@ -792,7 +1013,7 @@ async def handle_init(
 
     parsed_output, ai_session = await spawn_model(
         task_type=TaskType.HYPOTHESIS_GENERATION,
-        context={
+        context=_augment_context_from_task({
             "task_id": task.id,
             "topic": task.topic,
             "budget_remaining": cost_tracker.budget_remaining,
@@ -803,12 +1024,13 @@ async def handle_init(
                 for h in architecture.hypotheses
             ],
             "data_sources": architecture.data_sources,
-        },
+        }, task),
         output_schema=HypothesisGenerationOutput,
         branch_id=None,
         db=db,
         cost_tracker=cost_tracker,
         config=config,
+        quality_tier=(task.metadata or {}).get("quality_tier"),
     )
     # spawn_model already records cost internally via _record_cost — do NOT
     # call cost_tracker.record_call() again here (would double-count).
@@ -818,7 +1040,6 @@ async def handle_init(
     # create branches.  spawn_model does NOT write hypotheses to the DB —
     # that is the orchestrator's responsibility.
     hypothesis_output: HypothesisGenerationOutput = parsed_output  # type: ignore[assignment]
-    from mariana.data.models import Hypothesis, HypothesisStatus  # noqa: PLC0415
     import uuid as _uuid  # noqa: PLC0415
     created_hypotheses = []
     # BUG-023: Wrap hypothesis + branch insertion in a transaction to avoid partial state
@@ -871,6 +1092,31 @@ async def handle_init(
                     "[]",  # sources_searched
                 )
                 created_hypotheses.append(hyp)
+
+    # ── Write hypotheses + branches to investigation graph ───────────────
+    for hyp in created_hypotheses:
+        await graph_writer.add_hypothesis_node(db, task.id, hyp, redis_client)
+    # Fetch branches we just created so we can write them to graph
+    _new_branches = await db.fetch(
+        "SELECT * FROM branches WHERE task_id = $1 AND status = 'ACTIVE'", task.id
+    )
+    for _br_row in _new_branches:
+        _br_dict = _row_to_dict(_br_row)
+        _br_obj = Branch(
+            id=_br_dict["id"],
+            hypothesis_id=_br_dict["hypothesis_id"],
+            task_id=_br_dict["task_id"],
+            status=BranchStatus(_br_dict["status"]),
+            score_history=_br_dict.get("score_history", []),
+            budget_allocated=float(_br_dict.get("budget_allocated", 5.0)),
+            budget_spent=float(_br_dict.get("budget_spent", 0.0)),
+            cycles_completed=int(_br_dict.get("cycles_completed", 0)),
+        )
+        await graph_writer.add_branch_node(db, task.id, _br_obj, redis_client)
+        # Edge: branch → hypothesis
+        await graph_writer.add_evidence_edge(
+            db, task.id, _br_obj.id, _br_obj.hypothesis_id, "EXPLORES", redis_client
+        )
 
     log.info("hypotheses_ready", count=len(created_hypotheses))
     _emit_progress(redis_client, task.id, {
@@ -1007,9 +1253,9 @@ async def handle_search(
             # Inject Perplexity results as additional page_content if available
             page_content = perplexity_context.get(branch.id, "")
 
-            _, ai_session = await spawn_model(
+            extraction_output, ai_session = await spawn_model(
                 task_type=TaskType.EVIDENCE_EXTRACTION,
-                context={
+                context=_augment_context_from_task({
                     "task_id": task.id,
                     "hypothesis_id": branch.hypothesis_id,
                     "hypothesis_statement": _hyp_statement,
@@ -1017,15 +1263,98 @@ async def handle_search(
                     "source_url": "",
                     "sources_already_searched": branch.sources_searched,
                     "budget_remaining": cost_tracker.budget_remaining,
-                },
+                }, task),
                 output_schema=EvidenceExtractionOutput,
                 branch_id=branch.id,
                 db=db,
                 cost_tracker=cost_tracker,
                 config=config,
+                quality_tier=(task.metadata or {}).get("quality_tier"),
             )
             # spawn_model already records cost internally — do NOT double-count
             task.ai_call_counter += 1
+
+            # BUG-R3-01 fix: persist each extracted evidence item as a Finding record.
+            # The EvidenceExtractionOutput was previously discarded with `_`,
+            # meaning no findings were ever saved to the DB.  Without DB rows,
+            # session_data.recent_findings is always empty, STRONG_FINDINGS_EXIST
+            # never triggers, and handle_report generates an empty report.
+            _evidence_out: EvidenceExtractionOutput = extraction_output  # type: ignore[assignment]
+            for _item in _evidence_out.evidence_items:
+                _finding = Finding(
+                    id=str(uuid.uuid4()),
+                    task_id=task.id,
+                    hypothesis_id=branch.hypothesis_id,
+                    content=_item.content,
+                    content_language=_evidence_out.language_detected or "en",
+                    confidence=_item.confidence,
+                    evidence_type=_item.evidence_type,
+                    source_ids=[],  # no formal Source record for AI-synthesised content
+                    metadata={
+                        "quote": _item.quote,
+                        "data_point": _item.data_point,
+                        "relevance_explanation": _item.relevance_explanation,
+                        "page_relevance_score": _evidence_out.page_relevance_score,
+                        "red_flags": _evidence_out.red_flags,
+                    },
+                )
+                try:
+                    async with db.acquire() as _fconn:
+                        await _fconn.execute(
+                            """
+                            INSERT INTO findings (
+                                id, task_id, hypothesis_id, content,
+                                content_en, content_language,
+                                source_ids, confidence, evidence_type,
+                                is_compressed, raw_content_path,
+                                created_at, metadata
+                            ) VALUES (
+                                $1, $2, $3, $4,
+                                $5, $6,
+                                $7, $8, $9,
+                                $10, $11,
+                                NOW(), $12
+                            )
+                            ON CONFLICT (id) DO NOTHING
+                            """,
+                            _finding.id,
+                            _finding.task_id,
+                            _finding.hypothesis_id,
+                            _finding.content,
+                            _finding.content_en,
+                            _finding.content_language,
+                            json.dumps(_finding.source_ids),
+                            _finding.confidence,
+                            _finding.evidence_type.value,
+                            _finding.is_compressed,
+                            _finding.raw_content_path,
+                            json.dumps(_finding.metadata),
+                        )
+                    # BUG-R4-01 fix: write finding node + evidence edge to knowledge graph.
+                    # Previously findings were persisted to the findings table but never
+                    # added to graph_nodes/graph_edges, so the knowledge graph was always
+                    # empty and the SSE graph stream never received finding events.
+                    try:
+                        await graph_writer.add_finding_node(db, task.id, _finding, redis_client)
+                        await graph_writer.add_evidence_edge(
+                            db, task.id, _finding.id, _finding.hypothesis_id,
+                            _finding.evidence_type.value, redis_client,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass  # graph writes are fire-and-forget
+                except Exception as _fexc:  # noqa: BLE001
+                    log.warning(
+                        "finding_persist_failed",
+                        branch_id=branch.id,
+                        error=str(_fexc),
+                    )
+
+            log.info(
+                "evidence_extracted",
+                branch_id=branch.id,
+                items_saved=len(_evidence_out.evidence_items),
+                page_relevance=_evidence_out.page_relevance_score,
+            )
 
         except BudgetExhaustedError:
             log.warning("search_budget_exhausted", branch_id=branch.id)
@@ -1073,22 +1402,39 @@ async def handle_evaluate(
             # Count sources searched for this branch as a proxy for sources_searched
             sources_searched_count = len(branch.sources_searched)
 
+            # BUG-R15-02: Fetch actual findings for this branch's hypothesis
+            _findings_rows = await db.fetch(
+                """
+                SELECT content, confidence, evidence_type
+                FROM findings
+                WHERE task_id = $1 AND hypothesis_id = $2
+                ORDER BY confidence DESC
+                LIMIT 20
+                """,
+                task.id, branch.hypothesis_id,
+            )
+            _compressed_findings = "\n---\n".join(
+                f"[{r['evidence_type']}] confidence={r['confidence']:.2f}\n{r['content'][:500]}"
+                for r in _findings_rows
+            ) or "(no findings yet)"
+
             eval_output, ai_session = await spawn_model(
                 task_type=TaskType.EVALUATION,
-                context={
+                context=_augment_context_from_task({
                     "task_id": task.id,
                     "hypothesis_id": branch.hypothesis_id,
                     "hypothesis_statement": hyp_statement,
-                    "compressed_findings": "",
+                    "compressed_findings": _compressed_findings,
                     "sources_searched": sources_searched_count,
                     "prior_scores": branch.score_history,
                     "budget_remaining": cost_tracker.budget_remaining,
-                },
+                }, task),
                 output_schema=EvaluationOutput,
                 branch_id=branch.id,
                 db=db,
                 cost_tracker=cost_tracker,
                 config=config,
+                quality_tier=(task.metadata or {}).get("quality_tier"),
             )
             # spawn_model already records cost internally — do NOT double-count
             task.ai_call_counter += 1
@@ -1113,6 +1459,19 @@ async def handle_evaluate(
                 score=new_score,
                 decision=decision.action,
             )
+
+            # Update hypothesis graph node with latest score
+            try:
+                _hyp_for_graph = Hypothesis(
+                    id=branch.hypothesis_id,
+                    task_id=task.id,
+                    statement=hyp_statement,
+                    status=HypothesisStatus.ACTIVE,
+                    score=new_score,
+                )
+                await graph_writer.add_hypothesis_node(db, task.id, _hyp_for_graph, redis_client)
+            except Exception:  # noqa: BLE001
+                pass  # graph writes are fire-and-forget
 
         except BudgetExhaustedError:
             log.warning("evaluate_budget_exhausted", branch_id=branch.id)
@@ -1151,9 +1510,9 @@ async def handle_deepen(
             )
             _hyp_statement_d = _hyp_row_d["statement"] if _hyp_row_d else ""
 
-            _, ai_session = await spawn_model(
+            deepen_output, ai_session = await spawn_model(
                 task_type=TaskType.EVIDENCE_EXTRACTION,
-                context={
+                context=_augment_context_from_task({
                     "task_id": task.id,
                     "hypothesis_id": branch.hypothesis_id,
                     "hypothesis_statement": _hyp_statement_d,
@@ -1163,15 +1522,93 @@ async def handle_deepen(
                     "sources_already_searched": branch.sources_searched,
                     "prior_score": branch.latest_score,
                     "budget_remaining": cost_tracker.budget_remaining,
-                },
+                }, task),
                 output_schema=EvidenceExtractionOutput,
                 branch_id=branch.id,
                 db=db,
                 cost_tracker=cost_tracker,
                 config=config,
+                quality_tier=(task.metadata or {}).get("quality_tier"),
             )
             # spawn_model already records cost internally — do NOT double-count
             task.ai_call_counter += 1
+
+            # BUG-R3-01 fix (deepen path): persist deepened evidence items as Finding records.
+            # Same pattern as handle_search — output was previously discarded with `_`.
+            _deepen_out: EvidenceExtractionOutput = deepen_output  # type: ignore[assignment]
+            for _ditem in _deepen_out.evidence_items:
+                _dfinding = Finding(
+                    id=str(uuid.uuid4()),
+                    task_id=task.id,
+                    hypothesis_id=branch.hypothesis_id,
+                    content=_ditem.content,
+                    content_language=_deepen_out.language_detected or "en",
+                    confidence=_ditem.confidence,
+                    evidence_type=_ditem.evidence_type,
+                    source_ids=[],
+                    metadata={
+                        "quote": _ditem.quote,
+                        "data_point": _ditem.data_point,
+                        "relevance_explanation": _ditem.relevance_explanation,
+                        "page_relevance_score": _deepen_out.page_relevance_score,
+                        "red_flags": _deepen_out.red_flags,
+                        "mode": "DEEPEN",
+                    },
+                )
+                try:
+                    async with db.acquire() as _dfconn:
+                        await _dfconn.execute(
+                            """
+                            INSERT INTO findings (
+                                id, task_id, hypothesis_id, content,
+                                content_en, content_language,
+                                source_ids, confidence, evidence_type,
+                                is_compressed, raw_content_path,
+                                created_at, metadata
+                            ) VALUES (
+                                $1, $2, $3, $4,
+                                $5, $6,
+                                $7, $8, $9,
+                                $10, $11,
+                                NOW(), $12
+                            )
+                            ON CONFLICT (id) DO NOTHING
+                            """,
+                            _dfinding.id,
+                            _dfinding.task_id,
+                            _dfinding.hypothesis_id,
+                            _dfinding.content,
+                            _dfinding.content_en,
+                            _dfinding.content_language,
+                            json.dumps(_dfinding.source_ids),
+                            _dfinding.confidence,
+                            _dfinding.evidence_type.value,
+                            _dfinding.is_compressed,
+                            _dfinding.raw_content_path,
+                            json.dumps(_dfinding.metadata),
+                        )
+                    # BUG-R4-01 fix (deepen path): write finding node + evidence edge to
+                    # knowledge graph.  Mirrors the same fix in handle_search above.
+                    try:
+                        await graph_writer.add_finding_node(db, task.id, _dfinding, redis_client)
+                        await graph_writer.add_evidence_edge(
+                            db, task.id, _dfinding.id, _dfinding.hypothesis_id,
+                            _dfinding.evidence_type.value, redis_client,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass  # graph writes are fire-and-forget
+                except Exception as _dfexc:  # noqa: BLE001
+                    log.warning(
+                        "deepen_finding_persist_failed",
+                        branch_id=branch.id,
+                        error=str(_dfexc),
+                    )
+
+            log.info(
+                "deepen_evidence_extracted",
+                branch_id=branch.id,
+                items_saved=len(_deepen_out.evidence_items),
+            )
 
         except BudgetExhaustedError:
             log.warning("deepen_budget_exhausted", branch_id=branch.id)
@@ -1213,8 +1650,12 @@ async def handle_checkpoint(
         "SELECT COUNT(*) FROM sources WHERE task_id = $1", task.id
     )
 
-    # Run DR check on the best active branch (if any)
-    active = session_data.active_branches
+    # BUG-R5-01 fix: re-read active branches from the DB before checkpointing.
+    # session_data.active_branches is built before the current action list runs,
+    # so it can be stale if a prior action in the same iteration just killed a
+    # branch.  Using the stale list writes checkpoints with dead branches still
+    # marked active and also feeds stale data into diminishing-returns analysis.
+    active = await get_active_branches(task.id, db)
     dr_recommendation = None  # BUG-R3-05: track recommendation to pass to save_checkpoint
     if active:
         best_branch = max(
@@ -1262,7 +1703,11 @@ async def handle_checkpoint(
         active_branches=active,
         killed_branches=killed_branches,
         findings=findings,
-        current_state=task.current_state,
+        # BUG-R5-02 fix: SAVE_CHECKPOINT actions run before the main loop
+        # advances task.current_state to next_state.  Persisting the old state
+        # here writes stale checkpoints (for example EVALUATE instead of
+        # CHECKPOINT), causing resumes to restart from the wrong phase.
+        current_state=State.CHECKPOINT,
         cost_tracker=cost_tracker,
         db=db,
         data_root=data_root,
@@ -1308,49 +1753,132 @@ async def handle_tribunal(
     finding_id = top_finding["id"]
     tribunal_id = str(uuid.uuid4())
 
-    # Argument stages use TribunalArgumentOutput; judge uses TribunalVerdictOutput
-    argument_stages = (
-        TaskType.TRIBUNAL_PLAINTIFF,
-        TaskType.TRIBUNAL_DEFENDANT,
-        TaskType.TRIBUNAL_REBUTTAL,
-        TaskType.TRIBUNAL_COUNTER,
+    # BUG-R15-01: Fetch finding content, supporting evidence, and sources for tribunal context
+    _finding_row = await db.fetchrow(
+        "SELECT content, confidence FROM findings WHERE id = $1", finding_id
     )
-    total_tribunal_cost: float = 0.0
-    for task_type in argument_stages:
-        _, ai_session = await spawn_model(
-            task_type=task_type,
-            context={
-                "task_id": task.id,
-                "tribunal_id": tribunal_id,
-                "finding_id": finding_id,
-                "budget_remaining": cost_tracker.budget_remaining,
-            },
-            output_schema=TribunalArgumentOutput,
-            branch_id=None,
-            db=db,
-            cost_tracker=cost_tracker,
-            config=config,
-        )
-        # spawn_model already records cost internally — do NOT double-count
-        task.ai_call_counter += 1
-        total_tribunal_cost += ai_session.cost_usd
+    _finding_summary = _finding_row["content"] if _finding_row else "[no content]"
 
-    # Judge verdict — capture parsed output so we can persist the verdict
-    judge_output, judge_session = await spawn_model(
-        task_type=TaskType.TRIBUNAL_JUDGE,
-        context={
+    _supporting_rows = await db.fetch(
+        "SELECT content, confidence FROM findings WHERE task_id = $1 AND id != $2 ORDER BY confidence DESC LIMIT 5",
+        task.id, finding_id,
+    )
+    _supporting_evidence = "\n".join(
+        f"[{i}] confidence={r['confidence']:.2f}\n{r['content'][:600]}"
+        for i, r in enumerate(_supporting_rows, 1)
+    ) or "(no supporting findings)"
+
+    _source_rows = await db.fetch(
+        "SELECT url, title FROM sources WHERE task_id = $1 LIMIT 20", task.id
+    )
+    _sources_text = "\n".join(f"- {r['title'] or r['url']}" for r in _source_rows) or "(no sources)"
+
+    _quality_tier = (task.metadata or {}).get("quality_tier")
+    total_tribunal_cost: float = 0.0
+
+    def _format_arg(arg: "TribunalArgumentOutput") -> str:
+        return (
+            f"{arg.argument_summary}\n\nKey points:\n"
+            + "\n".join(f"\u2022 {pt}" for pt in arg.key_points)
+        )
+
+    # PLAINTIFF
+    _plaintiff_parsed, _plaintiff_session = await spawn_model(
+        task_type=TaskType.TRIBUNAL_PLAINTIFF,
+        context=_augment_context_from_task({
             "task_id": task.id,
             "tribunal_id": tribunal_id,
             "finding_id": finding_id,
+            "finding_summary": _finding_summary,
+            "supporting_evidence": _supporting_evidence,
+            "sources": _sources_text,
             "budget_remaining": cost_tracker.budget_remaining,
-        },
-        output_schema=TribunalVerdictOutput,
-        branch_id=None,
-        db=db,
-        cost_tracker=cost_tracker,
-        config=config,
+        }, task),
+        output_schema=TribunalArgumentOutput,
+        branch_id=None, db=db, cost_tracker=cost_tracker, config=config,
+        quality_tier=_quality_tier,
     )
-    # spawn_model already records cost internally — do NOT double-count
+    task.ai_call_counter += 1
+    total_tribunal_cost += _plaintiff_session.cost_usd
+    _plaintiff_text = _format_arg(_plaintiff_parsed)  # type: ignore[arg-type]
+
+    # DEFENDANT
+    _defendant_parsed, _defendant_session = await spawn_model(
+        task_type=TaskType.TRIBUNAL_DEFENDANT,
+        context=_augment_context_from_task({
+            "task_id": task.id,
+            "tribunal_id": tribunal_id,
+            "finding_id": finding_id,
+            "finding_summary": _finding_summary,
+            "plaintiff_argument": _plaintiff_text,
+            "budget_remaining": cost_tracker.budget_remaining,
+        }, task),
+        output_schema=TribunalArgumentOutput,
+        branch_id=None, db=db, cost_tracker=cost_tracker, config=config,
+        quality_tier=_quality_tier,
+    )
+    task.ai_call_counter += 1
+    total_tribunal_cost += _defendant_session.cost_usd
+    _defendant_text = _format_arg(_defendant_parsed)  # type: ignore[arg-type]
+
+    # REBUTTAL (plaintiff responds to defendant)
+    _rebuttal_parsed, _rebuttal_session = await spawn_model(
+        task_type=TaskType.TRIBUNAL_REBUTTAL,
+        context=_augment_context_from_task({
+            "task_id": task.id,
+            "tribunal_id": tribunal_id,
+            "finding_id": finding_id,
+            "finding_summary": _finding_summary,
+            "defendant_argument": _defendant_text,
+            "plaintiff_original": _plaintiff_text,
+            "budget_remaining": cost_tracker.budget_remaining,
+        }, task),
+        output_schema=TribunalArgumentOutput,
+        branch_id=None, db=db, cost_tracker=cost_tracker, config=config,
+        quality_tier=_quality_tier,
+    )
+    task.ai_call_counter += 1
+    total_tribunal_cost += _rebuttal_session.cost_usd
+    _rebuttal_text = _format_arg(_rebuttal_parsed)  # type: ignore[arg-type]
+
+    # COUNTER (defendant responds to rebuttal)
+    _counter_parsed, _counter_session = await spawn_model(
+        task_type=TaskType.TRIBUNAL_COUNTER,
+        context=_augment_context_from_task({
+            "task_id": task.id,
+            "tribunal_id": tribunal_id,
+            "finding_id": finding_id,
+            "finding_summary": _finding_summary,
+            "plaintiff_rebuttal": _rebuttal_text,
+            "defendant_original": _defendant_text,
+            "budget_remaining": cost_tracker.budget_remaining,
+        }, task),
+        output_schema=TribunalArgumentOutput,
+        branch_id=None, db=db, cost_tracker=cost_tracker, config=config,
+        quality_tier=_quality_tier,
+    )
+    task.ai_call_counter += 1
+    total_tribunal_cost += _counter_session.cost_usd
+    _counter_text = _format_arg(_counter_parsed)  # type: ignore[arg-type]
+
+    # JUDGE — capture parsed output so we can persist the verdict
+    judge_output, judge_session = await spawn_model(
+        task_type=TaskType.TRIBUNAL_JUDGE,
+        context=_augment_context_from_task({
+            "task_id": task.id,
+            "tribunal_id": tribunal_id,
+            "finding_id": finding_id,
+            "finding_summary": _finding_summary,
+            "plaintiff_summary": _plaintiff_text,
+            "defendant_summary": _defendant_text,
+            "plaintiff_rebuttal_summary": _rebuttal_text,
+            "defendant_counter_summary": _counter_text,
+            "budget_remaining": cost_tracker.budget_remaining,
+        }, task),
+        output_schema=TribunalVerdictOutput,
+        branch_id=None, db=db, cost_tracker=cost_tracker, config=config,
+        quality_tier=_quality_tier,
+    )
     task.ai_call_counter += 1
     total_tribunal_cost += judge_session.cost_usd
 
@@ -1473,18 +2001,53 @@ async def handle_skeptic(
     )
     _tribunal_session_id: str | None = _tribunal_row["id"] if _tribunal_row else None
 
+    # BUG-R15-03: Fetch finding content, confidence, and tribunal verdict for skeptic context
+    _s_finding_content = ""
+    _s_finding_confidence: float = 0.0
+    if _top_finding_row:
+        _s_full_finding = await db.fetchrow(
+            "SELECT content, confidence FROM findings WHERE id = $1",
+            _top_finding_row["id"],
+        )
+        if _s_full_finding:
+            _s_finding_content = _s_full_finding["content"]
+            _s_finding_confidence = float(_s_full_finding["confidence"])
+
+    _s_tribunal_verdict = ""
+    _s_unanswered_questions = ""
+    if _tribunal_row:
+        _s_full_tribunal = await db.fetchrow(
+            "SELECT verdict, judge_reasoning, unanswered_questions FROM tribunal_sessions WHERE id = $1",
+            _tribunal_row["id"],
+        )
+        if _s_full_tribunal:
+            _s_tribunal_verdict = _s_full_tribunal["verdict"] or ""
+            _s_unanswered_questions = _s_full_tribunal["unanswered_questions"] or ""
+            # unanswered_questions may be a JSON string — decode if so
+            if isinstance(_s_unanswered_questions, str) and _s_unanswered_questions.startswith("["):
+                import json as _json_uq  # noqa: PLC0415
+                try:
+                    _s_unanswered_questions = "\n".join(_json_uq.loads(_s_unanswered_questions))
+                except (ValueError, TypeError):
+                    pass
+
     skeptic_output, ai_session = await spawn_model(
         task_type=TaskType.SKEPTIC_QUESTIONS,
-        context={
+        context=_augment_context_from_task({
             "task_id": task.id,
             "task_topic": task.topic,
+            "finding_summary": _s_finding_content,
+            "confidence_score": _s_finding_confidence,
+            "tribunal_verdict": _s_tribunal_verdict,
+            "unanswered_questions": _s_unanswered_questions,
             "budget_remaining": cost_tracker.budget_remaining,
-        },
+        }, task),
         output_schema=SkepticQuestionsOutput,
         branch_id=None,
         db=db,
         cost_tracker=cost_tracker,
         config=config,
+        quality_tier=(task.metadata or {}).get("quality_tier"),
     )
     # spawn_model already records cost internally — do NOT double-count
     task.ai_call_counter += 1
@@ -1697,8 +2260,25 @@ async def _execute_action(
                     await handle_evaluate(task, session_data, cost_tracker, db, redis_client, config)
                 case State.DEEPEN:
                     await handle_deepen(task, session_data, cost_tracker, db, redis_client, config)
+                case State.PIVOT:
+                    # BUG-R4-03 fix: PIVOT+HYPOTHESES_READY emits SPAWN_AI but there was
+                    # no PIVOT case here, causing a silent "spawn_ai_unhandled_state" warning
+                    # and pivot hypothesis generation to be silently dropped.  Pivots need
+                    # new hypotheses and branches just like INIT, so handle_init() is correct.
+                    await handle_init(task, session_data, cost_tracker, db, redis_client, config)
                 case State.TRIBUNAL:
-                    await handle_tribunal(task, session_data, cost_tracker, db, redis_client, config)
+                    # BUG-R4-02 fix: TRIBUNAL+TRIBUNAL_CONFIRMED emits SPAWN_AI with
+                    # task_type='SKEPTIC_QUESTIONS', but task.current_state is still TRIBUNAL
+                    # when actions execute (state is only advanced after all actions complete).
+                    # Routing on task.current_state caused handle_tribunal() to re-run the
+                    # entire 5-step adversarial tribunal, persisting a second TribunalSession
+                    # and potentially overwriting the original verdict.
+                    # Fix: inspect action.params["task_type"]; if SKEPTIC_QUESTIONS, call
+                    # handle_skeptic; otherwise call handle_tribunal (plain TRIBUNAL entry).
+                    if task_type_str == "SKEPTIC_QUESTIONS":
+                        await handle_skeptic(task, session_data, cost_tracker, db, redis_client, config)
+                    else:
+                        await handle_tribunal(task, session_data, cost_tracker, db, redis_client, config)
                 case State.SKEPTIC:
                     await handle_skeptic(task, session_data, cost_tracker, db, redis_client, config)
                 case State.REPORT:
@@ -1725,8 +2305,14 @@ async def _execute_action(
 
         case "GRANT_BUDGET":
             score_band = action.params.get("score_band", "score7")
-            # BUG-020: score8 → $50 grant, score7 → $20 grant
-            amount = 50.0 if score_band == "score8" else 20.0
+            # BUG-D1-01 fix: score8 → $50 grant, score7 → $20 grant, minimal → $2 keep-alive
+            if score_band == "score8":
+                amount = 50.0
+            elif score_band == "score7":
+                amount = 20.0
+            else:
+                # "minimal" (dont_kill_branches keep-alive) — intentionally small
+                amount = 2.0
             active = session_data.active_branches
             if active:
                 best = max(
@@ -1829,6 +2415,9 @@ async def _build_session_data(
     )
     all_source_ids = {str(r["id"]) for r in source_rows}
 
+    # Read user flow control flags from task metadata
+    _dont_kill = bool((task.metadata or {}).get("dont_kill_branches", False))
+
     return ResearchSessionData(
         task=task,
         active_branches=active_branches,
@@ -1837,6 +2426,7 @@ async def _build_session_data(
         all_source_ids=all_source_ids,
         ai_call_counter=task.ai_call_counter,
         recent_action_summaries=[],
+        dont_kill_branches=_dont_kill,
     )
 
 
@@ -1913,7 +2503,7 @@ async def _emergency_checkpoint(
     Uses empty findings / branch lists if the DB is unavailable.
     """
     try:
-        active = await get_active_branches(task.id, db)
+        active = await get_active_branches(task.id, db)  # BUG-R3-02 fix: correct arg order (task_id, db)
     except Exception:  # noqa: BLE001
         active = []
 
@@ -1957,25 +2547,141 @@ async def _check_user_credits(user_id: str, config: Any) -> int | None:
     """
     import httpx as _httpx_check  # noqa: PLC0415
 
-    url = f"{config.SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=tokens"
+    api_key = config.SUPABASE_SERVICE_KEY or config.SUPABASE_ANON_KEY
+    # Use RPC function (SECURITY DEFINER) — works with both service key and anon key
+    rpc_url = f"{config.SUPABASE_URL}/rest/v1/rpc/get_user_tokens"
     headers = {
-        "apikey": config.SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {config.SUPABASE_SERVICE_KEY}",
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
     }
     async with _httpx_check.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(url, headers=headers)
+        resp = await client.post(
+            rpc_url,
+            json={"target_user_id": user_id},
+            headers=headers,
+        )
         if resp.status_code != 200:
             return None
-        rows = resp.json()
-        if not rows:
+        result = resp.json()
+        if result is None:
             return None
-        return int(rows[0].get("tokens", 0) or 0)
+        return int(result)
 
 
 # BUG-S2-09 fix: hold references to fire-and-forget tasks to prevent GC from
 # silently dropping them before they complete.  Python's asyncio will log
 # "Task was destroyed but it is pending!" warnings otherwise.
 _background_tasks: set[Any] = set()
+
+
+async def _write_handoff_context(
+    task: "ResearchTask",
+    cost_tracker: Any,
+    phase_name: str,
+    findings_summary: str = "",
+    db: Any = None,
+) -> None:
+    """Write orchestrator handoff context to task metadata AND orchestrator_handoffs table.
+
+    Called between major phase transitions so the next 'fresh' orchestrator
+    instance has all necessary context without relying on LLM conversation
+    history.  This prevents AI degradation over long research tasks.
+
+    The handoff record is stored under ``task.metadata["last_handoff"]`` (persisted
+    to the DB via ``_persist_task``) AND inserted into the ``orchestrator_handoffs``
+    table via ``rotation.write_handoff`` so that ``rotation.read_handoff`` can
+    retrieve it on next startup.
+
+    BUG-D1-02 fix: previously this function only wrote to in-memory task.metadata.
+    rotation.read_handoff() queries orchestrator_handoffs, which was always empty.
+    """
+    handoff: dict[str, Any] = {
+        "phase_completed": phase_name,
+        "total_spent_usd": round(cost_tracker.total_spent, 4),
+        "budget_remaining_usd": round(cost_tracker.budget_remaining, 4),
+        "ai_calls_made": cost_tracker.call_count,
+        "current_state": task.current_state.value,
+        "diminishing_flags": getattr(task, "diminishing_flags", 0),
+    }
+    if findings_summary:
+        handoff["findings_summary"] = findings_summary[:2000]
+
+    meta: dict[str, Any] = dict(task.metadata or {})
+    meta["last_handoff"] = handoff
+    task.metadata = meta
+
+    # BUG-D1-02 fix: persist to orchestrator_handoffs table so rotation.read_handoff works
+    # BUG-R3-03 fix: populate key_findings, active_hypotheses, killed_hypotheses, and
+    # sources_found from the DB so the rotation prompt contains real research state.
+    # Previously OrchestratorContext was created with all list fields empty, making
+    # build_rotation_prompt() return "(none)" for every section.
+    if db is not None:
+        task_meta = task.metadata or {}
+
+        # --- Fetch high-confidence findings for handoff ---
+        _hf_rows = []
+        _ah_rows = []
+        _kh_rows = []
+        _src_rows = []
+        try:
+            _hf_rows = await db.fetch(
+                """
+                SELECT content FROM findings
+                WHERE task_id = $1
+                ORDER BY confidence DESC
+                LIMIT 20
+                """,
+                task.id,
+            )
+            _ah_rows = await db.fetch(
+                "SELECT statement FROM hypotheses WHERE task_id = $1 AND status = 'ACTIVE'",
+                task.id,
+            )
+            _kh_rows = await db.fetch(
+                "SELECT h.statement, b.kill_reason FROM branches b "
+                "JOIN hypotheses h ON h.id = b.hypothesis_id "
+                "WHERE b.task_id = $1 AND b.status = 'KILLED'",
+                task.id,
+            )
+            _src_rows = await db.fetch(
+                "SELECT url FROM sources WHERE task_id = $1 LIMIT 100",
+                task.id,
+            )
+        except Exception as _ctx_exc:  # noqa: BLE001
+            logger.debug("handoff_context_db_fetch_failed", task_id=task.id, error=str(_ctx_exc))
+
+        _key_findings = [r["content"][:500] for r in _hf_rows]
+        _active_hyps = [r["statement"] for r in _ah_rows]
+        _killed_hyps = [
+            f"{r['statement']} (killed: {r.get('kill_reason', 'unknown')})"
+            for r in _kh_rows
+        ]
+        _sources = [r["url"] for r in _src_rows]
+
+        ctx = OrchestratorContext(
+            task_id=task.id,
+            phase=phase_name,
+            key_findings=_key_findings,
+            active_hypotheses=_active_hyps,
+            killed_hypotheses=_killed_hyps,
+            sources_found=_sources,
+            quality_tier=task_meta.get("quality_tier", "balanced"),
+            user_instructions=task_meta.get("user_flow_instructions", ""),
+            loop_config={
+                "continuous_mode": task_meta.get("continuous_mode", False),
+                "dont_kill_branches": task_meta.get("dont_kill_branches", False),
+            },
+        )
+        await rotation.write_handoff(db, ctx)
+
+    logger.debug(
+        "handoff_context_written",
+        task_id=task.id,
+        phase_completed=phase_name,
+        total_spent_usd=handoff["total_spent_usd"],
+        budget_remaining_usd=handoff["budget_remaining_usd"],
+    )
 
 
 def _emit_progress(redis_client: Any, task_id: str, event: dict[str, Any]) -> None:

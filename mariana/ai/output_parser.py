@@ -101,6 +101,125 @@ def _extract_json_object_greedy(text: str) -> str | None:
 
     return None
 
+def _repair_truncated_json(text: str) -> str | None:
+    """Attempt to close a truncated JSON object so it becomes parseable.
+
+    When an LLM hits ``max_tokens`` the response is cut off mid-JSON.
+    This function:
+    1. Detects if the text starts with ``{`` but has no balanced closing ``}``.
+    2. Finds the last position where a complete JSON value ended.
+    3. Closes all open strings, arrays and objects.
+
+    Returns the repaired text or None if repair is not applicable.
+    """
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return None
+
+    # Quick check: if the greedy extractor already finds a balanced object,
+    # truncation repair is not needed.
+    greedy = _extract_json_object_greedy(stripped)
+    if greedy is not None:
+        return None  # not actually truncated
+
+    # Strategy: walk the string and track the stack of containers.
+    # Record the position after each *complete* value (string, number, true,
+    # false, null, or closing brace/bracket).  The "last safe position" is
+    # the rightmost such point that is followed by a comma (or is the end of
+    # a complete key: value pair).
+    stack: list[str] = []  # '{' or '['
+    in_string = False
+    escape = False
+    last_safe_pos = 0  # last position after a complete entry + comma
+
+    i = 0
+    while i < len(stripped):
+        ch = stripped[i]
+
+        if escape:
+            escape = False
+            i += 1
+            continue
+
+        if in_string:
+            if ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        # Outside a string
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            stack.append("{")
+        elif ch == "[":
+            stack.append("[")
+        elif ch == "}":
+            if stack and stack[-1] == "{":
+                stack.pop()
+            # After closing a brace we have a complete value
+        elif ch == "]":
+            if stack and stack[-1] == "[":
+                stack.pop()
+        elif ch == ",":
+            # A comma after a complete value means everything up to this
+            # comma is safe (we can cut here and close containers).
+            last_safe_pos = i
+
+        i += 1
+
+    if last_safe_pos == 0:
+        return None  # couldn't find a safe cut point
+
+    # Cut at the last safe comma (exclude the comma itself).
+    truncated = stripped[:last_safe_pos]
+
+    # Re-count open containers in the truncated portion.
+    rstack: list[str] = []
+    in_str = False
+    esc = False
+    for ch in truncated:
+        if esc:
+            esc = False
+            continue
+        if in_str:
+            if ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            rstack.append("{")
+        elif ch == "[":
+            rstack.append("[")
+        elif ch == "}":
+            if rstack and rstack[-1] == "{":
+                rstack.pop()
+        elif ch == "]":
+            if rstack and rstack[-1] == "[":
+                rstack.pop()
+
+    # If we're inside an unclosed string, close it.
+    if in_str:
+        truncated += '"'
+
+    # Close remaining open containers in reverse order.
+    closers = "".join("}" if c == "{" else "]" for c in reversed(rstack))
+    repaired = truncated + closers
+
+    logger.info(
+        "Truncated JSON repair: cut at pos %d/%d, closing %d containers",
+        last_safe_pos,
+        len(stripped),
+        len(rstack),
+    )
+    return repaired
+
+
 # ─── Exceptions ──────────────────────────────────────────────────────────────
 
 
@@ -236,48 +355,59 @@ def parse_output(raw_text: str, output_schema: type[BaseModel]) -> BaseModel:
     json_text = _extract_json_text(raw_text)
 
     # Step 3 — parse JSON (with repair fallback)
+    data: dict | None = None
+
+    # Attempt 1: raw JSON parse
     try:
         data = json.loads(json_text)
     except json.JSONDecodeError:
-        # BUG-009 fix: attempt repair before giving up.
+        pass
+
+    # Attempt 2: cosmetic repair (trailing commas, control chars, etc.)
+    if data is None:
         repaired = _repair_json(json_text)
         try:
             data = json.loads(repaired)
-            logger.info(
-                "JSON repair succeeded for schema=%s",
-                output_schema.__name__,
-            )
+            logger.info("JSON repair succeeded for schema=%s", output_schema.__name__)
         except json.JSONDecodeError:
-            # Last resort: try greedy brace extraction on the repaired text
-            greedy = _extract_json_object_greedy(repaired)
-            if greedy is not None:
-                try:
-                    data = json.loads(greedy)
-                    logger.info(
-                        "Greedy brace extraction succeeded for schema=%s",
-                        output_schema.__name__,
-                    )
-                except json.JSONDecodeError as exc:
-                    logger.warning(
-                        "JSON decode failed after all repairs for schema=%s: %s | excerpt=%r",
-                        output_schema.__name__,
-                        exc,
-                        excerpt,
-                    )
-                    raise OutputParseError(
-                        detail=f"JSON decode error (after repair): {exc}",
-                        raw_excerpt=excerpt,
-                    ) from exc
-            else:
-                logger.warning(
-                    "JSON decode failed (no JSON object found) for schema=%s | excerpt=%r",
+            pass
+
+    # Attempt 3: greedy brace extraction
+    if data is None:
+        greedy = _extract_json_object_greedy(_repair_json(json_text))
+        if greedy is not None:
+            try:
+                data = json.loads(greedy)
+                logger.info("Greedy brace extraction succeeded for schema=%s", output_schema.__name__)
+            except json.JSONDecodeError:
+                pass
+
+    # Attempt 4 (BUG-020 fix): truncated JSON repair — the LLM hit max_tokens
+    # and the JSON was cut off mid-object.  Close open containers.
+    if data is None:
+        trunc_repaired = _repair_truncated_json(_repair_json(json_text))
+        if trunc_repaired is not None:
+            try:
+                data = json.loads(trunc_repaired)
+                logger.info(
+                    "Truncated JSON repair succeeded for schema=%s (cut from %d to %d chars)",
                     output_schema.__name__,
-                    excerpt,
+                    len(json_text),
+                    len(trunc_repaired),
                 )
-                raise OutputParseError(
-                    detail="No valid JSON object found in model response",
-                    raw_excerpt=excerpt,
-                )
+            except json.JSONDecodeError:
+                pass
+
+    if data is None:
+        logger.warning(
+            "JSON decode failed after all repair attempts for schema=%s | excerpt=%r",
+            output_schema.__name__,
+            excerpt,
+        )
+        raise OutputParseError(
+            detail="No valid JSON object found in model response",
+            raw_excerpt=excerpt,
+        )
 
     if not isinstance(data, dict):
         raise OutputParseError(

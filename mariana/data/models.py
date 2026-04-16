@@ -243,7 +243,7 @@ class Hypothesis(BaseModel):
     )
     momentum_note: str | None = Field(
         default=None,
-        max_length=512,
+        max_length=4096,
         description="Short qualitative note about score momentum",
     )
     rationale: str | None = Field(
@@ -715,7 +715,7 @@ class EvaluationOutput(BaseModel):
     momentum_note: str = Field(
         ...,
         min_length=5,
-        max_length=512,
+        max_length=4096,
         description="Brief qualitative note on score trajectory",
     )
     recommendation: Literal["DEEPEN", "SEARCH_MORE", "KILL", "PLATEAU"] = Field(
@@ -885,7 +885,7 @@ class CompressedFindings(BaseModel):
     evidence_against: list[str] = Field(default_factory=list, description="Key counter-points")
     confidence_score: float = Field(..., ge=0.0, le=1.0)
     key_sources: list[str] = Field(default_factory=list, description="Most important source URLs")
-    momentum_note: str | None = Field(default=None, max_length=512)
+    momentum_note: str | None = Field(default=None, max_length=4096)
     compressed_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
     raw_finding_count: int = Field(..., ge=0, description="Number of raw findings replaced by this summary")
 

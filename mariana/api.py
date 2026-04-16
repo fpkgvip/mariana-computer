@@ -39,13 +39,16 @@ import json as _json
 import os
 import secrets
 import re
+import signal
 import sys
 import time
 import uuid
+import weakref
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
+from urllib.parse import quote as _url_quote, urlsplit, urlunsplit
 
 import asyncpg
 import httpx
@@ -55,7 +58,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, 
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sse_starlette.sse import EventSourceResponse
 
 from mariana.config import AppConfig, load_config
@@ -83,6 +86,24 @@ ADMIN_USER_ID = "a34a319e-a046-4df2-8c98-9b83f6d512a0"
 _config: AppConfig | None = None
 _db_pool: asyncpg.Pool | None = None
 _redis: Any | None = None  # aioredis.Redis
+
+
+def _redact_url_for_logs(raw_url: str) -> str:
+    """Return a log-safe representation of a connection URL."""
+    if not raw_url:
+        return ""
+    try:
+        parts = urlsplit(raw_url)
+        hostname = parts.hostname or ""
+        if parts.port is not None:
+            hostname = f"{hostname}:{parts.port}"
+        if parts.username:
+            netloc = f"{parts.username}:***@{hostname}"
+        else:
+            netloc = hostname or parts.netloc
+        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    except Exception:  # noqa: BLE001
+        return "[redacted]"
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +137,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             max_size=_config.POSTGRES_POOL_MAX,
         )
         await init_schema(_db_pool)
-        log.info("db_pool_ready", dsn=_config.POSTGRES_DSN.split("@")[-1])
+        log.info("db_pool_ready", dsn=_redact_url_for_logs(_config.POSTGRES_DSN))
     except Exception as exc:  # noqa: BLE001
         log.error("db_pool_failed", error=str(exc))
         _db_pool = None
@@ -134,7 +155,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             decode_responses=True,
         )
         await _redis.ping()
-        log.info("redis_ready", url=_config.REDIS_URL)
+        log.info("redis_ready", url=_redact_url_for_logs(_config.REDIS_URL))
     except Exception as exc:  # noqa: BLE001
         log.warning("redis_unavailable", error=str(exc))
         _redis = None
@@ -247,6 +268,20 @@ class ConfigResponse(BaseModel):
 class StartInvestigationRequest(BaseModel):
     topic: str = Field(..., min_length=1, max_length=4096, description="Research topic or question")
     # All below are now optional — AI determines them if not provided
+
+    @field_validator("topic")
+    @classmethod
+    def _normalize_topic(cls, value: str) -> str:
+        """Trim whitespace and reject blank topics.
+
+        Pydantic's ``min_length`` alone accepts strings like ``"   "``. That
+        let whitespace-only submissions pass API validation, reserve credits,
+        and write a task file that the daemon later rejected as empty.
+        """
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("Topic must not be empty or whitespace only")
+        return trimmed
     budget_usd: float | None = Field(
         None, gt=0.0, le=10000.0, description="Budget ceiling in USD (AI-determined if omitted)"
     )
@@ -257,12 +292,24 @@ class StartInvestigationRequest(BaseModel):
     upload_session_uuid: str | None = Field(
         None, description="Session UUID from pre-submission file uploads (from POST /api/upload)",
     )
+    quality_tier: str | None = Field(None, description="Model quality: maximum, high, balanced, economy")
+    user_flow_instructions: str | None = Field(None, description="User's custom instructions for how AI should conduct research")
+    continuous_mode: bool = Field(False, description="If true, run in continuous loop until user manually stops")
+    dont_kill_branches: bool = Field(False, description="If true, never auto-kill branches regardless of score")
 
 
 class ClassifyRequest(BaseModel):
     """Request body for the /api/investigations/classify endpoint."""
 
     topic: str = Field(..., min_length=1, max_length=4096)
+
+    @field_validator("topic")
+    @classmethod
+    def _normalize_topic(cls, value: str) -> str:
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("Topic must not be empty or whitespace only")
+        return trimmed
 
 
 class ClassifyResponse(BaseModel):
@@ -273,6 +320,7 @@ class ClassifyResponse(BaseModel):
     estimated_credits: int
     plan_summary: str  # Brief description of what Mariana will do
     requires_approval: bool  # False for instant, True for standard/deep
+    quality_tier: str = "balanced"
 
 
 class StartInvestigationResponse(BaseModel):
@@ -349,6 +397,48 @@ class KillTaskResponse(BaseModel):
 
 class ShutdownResponse(BaseModel):
     message: str
+
+
+# ---------------------------------------------------------------------------
+# Graph models
+# ---------------------------------------------------------------------------
+
+
+class GraphNode(BaseModel):
+    """A single node in the investigation knowledge graph."""
+
+    id: str
+    label: str
+    type: str = "entity"
+    description: str = ""
+    metadata: dict = {}
+    x: float | None = None
+    y: float | None = None
+    source: str = "human"
+
+
+class GraphEdge(BaseModel):
+    """A directed edge connecting two nodes in the investigation graph.
+
+    Uses D3 naming conventions: ``source`` and ``target`` refer to node IDs.
+    The DB columns are ``source_node`` / ``target_node`` to avoid a name clash
+    with the ``source`` provenance field; this mapping is handled transparently
+    in the API layer.
+    """
+
+    id: str
+    source: str  # source_node ID (D3 convention)
+    target: str  # target_node ID (D3 convention)
+    label: str = ""
+    metadata: dict = {}
+    source_origin: str = "human"  # renamed to avoid clash with `source` node-ID field
+
+
+class GraphData(BaseModel):
+    """Full graph payload for a single investigation."""
+
+    nodes: list[GraphNode] = []
+    edges: list[GraphEdge] = []
 
 
 # ---------------------------------------------------------------------------
@@ -587,8 +677,47 @@ async def _require_investigation_owner(
 # ---------------------------------------------------------------------------
 # Stream token — short-lived HMAC-signed token for SSE (never expose full JWT)
 # ---------------------------------------------------------------------------
-_STREAM_TOKEN_SECRET: bytes = os.environ.get("STREAM_TOKEN_SECRET", secrets.token_hex(32)).encode()
+_STREAM_TOKEN_SECRET: bytes | None = None
 _STREAM_TOKEN_TTL_SECONDS = 120  # 2 minutes — client must refresh
+
+
+def _get_stream_token_secret() -> bytes:
+    """Return the HMAC key used for SSE stream tokens.
+
+    Prefer the explicit ``STREAM_TOKEN_SECRET`` env var. When it is absent,
+    derive a stable fallback from other deployment secrets so tokens remain
+    valid across worker processes and routine restarts instead of breaking
+    whenever a process generates a fresh random secret at import time.
+    """
+    global _STREAM_TOKEN_SECRET  # noqa: PLW0603
+
+    if _STREAM_TOKEN_SECRET is not None:
+        return _STREAM_TOKEN_SECRET
+
+    configured = os.environ.get("STREAM_TOKEN_SECRET", "")
+    if configured:
+        _STREAM_TOKEN_SECRET = configured.encode()
+        return _STREAM_TOKEN_SECRET
+
+    stable_material = "|".join(
+        value
+        for value in (
+            os.environ.get("ADMIN_SECRET_KEY", ""),
+            os.environ.get("SUPABASE_SERVICE_KEY", ""),
+            os.environ.get("POSTGRES_DSN", ""),
+            os.environ.get("POSTGRES_PASSWORD", ""),
+            os.environ.get("LLM_GATEWAY_API_KEY", ""),
+        )
+        if value
+    )
+    if stable_material:
+        _STREAM_TOKEN_SECRET = hashlib.sha256(stable_material.encode()).digest()
+        logger.warning("stream_token_secret_derived_fallback_in_use")
+        return _STREAM_TOKEN_SECRET
+
+    _STREAM_TOKEN_SECRET = secrets.token_bytes(32)
+    logger.warning("stream_token_secret_ephemeral_fallback_in_use")
+    return _STREAM_TOKEN_SECRET
 
 
 def _mint_stream_token(user_id: str, task_id: str) -> str:
@@ -599,7 +728,7 @@ def _mint_stream_token(user_id: str, task_id: str) -> str:
     """
     exp = int(time.time()) + _STREAM_TOKEN_TTL_SECONDS
     payload = f"{user_id}|{task_id}|{exp}"
-    sig = hmac.new(_STREAM_TOKEN_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+    sig = hmac.new(_get_stream_token_secret(), payload.encode(), hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
 
 
@@ -616,7 +745,7 @@ def _verify_stream_token(token: str, task_id: str) -> str:
         user_id, tok_task_id, exp_str, sig = parts
         # Verify HMAC
         payload = f"{user_id}|{tok_task_id}|{exp_str}"
-        expected_sig = hmac.new(_STREAM_TOKEN_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+        expected_sig = hmac.new(_get_stream_token_secret(), payload.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected_sig):
             raise ValueError("bad signature")
         # Verify task_id matches
@@ -835,6 +964,19 @@ async def start_investigation(
     task_id = str(uuid.uuid4())
     created_at = datetime.now(tz=timezone.utc).isoformat()
 
+    # ── BUG-D2-04 fix: Validate quality_tier before any processing ─────────
+    # Previously an invalid value like "ultra" was silently accepted and
+    # written to .task.json, only caught much later via a warning in session.py.
+    _VALID_QUALITY_TIERS: frozenset[str] = frozenset({"maximum", "high", "balanced", "economy"})
+    if body.quality_tier and body.quality_tier not in _VALID_QUALITY_TIERS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid quality_tier {body.quality_tier!r}. "
+                f"Must be one of: {sorted(_VALID_QUALITY_TIERS)}"
+            ),
+        )
+
     # ── Fill in AI-determined values when the caller omits them ─────────────
     classification = _classify_topic(body.topic)
 
@@ -895,7 +1037,8 @@ async def start_investigation(
                             status_code=403,
                             detail="Upload session belongs to another user",
                         )
-                task_upload_dir = Path(cfg.DATA_ROOT) / "uploads" / task_id
+                # BUG-R13-02: Store in files/{task_id} so listing/download endpoints find them
+                task_upload_dir = Path(cfg.DATA_ROOT) / "files" / task_id
                 task_upload_dir.mkdir(parents=True, exist_ok=True)
                 import shutil
                 for f in pending_dir.iterdir():
@@ -933,12 +1076,21 @@ async def start_investigation(
             "estimated_credits": classification.estimated_credits,
             "reserved_credits": reserved_credits,
             "uploaded_files": uploaded_file_names,
+            # User flow control fields
+            "quality_tier": body.quality_tier or "balanced",
+            "user_flow_instructions": body.user_flow_instructions or "",
+            "continuous_mode": body.continuous_mode,
+            "dont_kill_branches": body.dont_kill_branches,
         }
 
         inbox = Path(cfg.inbox_dir)
         inbox.mkdir(parents=True, exist_ok=True)
         task_file = inbox / f"{task_id}.task.json"
-        task_file.write_text(_json.dumps(task_payload, indent=2), encoding="utf-8")
+        # Atomic write: write to .tmp first, then rename to avoid daemon
+        # reading a partially-written file.
+        tmp_file = inbox / f"{task_id}.task.json.tmp"
+        tmp_file.write_text(_json.dumps(task_payload, indent=2), encoding="utf-8")
+        tmp_file.rename(task_file)
         logger.info(
             "task_submitted",
             task_id=task_id,
@@ -1133,6 +1285,64 @@ async def kill_investigation(
     return KillTaskResponse(task_id=task_id, message="Kill signal sent")
 
 
+@app.post(
+    "/api/investigations/{task_id}/stop",
+    response_model=KillTaskResponse,
+    tags=["Investigations"],
+)
+async def stop_investigation(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> KillTaskResponse:
+    """
+    Manually stop a running investigation that is in continuous mode.
+
+    Sets a Redis key ``stop:{task_id}`` (24 h TTL) that the event loop
+    reads before each continuous-mode restart.  Also marks the task
+    status as HALTED so it does not restart on a daemon reload.
+
+    Unlike ``/kill``, this endpoint is designed for graceful termination
+    of continuous-mode loops — it waits for the current research cycle
+    to finish rather than interrupting mid-cycle.
+    """
+    db = _get_db()
+
+    # Verify ownership
+    row = await db.fetchrow(
+        "SELECT metadata FROM research_tasks WHERE id = $1",
+        task_id,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+    metadata = row.get("metadata") or {}
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    task_user_id = metadata.get("user_id", "")
+    if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="You do not own this investigation")
+
+    # Set the Redis stop flag with a 24-hour TTL so the event loop
+    # will not restart the continuous loop on its next HALT.
+    if _redis is not None:
+        try:
+            await _redis.set(f"stop:{task_id}", "1", ex=86400)
+            logger.info("stop_flag_set", task_id=task_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("stop_flag_set_failed", task_id=task_id, error=str(exc))
+    else:
+        logger.warning("stop_flag_no_redis", task_id=task_id)
+
+    # Also mark the task HALTED in DB so it won't be resumed on daemon restart.
+    await db.execute(
+        "UPDATE research_tasks SET status = 'HALTED', completed_at = NOW() "
+        "WHERE id = $1 AND status IN ('RUNNING', 'PENDING')",
+        task_id,
+    )
+
+    logger.info("task_stop_requested", task_id=task_id)
+    return KillTaskResponse(task_id=task_id, message="Stop signal sent; investigation will halt after current cycle")
+
+
 # ---------------------------------------------------------------------------
 # Routes — Branches
 # ---------------------------------------------------------------------------
@@ -1288,6 +1498,202 @@ async def get_cost_breakdown(
 
 
 # ---------------------------------------------------------------------------
+# Routes — Investigation knowledge graph
+# ---------------------------------------------------------------------------
+
+
+def _row_to_graph_node(row: asyncpg.Record) -> GraphNode:
+    """Convert a raw graph_nodes DB row to a GraphNode response model."""
+    raw_meta = row["metadata"] or {}
+    if isinstance(raw_meta, str):
+        try:
+            raw_meta = json.loads(raw_meta)
+        except (json.JSONDecodeError, ValueError):
+            raw_meta = {}
+    return GraphNode(
+        id=str(row["id"]),
+        label=row["label"],
+        type=row["type"],
+        description=row["description"] or "",
+        metadata=raw_meta,
+        x=row["x"],
+        y=row["y"],
+        source=row["source"] or "ai",
+    )
+
+
+def _row_to_graph_edge(row: asyncpg.Record) -> GraphEdge:
+    """Convert a raw graph_edges DB row to a GraphEdge response model.
+
+    Maps DB columns ``source_node`` / ``target_node`` back to the D3-style
+    ``source`` / ``target`` fields expected by the frontend.
+    """
+    raw_meta = row["metadata"] or {}
+    if isinstance(raw_meta, str):
+        try:
+            raw_meta = json.loads(raw_meta)
+        except (json.JSONDecodeError, ValueError):
+            raw_meta = {}
+    return GraphEdge(
+        id=str(row["id"]),
+        source=str(row["source_node"]),
+        target=str(row["target_node"]),
+        label=row["label"] or "",
+        metadata=raw_meta,
+        source_origin=row["source"] or "ai",
+    )
+
+
+@app.get(
+    "/api/investigations/{task_id}/graph",
+    response_model=GraphData,
+    tags=["Graph"],
+    summary="Retrieve the investigation knowledge graph",
+)
+async def get_investigation_graph(
+    task_id: str,
+    _: dict[str, str] = Depends(_require_investigation_owner),
+) -> GraphData:
+    """Return all graph nodes and edges recorded for a given investigation.
+
+    Returns 404 if the task does not exist and 403 if the caller is not the
+    task owner.  Both checks are handled by the ``_require_investigation_owner``
+    dependency.
+    """
+    db = _get_db()
+
+    node_rows = await db.fetch(
+        """
+        SELECT id, label, type, description, metadata, x, y, source
+        FROM graph_nodes
+        WHERE task_id = $1
+        ORDER BY created_at ASC
+        """,
+        task_id,
+    )
+
+    edge_rows = await db.fetch(
+        """
+        SELECT id, source_node, target_node, label, metadata, source
+        FROM graph_edges
+        WHERE task_id = $1
+        ORDER BY created_at ASC
+        """,
+        task_id,
+    )
+
+    return GraphData(
+        nodes=[_row_to_graph_node(r) for r in node_rows],
+        edges=[_row_to_graph_edge(r) for r in edge_rows],
+    )
+
+
+@app.post(
+    "/api/investigations/{task_id}/graph",
+    response_model=GraphData,
+    tags=["Graph"],
+    summary="Upsert graph nodes and edges for an investigation",
+)
+async def upsert_investigation_graph(
+    task_id: str,
+    body: GraphData,
+    _: dict[str, str] = Depends(_require_investigation_owner),
+) -> GraphData:
+    """Upsert a batch of nodes and edges into the investigation graph.
+
+    Both nodes and edges use ``ON CONFLICT (id) DO UPDATE`` semantics so
+    callers can safely re-send the same payload without creating duplicates.
+    The D3-style ``source`` / ``target`` fields on edges are mapped to the
+    ``source_node`` / ``target_node`` DB columns transparently.
+
+    Returns the full graph state after the upsert (all nodes + edges for
+    the task, not just the ones in the request body).
+    """
+    db = _get_db()
+
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            # ── Upsert nodes ───────────────────────────────────────────────
+            for node in body.nodes:
+                await conn.execute(
+                    """
+                    INSERT INTO graph_nodes (
+                        id, task_id, label, type, description,
+                        metadata, x, y, source
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT (id) DO UPDATE
+                        SET label       = EXCLUDED.label,
+                            type        = EXCLUDED.type,
+                            description = EXCLUDED.description,
+                            metadata    = EXCLUDED.metadata,
+                            x           = EXCLUDED.x,
+                            y           = EXCLUDED.y,
+                            source      = EXCLUDED.source
+                    """,
+                    node.id,
+                    task_id,
+                    node.label,
+                    node.type,
+                    node.description,
+                    json.dumps(node.metadata),
+                    node.x,
+                    node.y,
+                    node.source,
+                )
+
+            # ── Upsert edges ───────────────────────────────────────────────
+            # D3 ``source`` / ``target`` fields map to DB ``source_node`` /
+            # ``target_node``; ``source_origin`` maps to the DB ``source``
+            # provenance column.
+            for edge in body.edges:
+                await conn.execute(
+                    """
+                    INSERT INTO graph_edges (
+                        id, task_id, source_node, target_node,
+                        label, metadata, source
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (id) DO UPDATE
+                        SET source_node = EXCLUDED.source_node,
+                            target_node = EXCLUDED.target_node,
+                            label       = EXCLUDED.label,
+                            metadata    = EXCLUDED.metadata,
+                            source      = EXCLUDED.source
+                    """,
+                    edge.id,
+                    task_id,
+                    edge.source,      # D3 source → source_node
+                    edge.target,      # D3 target → target_node
+                    edge.label,
+                    json.dumps(edge.metadata),
+                    edge.source_origin,  # provenance → source column
+                )
+
+    # Return the full current graph state for the task
+    node_rows = await db.fetch(
+        """
+        SELECT id, label, type, description, metadata, x, y, source
+        FROM graph_nodes
+        WHERE task_id = $1
+        ORDER BY created_at ASC
+        """,
+        task_id,
+    )
+    edge_rows = await db.fetch(
+        """
+        SELECT id, source_node, target_node, label, metadata, source
+        FROM graph_edges
+        WHERE task_id = $1
+        ORDER BY created_at ASC
+        """,
+        task_id,
+    )
+    return GraphData(
+        nodes=[_row_to_graph_node(r) for r in node_rows],
+        edges=[_row_to_graph_edge(r) for r in edge_rows],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Routes — SSE log stream
 # ---------------------------------------------------------------------------
 
@@ -1300,7 +1706,7 @@ async def get_cost_breakdown(
 async def create_stream_token(
     task_id: str,
     current_user: dict[str, str] = Depends(_require_investigation_owner),
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Issue a short-lived HMAC-signed token for the SSE log endpoint.
 
     The token is bound to the specific task and user, expires in 2 minutes,
@@ -1721,14 +2127,20 @@ _UPLOAD_MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
 _UPLOAD_MAX_FILES_PER_INVESTIGATION: int = 5
 # SEC-E3-R1-02: Per-target lock to serialize file-count-and-write, preventing
 # parallel requests from bypassing the file cap via TOCTOU race.
-_upload_locks: dict[str, asyncio.Lock] = {}
+_upload_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
 
 def _get_upload_lock(target_id: str) -> asyncio.Lock:
-    """Return a per-target asyncio.Lock for serializing upload file-count checks."""
-    if target_id not in _upload_locks:
-        _upload_locks[target_id] = asyncio.Lock()
-    return _upload_locks[target_id]
+    """Return a per-target asyncio.Lock for serializing upload file-count checks.
+
+    Uses a weak-value cache so one-off upload targets do not accumulate in a
+    process-long dictionary after their requests finish.
+    """
+    lock = _upload_locks.get(target_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _upload_locks[target_id] = lock
+    return lock
 _UPLOAD_ALLOWED_EXTENSIONS: frozenset[str] = frozenset({
     ".pdf", ".txt", ".md", ".csv", ".json", ".html",
     ".png", ".jpg", ".jpeg", ".xlsx", ".docx",
@@ -1813,7 +2225,8 @@ async def upload_investigation_files(
             detail=f"Maximum {_UPLOAD_MAX_FILES_PER_INVESTIGATION} files per upload",
         )
 
-    upload_dir = Path(cfg.DATA_ROOT) / "uploads" / task_id
+    # BUG-R13-02: Store in files/{task_id} so listing/download endpoints find them
+    upload_dir = Path(cfg.DATA_ROOT) / "files" / task_id
     upload_dir.mkdir(parents=True, exist_ok=True)
 
     # SEC-E3-R1-02: Serialize count-check-and-write to prevent TOCTOU race
@@ -2452,11 +2865,11 @@ async def _handle_checkout_completed(
         update_payload["subscription_current_period_end"] = period_end
     update_payload["subscription_status"] = "active"
 
-    if update_payload and cfg.SUPABASE_URL and cfg.SUPABASE_SERVICE_KEY:
+    if update_payload and cfg.SUPABASE_URL and _supabase_api_key(cfg):
         await _supabase_patch_profile(user_id, update_payload, cfg)
 
     # Increment credits — use supabase RPC or a direct PATCH with increment
-    if credits_to_add > 0 and cfg.SUPABASE_URL and cfg.SUPABASE_SERVICE_KEY:
+    if credits_to_add > 0 and cfg.SUPABASE_URL and _supabase_api_key(cfg):
         await _supabase_add_credits(user_id, credits_to_add, cfg)
 
     logger.info(
@@ -2478,7 +2891,7 @@ async def _handle_subscription_updated(
     if not stripe_customer_id:
         return
 
-    if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
+    if not cfg.SUPABASE_URL or not _supabase_api_key(cfg):
         logger.warning("supabase_not_configured_skip_subscription_update")
         return
 
@@ -2510,7 +2923,7 @@ async def _handle_subscription_deleted(
     if not stripe_customer_id:
         return
 
-    if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
+    if not cfg.SUPABASE_URL or not _supabase_api_key(cfg):
         logger.warning("supabase_not_configured_skip_subscription_delete")
         return
 
@@ -2527,21 +2940,38 @@ async def _handle_subscription_deleted(
 # ---------------------------------------------------------------------------
 
 
+def _supabase_api_key(cfg: AppConfig) -> str | None:
+    """Return the best available Supabase API key.
+
+    Prefers ``SUPABASE_SERVICE_KEY`` (full admin access), but falls back to
+    ``SUPABASE_ANON_KEY`` which works for RPC calls on ``SECURITY DEFINER``
+    functions that have been explicitly granted to the ``anon`` role.
+    """
+    return cfg.SUPABASE_SERVICE_KEY or cfg.SUPABASE_ANON_KEY or None
+
+
 async def _supabase_patch_profile(
     user_id: str,
     payload: dict[str, Any],
     cfg: AppConfig,
 ) -> None:
-    """PATCH a single Supabase profile row identified by user_id."""
-    url = f"{cfg.SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}"
+    """Update a single Supabase profile row identified by user_id via RPC."""
+    api_key = _supabase_api_key(cfg)
+    if not api_key:
+        logger.warning("supabase_no_api_key_skip_patch_profile")
+        return
+    rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/update_profile_by_id"
     headers = {
-        "apikey": cfg.SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "Prefer": "return=minimal",
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.patch(url, json=payload, headers=headers)
+        resp = await client.post(
+            rpc_url,
+            json={"target_user_id": user_id, "payload": payload},
+            headers=headers,
+        )
         if resp.status_code not in (200, 204):
             logger.error(
                 "supabase_patch_profile_failed",
@@ -2556,22 +2986,23 @@ async def _supabase_patch_profile_by_customer(
     payload: dict[str, Any],
     cfg: AppConfig,
 ) -> None:
-    """PATCH Supabase profile rows matching a stripe_customer_id."""
-    # BUG-S2-05 fix: URL-encode the customer ID to prevent query injection
-    # via crafted Stripe webhook payloads containing special characters.
-    from urllib.parse import quote as _url_quote  # noqa: PLC0415
-    url = (
-        f"{cfg.SUPABASE_URL}/rest/v1/profiles"
-        f"?stripe_customer_id=eq.{_url_quote(stripe_customer_id, safe='')}"
-    )
+    """Update Supabase profile rows matching a stripe_customer_id via RPC."""
+    api_key = _supabase_api_key(cfg)
+    if not api_key:
+        logger.warning("supabase_no_api_key_skip_patch_by_customer")
+        return
+    rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/update_profile_by_stripe_customer"
     headers = {
-        "apikey": cfg.SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "Prefer": "return=minimal",
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.patch(url, json=payload, headers=headers)
+        resp = await client.post(
+            rpc_url,
+            json={"target_customer_id": stripe_customer_id, "payload": payload},
+            headers=headers,
+        )
         if resp.status_code not in (200, 204):
             logger.error(
                 "supabase_patch_by_customer_failed",
@@ -2592,10 +3023,14 @@ async def _supabase_add_credits(
     Uses a Postgres RPC function (add_credits) if available; falls back
     to a read-modify-PATCH approach if the function is not present.
     """
+    api_key = _supabase_api_key(cfg)
+    if not api_key:
+        logger.error("supabase_no_api_key_for_add_credits")
+        raise HTTPException(status_code=503, detail="Credit service unavailable (no API key)")
     rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/add_credits"
     headers = {
-        "apikey": cfg.SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -2604,7 +3039,7 @@ async def _supabase_add_credits(
             json={"p_user_id": user_id, "p_credits": credits},
             headers=headers,
         )
-        if resp.status_code == 200:
+        if resp.status_code in (200, 204):
             logger.info("credits_added_via_rpc", user_id=user_id, credits=credits)
             return
 
@@ -2636,29 +3071,35 @@ async def _supabase_get_user_tokens(
     cfg: AppConfig,
 ) -> int | None:
     """Fetch the current token balance for a user from Supabase profiles."""
-    if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
+    api_key = _supabase_api_key(cfg)
+    if not cfg.SUPABASE_URL or not api_key:
         return None
-    url = (
-        f"{cfg.SUPABASE_URL}/rest/v1/profiles"
-        f"?id=eq.{user_id}&select=tokens"
-    )
+    # Use RPC function (SECURITY DEFINER) — works with both service key and anon key
+    rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/get_user_tokens"
     headers = {
-        "apikey": cfg.SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(url, headers=headers)
+        resp = await client.post(
+            rpc_url,
+            json={"target_user_id": user_id},
+            headers=headers,
+        )
         if resp.status_code != 200:
             logger.error(
                 "supabase_get_tokens_failed",
                 user_id=user_id,
                 status=resp.status_code,
+                body=resp.text[:200],
             )
             return None
-        rows = resp.json()
-        if not rows:
+        result = resp.json()
+        # RPC returns the integer directly
+        if result is None:
             return None
-        return int(rows[0].get("tokens", 0) or 0)
+        return int(result)
 
 
 async def _supabase_deduct_credits(
@@ -2674,14 +3115,15 @@ async def _supabase_deduct_credits(
     not attempt a read-modify-write fallback, because that sequence is not
     atomic and allows concurrent investigation submissions to overspend credits.
     """
-    if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
+    api_key = _supabase_api_key(cfg)
+    if not cfg.SUPABASE_URL or not api_key:
         logger.warning("supabase_not_configured_skip_deduct")
         return False
 
     rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/deduct_credits"
     headers = {
-        "apikey": cfg.SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -2727,18 +3169,22 @@ async def _get_stripe_customer_id(
     cfg: AppConfig,
 ) -> str | None:
     """Fetch the stripe_customer_id for a user from the Supabase profiles table."""
-    if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
+    api_key = _supabase_api_key(cfg)
+    if not cfg.SUPABASE_URL or not api_key:
         return None
-    url = (
-        f"{cfg.SUPABASE_URL}/rest/v1/profiles"
-        f"?id=eq.{user_id}&select=stripe_customer_id"
-    )
+    # Use RPC function (SECURITY DEFINER) — works with both service key and anon key
+    rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/get_stripe_customer_id"
     headers = {
-        "apikey": cfg.SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {cfg.SUPABASE_SERVICE_KEY}",
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(url, headers=headers)
+        resp = await client.post(
+            rpc_url,
+            json={"target_user_id": user_id},
+            headers=headers,
+        )
         if resp.status_code != 200:
             logger.error(
                 "supabase_get_customer_id_failed",
@@ -2746,10 +3192,8 @@ async def _get_stripe_customer_id(
                 status=resp.status_code,
             )
             return None
-        rows = resp.json()
-        if not rows:
-            return None
-        return rows[0].get("stripe_customer_id")
+        result = resp.json()
+        return result if isinstance(result, str) else None
 
 
 # ---------------------------------------------------------------------------
@@ -2978,8 +3422,9 @@ async def admin_stats(
             "SELECT COALESCE(SUM(total_spent_usd), 0.0) FROM research_tasks"
         ) or 0.0
     )
-    # Approximate credits consumed: $1 = 100 credits, round to integer
-    total_credits_consumed = int(total_spent * 100)
+    # Credits consumed: apply 20% platform markup before converting to credits.
+    # Formula: credits = raw_cost_usd * 1.20 / _CREDIT_USD_RATE = raw * 1.20 / 0.01 = raw * 120
+    total_credits_consumed = int(total_spent * 120)
     active_users_30d: int = await db.fetchval(
         """
         SELECT COUNT(DISTINCT metadata->>'user_id')
@@ -3047,13 +3492,18 @@ async def graceful_shutdown(
 
 
 def _exit_process() -> None:
-    """Force-exit the process. Called from the event loop after shutdown.
+    """Trigger process termination after the shutdown response is flushed.
 
-    Uses os._exit to avoid SystemExit propagation through asyncio tasks
-    (BUG-044). sys is imported at module level (BUG-060).
+    Prefer SIGTERM so the ASGI server can run its normal graceful-shutdown
+    path (lifespan teardown, connection cleanup, task cancellation). Fall back
+    to ``os._exit`` only if signalling the current process fails.
     """
-    logger.info("api_process_exit")
-    os._exit(0)  # noqa: SLF001
+    logger.info("api_process_exit_signal")
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("api_process_exit_signal_failed", error=str(exc))
+        os._exit(0)  # noqa: SLF001
 
 
 # ---------------------------------------------------------------------------

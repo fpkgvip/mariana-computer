@@ -792,6 +792,45 @@ async def spawn_model(
     usage = _extract_usage(response_json)
     final_model_id = model_cfg.model_id
 
+    # ── Step 3a: finish_reason truncation detection (BUG-020 fix) ───────────
+    # If the LLM stopped because of max_tokens (finish_reason="length"),
+    # retry with doubled max_tokens.  This prevents the cascade of
+    # OutputParseError from truncated JSON.
+    _finish_reason = "stop"
+    try:
+        _finish_reason = response_json.get("choices", [{}])[0].get("finish_reason", "stop") or "stop"
+    except (IndexError, AttributeError):
+        pass
+
+    if _finish_reason == "length" and effective_max_tokens < 32768:
+        doubled = min(effective_max_tokens * 2, 32768)
+        logger.warning(
+            "LLM output truncated (finish_reason=length): task=%s model=%s "
+            "max_tokens=%d → retrying with %d",
+            task_type.value,
+            model_cfg.model_id.value,
+            effective_max_tokens,
+            doubled,
+        )
+        retry_response = await _call_gateway_with_retry(
+            messages=messages,
+            model_config=ModelConfig(
+                model_id=model_cfg.model_id,
+                max_tokens=doubled,
+                temperature=model_cfg.temperature,
+                use_batch=model_cfg.use_batch,
+            ),
+            max_tokens=doubled,
+            config=config,
+        )
+        raw_content = _extract_response_content(retry_response)
+        retry_usage = _extract_usage(retry_response)
+        # Accumulate token usage from both calls.
+        usage["prompt_tokens"] += retry_usage["prompt_tokens"]
+        usage["completion_tokens"] += retry_usage["completion_tokens"]
+        usage["cache_creation_tokens"] += retry_usage["cache_creation_tokens"]
+        usage["cache_read_tokens"] += retry_usage["cache_read_tokens"]
+
     # ── Step 3b: refusal detection & multi-agent reframe ──────────────────────
     if _is_refusal(raw_content):
         logger.warning(

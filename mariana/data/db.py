@@ -48,6 +48,8 @@ _ALLOWED_TASK_COLUMNS: frozenset[str] = frozenset({
     "topic", "budget_usd", "status", "current_state", "total_spent_usd",
     "diminishing_flags", "ai_call_counter", "started_at", "completed_at",
     "error_message", "output_pdf_path", "output_docx_path", "metadata",
+    # BUG-D1-11 fix: include dedicated schema columns so update_research_task can set them
+    "quality_tier", "user_flow_instructions", "continuous_mode", "dont_kill_branches",
 })
 
 _ALLOWED_BRANCH_COLUMNS: frozenset[str] = frozenset({
@@ -114,7 +116,11 @@ CREATE TABLE IF NOT EXISTS research_tasks (
     error_message       TEXT,
     output_pdf_path     TEXT,
     output_docx_path    TEXT,
-    metadata            JSONB       NOT NULL DEFAULT '{}'
+    metadata            JSONB       NOT NULL DEFAULT '{}',
+    quality_tier        TEXT        DEFAULT 'balanced',
+    user_flow_instructions TEXT     DEFAULT '',
+    continuous_mode     BOOLEAN     DEFAULT FALSE,
+    dont_kill_branches  BOOLEAN     DEFAULT FALSE
 );
 
 CREATE TABLE IF NOT EXISTS hypotheses (
@@ -303,6 +309,41 @@ CREATE TABLE IF NOT EXISTS stripe_webhook_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_stripe_webhook_events_processed_at ON stripe_webhook_events(processed_at);
+
+CREATE TABLE IF NOT EXISTS graph_nodes (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES research_tasks(id) ON DELETE CASCADE,
+    label TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'entity',
+    description TEXT DEFAULT '',
+    metadata JSONB DEFAULT '{}',
+    x DOUBLE PRECISION,
+    y DOUBLE PRECISION,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    source TEXT DEFAULT 'ai'
+);
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_task ON graph_nodes(task_id);
+
+CREATE TABLE IF NOT EXISTS graph_edges (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES research_tasks(id) ON DELETE CASCADE,
+    source_node TEXT NOT NULL,
+    target_node TEXT NOT NULL,
+    label TEXT DEFAULT '',
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT now(),
+    source TEXT DEFAULT 'ai'
+);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_task ON graph_edges(task_id);
+
+CREATE TABLE IF NOT EXISTS orchestrator_handoffs (
+    id          TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    task_id     TEXT        NOT NULL REFERENCES research_tasks(id) ON DELETE CASCADE,
+    phase       TEXT        NOT NULL,
+    context     JSONB       NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_handoffs_task ON orchestrator_handoffs(task_id);
 """
 
 
@@ -371,19 +412,28 @@ def _row_to_dict(row: asyncpg.Record) -> dict[str, Any]:
 async def insert_research_task(pool: asyncpg.Pool, task: ResearchTask) -> None:
     """Insert a new ResearchTask record."""
     async with pool.acquire() as conn:
+        # BUG-D1-03 fix: include quality_tier, user_flow_instructions, continuous_mode,
+        # dont_kill_branches so their dedicated DB columns are populated at INSERT time.
+        # These are read from task.metadata (set by the API before calling insert).
+        _meta = task.metadata or {}
         await conn.execute(
             """
             INSERT INTO research_tasks (
                 id, topic, budget_usd, status, current_state,
                 total_spent_usd, diminishing_flags, ai_call_counter,
                 created_at, started_at, completed_at, error_message,
-                output_pdf_path, output_docx_path, metadata
+                output_pdf_path, output_docx_path, metadata,
+                quality_tier, user_flow_instructions,
+                continuous_mode, dont_kill_branches
             ) VALUES (
                 $1, $2, $3, $4, $5,
                 $6, $7, $8,
                 $9, $10, $11, $12,
-                $13, $14, $15
+                $13, $14, $15,
+                $16, $17,
+                $18, $19
             )
+            ON CONFLICT (id) DO NOTHING
             """,
             task.id,
             task.topic,
@@ -400,6 +450,10 @@ async def insert_research_task(pool: asyncpg.Pool, task: ResearchTask) -> None:
             task.output_pdf_path,
             task.output_docx_path,
             json.dumps(task.metadata),
+            _meta.get("quality_tier", "balanced"),
+            _meta.get("user_flow_instructions", ""),
+            bool(_meta.get("continuous_mode", False)),
+            bool(_meta.get("dont_kill_branches", False)),
         )
     logger.debug("Inserted ResearchTask id=%s", task.id)
 

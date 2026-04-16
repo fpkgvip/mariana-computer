@@ -46,27 +46,31 @@ class ModelConfig:
 # ─── Routing table ───────────────────────────────────────────────────────────
 
 ROUTING_TABLE: dict[TaskType, ModelConfig] = {
+    # BUG-014 fix: Increase max_tokens for tasks that produce large JSON.
+    # Claude and Gemini write verbose hypotheses (6+ with translations) and
+    # evidence extraction outputs that routinely exceed 4096 output tokens,
+    # causing truncated JSON and parse failures.
     TaskType.RESEARCH_ARCHITECTURE: ModelConfig(
         model_id=ModelID.OPUS_46,
-        max_tokens=4096,
+        max_tokens=8192,
         temperature=0.5,
         use_batch=False,
     ),
     TaskType.HYPOTHESIS_GENERATION: ModelConfig(
         model_id=ModelID.OPUS_46,
-        max_tokens=4096,
+        max_tokens=8192,
         temperature=0.7,
         use_batch=False,
     ),
     TaskType.EVIDENCE_EXTRACTION: ModelConfig(
         model_id=ModelID.DEEPSEEK_CHAT,
-        max_tokens=2048,
+        max_tokens=8192,  # BUG-020: evidence outputs exceed 4096 for complex topics
         temperature=0.1,
         use_batch=False,
     ),
     TaskType.EVALUATION: ModelConfig(
         model_id=ModelID.OPUS_46,
-        max_tokens=2048,
+        max_tokens=8192,  # BUG-020: evaluation verdicts with translations exceed 4096
         temperature=0.3,
         use_batch=False,
     ),
@@ -78,61 +82,61 @@ ROUTING_TABLE: dict[TaskType, ModelConfig] = {
     ),
     TaskType.SUMMARIZATION: ModelConfig(
         model_id=ModelID.SONNET_46,
-        max_tokens=2048,
+        max_tokens=4096,
         temperature=0.2,
         use_batch=False,
     ),
     TaskType.COMPRESSION: ModelConfig(
         model_id=ModelID.SONNET_46,
-        max_tokens=2048,
+        max_tokens=4096,
         temperature=0.1,
         use_batch=True,
     ),
     TaskType.TRIBUNAL_PLAINTIFF: ModelConfig(
         model_id=ModelID.OPUS_46,
-        max_tokens=4096,
+        max_tokens=8192,  # BUG-020: tribunal outputs with translations exceed 4096
         temperature=0.4,
         use_batch=True,
     ),
     TaskType.TRIBUNAL_DEFENDANT: ModelConfig(
         model_id=ModelID.OPUS_46,
-        max_tokens=4096,
+        max_tokens=8192,  # BUG-020
         temperature=0.4,
         use_batch=True,
     ),
     TaskType.TRIBUNAL_REBUTTAL: ModelConfig(
         model_id=ModelID.OPUS_46,
-        max_tokens=3000,
+        max_tokens=8192,  # BUG-020
         temperature=0.4,
         use_batch=True,
     ),
     TaskType.TRIBUNAL_COUNTER: ModelConfig(
         model_id=ModelID.OPUS_46,
-        max_tokens=3000,
+        max_tokens=8192,  # BUG-020
         temperature=0.4,
         use_batch=True,
     ),
     TaskType.TRIBUNAL_JUDGE: ModelConfig(
         model_id=ModelID.OPUS_46,
-        max_tokens=3000,
+        max_tokens=8192,  # BUG-020
         temperature=0.2,
         use_batch=True,
     ),
     TaskType.SKEPTIC_QUESTIONS: ModelConfig(
         model_id=ModelID.OPUS_46,
-        max_tokens=3000,
+        max_tokens=16384,  # BUG-020: skeptic produces massive bilingual Q&A JSON
         temperature=0.5,
         use_batch=False,
     ),
     TaskType.REPORT_DRAFT: ModelConfig(
         model_id=ModelID.SONNET_46,
-        max_tokens=8192,
+        max_tokens=16384,  # BUG-020: reports are the largest outputs
         temperature=0.4,
         use_batch=True,
     ),
     TaskType.REPORT_FINAL_EDIT: ModelConfig(
         model_id=ModelID.OPUS_46,
-        max_tokens=8192,
+        max_tokens=16384,  # BUG-020: final edited reports need full space
         temperature=0.3,
         use_batch=False,
     ),
