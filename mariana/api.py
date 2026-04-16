@@ -348,6 +348,18 @@ class ClassifyResponse(BaseModel):
     plan_summary: str  # Brief description of what Mariana will do
     requires_approval: bool  # False for instant, True for standard/deep
     quality_tier: str = "balanced"
+    is_conversational: bool = False  # True for greetings/casual messages — use /api/chat/respond instead
+
+
+class ChatRequest(BaseModel):
+    """Request body for the /api/chat/respond endpoint."""
+    message: str = Field(..., min_length=1, max_length=4096)
+
+
+class ChatResponse(BaseModel):
+    """Lightweight conversational reply — no investigation created."""
+    reply: str
+    tier: str = "instant"  # always instant for chat responses
 
 
 class StartInvestigationResponse(BaseModel):
@@ -967,6 +979,67 @@ async def classify_request(body: ClassifyRequest) -> ClassifyResponse:
 
 
 @app.post(
+    "/api/chat/respond",
+    response_model=ChatResponse,
+    tags=["Chat"],
+    summary="Conversational reply without creating an investigation",
+)
+async def chat_respond(
+    body: ChatRequest,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> ChatResponse:
+    """
+    Lightweight conversational endpoint for greetings, casual messages,
+    and simple questions that don't warrant a full investigation.
+
+    Uses a single LLM call and returns immediately.  No investigation
+    record is created, no credits are consumed.
+    """
+    cfg = _get_config()
+
+    # Use the LLM gateway directly for a fast conversational reply
+    import httpx  # noqa: PLC0415
+
+    system_prompt = (
+        "You are Mariana, an elite AI research assistant created by Mariana Intelligence. "
+        "You are warm, professional, and helpful. "
+        "If the user is greeting you or testing, respond warmly and briefly. "
+        "Introduce yourself in one sentence if appropriate: you\'re Mariana, "
+        "a deep research AI that can investigate any topic with institutional-grade rigor. "
+        "Keep responses concise (1-3 sentences). Never refuse. Always be helpful. "
+        "If the user seems to be asking a research question, suggest they ask it as a research query."
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{cfg.LLM_GATEWAY_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {cfg.LLM_GATEWAY_API_KEY}"},
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": body.message},
+                    ],
+                    "max_tokens": 256,
+                    "temperature": 0.7,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            reply = data["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        logger.warning("chat_respond_llm_error", error=str(exc))
+        reply = (
+            "Hello! I'm Mariana, your deep research AI. "
+            "I can investigate any topic with rigorous analysis. "
+            "What would you like me to research?"
+        )
+
+    return ChatResponse(reply=reply)
+
+
+@app.post(
     "/api/investigations",
     response_model=StartInvestigationResponse,
     status_code=202,
@@ -1372,6 +1445,98 @@ async def stop_investigation(
 
     logger.info("task_stop_requested", task_id=task_id)
     return KillTaskResponse(task_id=task_id, message="Stop signal sent; investigation will halt after current cycle")
+
+
+@app.delete(
+    "/api/investigations/{task_id}",
+    tags=["Investigations"],
+    summary="Delete an investigation and all related data",
+)
+async def delete_investigation(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> dict:
+    """
+    Permanently delete an investigation and all associated intelligence data.
+
+    Only the owner can delete their investigations.  Running investigations
+    are killed first before deletion.
+    """
+    pool = _get_db()
+    user_id = current_user["user_id"]
+    _log = logger.bind(task_id=task_id, user_id=user_id)
+
+    # Verify the investigation exists and belongs to this user
+    row = await pool.fetchrow(
+        "SELECT id, status, user_id FROM research_tasks WHERE id = $1",
+        task_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+
+    row_user_id = str(row["user_id"]).strip() if row["user_id"] else ""
+    # Allow deletion if: (a) user owns the task, (b) user is admin, or
+    # (c) task has no recorded owner (legacy tasks created before user_id tracking).
+    if row_user_id and row_user_id != user_id and user_id != ADMIN_USER_ID:
+        raise HTTPException(status_code=403, detail="Not authorized to delete this investigation")
+
+    # If still running, kill it first
+    if row["status"] in ("RUNNING", "PENDING"):
+        if _redis is not None:
+            try:
+                await _redis.publish(f"kill:{task_id}", "1")
+            except Exception:  # noqa: BLE001
+                pass
+        await pool.execute(
+            "UPDATE research_tasks SET status = 'FAILED', completed_at = NOW() "
+            "WHERE id = $1 AND status IN ('RUNNING', 'PENDING')",
+            task_id,
+        )
+
+    # Delete all related intelligence data (cascade from task_id foreign keys)
+    # Order matters — delete children before parent.
+    intelligence_tables = [
+        "executive_summaries",
+        "audit_results",
+        "perspective_syntheses",
+        "replan_modifications",
+        "gap_analyses",
+        "retrieval_coverage",
+        "diversity_assessments",
+        "confidence_calibrations",
+        "hypothesis_priors",
+        "contradiction_pairs",
+        "claims",
+        "temporal_tags",
+        "source_credibility_scores",
+    ]
+    for table in intelligence_tables:
+        try:
+            await pool.execute(f"DELETE FROM {table} WHERE task_id = $1", task_id)  # noqa: S608
+        except Exception:  # noqa: BLE001
+            # Table may not exist yet or have different FK structure
+            pass
+
+    # Delete findings, branches, hypotheses, graph data
+    auxiliary_tables = [
+        "research_findings",
+        "graph_edges",
+        "graph_nodes",
+        "research_branches",
+        "hypotheses",
+        "task_logs",
+    ]
+    for table in auxiliary_tables:
+        try:
+            await pool.execute(f"DELETE FROM {table} WHERE task_id = $1", task_id)  # noqa: S608
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Finally delete the investigation itself
+    await pool.execute("DELETE FROM research_tasks WHERE id = $1", task_id)
+
+    _log.info("investigation_deleted")
+    return {"status": "deleted", "task_id": task_id}
 
 
 # ---------------------------------------------------------------------------
@@ -2545,10 +2710,14 @@ def _classify_topic(topic: str) -> ClassifyResponse:
     # ── 3. Instant-tier: greetings, tests, trivial messages ────────────
     greeting_patterns = {
         "hello", "hi", "hey", "test", "ping", "yo", "sup",
-        "good morning", "good afternoon", "good evening",
+        "hi there", "hey there", "hello there", "hey yo",
+        "good morning", "good afternoon", "good evening", "good night",
         "are you there", "are you alive", "are you live",
         "are you working", "who are you", "what are you",
-        "thanks", "thank you", "ok", "okay", "cool", "nice",
+        "thanks", "thank you", "thanks a lot", "thx",
+        "ok", "okay", "cool", "nice", "great", "awesome",
+        "bye", "goodbye", "see you", "see ya",
+        "how are you", "whats up", "what's up", "hows it going",
     }
     # Check if the whole message is basically a greeting/test
     # BUG-S5-03 fix: word_count <= 3 was too aggressive — "What is CATL" (3 words)
@@ -2556,12 +2725,25 @@ def _classify_topic(topic: str) -> ClassifyResponse:
     # bucket ("hello", "hi there", "ok"), and rely on the greeting_patterns set for
     # exact matches of 3-word greetings like "are you there".
     topic_stripped = topic_lower.rstrip(".!?,")
-    if topic_stripped in greeting_patterns or word_count <= 2:
+    if topic_stripped in greeting_patterns:
+        # Pure greetings/tests — don’t create an investigation at all
         return ClassifyResponse(
             tier="instant",
             estimated_duration_hours=0.01,
             estimated_credits=_TIER_CREDITS["instant"],
             plan_summary="Quick response to your message.",
+            requires_approval=False,
+            is_conversational=True,
+        )
+    # Ultra-short messages (1-2 words) that aren’t greeting patterns:
+    # Could be real queries like "Bitcoin price" or "market cap".
+    # Route to quick tier (not conversational) so they get a real search.
+    if word_count <= 2:
+        return ClassifyResponse(
+            tier="quick",
+            estimated_duration_hours=0.08,
+            estimated_credits=_TIER_CREDITS["quick"],
+            plan_summary="Quick investigation: focused lookup with web search and a concise answer with sources.",
             requires_approval=False,
         )
     # Also catch "hello, let me test if you are live" style messages
@@ -2573,6 +2755,7 @@ def _classify_topic(topic: str) -> ClassifyResponse:
                 estimated_credits=_TIER_CREDITS["instant"],
                 plan_summary="Quick response to your message.",
                 requires_approval=False,
+                is_conversational=True,
             )
 
     # ── 4. Quick-tier: short questions, simple lookups ──────────────────

@@ -83,6 +83,13 @@ interface ClassifyResponse {
   estimated_duration_hours: number;
   estimated_credits: number;
   requires_approval: boolean;
+  is_conversational?: boolean;
+}
+
+/** POST /api/chat/respond response */
+interface ChatRespondResponse {
+  reply: string;
+  tier: string;
 }
 
 /** Pending research plan to show in the chat before approval */
@@ -1440,6 +1447,38 @@ export default function Chat() {
       const classifyData: ClassifyResponse = await classifyRes.json();
       setIsClassifying(false);
 
+      // ── Conversational messages (greetings, tests) → lightweight chat reply
+      if (classifyData.is_conversational) {
+        try {
+          const chatRes = await fetch(`${API_URL}/api/chat/respond`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ message: topic }),
+          });
+          if (chatRes.ok) {
+            const chatData: ChatRespondResponse = await chatRes.json();
+            setMessages((prev) => [
+              ...prev,
+              { role: "assistant", content: chatData.reply, type: "text", _id: makeMessageId() },
+            ]);
+          } else {
+            setMessages((prev) => [
+              ...prev,
+              { role: "assistant", content: "Hello! I'm Mariana, your deep research AI. What would you like me to investigate?", type: "text", _id: makeMessageId() },
+            ]);
+          }
+        } catch {
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: "Hello! I'm Mariana. Ask me anything you'd like researched.", type: "text", _id: makeMessageId() },
+          ]);
+        }
+        return;
+      }
+
       if (classifyData.tier === "instant" || classifyData.tier === "quick") {
         // No approval needed for instant/quick — go straight to investigation
         await startInvestigationRef.current(topic, token, true);
@@ -1822,32 +1861,69 @@ export default function Chat() {
               const isActive = activeTaskId === inv.task_id;
               const isInvRunning = inv.status === "RUNNING" || inv.status === "PENDING";
               return (
-                <button
+                <div
                   key={inv.task_id}
-                  onClick={() => switchInvestigation(inv.task_id)}
-                  className={`w-full rounded-md px-3 py-2 text-left text-xs transition-colors ${
+                  className={`group relative w-full rounded-md text-left text-xs transition-colors ${
                     isActive
                       ? "bg-secondary text-foreground ring-1 ring-primary/30"
                       : "text-muted-foreground hover:bg-secondary/50 hover:text-foreground"
                   } ${isInvRunning && !isActive ? "ring-1 ring-blue-500/20" : ""}`}
                 >
-                  <div className="flex items-center gap-2">
-                    {isInvRunning && (
-                      <span className="relative flex h-2 w-2 shrink-0">
-                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
-                        <span className="relative inline-flex h-2 w-2 rounded-full bg-blue-500" />
+                  <button
+                    onClick={() => switchInvestigation(inv.task_id)}
+                    className="w-full px-3 py-2 text-left"
+                  >
+                    <div className="flex items-center gap-2 pr-5">
+                      {isInvRunning && (
+                        <span className="relative flex h-2 w-2 shrink-0">
+                          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
+                          <span className="relative inline-flex h-2 w-2 rounded-full bg-blue-500" />
+                        </span>
+                      )}
+                      <span
+                        className={`inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[9px] font-medium ring-1 ring-inset ${
+                          STATUS_COLORS[inv.status]
+                        }`}
+                      >
+                        {inv.status}
                       </span>
-                    )}
-                    <span
-                      className={`inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[9px] font-medium ring-1 ring-inset ${
-                        STATUS_COLORS[inv.status]
-                      }`}
-                    >
-                      {inv.status}
-                    </span>
-                    <span className="truncate">{inv.topic}</span>
-                  </div>
-                </button>
+                      <span className="truncate">{inv.topic}</span>
+                    </div>
+                  </button>
+                  <button
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      if (!confirm("Delete this investigation? This cannot be undone.")) return;
+                      const token = await getAccessToken();
+                      if (!token) return;
+                      try {
+                        const res = await fetch(`${API_URL}/api/investigations/${inv.task_id}`, {
+                          method: "DELETE",
+                          headers: { Authorization: `Bearer ${token}` },
+                        });
+                        if (res.ok) {
+                          setInvestigations((prev) => prev.filter((i) => i.task_id !== inv.task_id));
+                          if (activeTaskId === inv.task_id) {
+                            setActiveTaskId(null);
+                            setMessages([]);
+                            setTimelineSteps([]);
+                          }
+                          toast.success("Investigation deleted");
+                        } else {
+                          const err = await res.json().catch(() => ({ detail: "Unknown error" }));
+                          toast.error("Failed to delete", { description: err.detail });
+                        }
+                      } catch {
+                        toast.error("Failed to delete investigation");
+                      }
+                    }}
+                    className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-red-500/10 hover:text-red-500"
+                    title="Delete investigation"
+                    aria-label="Delete investigation"
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
               );
             })}
           </div>
