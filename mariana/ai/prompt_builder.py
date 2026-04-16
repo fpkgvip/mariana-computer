@@ -410,12 +410,40 @@ def _build_dynamic_context(task_type: TaskType, context: dict[str, Any]) -> str:
         TaskType.REPORT_DRAFT: _ctx_report_draft,
         TaskType.REPORT_FINAL_EDIT: _ctx_report_final_edit,
         TaskType.WATCHDOG: _ctx_watchdog,
+        # Intelligence Engine
+        TaskType.CLAIM_EXTRACTION: _ctx_claim_extraction,
+        TaskType.SOURCE_CREDIBILITY: _ctx_source_credibility,
+        TaskType.CONTRADICTION_DETECTION: _ctx_contradiction_detection,
+        TaskType.REPLAN: _ctx_replan,
+        TaskType.BAYESIAN_UPDATE: _ctx_bayesian_update,
+        TaskType.GAP_DETECTION: _ctx_gap_detection,
+        TaskType.PERSPECTIVE_SYNTHESIS: _ctx_perspective_synthesis,
+        TaskType.META_SYNTHESIS: _ctx_meta_synthesis,
+        TaskType.RETRIEVAL_STRATEGY: _ctx_retrieval_strategy,
+        TaskType.REASONING_AUDIT: _ctx_reasoning_audit,
+        TaskType.EXECUTIVE_SUMMARY: _ctx_executive_summary,
     }
     builder = builders.get(task_type)
     if builder is None:
         logger.error("No dynamic context builder for task_type=%s", task_type.value)
         return f"TASK: {task_type.value}\nCONTEXT:\n{json.dumps(context, ensure_ascii=False, indent=2)}"
-    return builder(context)
+
+    base_text = builder(context)
+
+    # ── Universal suffixes: user flow instructions + learning context ──
+    # Appended to every prompt so the AI respects user directives and learns
+    # from past investigations.
+    _ufi = context.get("user_flow_instructions", "")
+    _lc = context.get("learning_context", "")
+    suffix_parts: list[str] = []
+    if _ufi:
+        suffix_parts.append(
+            f"\n\n=== USER INSTRUCTIONS (MUST OBEY) ===\n{_ufi}\n=== END USER INSTRUCTIONS ==="
+        )
+    if _lc:
+        suffix_parts.append(f"\n\n{_lc}")
+
+    return base_text + "".join(suffix_parts)
 
 
 # ── Individual context builders ───────────────────────────────────────────────
@@ -709,6 +737,241 @@ def _ctx_watchdog(ctx: dict[str, Any]) -> str:
         "hypotheses, stalled progress, or budget waste. Return a verdict "
         "and a recommended action (CONTINUE / SEARCH_DIFFERENT_SOURCES / "
         "PIVOT / HALT) with rationale."
+    )
+
+
+# ─── Intelligence Engine context builders ─────────────────────────────────────
+
+
+def _ctx_claim_extraction(ctx: dict[str, Any]) -> str:
+    return (
+        "TASK: CLAIM_EXTRACTION\n\n"
+        "You are a precise information extraction system. Your job is to decompose "
+        "a research finding into discrete, atomic claims — each expressible as a "
+        "(Subject, Predicate, Object) triple.\n\n"
+        f"Hypothesis context:\n{ctx.get('hypothesis_statement', '[missing]')}\n\n"
+        f"Finding text to decompose:\n{ctx.get('finding_content', '[missing]')}\n\n"
+        "Extract ALL factual claims from this text. Each claim must be:\n"
+        "1. Atomic — one fact per claim, not compound statements\n"
+        "2. Structured — Subject (entity), Predicate (relationship/attribute), Object (value)\n"
+        "3. Confidence-scored — how certain is this claim based on the source text?\n"
+        "4. Temporally tagged — if the claim mentions a time period, extract temporal_start/temporal_end as ISO timestamps\n"
+        "5. Human-readable — claim_text should be a clear natural-language statement\n\n"
+        "Be thorough. Extract every distinct factual assertion, including numeric data points, "
+        "dates, relationships, and status information."
+    )
+
+
+def _ctx_source_credibility(ctx: dict[str, Any]) -> str:
+    return (
+        "TASK: SOURCE_CREDIBILITY\n\n"
+        "Classify this source's authority and relevance.\n\n"
+        f"Source URL: {ctx.get('source_url', '[missing]')}\n"
+        f"Source title: {ctx.get('source_title', '[unknown]')}\n"
+        f"Domain: {ctx.get('domain', '[unknown]')}\n\n"
+        f"Research topic: {ctx.get('research_topic', '[missing]')}\n\n"
+        "Determine:\n"
+        "1. domain_authority: government, central_bank, international_org, academic, "
+        "peer_reviewed, wire_service, financial_press, major_news, industry_report, "
+        "sec_filing, company_official, analyst_report, trade_publication, general_news, "
+        "magazine, blog, social_media, forum, unknown\n"
+        "2. publication_type: peer_reviewed, editorial, press_release, blog_post, "
+        "official_report, data_release, opinion, research_note, news_article, unknown\n"
+        "3. relevance_to_topic: [0, 1] — how relevant is this source to the research topic?\n"
+        "4. rationale: brief explanation\n"
+    )
+
+
+def _ctx_contradiction_detection(ctx: dict[str, Any]) -> str:
+    return (
+        "TASK: CONTRADICTION_DETECTION\n\n"
+        "You are a Natural Language Inference (NLI) system specialized in detecting "
+        "contradictions between factual claims. Review the following claims and identify "
+        "all pairs that contradict each other.\n\n"
+        f"Number of claims to check: {ctx.get('claims_count', 0)}\n\n"
+        f"Claims (indexed):\n{ctx.get('claims', '[missing]')}\n\n"
+        "For each contradiction pair, specify:\n"
+        "- claim_a_index and claim_b_index (the 0-based indices from above)\n"
+        "- contradiction_type: direct (A says X, B says not-X), temporal (same entity, "
+        "different values at overlapping times), quantitative (incompatible numbers), "
+        "qualitative (incompatible descriptions)\n"
+        "- severity: 0-1 (how critical is this contradiction?)\n"
+        "- explanation: why these claims contradict\n"
+        "- suggested_resolution: how this might be resolved\n\n"
+        "Only flag GENUINE contradictions. Claims about different time periods or "
+        "different aspects of the same subject are NOT contradictions."
+    )
+
+
+def _ctx_replan(ctx: dict[str, Any]) -> str:
+    return (
+        "TASK: REPLAN\n\n"
+        "You are a research planner evaluating the effectiveness of the current "
+        "investigation strategy and proposing modifications.\n\n"
+        f"Research topic: {ctx.get('research_topic', '[missing]')}\n"
+        f"Current plan version: {ctx.get('current_plan_version', 0)}\n"
+        f"Evaluation cycle: {ctx.get('evaluation_cycle', 0)}\n\n"
+        f"Branch status:\n{ctx.get('branch_summary', '[missing]')}\n\n"
+        f"Evidence gaps:\n{ctx.get('gaps_summary', '[none]')}\n\n"
+        f"Evidence coverage: {ctx.get('evidence_info', '[none]')}\n\n"
+        "Assess whether the research plan needs modification. Propose specific actions:\n"
+        "- spawn_branch: Create a new research branch for an unexplored angle\n"
+        "- kill_branch: Terminate a branch that's not producing results\n"
+        "- modify_query: Reformulate a branch's search strategy\n"
+        "- redirect_focus: Shift attention to more promising areas\n"
+        "- add_source_type: Seek a different type of source\n"
+    )
+
+
+def _ctx_bayesian_update(ctx: dict[str, Any]) -> str:
+    return (
+        "TASK: BAYESIAN_UPDATE\n\n"
+        "You are a Bayesian reasoning system. Given new evidence (a claim), estimate "
+        "the likelihood ratios for each hypothesis.\n\n"
+        f"New evidence (claim):\n{ctx.get('claim_text', '[missing]')}\n\n"
+        f"Active hypotheses ({ctx.get('hypotheses_count', 0)}):\n{ctx.get('hypotheses', '[missing]')}\n\n"
+        "For each hypothesis, estimate:\n"
+        "1. likelihood_given_h: P(evidence | hypothesis is TRUE) — how expected is this "
+        "evidence if the hypothesis is correct? [0.01-0.99]\n"
+        "2. likelihood_given_not_h: P(evidence | hypothesis is FALSE) — how expected is "
+        "this evidence if the hypothesis is wrong? [0.01-0.99]\n"
+        "3. reasoning: brief explanation of your likelihood estimates\n\n"
+        "Think carefully. Evidence that strongly confirms a hypothesis should have high "
+        "P(E|H) and low P(E|~H). Evidence that is equally expected regardless of the "
+        "hypothesis should have similar values for both."
+    )
+
+
+def _ctx_gap_detection(ctx: dict[str, Any]) -> str:
+    return (
+        "TASK: GAP_DETECTION\n\n"
+        "You are a research quality analyst. Review the evidence collected so far and "
+        "identify what's MISSING — gaps in the evidence that should be filled.\n\n"
+        f"Research topic: {ctx.get('research_topic', '[missing]')}\n"
+        f"Claims collected: {ctx.get('claims_count', 0)}\n\n"
+        f"Evidence summary (top claims by confidence):\n{ctx.get('claims_summary', '[none]')}\n\n"
+        f"Hypothesis status:\n{ctx.get('hypotheses_summary', '[none]')}\n\n"
+        f"Unresolved contradictions:\n{ctx.get('contradictions_summary', '[none]')}\n\n"
+        f"Source diversity: {ctx.get('diversity_info', '[none]')}\n\n"
+        "Identify gaps. For each gap, specify:\n"
+        "1. description: what evidence is missing\n"
+        "2. priority: critical, high, medium, low\n"
+        "3. category: data_missing, perspective_missing, temporal_gap, "
+        "source_type_missing, contradiction_unresolved, methodology_unclear\n"
+        "4. follow_up_query: specific search query to fill this gap\n"
+        "5. expected_source_types: where this data is likely found\n\n"
+        "Also rate the overall completeness_score [0, 1] of the evidence."
+    )
+
+
+def _ctx_perspective_synthesis(ctx: dict[str, Any]) -> str:
+    instruction = ctx.get("perspective_instruction", "Analyze from your assigned perspective.")
+    return (
+        f"TASK: PERSPECTIVE_SYNTHESIS\n\n"
+        f"{instruction}\n\n"
+        f"Research topic: {ctx.get('research_topic', '[missing]')}\n\n"
+        f"Evidence base:\n{ctx.get('evidence', '[none]')}\n\n"
+        f"Hypothesis rankings:\n{ctx.get('hypotheses', '[none]')}\n\n"
+        f"Unresolved contradictions:\n{ctx.get('contradictions', '[none]')}\n\n"
+        "Produce a thorough analysis from your assigned perspective. Include:\n"
+        "1. thesis_statement: one-sentence thesis from your perspective\n"
+        "2. key_arguments: ranked list of supporting arguments\n"
+        "3. supporting_evidence: specific evidence backing each argument\n"
+        "4. confidence: how confident you are in your thesis [0, 1]\n"
+        "5. synthesis_text: full paragraph-length synthesis\n"
+    )
+
+
+def _ctx_meta_synthesis(ctx: dict[str, Any]) -> str:
+    return (
+        "TASK: META_SYNTHESIS\n\n"
+        "You are a senior analyst merging multiple perspective analyses into a balanced, "
+        "nuanced view. You must identify consensus, disagreements, and produce a "
+        "recommended overall view.\n\n"
+        f"Research topic: {ctx.get('research_topic', '[missing]')}\n\n"
+        f"Perspective analyses ({ctx.get('perspective_count', 0)}):\n"
+        f"{ctx.get('perspectives', '[missing]')}\n\n"
+        "Produce:\n"
+        "1. balanced_synthesis: comprehensive text merging all perspectives\n"
+        "2. consensus_points: where all perspectives agree\n"
+        "3. disagreement_points: where perspectives meaningfully differ\n"
+        "4. recommended_view: your recommended overall position with nuance\n"
+        "5. confidence: overall confidence in the balanced synthesis [0, 1]\n"
+    )
+
+
+def _ctx_retrieval_strategy(ctx: dict[str, Any]) -> str:
+    diversity = ctx.get("diversity_constraints", "")
+    diversity_block = f"\n\nDiversity constraints:\n{diversity}" if diversity else ""
+    return (
+        "TASK: RETRIEVAL_STRATEGY\n\n"
+        "Select the optimal retrieval strategy for this query.\n\n"
+        f"Query: {ctx.get('query', '[missing]')}\n"
+        f"Research topic: {ctx.get('research_topic', '[missing]')}\n\n"
+        f"Available strategies:\n{ctx.get('available_strategies', '[missing]')}"
+        f"{diversity_block}\n\n"
+        "Rank the strategies by suitability. For each, specify a modified_query "
+        "optimized for that specific retrieval method."
+    )
+
+
+def _ctx_reasoning_audit(ctx: dict[str, Any]) -> str:
+    return (
+        "TASK: REASONING_AUDIT\n\n"
+        "You are a senior analyst conducting a quality audit of a research investigation. "
+        "Review the full reasoning chain and identify ANY issues.\n\n"
+        f"Research topic: {ctx.get('research_topic', '[missing]')}\n"
+        f"Audit type: {ctx.get('audit_type', 'full')}\n\n"
+        f"Claims ({ctx.get('claims_count', 0)}):\n{ctx.get('claims', '[none]')}\n\n"
+        f"Hypotheses:\n{ctx.get('hypotheses', '[none]')}\n\n"
+        f"Contradictions:\n{ctx.get('contradictions', '[none]')}\n\n"
+        f"Perspectives:\n{ctx.get('perspectives', '[none]')}\n\n"
+        f"Source info: {ctx.get('source_info', '[none]')}\n\n"
+        "Check for:\n"
+        "1. Logical fallacies (hasty generalization, false cause, etc.)\n"
+        "2. Unsupported jumps (conclusions not supported by evidence)\n"
+        "3. Circular reasoning\n"
+        "4. Cherry-picking (selective use of evidence)\n"
+        "5. Overconfidence (high confidence with thin evidence)\n"
+        "6. Missing context\n"
+        "7. Source quality issues\n\n"
+        "For each issue, specify type, severity (critical/major/minor), "
+        "description, location, and suggestion for fixing it.\n"
+        "Rate overall quality [0, 1] and determine if it passes the quality gate."
+    )
+
+
+def _ctx_executive_summary(ctx: dict[str, Any]) -> str:
+    level = ctx.get("compression_level", "paragraph")
+    level_instruction = {
+        "one_liner": (
+            "Generate a single sentence that captures THE most important insight "
+            "from this research. This is not a summary — it's the one thing someone "
+            "MUST know. Be specific and impactful."
+        ),
+        "paragraph": (
+            "Generate a paragraph-length summary (3-5 sentences) covering the top "
+            "insights. Lead with the most important finding. Include key data points. "
+            "Mention significant uncertainties or contradictions. Extract 3-5 key_points "
+            "as bullet-point items."
+        ),
+        "page": (
+            "Generate a comprehensive page-length summary with structured sections. "
+            "Include an overview, key findings, supporting data, risks/uncertainties, "
+            "and conclusions. Cite specific sources where possible. This should be "
+            "suitable as a standalone briefing document."
+        ),
+    }.get(level, "Generate a summary of this research.")
+
+    return (
+        f"TASK: EXECUTIVE_SUMMARY (level: {level})\n\n"
+        f"{level_instruction}\n\n"
+        f"Research topic: {ctx.get('research_topic', '[missing]')}\n\n"
+        f"Evidence base:\n{ctx.get('evidence', '[none]')}\n\n"
+        f"Hypothesis rankings:\n{ctx.get('hypotheses', '[none]')}\n"
+        + (f"\nPerspective syntheses:\n{ctx.get('perspectives', '')}\n" if ctx.get('perspectives') else "")
+        + (f"\nSource info: {ctx.get('source_info', '')}\n" if ctx.get('source_info') else "")
+        + (f"\nUnresolved contradictions: {ctx.get('unresolved_contradictions', 0)}" if ctx.get('unresolved_contradictions') else "")
     )
 
 

@@ -166,6 +166,12 @@ class ResearchSessionData:
     all_source_ids: set[str]
     ai_call_counter: int
     recent_action_summaries: list[str]
+    dont_kill_branches: bool = False
+    # User-driven flow directives
+    force_report_on_halt: bool = False
+    skip_skeptic: bool = False
+    skip_tribunal: bool = False
+    user_directives: dict = field(default_factory=dict)
 
 
 # ===========================================================================
@@ -443,6 +449,16 @@ def _apply_guards(
             return State.SEARCH, actions
 
         if trigger == TransitionTrigger.BRANCH_SCORE_LOW:
+            if session_data.dont_kill_branches:
+                # User requested no branch kills: give the branch a minimal budget grant instead
+                logger.info(
+                    "dont_kill_branches_active",
+                    state=current_state.value,
+                    action="GRANT_BUDGET",
+                    reason="low_score_but_kill_suppressed",
+                )
+                actions.append(Action("GRANT_BUDGET", {"score_band": "minimal", "reason": "dont_kill_branches"}))
+                return State.SEARCH, actions
             # Kill the lowest-scoring branch first
             actions.append(Action("KILL_BRANCH", {"reason": "low_score"}))
             # BUG-015: Account for the branch about to be killed when checking exhaustion
@@ -493,6 +509,16 @@ def _apply_guards(
             return State.SEARCH, actions
 
         if trigger == TransitionTrigger.BRANCH_SCORE_LOW:
+            if session_data.dont_kill_branches:
+                # User requested no branch kills: give the branch a minimal budget grant instead
+                logger.info(
+                    "dont_kill_branches_active",
+                    state=current_state.value,
+                    action="GRANT_BUDGET",
+                    reason="low_score_in_deepen_but_kill_suppressed",
+                )
+                actions.append(Action("GRANT_BUDGET", {"score_band": "minimal", "reason": "dont_kill_branches"}))
+                return State.SEARCH, actions
             actions.append(Action("KILL_BRANCH", {"reason": "low_score_in_deepen"}))
             # BUG-015: Account for the branch about to be killed when checking exhaustion
             remaining_active = len(active) - 1
@@ -517,9 +543,28 @@ def _apply_guards(
             return State.SEARCH, actions
 
         if trigger == TransitionTrigger.STRONG_FINDINGS_EXIST:
+            # User directive: skip tribunal → go directly to SKEPTIC or REPORT
+            if session_data.skip_tribunal:
+                logger.info(
+                    "user_directive_skip_tribunal",
+                    state=current_state.value,
+                )
+                if session_data.skip_skeptic:
+                    actions.append(Action("GENERATE_REPORT", {}))
+                    return State.REPORT, actions
+                actions.append(Action("SPAWN_AI", {"task_type": "SKEPTIC_QUESTIONS"}))
+                return State.SKEPTIC, actions
             return State.TRIBUNAL, actions
 
         if trigger == TransitionTrigger.CONSECUTIVE_DR_FLAGS_3:
+            # User directive: force report on halt
+            if session_data.force_report_on_halt:
+                logger.info(
+                    "user_directive_force_report_on_dr_halt",
+                    state=current_state.value,
+                )
+                actions.append(Action("GENERATE_REPORT", {"reason": "forced_by_user"}))
+                return State.REPORT, actions
             actions.append(Action("HALT", {"reason": "3_consecutive_dr_flags"}))
             return State.HALT, actions
 
@@ -567,10 +612,26 @@ def _apply_guards(
     # ------------------------------------------------------------------
     if current_state == State.TRIBUNAL:
         if trigger == TransitionTrigger.TRIBUNAL_CONFIRMED:
+            # User directive: skip skeptic → go directly to REPORT
+            if session_data.skip_skeptic:
+                logger.info(
+                    "user_directive_skip_skeptic",
+                    state=current_state.value,
+                )
+                actions.append(Action("GENERATE_REPORT", {}))
+                return State.REPORT, actions
             actions.append(Action("SPAWN_AI", {"task_type": "SKEPTIC_QUESTIONS"}))
             return State.SKEPTIC, actions
 
         if trigger == TransitionTrigger.TRIBUNAL_WEAKENED:
+            # User directive: force report even on weakened verdict
+            if session_data.force_report_on_halt:
+                logger.info(
+                    "user_directive_force_report_on_weakened",
+                    state=current_state.value,
+                )
+                actions.append(Action("GENERATE_REPORT", {"reason": "forced_by_user", "partial": True}))
+                return State.REPORT, actions
             if _budget_is_available(cost_tracker, _MIN_BUDGET_TO_CONTINUE):
                 return State.SEARCH, actions
             else:
@@ -578,6 +639,14 @@ def _apply_guards(
                 return State.HALT, actions
 
         if trigger == TransitionTrigger.TRIBUNAL_DESTROYED:
+            # User directive: force report even on destroyed verdict
+            if session_data.force_report_on_halt:
+                logger.info(
+                    "user_directive_force_report_on_destroyed",
+                    state=current_state.value,
+                )
+                actions.append(Action("GENERATE_REPORT", {"reason": "forced_by_user", "partial": True}))
+                return State.REPORT, actions
             if _budget_is_available(cost_tracker, _MIN_BUDGET_TO_CONTINUE):
                 return State.PIVOT, actions
             else:
@@ -601,6 +670,14 @@ def _apply_guards(
                 return State.REPORT, actions
 
         if trigger == TransitionTrigger.SKEPTIC_CRITICAL_OPEN:
+            # User directive: force report even with critical open questions
+            if session_data.force_report_on_halt:
+                logger.info(
+                    "user_directive_force_report_on_critical_open",
+                    state=current_state.value,
+                )
+                actions.append(Action("GENERATE_REPORT", {"reason": "forced_by_user", "partial": True}))
+                return State.REPORT, actions
             actions.append(Action("HALT", {"reason": "critical_open_questions"}))
             return State.HALT, actions
 

@@ -146,6 +146,73 @@ ROUTING_TABLE: dict[TaskType, ModelConfig] = {
         temperature=0.1,
         use_batch=False,
     ),
+    # ── Intelligence Engine task types ────────────────────────────────────────
+    TaskType.CLAIM_EXTRACTION: ModelConfig(
+        model_id=ModelID.HAIKU_45,
+        max_tokens=4096,
+        temperature=0.1,
+        use_batch=False,
+    ),
+    TaskType.SOURCE_CREDIBILITY: ModelConfig(
+        model_id=ModelID.HAIKU_45,
+        max_tokens=1024,
+        temperature=0.1,
+        use_batch=False,
+    ),
+    TaskType.CONTRADICTION_DETECTION: ModelConfig(
+        model_id=ModelID.SONNET_46,
+        max_tokens=8192,
+        temperature=0.2,
+        use_batch=False,
+    ),
+    TaskType.REPLAN: ModelConfig(
+        model_id=ModelID.SONNET_46,
+        max_tokens=4096,
+        temperature=0.3,
+        use_batch=False,
+    ),
+    TaskType.BAYESIAN_UPDATE: ModelConfig(
+        model_id=ModelID.SONNET_46,
+        max_tokens=4096,
+        temperature=0.2,
+        use_batch=False,
+    ),
+    TaskType.GAP_DETECTION: ModelConfig(
+        model_id=ModelID.SONNET_46,
+        max_tokens=4096,
+        temperature=0.3,
+        use_batch=False,
+    ),
+    TaskType.PERSPECTIVE_SYNTHESIS: ModelConfig(
+        model_id=ModelID.OPUS_46,
+        max_tokens=8192,
+        temperature=0.5,
+        use_batch=False,
+    ),
+    TaskType.META_SYNTHESIS: ModelConfig(
+        model_id=ModelID.OPUS_46,
+        max_tokens=8192,
+        temperature=0.3,
+        use_batch=False,
+    ),
+    TaskType.RETRIEVAL_STRATEGY: ModelConfig(
+        model_id=ModelID.HAIKU_45,
+        max_tokens=2048,
+        temperature=0.1,
+        use_batch=False,
+    ),
+    TaskType.REASONING_AUDIT: ModelConfig(
+        model_id=ModelID.OPUS_46,
+        max_tokens=8192,
+        temperature=0.2,
+        use_batch=False,
+    ),
+    TaskType.EXECUTIVE_SUMMARY: ModelConfig(
+        model_id=ModelID.SONNET_46,
+        max_tokens=8192,
+        temperature=0.3,
+        use_batch=False,
+    ),
 }
 
 # ─── Quality-tier routing ────────────────────────────────────────────────────
@@ -201,6 +268,18 @@ _TASK_CATEGORY: dict[TaskType, str] = {
     TaskType.REPORT_DRAFT: "writing",
     TaskType.REPORT_FINAL_EDIT: "writing",
     TaskType.WATCHDOG: "cheap",
+    # Intelligence Engine
+    TaskType.CLAIM_EXTRACTION: "cheap",
+    TaskType.SOURCE_CREDIBILITY: "cheap",
+    TaskType.CONTRADICTION_DETECTION: "analysis",
+    TaskType.REPLAN: "analysis",
+    TaskType.BAYESIAN_UPDATE: "analysis",
+    TaskType.GAP_DETECTION: "analysis",
+    TaskType.PERSPECTIVE_SYNTHESIS: "orchestrator",
+    TaskType.META_SYNTHESIS: "orchestrator",
+    TaskType.RETRIEVAL_STRATEGY: "cheap",
+    TaskType.REASONING_AUDIT: "orchestrator",
+    TaskType.EXECUTIVE_SUMMARY: "writing",
 }
 
 # Used when DeepSeek is unhealthy and the originally routed model is DeepSeek.

@@ -344,6 +344,193 @@ CREATE TABLE IF NOT EXISTS orchestrator_handoffs (
     created_at  TIMESTAMPTZ DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_handoffs_task ON orchestrator_handoffs(task_id);
+
+-- =========================================================================
+-- Learning Loop tables
+-- =========================================================================
+
+CREATE TABLE IF NOT EXISTS learning_events (
+    id          TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    user_id     TEXT        NOT NULL,
+    task_id     TEXT        REFERENCES research_tasks(id) ON DELETE SET NULL,
+    event_type  TEXT        NOT NULL,
+    category    TEXT,
+    content     JSONB       NOT NULL DEFAULT '{}',
+    created_at  TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_learning_events_user    ON learning_events(user_id);
+CREATE INDEX IF NOT EXISTS idx_learning_events_task    ON learning_events(task_id);
+CREATE INDEX IF NOT EXISTS idx_learning_events_type    ON learning_events(event_type);
+
+CREATE TABLE IF NOT EXISTS investigation_outcomes (
+    id                      TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    task_id                 TEXT        UNIQUE REFERENCES research_tasks(id) ON DELETE CASCADE,
+    user_id                 TEXT        NOT NULL,
+    topic                   TEXT        NOT NULL,
+    quality_tier            TEXT,
+    total_cost_usd          FLOAT       DEFAULT 0.0,
+    total_ai_calls          INT         DEFAULT 0,
+    duration_seconds        INT         DEFAULT 0,
+    final_state             TEXT,
+    report_generated        BOOLEAN     DEFAULT FALSE,
+    user_rating             INT,
+    user_feedback           TEXT,
+    hypotheses_count        INT         DEFAULT 0,
+    findings_count          INT         DEFAULT 0,
+    killed_branches_count   INT         DEFAULT 0,
+    tribunal_verdicts       JSONB       DEFAULT '[]',
+    skeptic_pass            BOOLEAN,
+    patterns                JSONB       DEFAULT '{}',
+    created_at              TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_investigation_outcomes_user ON investigation_outcomes(user_id);
+CREATE INDEX IF NOT EXISTS idx_investigation_outcomes_task ON investigation_outcomes(task_id);
+
+CREATE TABLE IF NOT EXISTS learning_insights (
+    id              TEXT        PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    user_id         TEXT        NOT NULL,
+    insight_type    TEXT        NOT NULL,
+    insight_key     TEXT        NOT NULL,
+    insight_value   JSONB       NOT NULL DEFAULT '{}',
+    confidence      FLOAT       DEFAULT 0.5,
+    sample_count    INT         DEFAULT 1,
+    last_updated    TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(user_id, insight_type, insight_key)
+);
+CREATE INDEX IF NOT EXISTS idx_learning_insights_user ON learning_insights(user_id);
+CREATE INDEX IF NOT EXISTS idx_learning_insights_type ON learning_insights(user_id, insight_type);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Intelligence Engine tables (v2)
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS claims (
+    id                  TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    task_id             TEXT NOT NULL REFERENCES research_tasks(id) ON DELETE CASCADE,
+    finding_id          TEXT REFERENCES findings(id) ON DELETE SET NULL,
+    hypothesis_id       TEXT REFERENCES hypotheses(id) ON DELETE SET NULL,
+    subject             TEXT NOT NULL,
+    predicate           TEXT NOT NULL,
+    object              TEXT NOT NULL,
+    claim_text          TEXT NOT NULL,
+    source_ids          JSONB NOT NULL DEFAULT '[]',
+    confidence          DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    credibility_score   DOUBLE PRECISION,
+    corroboration_count INTEGER NOT NULL DEFAULT 0,
+    contradiction_ids   JSONB NOT NULL DEFAULT '[]',
+    temporal_start      TIMESTAMPTZ,
+    temporal_end        TIMESTAMPTZ,
+    temporal_type       TEXT DEFAULT 'point',
+    is_resolved         BOOLEAN NOT NULL DEFAULT FALSE,
+    resolution_note     TEXT,
+    created_at          TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_claims_task       ON claims(task_id);
+CREATE INDEX IF NOT EXISTS idx_claims_finding    ON claims(finding_id);
+CREATE INDEX IF NOT EXISTS idx_claims_hypothesis ON claims(hypothesis_id);
+CREATE INDEX IF NOT EXISTS idx_claims_subject    ON claims(task_id, subject);
+
+CREATE TABLE IF NOT EXISTS source_scores (
+    id                  TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    task_id             TEXT NOT NULL REFERENCES research_tasks(id) ON DELETE CASCADE,
+    domain              TEXT NOT NULL,
+    credibility         DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    relevance           DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    recency             DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    composite_score     DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    domain_authority    TEXT DEFAULT 'unknown',
+    publication_type    TEXT DEFAULT 'unknown',
+    cross_ref_density   INTEGER NOT NULL DEFAULT 0,
+    scoring_rationale   TEXT,
+    created_at          TIMESTAMPTZ DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_source_scores_source ON source_scores(source_id);
+CREATE INDEX IF NOT EXISTS idx_source_scores_task   ON source_scores(task_id);
+
+CREATE TABLE IF NOT EXISTS contradiction_pairs (
+    id                      TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    task_id                 TEXT NOT NULL REFERENCES research_tasks(id) ON DELETE CASCADE,
+    claim_a_id              TEXT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
+    claim_b_id              TEXT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
+    contradiction_type      TEXT NOT NULL DEFAULT 'direct',
+    severity                DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    resolution_status       TEXT NOT NULL DEFAULT 'unresolved',
+    resolution_source_id    TEXT,
+    resolution_note         TEXT,
+    created_at              TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_contradictions_task ON contradiction_pairs(task_id);
+
+CREATE TABLE IF NOT EXISTS research_plans (
+    id                  TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    task_id             TEXT NOT NULL REFERENCES research_tasks(id) ON DELETE CASCADE,
+    version             INTEGER NOT NULL DEFAULT 1,
+    plan_data           JSONB NOT NULL DEFAULT '{}',
+    trigger_reason      TEXT,
+    spawned_branches    JSONB DEFAULT '[]',
+    is_active           BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at          TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_research_plans_task ON research_plans(task_id);
+
+CREATE TABLE IF NOT EXISTS hypothesis_priors (
+    id                  TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    task_id             TEXT NOT NULL REFERENCES research_tasks(id) ON DELETE CASCADE,
+    hypothesis_id       TEXT NOT NULL REFERENCES hypotheses(id) ON DELETE CASCADE,
+    prior               DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    posterior           DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    evidence_updates    JSONB NOT NULL DEFAULT '[]',
+    last_updated        TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(task_id, hypothesis_id)
+);
+CREATE INDEX IF NOT EXISTS idx_hypothesis_priors_task ON hypothesis_priors(task_id);
+
+CREATE TABLE IF NOT EXISTS gap_analyses (
+    id                      TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    task_id                 TEXT NOT NULL REFERENCES research_tasks(id) ON DELETE CASCADE,
+    gaps                    JSONB NOT NULL DEFAULT '[]',
+    follow_ups_launched     JSONB NOT NULL DEFAULT '[]',
+    analysis_round          INTEGER NOT NULL DEFAULT 1,
+    created_at              TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_gap_analyses_task ON gap_analyses(task_id);
+
+CREATE TABLE IF NOT EXISTS perspective_syntheses (
+    id                  TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    task_id             TEXT NOT NULL REFERENCES research_tasks(id) ON DELETE CASCADE,
+    perspective         TEXT NOT NULL,
+    synthesis_text      TEXT NOT NULL,
+    key_arguments       JSONB NOT NULL DEFAULT '[]',
+    confidence          DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    cited_claim_ids     JSONB NOT NULL DEFAULT '[]',
+    created_at          TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_perspective_syntheses_task ON perspective_syntheses(task_id);
+
+CREATE TABLE IF NOT EXISTS audit_results (
+    id                  TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    task_id             TEXT NOT NULL REFERENCES research_tasks(id) ON DELETE CASCADE,
+    audit_type          TEXT NOT NULL DEFAULT 'full',
+    issues              JSONB NOT NULL DEFAULT '[]',
+    passed              BOOLEAN NOT NULL DEFAULT FALSE,
+    overall_score       DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    auditor_notes       TEXT,
+    created_at          TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_audit_results_task ON audit_results(task_id);
+
+CREATE TABLE IF NOT EXISTS executive_summaries (
+    id                  TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    task_id             TEXT NOT NULL REFERENCES research_tasks(id) ON DELETE CASCADE,
+    one_liner           TEXT NOT NULL DEFAULT '',
+    paragraph           TEXT NOT NULL DEFAULT '',
+    page_summary        TEXT NOT NULL DEFAULT '',
+    full_summary        TEXT NOT NULL DEFAULT '',
+    compression_metadata JSONB NOT NULL DEFAULT '{}',
+    created_at          TIMESTAMPTZ DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_executive_summaries_task ON executive_summaries(task_id);
 """
 
 
@@ -387,6 +574,21 @@ _JSON_COLUMNS: frozenset[str] = frozenset({
     "questions",
     # evaluation_results
     "next_search_keywords",
+    # learning tables
+    "tribunal_verdicts",
+    "patterns",
+    "insight_value",
+    # intelligence engine tables
+    "contradiction_ids",
+    "plan_data",
+    "spawned_branches",
+    "evidence_updates",
+    "gaps",
+    "follow_ups_launched",
+    "key_arguments",
+    "cited_claim_ids",
+    "issues",
+    "compression_metadata",
 })
 
 

@@ -87,6 +87,10 @@ class CostTracker:
         self.total_spent: float = 0.0
         self.per_model: dict[str, float] = {}
         self.per_branch: dict[str, float] = {}
+
+        # When True, budget checks are bypassed (for post-investigation
+        # intelligence hooks that MUST run regardless of remaining budget).
+        self.finalization_mode: bool = False
         self.call_count: int = 0
 
     # ------------------------------------------------------------------
@@ -146,8 +150,8 @@ class CostTracker:
                     self.branch_hard_cap,
                 )
 
-        # Task-level cap check
-        if self.total_spent > self.task_budget:
+        # Task-level cap check (bypassed in finalization mode)
+        if not self.finalization_mode and self.total_spent > self.task_budget:
             logger.warning(
                 "task_budget_exhausted",
                 total_spent=self.total_spent,
@@ -223,7 +227,15 @@ class CostTracker:
 
     @property
     def is_exhausted(self) -> bool:
-        """True when the task budget has been fully consumed."""
+        """True when the task budget has been fully consumed.
+
+        Returns False when ``finalization_mode`` is active so that
+        post-investigation intelligence hooks (perspectives, audit,
+        executive summary) can always run even if the main loop
+        consumed the entire budget.
+        """
+        if self.finalization_mode:
+            return False
         return self.total_spent >= self.task_budget
 
     def branch_remaining(self, branch_id: str) -> float:

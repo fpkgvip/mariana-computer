@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from mariana.data.db import _row_to_dict
-from mariana.data.models import Branch, BranchStatus
+from mariana.data.models import Branch, BranchStatus, HypothesisStatus
 
 if TYPE_CHECKING:
     # Avoid circular imports at runtime; only used for type-checker hints.
@@ -32,30 +32,49 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Budget / scoring constants  (mirrors AppConfig defaults)
+# Budget / scoring constants — read from AppConfig when available,
+# falling back to defaults if config is not loaded yet.
 # ---------------------------------------------------------------------------
 
-SCORE_KILL_THRESHOLD: float = 0.4
-"""Branches with a score strictly below this are killed immediately (0–1 scale)."""
+_DEFAULT_SCORE_KILL_THRESHOLD: float = 0.4
+_DEFAULT_SCORE_DEEPEN_THRESHOLD: float = 0.7
+_DEFAULT_SCORE_TRIBUNAL_THRESHOLD: float = 0.8
+_DEFAULT_BUDGET_INITIAL: float = 5.00
+_DEFAULT_BUDGET_GRANT_SCORE7: float = 20.00
+_DEFAULT_BUDGET_GRANT_SCORE8: float = 50.00
+_DEFAULT_BUDGET_HARD_CAP: float = 75.00
 
-SCORE_DEEPEN_THRESHOLD: float = 0.7
-"""Branches at or above this score qualify for the first budget grant (0–1 scale)."""
 
-SCORE_TRIBUNAL_THRESHOLD: float = 0.8
-"""Branches at or above this score qualify for the larger $50 grant (0–1 scale)."""
+def _cfg_val(attr: str, default: float) -> float:
+    """Read a config value from AppConfig, falling back to default."""
+    try:
+        from mariana.config import get_config  # noqa: PLC0415
+        return float(getattr(get_config(), attr, default))
+    except Exception:
+        return default
 
-BUDGET_INITIAL: float = 5.00
-"""Starting budget allocated to every new branch (USD)."""
 
-BUDGET_GRANT_SCORE7: float = 20.00
-"""Additional budget granted when a branch first reaches score ≥ 7."""
+# Module-level aliases for backward compatibility — now config-aware.
+SCORE_KILL_THRESHOLD: float = _DEFAULT_SCORE_KILL_THRESHOLD
+SCORE_DEEPEN_THRESHOLD: float = _DEFAULT_SCORE_DEEPEN_THRESHOLD
+SCORE_TRIBUNAL_THRESHOLD: float = _DEFAULT_SCORE_TRIBUNAL_THRESHOLD
+BUDGET_INITIAL: float = _DEFAULT_BUDGET_INITIAL
+BUDGET_GRANT_SCORE7: float = _DEFAULT_BUDGET_GRANT_SCORE7
+BUDGET_GRANT_SCORE8: float = _DEFAULT_BUDGET_GRANT_SCORE8
+BUDGET_HARD_CAP: float = _DEFAULT_BUDGET_HARD_CAP
 
-BUDGET_GRANT_SCORE8: float = 50.00
-"""Additional budget granted when a branch reaches score ≥ 8 after the
-first grant has already been issued."""
 
-BUDGET_HARD_CAP: float = 75.00
-"""Absolute per-branch ceiling in USD; enforced by CostTracker."""
+def _load_config_thresholds() -> None:
+    """Refresh module-level constants from AppConfig. Called at score_branch entry."""
+    global SCORE_KILL_THRESHOLD, SCORE_DEEPEN_THRESHOLD, SCORE_TRIBUNAL_THRESHOLD
+    global BUDGET_INITIAL, BUDGET_GRANT_SCORE7, BUDGET_GRANT_SCORE8, BUDGET_HARD_CAP
+    SCORE_KILL_THRESHOLD = _cfg_val("SCORE_KILL_THRESHOLD", _DEFAULT_SCORE_KILL_THRESHOLD)
+    SCORE_DEEPEN_THRESHOLD = _cfg_val("SCORE_DEEPEN_THRESHOLD", _DEFAULT_SCORE_DEEPEN_THRESHOLD)
+    SCORE_TRIBUNAL_THRESHOLD = _cfg_val("SCORE_TRIBUNAL_THRESHOLD", _DEFAULT_SCORE_TRIBUNAL_THRESHOLD)
+    BUDGET_INITIAL = _cfg_val("BUDGET_BRANCH_INITIAL", _DEFAULT_BUDGET_INITIAL)
+    BUDGET_GRANT_SCORE7 = _cfg_val("BUDGET_BRANCH_GRANT_SCORE7", _DEFAULT_BUDGET_GRANT_SCORE7)
+    BUDGET_GRANT_SCORE8 = _cfg_val("BUDGET_BRANCH_GRANT_SCORE8", _DEFAULT_BUDGET_GRANT_SCORE8)
+    BUDGET_HARD_CAP = _cfg_val("BUDGET_BRANCH_HARD_CAP", _DEFAULT_BUDGET_HARD_CAP)
 
 # BUG-010: On 0–1 scale, plateau delta of 0.1 (10% change) is appropriate
 _PLATEAU_DELTA_THRESHOLD: float = 0.1
@@ -213,7 +232,12 @@ async def score_branch(
         The recommended action and (if a grant) the grant amount.
     """
     # ------------------------------------------------------------------ #
-    # Step 0: Load branch record from DB
+    # Step 0: Refresh config-driven thresholds
+    # ------------------------------------------------------------------ #
+    _load_config_thresholds()
+
+    # ------------------------------------------------------------------ #
+    # Step 0b: Load branch record from DB
     # ------------------------------------------------------------------ #
     row = await db.fetchrow(
         """
@@ -392,19 +416,41 @@ async def kill_branch(
         asyncpg connection pool.
     """
     now = datetime.now(timezone.utc)  # BUG-001
-    await db.execute(
-        """
-        UPDATE branches
-        SET status = $1,
-            kill_reason = $2,
-            updated_at = $3
-        WHERE id = $4
-        """,
-        BranchStatus.KILLED.value,
-        reason,
-        now,
-        branch_id,
-    )
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            hypothesis_id = await conn.fetchval(
+                "SELECT hypothesis_id FROM branches WHERE id = $1",
+                branch_id,
+            )
+            await conn.execute(
+                """
+                UPDATE branches
+                SET status = $1,
+                    kill_reason = $2,
+                    updated_at = $3
+                WHERE id = $4
+                """,
+                BranchStatus.KILLED.value,
+                reason,
+                now,
+                branch_id,
+            )
+            # BUG-R5-04 fix: branch termination must retire the parent
+            # hypothesis as well.  Otherwise hypotheses remain ACTIVE forever,
+            # which breaks failed_hypotheses reporting and causes rotation
+            # handoffs to keep listing dead hypotheses as still active.
+            if hypothesis_id is not None:
+                await conn.execute(
+                    """
+                    UPDATE hypotheses
+                    SET status = $1,
+                        updated_at = $2
+                    WHERE id = $3 AND status = 'ACTIVE'
+                    """,
+                    HypothesisStatus.KILLED.value,
+                    now,
+                    hypothesis_id,
+                )
     logger.info("branch_killed", branch_id=branch_id, reason=reason)
 
 

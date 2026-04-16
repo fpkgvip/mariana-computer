@@ -45,7 +45,8 @@ import time
 import uuid
 import weakref
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import quote as _url_quote, urlsplit, urlunsplit
@@ -65,6 +66,28 @@ from mariana.config import AppConfig, load_config
 from mariana.data.db import create_pool, init_schema
 
 logger = structlog.get_logger(__name__)
+
+
+def _jsonable(obj: Any) -> Any:
+    """Recursively convert non-JSON-serializable types (datetime, UUID, etc.) to strings."""
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")
+    try:
+        json.dumps(obj)
+        return obj
+    except (TypeError, ValueError):
+        return str(obj)
+
 
 # ---------------------------------------------------------------------------
 # Application version
@@ -296,6 +319,10 @@ class StartInvestigationRequest(BaseModel):
     user_flow_instructions: str | None = Field(None, description="User's custom instructions for how AI should conduct research")
     continuous_mode: bool = Field(False, description="If true, run in continuous loop until user manually stops")
     dont_kill_branches: bool = Field(False, description="If true, never auto-kill branches regardless of score")
+    force_report_on_halt: bool = Field(False, description="If true, generate report instead of halting on critical failures")
+    skip_skeptic: bool = Field(False, description="If true, skip the skeptic quality gate")
+    skip_tribunal: bool = Field(False, description="If true, skip the adversarial tribunal review")
+    user_directives: dict | None = Field(None, description="Freeform user directives dict for custom flow control")
 
 
 class ClassifyRequest(BaseModel):
@@ -1081,6 +1108,10 @@ async def start_investigation(
             "user_flow_instructions": body.user_flow_instructions or "",
             "continuous_mode": body.continuous_mode,
             "dont_kill_branches": body.dont_kill_branches,
+            "force_report_on_halt": body.force_report_on_halt,
+            "skip_skeptic": body.skip_skeptic,
+            "skip_tribunal": body.skip_tribunal,
+            "user_directives": body.user_directives or {},
         }
 
         inbox = Path(cfg.inbox_dir)
@@ -3779,6 +3810,504 @@ def _ensure_task_exists(row: asyncpg.Record | None, task_id: str) -> None:
     """Raise HTTP 404 if the task lookup returned None."""
     if row is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+
+
+# ===========================================================================
+# Learning Loop — Feedback & Insights endpoints
+# ===========================================================================
+
+
+class FeedbackRequest(BaseModel):
+    """Request body for submitting investigation feedback."""
+    task_id: str | None = Field(None, description="UUID of the related investigation")
+    event_type: str = Field(..., description="One of: rating, feedback, correction, preference")
+    category: str | None = Field(None, description="Category: report_quality, search_depth, branch_decision, general")
+    content: dict = Field(..., description="Structured feedback payload")
+
+
+class FeedbackResponse(BaseModel):
+    event_id: str
+    status: str = "recorded"
+
+
+class InsightItem(BaseModel):
+    id: str
+    insight_type: str
+    insight_key: str
+    insight_value: dict
+    confidence: float
+    sample_count: int
+    last_updated: str | None
+
+
+class InsightsResponse(BaseModel):
+    insights: list[InsightItem]
+    count: int
+
+
+class LearningContextResponse(BaseModel):
+    context: str
+    has_insights: bool
+
+
+class OutcomeResponse(BaseModel):
+    task_id: str
+    topic: str
+    quality_tier: str | None
+    total_cost_usd: float
+    total_ai_calls: int
+    duration_seconds: int
+    final_state: str | None
+    report_generated: bool
+    user_rating: int | None
+    user_feedback: str | None
+    hypotheses_count: int
+    findings_count: int
+    killed_branches_count: int
+    skeptic_pass: bool | None
+    created_at: str | None
+
+
+@app.post(
+    "/api/feedback",
+    response_model=FeedbackResponse,
+    summary="Submit investigation feedback",
+    tags=["learning"],
+)
+async def submit_feedback(
+    body: FeedbackRequest,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> FeedbackResponse:
+    """Submit feedback for an investigation (rating, correction, preference)."""
+    db = _get_db()
+    from mariana.orchestrator.learning import record_feedback  # noqa: PLC0415
+
+    if body.event_type not in ("rating", "feedback", "correction", "preference"):
+        raise HTTPException(status_code=400, detail="event_type must be one of: rating, feedback, correction, preference")
+
+    event_id = await record_feedback(
+        user_id=current_user["user_id"],
+        task_id=body.task_id,
+        event_type=body.event_type,
+        category=body.category,
+        content=body.content,
+        db=db,
+    )
+    if not event_id:
+        raise HTTPException(status_code=500, detail="Failed to record feedback")
+
+    return FeedbackResponse(event_id=event_id)
+
+
+@app.get(
+    "/api/feedback/{task_id}",
+    summary="Get feedback for an investigation",
+    tags=["learning"],
+)
+async def get_feedback(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> JSONResponse:
+    """Fetch all feedback events for a specific investigation."""
+    db = _get_db()
+    from mariana.orchestrator.learning import get_investigation_feedback  # noqa: PLC0415
+
+    events = await get_investigation_feedback(task_id, db)
+    return JSONResponse(content={"feedback": events, "count": len(events)})
+
+
+@app.get(
+    "/api/learning/insights",
+    response_model=InsightsResponse,
+    summary="Get user learning insights",
+    tags=["learning"],
+)
+async def get_insights(
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> InsightsResponse:
+    """Fetch all learning insights extracted from the user's investigations."""
+    db = _get_db()
+    from mariana.orchestrator.learning import get_user_insights  # noqa: PLC0415
+
+    insights = await get_user_insights(current_user["user_id"], db)
+    return InsightsResponse(
+        insights=[InsightItem(**i) for i in insights],
+        count=len(insights),
+    )
+
+
+@app.get(
+    "/api/learning/context",
+    response_model=LearningContextResponse,
+    summary="Get learning context for prompts",
+    tags=["learning"],
+)
+async def get_learning_context(
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> LearningContextResponse:
+    """Get the formatted learning context string used for prompt injection."""
+    db = _get_db()
+    from mariana.orchestrator.learning import build_learning_context  # noqa: PLC0415
+
+    context = await build_learning_context(current_user["user_id"], db)
+    return LearningContextResponse(
+        context=context,
+        has_insights=bool(context),
+    )
+
+
+@app.post(
+    "/api/learning/extract",
+    summary="Trigger full pattern extraction",
+    tags=["learning"],
+)
+async def trigger_extraction(
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> JSONResponse:
+    """Trigger full pattern extraction across all user's investigations."""
+    db = _get_db()
+    from mariana.orchestrator.learning import extract_patterns  # noqa: PLC0415
+
+    count = await extract_patterns(current_user["user_id"], db)
+    return JSONResponse(content={"insights_updated": count, "status": "complete"})
+
+
+@app.get(
+    "/api/learning/outcome/{task_id}",
+    response_model=OutcomeResponse,
+    summary="Get investigation outcome",
+    tags=["learning"],
+)
+async def get_outcome(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> OutcomeResponse:
+    """Get the automated outcome record for an investigation."""
+    db = _get_db()
+    row = await db.fetchrow(
+        "SELECT * FROM investigation_outcomes WHERE task_id = $1",
+        task_id,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No outcome found for task {task_id}")
+
+    return OutcomeResponse(
+        task_id=row["task_id"],
+        topic=row["topic"],
+        quality_tier=row["quality_tier"],
+        total_cost_usd=float(row["total_cost_usd"] or 0),
+        total_ai_calls=int(row["total_ai_calls"] or 0),
+        duration_seconds=int(row["duration_seconds"] or 0),
+        final_state=row["final_state"],
+        report_generated=bool(row["report_generated"]),
+        user_rating=row["user_rating"],
+        user_feedback=row["user_feedback"],
+        hypotheses_count=int(row["hypotheses_count"] or 0),
+        findings_count=int(row["findings_count"] or 0),
+        killed_branches_count=int(row["killed_branches_count"] or 0),
+        skeptic_pass=row["skeptic_pass"],
+        created_at=row["created_at"].isoformat() if row["created_at"] else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Intelligence Engine API endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/api/intelligence/{task_id}/claims",
+    summary="Get evidence ledger (all extracted claims)",
+    tags=["intelligence"],
+)
+async def get_claims(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> JSONResponse:
+    """Fetch all atomic claims extracted from research findings."""
+    db = _get_db()
+    from mariana.orchestrator.intelligence.evidence_ledger import get_evidence_ledger  # noqa: PLC0415
+    claims = await get_evidence_ledger(task_id, db)
+    return JSONResponse(content=_jsonable({"claims": claims, "count": len(claims)}))
+
+
+@app.get(
+    "/api/intelligence/{task_id}/claims/summary",
+    summary="Get evidence ledger summary",
+    tags=["intelligence"],
+)
+async def get_claims_summary(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> JSONResponse:
+    """Fetch summary statistics for the evidence ledger."""
+    db = _get_db()
+    from mariana.orchestrator.intelligence.evidence_ledger import get_ledger_summary  # noqa: PLC0415
+    summary = await get_ledger_summary(task_id, db)
+    return JSONResponse(content=summary)
+
+
+@app.get(
+    "/api/intelligence/{task_id}/source-scores",
+    summary="Get source credibility scores",
+    tags=["intelligence"],
+)
+async def get_source_scores(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> JSONResponse:
+    """Fetch credibility scores for all sources in an investigation."""
+    db = _get_db()
+    from mariana.orchestrator.intelligence.credibility import get_source_scores, get_average_credibility  # noqa: PLC0415
+    scores = await get_source_scores(task_id, db)
+    avg = await get_average_credibility(task_id, db)
+    return JSONResponse(content=_jsonable({"scores": scores, "count": len(scores), "average_credibility": avg}))
+
+
+@app.get(
+    "/api/intelligence/{task_id}/contradictions",
+    summary="Get contradiction matrix",
+    tags=["intelligence"],
+)
+async def get_contradictions(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> JSONResponse:
+    """Fetch detected contradictions between claims."""
+    db = _get_db()
+    from mariana.orchestrator.intelligence.contradictions import get_contradiction_matrix  # noqa: PLC0415
+    matrix = await get_contradiction_matrix(task_id, db)
+    return JSONResponse(content=_jsonable(matrix))
+
+
+@app.get(
+    "/api/intelligence/{task_id}/hypotheses/rankings",
+    summary="Get Bayesian hypothesis rankings",
+    tags=["intelligence"],
+)
+async def get_hypothesis_rankings(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> JSONResponse:
+    """Fetch Bayesian posterior rankings for all hypotheses."""
+    db = _get_db()
+    from mariana.orchestrator.intelligence.hypothesis_engine import get_hypothesis_rankings, get_winning_hypothesis  # noqa: PLC0415
+    rankings = await get_hypothesis_rankings(task_id, db)
+    winner = await get_winning_hypothesis(task_id, db)
+    return JSONResponse(content=_jsonable({"rankings": rankings, "winner": winner}))
+
+
+@app.get(
+    "/api/intelligence/{task_id}/gaps",
+    summary="Get gap analysis",
+    tags=["intelligence"],
+)
+async def get_gaps(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> JSONResponse:
+    """Fetch the latest gap analysis (missing evidence, completeness score)."""
+    db = _get_db()
+    from mariana.orchestrator.intelligence.gap_detector import get_latest_gap_analysis  # noqa: PLC0415
+    gap = await get_latest_gap_analysis(task_id, db)
+    if gap is None:
+        return JSONResponse(content={"gap_analysis": None, "status": "not_yet_run"})
+    return JSONResponse(content=_jsonable({"gap_analysis": gap}))
+
+
+@app.get(
+    "/api/intelligence/{task_id}/temporal",
+    summary="Get temporal analysis",
+    tags=["intelligence"],
+)
+async def get_temporal(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> JSONResponse:
+    """Fetch temporal coverage and timeline of claims."""
+    db = _get_db()
+    from mariana.orchestrator.intelligence.temporal import get_temporal_coverage  # noqa: PLC0415
+    coverage = await get_temporal_coverage(task_id, db)
+    # Get a flat timeline of all temporally-tagged claims
+    timeline_rows = await db.fetch(
+        """
+        SELECT id, subject, predicate, object, claim_text,
+               confidence, temporal_start, temporal_end, temporal_type
+        FROM claims
+        WHERE task_id = $1 AND temporal_start IS NOT NULL
+        ORDER BY temporal_start ASC
+        LIMIT 100
+        """,
+        task_id,
+    )
+    from mariana.data.db import _row_to_dict  # noqa: PLC0415
+    timeline = []
+    for r in timeline_rows:
+        d = _row_to_dict(r)
+        for k in ("temporal_start", "temporal_end"):
+            if d.get(k):
+                d[k] = d[k].isoformat()
+        timeline.append(d)
+    return JSONResponse(content=_jsonable({"coverage": coverage, "timeline": timeline}))
+
+
+@app.get(
+    "/api/intelligence/{task_id}/perspectives",
+    summary="Get multi-perspective synthesis",
+    tags=["intelligence"],
+)
+async def get_perspectives(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> JSONResponse:
+    """Fetch multi-perspective synthesis (bull/bear/skeptic/expert views)."""
+    db = _get_db()
+    rows = await db.fetch(
+        """
+        SELECT id, task_id, perspective, synthesis_text, confidence, key_arguments,
+               cited_claim_ids, created_at
+        FROM perspective_syntheses
+        WHERE task_id = $1
+        ORDER BY created_at DESC
+        """,
+        task_id,
+    )
+    from mariana.data.db import _row_to_dict  # noqa: PLC0415
+    perspectives = [_row_to_dict(r) for r in rows]
+    # Serialize datetimes
+    for p in perspectives:
+        if p.get("created_at"):
+            p["created_at"] = p["created_at"].isoformat()
+    return JSONResponse(content=_jsonable({"perspectives": perspectives, "count": len(perspectives)}))
+
+
+@app.get(
+    "/api/intelligence/{task_id}/audit",
+    summary="Get reasoning chain audit",
+    tags=["intelligence"],
+)
+async def get_audit(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> JSONResponse:
+    """Fetch the latest reasoning chain audit results."""
+    db = _get_db()
+    from mariana.orchestrator.intelligence.auditor import get_latest_audit  # noqa: PLC0415
+    audit = await get_latest_audit(task_id, db)
+    if audit is None:
+        return JSONResponse(content={"audit": None, "status": "not_yet_run"})
+    return JSONResponse(content=_jsonable({"audit": audit}))
+
+
+@app.get(
+    "/api/intelligence/{task_id}/executive-summary",
+    summary="Get executive summaries",
+    tags=["intelligence"],
+)
+async def get_executive_summary(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> JSONResponse:
+    """Fetch executive summaries at all compression levels."""
+    db = _get_db()
+    from mariana.orchestrator.intelligence.executive_summary import get_executive_summary as _get_exec_summary  # noqa: PLC0415
+    summary = await _get_exec_summary(task_id, db)
+    if summary is None:
+        return JSONResponse(content={"summary": None, "status": "not_yet_generated"})
+    return JSONResponse(content=_jsonable({"summary": summary}))
+
+
+@app.get(
+    "/api/intelligence/{task_id}/diversity",
+    summary="Get source diversity assessment",
+    tags=["intelligence"],
+)
+async def get_diversity(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> JSONResponse:
+    """Fetch source diversity assessment for an investigation."""
+    db = _get_db()
+    from mariana.orchestrator.intelligence.diversity import assess_diversity  # noqa: PLC0415
+    result = await assess_diversity(task_id, db)
+    return JSONResponse(content=_jsonable(result))
+
+
+@app.get(
+    "/api/intelligence/{task_id}/overview",
+    summary="Get full intelligence engine overview",
+    tags=["intelligence"],
+)
+async def get_intelligence_overview(
+    task_id: str,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> JSONResponse:
+    """Comprehensive intelligence overview: claims, credibility, contradictions,
+    Bayesian rankings, gaps, audit, perspectives, and executive summary — all in one call."""
+    db = _get_db()
+
+    overview: dict = {"task_id": task_id}
+
+    # Claims summary
+    try:
+        from mariana.orchestrator.intelligence.evidence_ledger import get_ledger_summary  # noqa: PLC0415
+        overview["claims"] = await get_ledger_summary(task_id, db)
+    except Exception:
+        overview["claims"] = None
+
+    # Source credibility
+    try:
+        from mariana.orchestrator.intelligence.credibility import get_average_credibility  # noqa: PLC0415
+        overview["average_credibility"] = await get_average_credibility(task_id, db)
+    except Exception:
+        overview["average_credibility"] = None
+
+    # Contradictions count
+    try:
+        cnt = await db.fetchval(
+            "SELECT COUNT(*) FROM contradiction_pairs WHERE task_id = $1",
+            task_id,
+        )
+        overview["contradictions_count"] = cnt or 0
+    except Exception:
+        overview["contradictions_count"] = 0
+
+    # Bayesian winner
+    try:
+        from mariana.orchestrator.intelligence.hypothesis_engine import get_winning_hypothesis  # noqa: PLC0415
+        overview["bayesian_winner"] = await get_winning_hypothesis(task_id, db)
+    except Exception:
+        overview["bayesian_winner"] = None
+
+    # Gap analysis
+    try:
+        from mariana.orchestrator.intelligence.gap_detector import get_latest_gap_analysis  # noqa: PLC0415
+        gap = await get_latest_gap_analysis(task_id, db)
+        overview["completeness_score"] = gap.get("completeness_score") if gap else None
+        overview["gaps_found"] = len(gap.get("gaps", [])) if gap else 0
+    except Exception:
+        overview["completeness_score"] = None
+        overview["gaps_found"] = 0
+
+    # Audit
+    try:
+        from mariana.orchestrator.intelligence.auditor import get_latest_audit  # noqa: PLC0415
+        audit = await get_latest_audit(task_id, db)
+        overview["audit_passed"] = audit.get("passed") if audit else None
+        overview["audit_score"] = audit.get("overall_score") if audit else None
+    except Exception:
+        overview["audit_passed"] = None
+        overview["audit_score"] = None
+
+    # Executive summary one-liner
+    try:
+        from mariana.orchestrator.intelligence.executive_summary import get_executive_summary as _get_es  # noqa: PLC0415
+        es = await _get_es(task_id, db)
+        overview["one_liner"] = es.get("one_liner", "") if es else ""
+    except Exception:
+        overview["one_liner"] = ""
+
+    return JSONResponse(content=_jsonable(overview))
 
 
 # ---------------------------------------------------------------------------

@@ -129,10 +129,13 @@ def _augment_context_from_task(base: dict[str, Any], task: ResearchTask) -> dict
     meta = task.metadata or {}
     user_flow_instructions: str = meta.get("user_flow_instructions", "") or ""
     quality_tier: str = meta.get("quality_tier", "balanced") or "balanced"
+    learning_context: str = meta.get("learning_context", "") or ""
     if user_flow_instructions:
         base["user_flow_instructions"] = user_flow_instructions
     if quality_tier and quality_tier != "balanced":
         base["quality_tier"] = quality_tier
+    if learning_context:
+        base["learning_context"] = learning_context
     return base
 
 
@@ -235,9 +238,9 @@ async def run(
     def _build_context(base: dict[str, Any]) -> dict[str, Any]:
         """Augment a spawn_model context dict with user flow instructions.
 
-        Defined as a closure over ``user_flow_instructions`` and
-        ``quality_tier`` so every spawn_model call inside run() picks
-        them up automatically.
+        Defined as a closure over ``user_flow_instructions``,
+        ``quality_tier``, and task metadata so every spawn_model call
+        inside run() picks them up automatically.
 
         For handlers that are standalone module-level functions, use
         :func:`_augment_context_from_task` instead.
@@ -246,6 +249,10 @@ async def run(
             base["user_flow_instructions"] = user_flow_instructions
         if quality_tier and quality_tier != "balanced":
             base["quality_tier"] = quality_tier
+        # Inject learning context if available in task metadata
+        _lc = (task.metadata or {}).get("learning_context", "")
+        if _lc:
+            base["learning_context"] = _lc
         return base
 
     # ------------------------------------------------------------------
@@ -483,6 +490,8 @@ async def run(
             # --------------------------------------------------------- #
             # 4. Execute actions
             # --------------------------------------------------------- #
+            # Capture pre-action state before HALT action can modify it
+            _pre_action_state = task.current_state
             for action in actions:
                 await _execute_action(
                     action=action,
@@ -501,7 +510,9 @@ async def run(
             # Orchestrator rotation: capture handoff context on every state
             # change so the next fresh LLM call has full situational awareness
             # without depending on conversation history.
-            _prev_state = task.current_state
+            # Use _pre_action_state (not task.current_state) because HALT
+            # action may have prematurely set task.current_state = HALT.
+            _prev_state = _pre_action_state
             task.current_state = next_state
             if next_state != _prev_state:
                 await _write_handoff_context(
@@ -527,6 +538,101 @@ async def run(
                 "budget_usd": cost_tracker.task_budget,
                 "raw_spent_usd": round(cost_tracker.total_spent, 4),
             })
+
+            # --------------------------------------------------------- #
+            # 5b. Intelligence hooks triggered on state transitions
+            # --------------------------------------------------------- #
+            # after_evaluate fires when leaving EVALUATE (i.e. evaluation
+            # phase is complete and we're moving to CHECKPOINT/DEEPEN/etc.)
+            if _prev_state == State.EVALUATE and next_state != State.EVALUATE:
+                try:
+                    from mariana.orchestrator.intelligence.engine import after_evaluate as _intel_after_eval_hook  # noqa: PLC0415
+                    _intel_eval_result = await _intel_after_eval_hook(
+                        task_id=task.id,
+                        topic=task.topic,
+                        evaluation_cycle=iteration,
+                        db=db,
+                        cost_tracker=cost_tracker,
+                        config=config,
+                    )
+                    log.info("intelligence_after_evaluate_complete_hook", **{
+                        k: v for k, v in _intel_eval_result.items()
+                        if not isinstance(v, (dict, list))
+                    })
+                except Exception as _intel_exc:
+                    log.warning("intelligence_after_evaluate_hook_failed", error=str(_intel_exc))
+
+            # before_report fires when entering REPORT state
+            if next_state == State.REPORT and _prev_state != State.REPORT:
+                # Enable finalization mode so intelligence hooks can run
+                # even if the main loop nearly exhausted the budget.
+                cost_tracker.finalization_mode = True
+                try:
+                    from mariana.orchestrator.intelligence.engine import before_report as _intel_before_report_hook  # noqa: PLC0415
+                    _intel_report_result = await _intel_before_report_hook(
+                        task_id=task.id,
+                        topic=task.topic,
+                        db=db,
+                        cost_tracker=cost_tracker,
+                        config=config,
+                    )
+                    log.info("intelligence_before_report_complete_hook", **{
+                        k: v for k, v in _intel_report_result.items()
+                        if not isinstance(v, (dict, list)) and k != "one_liner"
+                    })
+                    # Store in task metadata for report generator
+                    _meta = task.meta if task.meta else {}
+                    _meta["intelligence_report_context"] = {
+                        "audit_passed": _intel_report_result.get("audit_passed", False),
+                        "audit_score": _intel_report_result.get("audit_score", 0.0),
+                        "perspectives_count": _intel_report_result.get("perspectives_generated", 0),
+                        "one_liner": _intel_report_result.get("one_liner", ""),
+                    }
+                    task.meta = _meta
+                except Exception as _intel_exc:
+                    log.warning("intelligence_before_report_hook_failed", error=str(_intel_exc))
+
+            # before_halt: when entering HALT, run after_evaluate + before_report
+            # to ensure intelligence data is always generated (even without REPORT phase)
+            if next_state == State.HALT and _prev_state != State.HALT:
+                # Enable finalization mode so post-investigation intelligence
+                # hooks can run even if the main loop exhausted the budget.
+                cost_tracker.finalization_mode = True
+                # Run after_evaluate if it wasn't already run
+                if _prev_state != State.EVALUATE:
+                    try:
+                        from mariana.orchestrator.intelligence.engine import after_evaluate as _intel_halt_eval  # noqa: PLC0415
+                        _halt_eval = await _intel_halt_eval(
+                            task_id=task.id,
+                            topic=task.topic,
+                            evaluation_cycle=iteration,
+                            db=db,
+                            cost_tracker=cost_tracker,
+                            config=config,
+                        )
+                        log.info("intelligence_after_evaluate_on_halt", **{
+                            k: v for k, v in _halt_eval.items()
+                            if not isinstance(v, (dict, list))
+                        })
+                    except Exception as _intel_exc:
+                        log.warning("intelligence_after_evaluate_on_halt_failed", error=str(_intel_exc))
+
+                # Always run before_report on halt to generate summaries
+                try:
+                    from mariana.orchestrator.intelligence.engine import before_report as _intel_halt_report  # noqa: PLC0415
+                    _halt_report = await _intel_halt_report(
+                        task_id=task.id,
+                        topic=task.topic,
+                        db=db,
+                        cost_tracker=cost_tracker,
+                        config=config,
+                    )
+                    log.info("intelligence_before_report_on_halt", **{
+                        k: v for k, v in _halt_report.items()
+                        if not isinstance(v, (dict, list)) and k != "one_liner"
+                    })
+                except Exception as _intel_exc:
+                    log.warning("intelligence_before_report_on_halt_failed", error=str(_intel_exc))
 
             # --------------------------------------------------------- #
             # 6. Continuous mode: restart instead of halting
@@ -610,6 +716,30 @@ async def run(
                 log.info("user_memory_updated", user_id=_mem_user_id)
             except Exception as _mem_exc:
                 log.debug("user_memory_save_skipped", error=str(_mem_exc))
+
+        # ── Learning Loop: Record investigation outcome ────────────────────
+        _learn_user_id = (task.metadata or {}).get("user_id", "")
+        if _learn_user_id and task.status in (TaskStatus.COMPLETED, TaskStatus.HALTED):
+            try:
+                from mariana.orchestrator.learning import record_investigation_outcome  # noqa: PLC0415
+                _duration = 0
+                if task.started_at and task.completed_at:
+                    _duration = int((task.completed_at - task.started_at).total_seconds())
+                await record_investigation_outcome(
+                    task_id=task.id,
+                    user_id=_learn_user_id,
+                    topic=task.topic,
+                    quality_tier=(task.metadata or {}).get("quality_tier"),
+                    total_cost_usd=cost_tracker.total_spent,
+                    total_ai_calls=cost_tracker.call_count,
+                    duration_seconds=_duration,
+                    final_state=task.current_state.value,
+                    report_generated=bool(task.output_pdf_path),
+                    db=db,
+                )
+                log.info("learning_outcome_recorded", user_id=_learn_user_id)
+            except Exception as _learn_exc:
+                log.debug("learning_outcome_save_skipped", error=str(_learn_exc))
 
     except BudgetExhaustedError as exc:
         log.warning(
@@ -1153,6 +1283,17 @@ async def handle_init(
         except Exception as exc:
             log.debug("user_memory_skipped", error=str(exc))
 
+    # ── Learning Loop: inject learning context ──────────────────────────
+    if user_id:
+        try:
+            from mariana.orchestrator.learning import build_learning_context  # noqa: PLC0415
+            _learning_ctx = await build_learning_context(user_id, db)
+            if _learning_ctx:
+                task.metadata = {**(task.metadata or {}), "learning_context": _learning_ctx}
+                log.info("learning_context_injected", user_id=user_id, length=len(_learning_ctx))
+        except Exception as exc:
+            log.debug("learning_context_skipped", error=str(exc))
+
     # ── Sub-agent delegation for complex multi-faceted queries ───────────
     if len(created_hypotheses) >= 3:
         try:
@@ -1173,6 +1314,18 @@ async def handle_init(
             log.info("sub_agents_complete", count=len(completed))
         except Exception as exc:
             log.debug("sub_agent_delegation_skipped", error=str(exc))
+
+    # ── Intelligence Engine: Initialize hypothesis priors for Bayesian updates ─
+    try:
+        from mariana.orchestrator.intelligence.hypothesis_engine import initialize_priors  # noqa: PLC0415
+        _prior_map = await initialize_priors(
+            task_id=task.id,
+            hypothesis_ids=[h.id for h in created_hypotheses],
+            db=db,
+        )
+        log.info("intelligence_priors_initialized", count=len(_prior_map))
+    except Exception as exc:
+        log.debug("intelligence_priors_init_skipped", error=str(exc))
 
 
 async def handle_search(
@@ -1362,6 +1515,72 @@ async def handle_search(
 
     log.info("search_batch_complete", branches_searched=len(active))
 
+    # ── Intelligence Engine: after_search hook ────────────────────────────
+    # Collect all newly persisted findings + sources for intelligence processing.
+    # This runs claim extraction, source credibility, contradiction detection,
+    # and Bayesian updates on the newly gathered evidence.
+    try:
+        from mariana.orchestrator.intelligence.engine import after_search as _intel_after_search  # noqa: PLC0415
+
+        # Fetch findings created in the last 5 minutes (this search pass)
+        _recent_findings_rows = await db.fetch(
+            """
+            SELECT id, task_id, hypothesis_id, content, source_ids, confidence
+            FROM findings
+            WHERE task_id = $1 AND created_at >= NOW() - INTERVAL '5 minutes'
+            ORDER BY created_at DESC
+            LIMIT 50
+            """,
+            task.id,
+        )
+        _recent_findings = [
+            {
+                "id": r["id"],
+                "hypothesis_id": r["hypothesis_id"],
+                "content": r["content"],
+                "source_ids": json.loads(r["source_ids"]) if isinstance(r["source_ids"], str) else (r["source_ids"] or []),
+            }
+            for r in _recent_findings_rows
+        ]
+
+        # Fetch sources used in this task
+        _recent_source_rows = await db.fetch(
+            """
+            SELECT id, url, title, fetched_at
+            FROM sources
+            WHERE task_id = $1
+            ORDER BY fetched_at DESC
+            LIMIT 50
+            """,
+            task.id,
+        )
+        _recent_sources = [
+            {
+                "id": r["id"],
+                "url": r["url"],
+                "title": r["title"],
+                "fetched_at": r["fetched_at"],
+            }
+            for r in _recent_source_rows
+        ]
+
+        if _recent_findings:
+            _intel_result = await _intel_after_search(
+                task_id=task.id,
+                topic=task.topic,
+                findings=_recent_findings,
+                sources=_recent_sources,
+                db=db,
+                cost_tracker=cost_tracker,
+                config=config,
+                quality_tier=(task.metadata or {}).get("quality_tier"),
+            )
+            log.info("intelligence_after_search_complete", **{
+                k: v for k, v in _intel_result.items() if not isinstance(v, (dict, list))
+            })
+    except Exception as _intel_exc:
+        log.warning("intelligence_after_search_failed", error=str(_intel_exc))
+
 
 async def handle_evaluate(
     task: ResearchTask,
@@ -1476,6 +1695,42 @@ async def handle_evaluate(
         except BudgetExhaustedError:
             log.warning("evaluate_budget_exhausted", branch_id=branch.id)
             raise
+
+    # ── Intelligence Engine: after_evaluate hook ─────────────────────────
+    # Runs confidence calibration, source diversity assessment, gap detection,
+    # and adaptive replanning after all branches have been evaluated.
+    try:
+        from mariana.orchestrator.intelligence.engine import after_evaluate as _intel_after_evaluate  # noqa: PLC0415
+
+        # Determine evaluation cycle from first branch's cycle count
+        _eval_cycle = max(
+            (b.cycles_completed for b in active if b.status == BranchStatus.ACTIVE),
+            default=1,
+        )
+
+        _intel_eval_result = await _intel_after_evaluate(
+            task_id=task.id,
+            topic=task.topic,
+            evaluation_cycle=_eval_cycle,
+            db=db,
+            cost_tracker=cost_tracker,
+            config=config,
+            quality_tier=(task.metadata or {}).get("quality_tier"),
+        )
+        log.info("intelligence_after_evaluate_complete", **{
+            k: v for k, v in _intel_eval_result.items()
+            if not isinstance(v, (dict, list))
+        })
+
+        # If replanning produced follow-up queries, store them in task metadata
+        # for the next search cycle to pick up
+        _follow_ups = _intel_eval_result.get("follow_up_queries", [])
+        if _follow_ups:
+            _meta = task.metadata or {}
+            _meta["intelligence_follow_up_queries"] = _follow_ups[:5]
+            task.metadata = _meta
+    except Exception as _intel_exc:
+        log.warning("intelligence_after_evaluate_failed", error=str(_intel_exc))
 
 
 async def handle_deepen(
@@ -2145,6 +2400,44 @@ async def handle_report(
 
     log = logger.bind(task_id=task.id, handler="report")
 
+    # ── Intelligence Engine: before_report hook ──────────────────────────
+    # Runs multi-perspective synthesis, reasoning chain audit, and executive
+    # summary generation BEFORE the final report is compiled.  Results are
+    # stored in DB tables and injected into task metadata so the report
+    # generator can reference them.
+    _intel_report_ctx: dict[str, Any] = {}
+    try:
+        from mariana.orchestrator.intelligence.engine import before_report as _intel_before_report  # noqa: PLC0415
+
+        _intel_report_ctx = await _intel_before_report(
+            task_id=task.id,
+            topic=task.topic,
+            db=db,
+            cost_tracker=cost_tracker,
+            config=config,
+            quality_tier=(task.metadata or {}).get("quality_tier"),
+        )
+        log.info(
+            "intelligence_before_report_complete",
+            perspectives=_intel_report_ctx.get("perspectives_generated", 0),
+            audit_passed=_intel_report_ctx.get("audit_passed", False),
+            audit_score=_intel_report_ctx.get("audit_score", 0.0),
+            summaries=_intel_report_ctx.get("summaries_generated", False),
+        )
+
+        # Inject intelligence context into task metadata for the report generator
+        _meta = task.metadata or {}
+        _meta["intelligence_report_context"] = {
+            "audit_passed": _intel_report_ctx.get("audit_passed", False),
+            "audit_score": _intel_report_ctx.get("audit_score", 0.0),
+            "audit_issues": _intel_report_ctx.get("audit_issues", 0),
+            "perspectives_generated": _intel_report_ctx.get("perspectives_generated", 0),
+            "one_liner": _intel_report_ctx.get("one_liner", ""),
+        }
+        task.metadata = _meta
+    except Exception as _intel_exc:
+        log.warning("intelligence_before_report_failed", error=str(_intel_exc))
+
     # Fetch confirmed / high-confidence findings for the report
     # BUG-047: include metadata column
     finding_rows = await db.fetch(
@@ -2416,7 +2709,14 @@ async def _build_session_data(
     all_source_ids = {str(r["id"]) for r in source_rows}
 
     # Read user flow control flags from task metadata
-    _dont_kill = bool((task.metadata or {}).get("dont_kill_branches", False))
+    _meta = task.metadata or {}
+    _dont_kill = bool(_meta.get("dont_kill_branches", False))
+    _force_report = bool(_meta.get("force_report_on_halt", False))
+    _skip_skeptic = bool(_meta.get("skip_skeptic", False))
+    _skip_tribunal = bool(_meta.get("skip_tribunal", False))
+    _user_directives = _meta.get("user_directives", {})
+    if not isinstance(_user_directives, dict):
+        _user_directives = {}
 
     return ResearchSessionData(
         task=task,
@@ -2427,6 +2727,10 @@ async def _build_session_data(
         ai_call_counter=task.ai_call_counter,
         recent_action_summaries=[],
         dont_kill_branches=_dont_kill,
+        force_report_on_halt=_force_report,
+        skip_skeptic=_skip_skeptic,
+        skip_tribunal=_skip_tribunal,
+        user_directives=_user_directives,
     )
 
 

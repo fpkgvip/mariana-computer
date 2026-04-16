@@ -426,12 +426,13 @@ async def _call_gateway(
     model_config: ModelConfig,
     max_tokens: int,
     config: AppConfig,
-    timeout_seconds: float = 120.0,
+    timeout_seconds: float = 300.0,
 ) -> dict[str, Any]:
     """
     Send a single HTTP request to the LLM Gateway.
 
-    Returns the parsed JSON response dict.
+    Returns the parsed JSON response dict.  Timeout is 300s to accommodate
+    long-running reasoning models and large token outputs.
 
     Raises:
         ModelCallError: On HTTP errors or network failures.
