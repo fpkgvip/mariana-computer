@@ -21,6 +21,8 @@ import {
   GitBranch,
   Square,
   LogOut,
+  MessageSquare,
+  Plus,
 } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
@@ -93,6 +95,24 @@ interface ChatRespondResponse {
   research_topic?: string;
   tier?: string;
   user_instructions?: string | null;
+}
+
+/** Conversation from the backend */
+interface Conversation {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A persisted message from the backend */
+interface PersistedMessage {
+  id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  type: string;
+  metadata?: Record<string, unknown> | null;
+  created_at: string;
 }
 
 /** Pending research plan to show in the chat before approval */
@@ -314,7 +334,14 @@ export default function Chat() {
   const { user, refreshUser, logout } = useAuth();
   const navigate = useNavigate();
 
-  // Messages for the currently viewed investigation
+  // Conversation state
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const activeConversationIdRef = useRef<string | null>(null);
+  activeConversationIdRef.current = activeConversationId;
+  const [conversationLoading, setConversationLoading] = useState(false);
+
+  // Messages for the currently viewed conversation
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -581,6 +608,145 @@ export default function Chat() {
     };
     loadInvestigations();
   }, [userId]);
+
+  /* ---------------------------------------------------------------- */
+  /*  Load conversations from backend                                 */
+  /* ---------------------------------------------------------------- */
+
+  const loadConversations = useCallback(async () => {
+    try {
+      const token = await getAccessToken();
+      if (!token) return;
+      const res = await fetch(`${API_URL}/api/conversations`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      setConversations(data.items ?? []);
+    } catch (err) {
+      console.warn("[Chat] Failed to load conversations:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!userId) return;
+    loadConversations();
+  }, [userId, loadConversations]);
+
+  /* ---------------------------------------------------------------- */
+  /*  Load a conversation's messages from backend                     */
+  /* ---------------------------------------------------------------- */
+
+  const loadConversationMessages = useCallback(async (conversationId: string) => {
+    setConversationLoading(true);
+    try {
+      const token = await getAccessToken();
+      if (!token) { setConversationLoading(false); return; }
+      const res = await fetch(`${API_URL}/api/conversations/${conversationId}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) { setConversationLoading(false); return; }
+      // Guard against stale responses from rapid conversation switching
+      if (activeConversationIdRef.current !== conversationId) { setConversationLoading(false); return; }
+      const data = await res.json();
+      const restored: Message[] = (data.messages || []).map((m: PersistedMessage) => ({
+        role: m.role as Message["role"],
+        content: m.content,
+        type: (m.type || "text") as Message["type"],
+        _id: m.id,
+      }));
+      setMessages(restored);
+
+      // If there are linked investigations, find them and set the latest running one as active
+      if (data.investigations && data.investigations.length > 0) {
+        const runningInv = investigations.find(
+          (inv) => data.investigations.includes(inv.task_id) && (inv.status === "RUNNING" || inv.status === "PENDING")
+        );
+        if (runningInv) {
+          setActiveTaskId(runningInv.task_id);
+          setIsSending(true);
+          // Restore timeline steps from in-memory cache if available
+          const cachedTimeline = timelineStoreRef.current[runningInv.task_id];
+          if (cachedTimeline && cachedTimeline.length > 0) {
+            setTimelineSteps(cachedTimeline);
+          }
+          const token2 = await getAccessToken();
+          if (token2) {
+            startTimer(runningInv.created_at);
+            startSSE(runningInv.task_id, token2);
+          }
+        } else {
+          // Set the most recent investigation as active (for download buttons etc.)
+          const lastInv = investigations.find((inv) => data.investigations.includes(inv.task_id));
+          if (lastInv) {
+            setActiveTaskId(lastInv.task_id);
+            // Restore timeline steps from cache
+            const cachedTimeline = timelineStoreRef.current[lastInv.task_id];
+            if (cachedTimeline && cachedTimeline.length > 0) {
+              setTimelineSteps(cachedTimeline);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("[Chat] Failed to load conversation messages:", err);
+    } finally {
+      setConversationLoading(false);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [investigations]);
+
+  /* ---------------------------------------------------------------- */
+  /*  Save a message to the backend                                   */
+  /* ---------------------------------------------------------------- */
+
+  const persistMessage = useCallback(async (
+    conversationId: string,
+    role: string,
+    content: string,
+    type: string = "text",
+  ) => {
+    try {
+      const token = await getAccessToken();
+      if (!token) return;
+      await fetch(`${API_URL}/api/conversations/messages`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ conversation_id: conversationId, role, content, type }),
+      });
+    } catch (err) {
+      console.warn("[Chat] Failed to persist message:", err);
+    }
+  }, []);
+
+  /* ---------------------------------------------------------------- */
+  /*  Create a new conversation                                       */
+  /* ---------------------------------------------------------------- */
+
+  const createConversation = useCallback(async (title?: string): Promise<string | null> => {
+    try {
+      const token = await getAccessToken();
+      if (!token) return null;
+      const res = await fetch(`${API_URL}/api/conversations`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ title: title || "New conversation" }),
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      const newConv: Conversation = {
+        id: data.id,
+        title: data.title,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+      setConversations((prev) => [newConv, ...prev]);
+      return data.id;
+    } catch (err) {
+      console.warn("[Chat] Failed to create conversation:", err);
+      return null;
+    }
+  }, []);
 
   /* ---------------------------------------------------------------- */
   /*  Auto-scroll on new messages                                     */
@@ -1408,10 +1574,35 @@ export default function Chat() {
     // Clear timeline for new investigation
     setTimelineSteps([]);
 
+    // ── Conversation management: create or continue ───────────────
+    let convId = activeConversationIdRef.current;
+    if (!convId) {
+      // No active conversation — create one. Auto-title from the user's message.
+      convId = await createConversation(topic.slice(0, 60));
+      if (convId) {
+        setActiveConversationId(convId);
+      }
+    }
+
     const newMessages: Message[] = [
       { role: "user", content: topic, type: "text", _id: makeMessageId() },
     ];
-    setMessages(newMessages);
+    // Append to existing messages (continuing a conversation)
+    setMessages((prev) => [...prev, ...newMessages]);
+
+    // Persist the user message to the backend
+    if (convId) {
+      persistMessage(convId, "user", topic, "text");
+      // Move this conversation to top of sidebar (most recently active)
+      setConversations((prev) => {
+        const idx = prev.findIndex((c) => c.id === convId);
+        if (idx <= 0) return prev; // already at top or not found
+        const updated = [...prev];
+        const [moved] = updated.splice(idx, 1);
+        moved.updated_at = new Date().toISOString();
+        return [moved, ...updated];
+      });
+    }
 
     // Get auth token
     const token = await getAccessToken();
@@ -1433,7 +1624,7 @@ export default function Chat() {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ message: topic }),
+        body: JSON.stringify({ message: topic, conversation_id: convId }),
       });
 
       if (chatRes.status === 401) {
@@ -1447,7 +1638,7 @@ export default function Chat() {
         // Chat endpoint failed — fall back to direct investigation
         console.warn("[Chat] chat/respond failed, starting investigation directly.");
         setIsClassifying(false);
-        await startInvestigationRef.current(topic, token, true, undefined, undefined);
+        await startInvestigationRef.current(topic, token, true, undefined, undefined, convId || undefined);
         return;
       }
 
@@ -1461,6 +1652,10 @@ export default function Chat() {
           ...prev,
           { role: "assistant", content: chatData.reply, type: "text", _id: makeMessageId() },
         ]);
+        // Persist the assistant reply
+        if (convId) {
+          persistMessage(convId, "assistant", chatData.reply, "text");
+        }
         return;
       }
 
@@ -1474,6 +1669,10 @@ export default function Chat() {
           ...prev,
           { role: "assistant", content: chatData.reply, type: "text", _id: makeMessageId() },
         ]);
+        // Persist the assistant reply
+        if (convId) {
+          persistMessage(convId, "assistant", chatData.reply, "text");
+        }
       }
 
       if (tier === "deep") {
@@ -1487,16 +1686,16 @@ export default function Chat() {
         });
       } else {
         // Quick/standard — auto-launch, pass tier so backend doesn't re-classify
-        await startInvestigationRef.current(researchTopic, token, true, tier, chatData.user_instructions || undefined);
+        await startInvestigationRef.current(researchTopic, token, true, tier, chatData.user_instructions || undefined, convId || undefined);
       }
     } catch (err) {
       setIsClassifying(false);
       console.warn("[Chat] Chat error, starting investigation directly:", err);
-      await startInvestigationRef.current(topic, token, true, undefined, undefined);
+      await startInvestigationRef.current(topic, token, true, undefined, undefined, convId || undefined);
     }
   // BUG-C3-06 fix: startInvestigation accessed via startInvestigationRef.current
   // so handleSend always calls the latest version (avoids stale uploadSessionUuid).
-  }, [isSending, isClassifying, input, retryPayload, activeTaskId, stopConnectionsOnly, navigate]);
+  }, [isSending, isClassifying, input, retryPayload, activeTaskId, stopConnectionsOnly, navigate, createConversation, persistMessage]);
 
   /* ---------------------------------------------------------------- */
   /*  Start investigation (after classify or after plan approval)     */
@@ -1508,6 +1707,7 @@ export default function Chat() {
     planApproved: boolean,
     overrideTier?: string,
     chatUserInstructions?: string,
+    conversationId?: string,
   ) => {
     setIsSending(true);
     setPendingPlan(null);
@@ -1541,6 +1741,7 @@ export default function Chat() {
         dont_kill_branches: dontKillBranches,
         user_flow_instructions: mergedInstructions,
         ...(overrideTier ? { tier: overrideTier } : {}),
+        ...(conversationId ? { conversation_id: conversationId } : {}),
       };
       if (uploadSessionUuid) {
         requestBody.upload_session_uuid = uploadSessionUuid;
@@ -1631,6 +1832,7 @@ export default function Chat() {
             duration_hours: 0,
             budget_usd: 0,
             user_id: user.id, // guaranteed non-null
+            ...(conversationId ? { conversation_id: conversationId } : {}),
           })
           .then(({ error }) => {
             if (error) console.error("[Chat] Failed to persist investigation:", error.message);
@@ -1698,7 +1900,7 @@ export default function Chat() {
       }
 
       setPendingPlan(null);
-      await startInvestigationRef.current(planToApprove.topic, token, true, planToApprove.tier, undefined);
+      await startInvestigationRef.current(planToApprove.topic, token, true, planToApprove.tier, undefined, activeConversationIdRef.current || undefined);
     } finally {
       setIsClassifying(false);
     }
@@ -1710,8 +1912,7 @@ export default function Chat() {
 
   const handleCancelPlan = useCallback(() => {
     setPendingPlan(null);
-    // Remove the user message and plan from the chat — reset to empty
-    setMessages([]);
+    // Remove the plan from the chat — keep messages from conversation history
     setTimelineSteps([]);
     setActiveTaskId(null);
     setUploadedFiles([]);
@@ -1827,7 +2028,7 @@ export default function Chat() {
           </button>
         </div>
 
-        {/* New investigation button */}
+        {/* New chat button */}
         <div className="px-4 pt-4">
           <button
             onClick={() => {
@@ -1839,6 +2040,7 @@ export default function Chat() {
               }
               stopAllConnections();
               setActiveTaskId(null);
+              setActiveConversationId(null);
               setMessages([]);
               setTimelineSteps([]);
               setPendingPlan(null);
@@ -1851,84 +2053,93 @@ export default function Chat() {
               seenStatusIds.current.clear();
               setSidebarOpen(false);
             }}
-            className="w-full rounded-md border border-border px-3 py-2 text-xs text-foreground hover:bg-secondary transition-colors"
+            className="w-full flex items-center justify-center gap-1.5 rounded-md border border-border px-3 py-2 text-xs text-foreground hover:bg-secondary transition-colors"
           >
-            + New Investigation
+            <Plus size={13} />
+            New Chat
           </button>
         </div>
 
-        {/* Investigation list */}
+        {/* Conversation list */}
         <div className="flex-1 overflow-y-auto px-4 py-4">
-          <p className="mb-2 text-[10px] font-medium uppercase tracking-[0.15em] text-muted-foreground">
-            Investigations
-          </p>
-          <div className="space-y-1">
-            {investigations.length === 0 && (
-              <p className="text-xs text-muted-foreground/60 py-2">No investigations yet</p>
-            )}
-            {investigations.map((inv) => {
-              const isActive = activeTaskId === inv.task_id;
-              const isInvRunning = inv.status === "RUNNING" || inv.status === "PENDING";
+          {conversations.length === 0 && (
+            <p className="text-xs text-muted-foreground/60 py-2 text-center">No conversations yet</p>
+          )}
+          <div className="space-y-0.5">
+            {conversations.map((conv) => {
+              const isActive = activeConversationId === conv.id;
               return (
                 <div
-                  key={inv.task_id}
+                  key={conv.id}
                   className={`group relative w-full rounded-md text-left text-xs transition-colors ${
                     isActive
                       ? "bg-secondary text-foreground ring-1 ring-primary/30"
                       : "text-muted-foreground hover:bg-secondary/50 hover:text-foreground"
-                  } ${isInvRunning && !isActive ? "ring-1 ring-blue-500/20" : ""}`}
+                  }`}
                 >
                   <button
-                    onClick={() => switchInvestigation(inv.task_id)}
-                    className="w-full px-3 py-2 text-left"
+                    onClick={() => {
+                      if (isActive) return;
+                      // Save current state
+                      if (activeTaskId && messagesRef.current.length > 0) {
+                        messageStoreRef.current[activeTaskId] = [...messagesRef.current];
+                      }
+                      if (activeTaskId) {
+                        timelineStoreRef.current[activeTaskId] = [...timelineStepsRef.current];
+                      }
+                      stopAllConnections();
+                      setActiveTaskId(null);
+                      setActiveConversationId(conv.id);
+                      setIsSending(false);
+                      setMessages([]);
+                      setTimelineSteps([]);
+                      setPendingPlan(null);
+                      setUploadedFiles([]);
+                      setUploadSessionUuid(null);
+                      setElapsedSeconds(0);
+                      setConversationLoading(true); // Set BEFORE async call to prevent welcome screen flash
+                      seenStatusIds.current.clear();
+                      setSidebarOpen(false);
+                      // Load the conversation's messages from backend (sets messages atomically)
+                      loadConversationMessages(conv.id);
+                    }}
+                    className="w-full px-3 py-2.5 text-left"
                   >
                     <div className="flex items-center gap-2 pr-5">
-                      {isInvRunning && (
-                        <span className="relative flex h-2 w-2 shrink-0">
-                          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
-                          <span className="relative inline-flex h-2 w-2 rounded-full bg-blue-500" />
-                        </span>
-                      )}
-                      <span
-                        className={`inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[9px] font-medium ring-1 ring-inset ${
-                          STATUS_COLORS[inv.status]
-                        }`}
-                      >
-                        {inv.status}
-                      </span>
-                      <span className="truncate">{inv.topic}</span>
+                      <MessageSquare size={12} className="shrink-0 opacity-40" />
+                      <span className="truncate">{conv.title}</span>
                     </div>
                   </button>
                   <button
                     onClick={async (e) => {
                       e.stopPropagation();
-                      if (!confirm("Delete this investigation? This cannot be undone.")) return;
+                      if (!confirm("Delete this conversation? This cannot be undone.")) return;
                       const token = await getAccessToken();
                       if (!token) return;
                       try {
-                        const res = await fetch(`${API_URL}/api/investigations/${inv.task_id}`, {
+                        const res = await fetch(`${API_URL}/api/conversations/${conv.id}`, {
                           method: "DELETE",
                           headers: { Authorization: `Bearer ${token}` },
                         });
-                        if (res.ok) {
-                          setInvestigations((prev) => prev.filter((i) => i.task_id !== inv.task_id));
-                          if (activeTaskId === inv.task_id) {
+                        if (res.ok || res.status === 204) {
+                          setConversations((prev) => prev.filter((c) => c.id !== conv.id));
+                          if (activeConversationId === conv.id) {
+                            setActiveConversationId(null);
                             setActiveTaskId(null);
                             setMessages([]);
                             setTimelineSteps([]);
                           }
-                          toast.success("Investigation deleted");
+                          toast.success("Conversation deleted");
                         } else {
-                          const err = await res.json().catch(() => ({ detail: "Unknown error" }));
-                          toast.error("Failed to delete", { description: err.detail });
+                          toast.error("Failed to delete conversation");
                         }
                       } catch {
-                        toast.error("Failed to delete investigation");
+                        toast.error("Failed to delete conversation");
                       }
                     }}
                     className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-red-500/10 hover:text-red-500"
-                    title="Delete investigation"
-                    aria-label="Delete investigation"
+                    title="Delete conversation"
+                    aria-label="Delete conversation"
                   >
                     <Trash2 size={12} />
                   </button>
@@ -2072,14 +2283,22 @@ export default function Chat() {
               </div>
             )}
 
+            {/* Loading state when switching conversations */}
+            {conversationLoading && messages.length === 0 && (
+              <div className="flex items-center justify-center py-24">
+                <div className="h-5 w-5 animate-spin rounded-full border-2 border-primary/20 border-t-primary" />
+              </div>
+            )}
+
             {/* Empty state */}
-            {messages.length === 0 && !isSending && !pendingPlan && (
+            {messages.length === 0 && !isSending && !pendingPlan && !conversationLoading && (
               <div className="flex flex-col items-center justify-center py-24 text-center">
                 <h2 className="font-serif text-xl font-semibold text-foreground mb-2">
                   What would you like to know?
                 </h2>
                 <p className="text-sm text-muted-foreground max-w-md">
                   Ask anything. Mariana adapts — from quick answers to multi-day investigations.
+                  Your conversations are saved so you can pick up where you left off.
                 </p>
               </div>
             )}

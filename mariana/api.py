@@ -288,8 +288,70 @@ class ConfigResponse(BaseModel):
     log_level: str
 
 
+# ── Conversation models ─────────────────────────────────────────────────────
+
+class ConversationSummary(BaseModel):
+    """A conversation summary for the sidebar list."""
+    id: str
+    title: str
+    created_at: str
+    updated_at: str
+
+
+class ConversationListResponse(BaseModel):
+    items: list[ConversationSummary]
+
+
+class ConversationMessageOut(BaseModel):
+    """A single persisted message."""
+    id: str
+    role: str
+    content: str
+    type: str = "text"
+    metadata: dict | None = None
+    created_at: str
+
+
+class ConversationDetailResponse(BaseModel):
+    id: str
+    title: str
+    created_at: str
+    updated_at: str
+    messages: list[ConversationMessageOut]
+    investigations: list[str]  # task_ids linked to this conversation
+
+
+class CreateConversationRequest(BaseModel):
+    title: str = Field("New conversation", max_length=200)
+
+
+class CreateConversationResponse(BaseModel):
+    id: str
+    title: str
+
+
+class UpdateConversationRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+
+
+class SaveMessageRequest(BaseModel):
+    conversation_id: str
+    role: str = Field(..., pattern=r"^(user|assistant|system)$")
+    content: str = Field(..., min_length=1, max_length=65536)
+    type: str = Field("text", pattern=r"^(text|code|status|error|plan)$")
+    metadata: dict | None = None
+
+
+class SaveMessageResponse(BaseModel):
+    id: str
+    conversation_id: str
+
+
+# ── Investigation models ───────────────────────────────────────────────────
+
 class StartInvestigationRequest(BaseModel):
     topic: str = Field(..., min_length=1, max_length=4096, description="Research topic or question")
+    conversation_id: str | None = Field(None, description="Conversation to link this investigation to")
     # All below are now optional — AI determines them if not provided
 
     @field_validator("topic")
@@ -305,6 +367,7 @@ class StartInvestigationRequest(BaseModel):
         if not trimmed:
             raise ValueError("Topic must not be empty or whitespace only")
         return trimmed
+
     budget_usd: float | None = Field(
         None, gt=0.0, le=10000.0, description="Budget ceiling in USD (AI-determined if omitted)"
     )
@@ -1125,6 +1188,308 @@ If they ask what you can do, explain you're an AI that can have normal conversat
             )
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  Conversations CRUD
+# ════════════════════════════════════════════════════════════════════════════
+
+
+async def _supabase_rest(
+    cfg: AppConfig,
+    method: str,
+    path: str,
+    *,
+    json: dict | list | None = None,
+    params: dict[str, str] | None = None,
+    headers_extra: dict[str, str] | None = None,
+    user_token: str | None = None,
+) -> httpx.Response:
+    """Low-level Supabase REST helper. Uses service key for admin ops, or user token for RLS-respecting ops."""
+    api_key = _supabase_api_key(cfg)
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+    auth_key = user_token or api_key
+    headers = {
+        "apikey": api_key,
+        "Authorization": f"Bearer {auth_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+    if headers_extra:
+        headers.update(headers_extra)
+    url = f"{cfg.SUPABASE_URL}/rest/v1{path}"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.request(method, url, json=json, params=params, headers=headers)
+    return resp
+
+
+@app.post(
+    "/api/conversations",
+    response_model=CreateConversationResponse,
+    status_code=201,
+    tags=["Conversations"],
+    summary="Create a new conversation",
+)
+async def create_conversation(
+    body: CreateConversationRequest,
+    authorization: str | None = Header(None),
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> CreateConversationResponse:
+    cfg = _get_config()
+    user_id = current_user["user_id"]
+    user_token = authorization.split(" ", 1)[1].strip() if authorization and authorization.startswith("Bearer ") else None
+    row = {"user_id": user_id, "title": body.title.strip() or "New conversation"}
+    resp = await _supabase_rest(cfg, "POST", "/conversations", json=row, user_token=user_token)
+    if resp.status_code not in (200, 201):
+        logger.error("create_conversation_failed", status=resp.status_code, body=resp.text)
+        raise HTTPException(status_code=500, detail="Failed to create conversation")
+    data = resp.json()
+    created = data[0] if isinstance(data, list) else data
+    return CreateConversationResponse(id=created["id"], title=created["title"])
+
+
+@app.get(
+    "/api/conversations",
+    response_model=ConversationListResponse,
+    tags=["Conversations"],
+    summary="List all conversations for the current user",
+)
+async def list_conversations(
+    authorization: str | None = Header(None),
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> ConversationListResponse:
+    cfg = _get_config()
+    user_id = current_user["user_id"]
+    user_token = authorization.split(" ", 1)[1].strip() if authorization and authorization.startswith("Bearer ") else None
+    resp = await _supabase_rest(
+        cfg, "GET", "/conversations",
+        params={
+            "user_id": f"eq.{user_id}",
+            "select": "id,title,created_at,updated_at",
+            "order": "updated_at.desc",
+            "limit": "100",
+        },
+        user_token=user_token,
+    )
+    if resp.status_code != 200:
+        logger.error("list_conversations_failed", status=resp.status_code, body=resp.text)
+        raise HTTPException(status_code=500, detail="Failed to list conversations")
+    rows = resp.json()
+    items = [
+        ConversationSummary(
+            id=r["id"],
+            title=r["title"],
+            created_at=r["created_at"],
+            updated_at=r["updated_at"],
+        )
+        for r in rows
+    ]
+    return ConversationListResponse(items=items)
+
+
+@app.get(
+    "/api/conversations/{conversation_id}",
+    response_model=ConversationDetailResponse,
+    tags=["Conversations"],
+    summary="Get a conversation with all messages and linked investigation IDs",
+)
+async def get_conversation(
+    conversation_id: str,
+    authorization: str | None = Header(None),
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> ConversationDetailResponse:
+    cfg = _get_config()
+    user_id = current_user["user_id"]
+    user_token = authorization.split(" ", 1)[1].strip() if authorization and authorization.startswith("Bearer ") else None
+
+    # Fetch conversation (RLS ensures ownership)
+    conv_resp = await _supabase_rest(
+        cfg, "GET", "/conversations",
+        params={
+            "id": f"eq.{conversation_id}",
+            "user_id": f"eq.{user_id}",
+            "select": "id,title,created_at,updated_at",
+            "limit": "1",
+        },
+        user_token=user_token,
+    )
+    if conv_resp.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to fetch conversation")
+    convs = conv_resp.json()
+    if not convs:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    conv = convs[0]
+
+    # Fetch messages
+    msg_resp = await _supabase_rest(
+        cfg, "GET", "/conversation_messages",
+        params={
+            "conversation_id": f"eq.{conversation_id}",
+            "select": "id,role,content,type,metadata,created_at",
+            "order": "created_at.asc",
+            "limit": "1000",
+        },
+        user_token=user_token,
+    )
+    msgs: list[ConversationMessageOut] = []
+    if msg_resp.status_code == 200:
+        for m in msg_resp.json():
+            raw_meta = m.get("metadata")
+            if isinstance(raw_meta, str):
+                try:
+                    raw_meta = _json.loads(raw_meta)
+                except (ValueError, TypeError):
+                    raw_meta = None
+            msgs.append(ConversationMessageOut(
+                id=m["id"],
+                role=m["role"],
+                content=m["content"],
+                type=m.get("type") or "text",
+                metadata=raw_meta if isinstance(raw_meta, dict) else None,
+                created_at=m["created_at"],
+            ))
+
+    # Fetch linked investigation task_ids
+    inv_resp = await _supabase_rest(
+        cfg, "GET", "/investigations",
+        params={
+            "conversation_id": f"eq.{conversation_id}",
+            "user_id": f"eq.{user_id}",
+            "select": "task_id",
+        },
+        user_token=user_token,
+    )
+    inv_ids: list[str] = []
+    if inv_resp.status_code == 200:
+        inv_ids = [r["task_id"] for r in inv_resp.json() if r.get("task_id")]
+
+    return ConversationDetailResponse(
+        id=conv["id"],
+        title=conv["title"],
+        created_at=conv["created_at"],
+        updated_at=conv["updated_at"],
+        messages=msgs,
+        investigations=inv_ids,
+    )
+
+
+@app.patch(
+    "/api/conversations/{conversation_id}",
+    tags=["Conversations"],
+    summary="Update conversation title",
+)
+async def update_conversation(
+    conversation_id: str,
+    body: UpdateConversationRequest,
+    authorization: str | None = Header(None),
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> dict:
+    cfg = _get_config()
+    user_id = current_user["user_id"]
+    user_token = authorization.split(" ", 1)[1].strip() if authorization and authorization.startswith("Bearer ") else None
+    resp = await _supabase_rest(
+        cfg, "PATCH", "/conversations",
+        json={"title": body.title.strip(), "updated_at": datetime.now(tz=timezone.utc).isoformat()},
+        params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
+        user_token=user_token,
+    )
+    if resp.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail="Failed to update conversation")
+    return {"ok": True}
+
+
+@app.delete(
+    "/api/conversations/{conversation_id}",
+    tags=["Conversations"],
+    summary="Delete a conversation and all its messages",
+)
+async def delete_conversation(
+    conversation_id: str,
+    authorization: str | None = Header(None),
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> dict:
+    cfg = _get_config()
+    user_id = current_user["user_id"]
+    user_token = authorization.split(" ", 1)[1].strip() if authorization and authorization.startswith("Bearer ") else None
+    # Cascade delete handles messages. Unlink investigations (SET NULL).
+    resp = await _supabase_rest(
+        cfg, "DELETE", "/conversations",
+        params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
+        user_token=user_token,
+    )
+    if resp.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail="Failed to delete conversation")
+    return {"ok": True}
+
+
+@app.post(
+    "/api/conversations/messages",
+    response_model=SaveMessageResponse,
+    status_code=201,
+    tags=["Conversations"],
+    summary="Save a message to a conversation",
+)
+async def save_message(
+    body: SaveMessageRequest,
+    authorization: str | None = Header(None),
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> SaveMessageResponse:
+    """Persist a single message to a conversation. The frontend calls this
+    to save user, assistant, and system messages as they happen."""
+    cfg = _get_config()
+    user_id = current_user["user_id"]
+    user_token = authorization.split(" ", 1)[1].strip() if authorization and authorization.startswith("Bearer ") else None
+
+    # Verify conversation ownership first
+    check = await _supabase_rest(
+        cfg, "GET", "/conversations",
+        params={"id": f"eq.{body.conversation_id}", "user_id": f"eq.{user_id}", "select": "id", "limit": "1"},
+        user_token=user_token,
+    )
+    if check.status_code != 200 or not check.json():
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    import json as _json  # noqa: PLC0415
+    row = {
+        "conversation_id": body.conversation_id,
+        "role": body.role,
+        "content": body.content,
+        "type": body.type,
+        "metadata": _json.dumps(body.metadata) if body.metadata else "{}",
+    }
+    resp = await _supabase_rest(cfg, "POST", "/conversation_messages", json=row, user_token=user_token)
+    if resp.status_code not in (200, 201):
+        logger.error("save_message_failed", status=resp.status_code, body=resp.text)
+        raise HTTPException(status_code=500, detail="Failed to save message")
+
+    data = resp.json()
+    created = data[0] if isinstance(data, list) else data
+
+    # Update conversation's updated_at and auto-title from first user message
+    patch: dict[str, str] = {"updated_at": datetime.now(tz=timezone.utc).isoformat()}
+    if body.role == "user":
+        # Auto-title: use first ~60 chars of the first user message
+        title_candidate = body.content.strip()[:60]
+        if title_candidate:
+            # Only auto-title if current title is default
+            conv_check = await _supabase_rest(
+                cfg, "GET", "/conversations",
+                params={"id": f"eq.{body.conversation_id}", "select": "title", "limit": "1"},
+                user_token=user_token,
+            )
+            if conv_check.status_code == 200:
+                conv_data = conv_check.json()
+                if conv_data and conv_data[0].get("title") in ("New conversation", ""):
+                    patch["title"] = title_candidate
+    await _supabase_rest(
+        cfg, "PATCH", "/conversations",
+        json=patch,
+        params={"id": f"eq.{body.conversation_id}"},
+        user_token=user_token,
+    )
+
+    return SaveMessageResponse(id=created["id"], conversation_id=body.conversation_id)
+
+
 @app.post(
     "/api/investigations",
     response_model=StartInvestigationResponse,
@@ -1294,6 +1659,17 @@ async def start_investigation(
             user_id=current_user["user_id"],
             reserved_credits=reserved_credits,
         )
+
+        # Link investigation to conversation in Supabase if conversation_id provided
+        if body.conversation_id:
+            try:
+                await _supabase_rest(
+                    cfg, "PATCH", "/investigations",
+                    json={"conversation_id": body.conversation_id},
+                    params={"task_id": f"eq.{task_id}"},
+                )
+            except Exception as link_err:
+                logger.warning("investigation_conversation_link_failed", error=str(link_err))
     except HTTPException:
         if reserved_credits > 0:
             await _supabase_add_credits(current_user["user_id"], reserved_credits, cfg)
