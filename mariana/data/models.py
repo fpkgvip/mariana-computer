@@ -109,6 +109,7 @@ class TaskType(str, Enum):
     RETRIEVAL_STRATEGY = "RETRIEVAL_STRATEGY"
     REASONING_AUDIT = "REASONING_AUDIT"
     EXECUTIVE_SUMMARY = "EXECUTIVE_SUMMARY"
+    FAST_PATH = "FAST_PATH"
 
 
 class ModelID(str, Enum):
@@ -660,6 +661,33 @@ class HypothesisGenerationOutput(BaseModel):
     recommended_starting_hypotheses: list[int] = Field(
         ...,
         description="0-based indices into `hypotheses` to pursue first",
+    )
+
+
+class FastPathOutput(BaseModel):
+    """Lightweight output for instant/quick tier fast-path responses.
+
+    Used instead of HypothesisGenerationOutput when the orchestrator
+    takes the fast path (instant / quick tiers).
+    """
+
+    model_config = _COMMON_CONFIG
+
+    answer: str = Field(
+        ...,
+        min_length=1,
+        max_length=16384,
+        description="The direct answer to the user's question or request",
+    )
+    sources: list[str] = Field(
+        default_factory=list,
+        description="Optional list of source URLs or references cited in the answer",
+    )
+    confidence: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        description="Confidence in the answer (0-1)",
     )
 
 

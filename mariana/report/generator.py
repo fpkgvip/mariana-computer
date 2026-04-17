@@ -109,6 +109,7 @@ async def generate_report(
     db: Any,  # asyncpg.Pool
     cost_tracker: Any,  # mariana.orchestrator.cost_tracker.CostTracker
     report_dir: str,
+    config: Any = None,  # mariana.config.AppConfig — passed for spawn_model routing
 ) -> tuple[str, str | None]:  # TODO: implement DOCX generation
     """
     Generate the full bilingual PDF research report.
@@ -160,6 +161,9 @@ async def generate_report(
     log.info("report_pass", pass_num=1, task_type=TaskType.REPORT_DRAFT.value)
     t0 = time.monotonic()
 
+    # Determine quality_tier from task metadata for economy routing
+    _quality_tier = (task.metadata or {}).get("quality_tier") or None
+
     draft_parsed, draft_session = await spawn_model(
         task_type=TaskType.REPORT_DRAFT,
         context={
@@ -172,6 +176,8 @@ async def generate_report(
         output_schema=ReportDraftOutput,
         db=db,
         cost_tracker=cost_tracker,
+        config=config,
+        quality_tier=_quality_tier,
     )
     draft_output: ReportDraftOutput = draft_parsed
 
@@ -196,6 +202,8 @@ async def generate_report(
         output_schema=ReportDraftOutput,
         db=db,
         cost_tracker=cost_tracker,
+        config=config,
+        quality_tier=_quality_tier,
     )
     final_output: ReportDraftOutput = final_parsed
 

@@ -323,6 +323,7 @@ class StartInvestigationRequest(BaseModel):
     skip_skeptic: bool = Field(False, description="If true, skip the skeptic quality gate")
     skip_tribunal: bool = Field(False, description="If true, skip the adversarial tribunal review")
     user_directives: dict | None = Field(None, description="Freeform user directives dict for custom flow control")
+    tier: str | None = Field(None, description="Override tier: instant, quick, standard, deep. If omitted, auto-classified.")
 
 
 class ClassifyRequest(BaseModel):
@@ -353,13 +354,17 @@ class ClassifyResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     """Request body for the /api/chat/respond endpoint."""
-    message: str = Field(..., min_length=1, max_length=4096)
+    message: str = Field(..., min_length=1, max_length=8192)
+    conversation_id: str | None = None
 
 
 class ChatResponse(BaseModel):
-    """Lightweight conversational reply — no investigation created."""
+    """Smart reply: either a conversational response or a research launch signal."""
     reply: str
-    tier: str = "instant"  # always instant for chat responses
+    action: str = "chat"  # "chat" = just reply, "research" = launch investigation
+    research_topic: str | None = None  # refined topic for investigation (when action=research)
+    tier: str | None = None  # suggested tier (when action=research)
+    user_instructions: str | None = None  # extracted user methodology / custom instructions (when action=research)
 
 
 class StartInvestigationResponse(BaseModel):
@@ -912,9 +917,9 @@ _PLANS: list[dict[str, Any]] = [
 #: Minimum budgets: standard=$5, deep=$20 per the architecture spec.
 _TIER_CREDITS: dict[str, int] = {
     "instant": 5,
-    "quick": 50,
-    "standard": 500,
-    "deep": 2000,
+    "quick": 20,       # ~$0.20 budget, ~30s, single search
+    "standard": 100,   # ~$1.00 budget, 3-5 min, moderate analysis
+    "deep": 500,       # ~$5.00 budget, 15-45 min, exhaustive research
 }
 
 #: Credits-to-USD ratio (1 credit = $0.01 USD)
@@ -982,33 +987,81 @@ async def classify_request(body: ClassifyRequest) -> ClassifyResponse:
     "/api/chat/respond",
     response_model=ChatResponse,
     tags=["Chat"],
-    summary="Conversational reply without creating an investigation",
+    summary="Smart chat: replies conversationally or signals a research launch",
 )
 async def chat_respond(
     body: ChatRequest,
     current_user: dict[str, str] = Depends(_get_current_user),
 ) -> ChatResponse:
     """
-    Lightweight conversational endpoint for greetings, casual messages,
-    and simple questions that don't warrant a full investigation.
+    Primary chat endpoint.  The LLM decides how to handle the message:
 
-    Uses a single LLM call and returns immediately.  No investigation
-    record is created, no credits are consumed.
+    - **Conversation** (greetings, meta questions, casual chat): returns a
+      reply directly.  No investigation is created.
+    - **Research request** (questions requiring deep investigation): returns
+      ``action="research"`` with a refined research topic and suggested tier.
+      The frontend should then call ``POST /api/investigations`` to launch it.
+
+    Uses a single fast LLM call (~1-2s).  No credits consumed for
+    conversational replies.
     """
     cfg = _get_config()
-
-    # Use the LLM gateway directly for a fast conversational reply
     import httpx  # noqa: PLC0415
 
-    system_prompt = (
-        "You are Mariana, an elite AI research assistant created by Mariana Intelligence. "
-        "You are warm, professional, and helpful. "
-        "If the user is greeting you or testing, respond warmly and briefly. "
-        "Introduce yourself in one sentence if appropriate: you\'re Mariana, "
-        "a deep research AI that can investigate any topic with institutional-grade rigor. "
-        "Keep responses concise (1-3 sentences). Never refuse. Always be helpful. "
-        "If the user seems to be asking a research question, suggest they ask it as a research query."
-    )
+    system_prompt = """You are Mariana, an elite AI research assistant built by Mariana Intelligence.
+You help users with deep research on any topic with institutional-grade rigor.
+
+Your job: decide how to handle the user's message.
+
+RULE 1: If the message is casual conversation, a greeting, a meta-question about you
+("what can you do?", "how does this work?", "who are you?"), or anything that does NOT
+require looking up real-world facts or research — REPLY CONVERSATIONALLY.
+
+RULE 2: If the message is a question that requires researching real-world facts, data,
+news, analysis, or investigation — signal that you want to launch a research investigation.
+
+RULE 3 (CRITICAL): If the user provides ANY specific instructions about HOW to research,
+what methodology to use, what to focus on, what to avoid, what tone to use, what format
+to produce, or any other customization — you MUST extract those instructions into the
+"user_instructions" field. The user is the boss. Whatever they say about how to do the
+research, the AI must obey.
+
+Examples of CONVERSATION (reply directly):
+- "hello" / "hi" / "hey there"
+- "what can you do?" / "how does this work?"
+- "tell me about yourself"
+- "thanks" / "cool" / "ok"
+- "can you help me?" / "what are you good at?"
+
+Examples of RESEARCH (launch investigation):
+- "What is the current state of AI regulation in the EU?"
+- "Compare Tesla and BYD market share in 2025"
+- "Analyze the impact of rate cuts on CMBS markets, focus on default rates and use only academic sources"
+- "Research Bitcoin price prediction but use technical analysis methodology, not fundamental"
+
+RESPOND IN THIS EXACT JSON FORMAT (nothing else):
+{"action": "chat", "reply": "your conversational reply here"}
+OR
+{"action": "research", "reply": "brief message to the user", "research_topic": "clean research topic", "tier": "standard", "user_instructions": "extracted user instructions on HOW to research (methodology, focus, constraints, tone, etc.) — include EVERYTHING the user said about how to do it. If no special instructions, use null."}
+
+For the tier field when action is "research":
+- "quick" = simple factual lookup, takes ~30 seconds (e.g. "what is X?", "who is Y?")
+- "standard" = moderate analysis, takes 3-5 minutes (e.g. "compare X and Y", "what happened with Z?")
+- "deep" = exhaustive multi-angle investigation, takes 15-45 minutes (only when the user explicitly asks for deep research, thorough analysis, or a comprehensive report)
+
+Default to "standard" if unsure. Only use "deep" when explicitly requested.
+
+For user_instructions: Extract the user's FULL intent about HOW to research. Examples:
+- "focus on emerging markets" → user_instructions: "Focus the research on emerging markets specifically"
+- "use only peer-reviewed sources" → user_instructions: "Use only peer-reviewed academic sources"
+- "I don't care if the hypothesis is bad just continue" → user_instructions: "Do not kill hypotheses even if they seem weak. Continue researching all angles regardless of initial quality."
+- "make it a bear case analysis" → user_instructions: "Frame the research from a bear/pessimistic perspective"
+- "research this but be contrarian" → user_instructions: "Take a contrarian stance. Challenge consensus views."
+If the user gives no special instructions, set user_instructions to null.
+
+For conversational replies: be warm, concise (1-3 sentences), professional.
+Introduce yourself briefly if it's a first greeting.
+If they ask what you can do, explain you're an AI that can have normal conversations AND launch deep research investigations on any topic."""
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1021,22 +1074,55 @@ async def chat_respond(
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": body.message},
                     ],
-                    "max_tokens": 256,
-                    "temperature": 0.7,
+                    "max_tokens": 512,
+                    "temperature": 0.3,
                 },
             )
             resp.raise_for_status()
             data = resp.json()
-            reply = data["choices"][0]["message"]["content"].strip()
-    except Exception as exc:
-        logger.warning("chat_respond_llm_error", error=str(exc))
-        reply = (
-            "Hello! I'm Mariana, your deep research AI. "
-            "I can investigate any topic with rigorous analysis. "
-            "What would you like me to research?"
-        )
+            raw = data["choices"][0]["message"]["content"].strip()
 
-    return ChatResponse(reply=reply)
+            # Parse the JSON response from the LLM
+            import json as _json  # noqa: PLC0415
+            # Strip markdown code fences if present
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            parsed = _json.loads(raw)
+
+            action = parsed.get("action", "chat")
+            reply = parsed.get("reply", "")
+
+            if action == "research":
+                return ChatResponse(
+                    reply=reply,
+                    action="research",
+                    research_topic=parsed.get("research_topic", body.message),
+                    tier=parsed.get("tier", "standard"),
+                    user_instructions=parsed.get("user_instructions") or None,
+                )
+            else:
+                return ChatResponse(reply=reply, action="chat")
+
+    except Exception as exc:
+        logger.warning("chat_respond_error", error=str(exc))
+        # Fallback: use the old pattern-matching classify for safety
+        classification = _classify_topic(body.message)
+        if classification.is_conversational:
+            return ChatResponse(
+                reply=(
+                    "Hello! I'm Mariana, your AI research assistant. "
+                    "I can chat with you normally, and when you have a topic "
+                    "that needs deep research, just ask and I'll investigate it for you."
+                ),
+                action="chat",
+            )
+        else:
+            return ChatResponse(
+                reply=f"I'll research that for you: {body.message}",
+                action="research",
+                research_topic=body.message,
+                tier=classification.tier,
+            )
 
 
 @app.post(
@@ -1079,6 +1165,11 @@ async def start_investigation(
 
     # ── Fill in AI-determined values when the caller omits them ─────────────
     classification = _classify_topic(body.topic)
+
+    # Allow the caller (or the chat LLM) to override the tier.
+    if body.tier and body.tier in ("instant", "quick", "standard", "deep"):
+        classification.tier = body.tier
+        classification.estimated_credits = _TIER_CREDITS.get(body.tier, 100)
 
     effective_duration_hours: float = (
         body.duration_hours
@@ -1485,6 +1576,8 @@ async def delete_investigation(
         if _redis is not None:
             try:
                 await _redis.publish(f"kill:{task_id}", "1")
+                # Also set the stop key so continuous-mode checks pick it up
+                await _redis.set(f"stop:{task_id}", "1", ex=3600)
             except Exception:  # noqa: BLE001
                 pass
         await pool.execute(

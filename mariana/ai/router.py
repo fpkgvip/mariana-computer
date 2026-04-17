@@ -213,6 +213,13 @@ ROUTING_TABLE: dict[TaskType, ModelConfig] = {
         temperature=0.3,
         use_batch=False,
     ),
+    # ── Fast path (instant / quick tiers) ─────────────────────────────────────
+    TaskType.FAST_PATH: ModelConfig(
+        model_id=ModelID.GPT4O_MINI,
+        max_tokens=4096,
+        temperature=0.5,
+        use_batch=False,
+    ),
 }
 
 # ─── Quality-tier routing ────────────────────────────────────────────────────
@@ -280,6 +287,7 @@ _TASK_CATEGORY: dict[TaskType, str] = {
     TaskType.RETRIEVAL_STRATEGY: "cheap",
     TaskType.REASONING_AUDIT: "orchestrator",
     TaskType.EXECUTIVE_SUMMARY: "writing",
+    TaskType.FAST_PATH: "cheap",
 }
 
 # Used when DeepSeek is unhealthy and the originally routed model is DeepSeek.

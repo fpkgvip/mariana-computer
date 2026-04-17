@@ -269,6 +269,13 @@ _INLINE_JSON_FENCE_RE = re.compile(
 )
 
 
+# Regex to detect an opening fence with no matching close (truncated response).
+_OPEN_FENCE_RE = re.compile(
+    r"```(?:json)?\s*\r?\n",
+    re.IGNORECASE,
+)
+
+
 def _extract_json_text(text: str) -> str:
     """
     Find the first JSON block in *text*.
@@ -277,8 +284,9 @@ def _extract_json_text(text: str) -> str:
     1. ``json-fenced block (```json … ```)
     2. Bare fenced block (``` … ```)
     3. Inline fenced block (```json{...}```)
-    4. Greedy brace-matching extraction (handles prose around the JSON)
-    5. Entire text stripped of leading/trailing whitespace
+    4. Truncated fence (opening ```json but no closing ```) — strip prefix
+    5. Greedy brace-matching extraction (handles prose around the JSON)
+    6. Entire text stripped of leading/trailing whitespace
 
     Returns the candidate JSON string without the fence markers.
     """
@@ -297,6 +305,16 @@ def _extract_json_text(text: str) -> str:
         # Only use the inline match if it looks like JSON (starts with { or [).
         if candidate.startswith("{") or candidate.startswith("["):
             return candidate
+
+    # BUG-021 fix: handle truncated responses where the opening fence
+    # (```json\n) exists but the closing (```) was cut off by max_tokens.
+    # Strip the opening fence prefix so downstream repairers see raw JSON.
+    m_open = _OPEN_FENCE_RE.search(text)
+    if m_open:
+        after_fence = text[m_open.end():].strip()
+        if after_fence.startswith("{") or after_fence.startswith("["):
+            logger.info("Stripped truncated opening fence (no closing fence found)")
+            return after_fence
 
     # BUG-009 fix: Claude may produce prose before/after the JSON object.
     # Use greedy brace-matching to extract the outermost {...}.

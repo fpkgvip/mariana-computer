@@ -89,7 +89,10 @@ interface ClassifyResponse {
 /** POST /api/chat/respond response */
 interface ChatRespondResponse {
   reply: string;
-  tier: string;
+  action: "chat" | "research";
+  research_topic?: string;
+  tier?: string;
+  user_instructions?: string | null;
 }
 
 /** Pending research plan to show in the chat before approval */
@@ -1374,9 +1377,12 @@ export default function Chat() {
   /* ---------------------------------------------------------------- */
 
   /**
-   * Entry point: user hits send. We classify the topic first.
-   * - instant tier → skip plan, go straight to startInvestigation
-   * - standard/deep tier → show ResearchPlan card for user approval
+   * Entry point: user hits send.
+   *
+   * Chat-first architecture:
+   * 1. Every message goes to /api/chat/respond first
+   * 2. The AI decides: conversation (reply directly) or research (launch investigation)
+   * 3. For research: quick/standard auto-launch, deep shows approval card
    */
   const handleSend = useCallback(async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -1411,7 +1417,7 @@ export default function Chat() {
     const token = await getAccessToken();
     if (!token) {
       toast.error("Not authenticated", {
-        description: "Please sign in to run an investigation.",
+        description: "Please sign in.",
       });
       navigate("/login");
       return;
@@ -1420,82 +1426,73 @@ export default function Chat() {
     setIsClassifying(true);
 
     try {
-      const classifyRes = await fetch(`${API_URL}/api/investigations/classify`, {
+      // ── Step 1: Ask the AI how to handle this message ─────────────────
+      const chatRes = await fetch(`${API_URL}/api/chat/respond`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ topic }),
+        body: JSON.stringify({ message: topic }),
       });
 
-      if (classifyRes.status === 401) {
+      if (chatRes.status === 401) {
         toast.error("Session expired", { description: "Please sign in again." });
         setIsClassifying(false);
         navigate("/login");
         return;
       }
 
-      if (!classifyRes.ok) {
-        // Classify failed — fall through to direct investigation start
-        console.warn("[Chat] Classify failed, starting investigation directly.");
+      if (!chatRes.ok) {
+        // Chat endpoint failed — fall back to direct investigation
+        console.warn("[Chat] chat/respond failed, starting investigation directly.");
         setIsClassifying(false);
-        await startInvestigationRef.current(topic, token, true);
+        await startInvestigationRef.current(topic, token, true, undefined, undefined);
         return;
       }
 
-      const classifyData: ClassifyResponse = await classifyRes.json();
+      const chatData: ChatRespondResponse = await chatRes.json();
       setIsClassifying(false);
 
-      // ── Conversational messages (greetings, tests) → lightweight chat reply
-      if (classifyData.is_conversational) {
-        try {
-          const chatRes = await fetch(`${API_URL}/api/chat/respond`, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${token}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({ message: topic }),
-          });
-          if (chatRes.ok) {
-            const chatData: ChatRespondResponse = await chatRes.json();
-            setMessages((prev) => [
-              ...prev,
-              { role: "assistant", content: chatData.reply, type: "text", _id: makeMessageId() },
-            ]);
-          } else {
-            setMessages((prev) => [
-              ...prev,
-              { role: "assistant", content: "Hello! I'm Mariana, your deep research AI. What would you like me to investigate?", type: "text", _id: makeMessageId() },
-            ]);
-          }
-        } catch {
-          setMessages((prev) => [
-            ...prev,
-            { role: "assistant", content: "Hello! I'm Mariana. Ask me anything you'd like researched.", type: "text", _id: makeMessageId() },
-          ]);
-        }
+      // ── Step 2: Route based on AI decision ────────────────────────
+      if (chatData.action === "chat") {
+        // Pure conversation — show the reply, no investigation
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: chatData.reply, type: "text", _id: makeMessageId() },
+        ]);
         return;
       }
 
-      if (classifyData.tier === "instant" || classifyData.tier === "quick") {
-        // No approval needed for instant/quick — go straight to investigation
-        await startInvestigationRef.current(topic, token, true);
-      } else {
-        // Show research plan card for user approval
+      // action === "research" — AI wants to launch an investigation
+      const researchTopic = chatData.research_topic || topic;
+      const tier = chatData.tier || "standard";
+
+      // Show the AI's message about what it will research
+      if (chatData.reply) {
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: chatData.reply, type: "text", _id: makeMessageId() },
+        ]);
+      }
+
+      if (tier === "deep") {
+        // Deep tier needs user approval
         setPendingPlan({
-          topic,
-          tier: classifyData.tier,
-          plan_summary: classifyData.plan_summary,
-          estimated_duration_hours: classifyData.estimated_duration_hours,
-          estimated_credits: classifyData.estimated_credits,
+          topic: researchTopic,
+          tier: "deep",
+          plan_summary: `Deep investigation: ${researchTopic}`,
+          estimated_duration_hours: 0.5,
+          estimated_credits: 500,
         });
+      } else {
+        // Quick/standard — auto-launch, pass tier so backend doesn't re-classify
+        await startInvestigationRef.current(researchTopic, token, true, tier, chatData.user_instructions || undefined);
       }
     } catch (err) {
       setIsClassifying(false);
-      console.warn("[Chat] Classify error, starting investigation directly:", err);
-      await startInvestigationRef.current(topic, token, true);
+      console.warn("[Chat] Chat error, starting investigation directly:", err);
+      await startInvestigationRef.current(topic, token, true, undefined, undefined);
     }
   // BUG-C3-06 fix: startInvestigation accessed via startInvestigationRef.current
   // so handleSend always calls the latest version (avoids stale uploadSessionUuid).
@@ -1509,6 +1506,8 @@ export default function Chat() {
     topic: string,
     token: string,
     planApproved: boolean,
+    overrideTier?: string,
+    chatUserInstructions?: string,
   ) => {
     setIsSending(true);
     setPendingPlan(null);
@@ -1525,13 +1524,23 @@ export default function Chat() {
     setMessages((prev) => [...prev, initMsg]);
 
     try {
+      // Merge user instructions: chat-extracted instructions + advanced panel instructions.
+      // Chat instructions come from the AI parsing the user's message (e.g. "focus on X").
+      // Panel instructions come from the advanced settings textarea.
+      // Both are combined so the AI sees everything the user wants.
+      const mergedInstructions = [
+        chatUserInstructions || "",
+        userFlowInstructions || "",
+      ].filter(Boolean).join("\n\n");
+
       const requestBody: Record<string, unknown> = {
         topic,
         plan_approved: planApproved,
         quality_tier: selectedTier,
         continuous_mode: continuousMode,
         dont_kill_branches: dontKillBranches,
-        user_flow_instructions: userFlowInstructions,
+        user_flow_instructions: mergedInstructions,
+        ...(overrideTier ? { tier: overrideTier } : {}),
       };
       if (uploadSessionUuid) {
         requestBody.upload_session_uuid = uploadSessionUuid;
@@ -1689,7 +1698,7 @@ export default function Chat() {
       }
 
       setPendingPlan(null);
-      await startInvestigationRef.current(planToApprove.topic, token, true);
+      await startInvestigationRef.current(planToApprove.topic, token, true, planToApprove.tier, undefined);
     } finally {
       setIsClassifying(false);
     }

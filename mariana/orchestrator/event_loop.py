@@ -42,6 +42,7 @@ from mariana.data.models import (
     EvidenceExtractionOutput,
     EvidenceType,
     EvaluationOutput,
+    FastPathOutput,
     Finding,
     Hypothesis,
     HypothesisGenerationOutput,
@@ -225,6 +226,45 @@ async def run(
     quality_tier: str = _task_meta.get("quality_tier", "balanced") or "balanced"
     user_flow_instructions: str = _task_meta.get("user_flow_instructions", "") or ""
     continuous_mode: bool = bool(_task_meta.get("continuous_mode", False))
+
+    # ── Inject uploaded file contents into user_flow_instructions ────────
+    # Users can attach .md / .txt files containing custom research methodology,
+    # constraints, or instructions.  Files are stored at
+    # {DATA_ROOT}/files/{task_id}/ by the API.  We read them here so every
+    # AI call in the pipeline sees the user's full intent.
+    _files_dir = Path(getattr(config, "DATA_ROOT", "/data/mariana")) / "files" / task.id
+    if _files_dir.is_dir():
+        _file_parts: list[str] = []
+        for _fp in sorted(_files_dir.iterdir()):
+            if _fp.is_file() and _fp.suffix.lower() in (".md", ".txt", ".markdown"):
+                try:
+                    _content = _fp.read_text(encoding="utf-8", errors="replace")[:20_000]  # cap per file
+                    _file_parts.append(f"--- Attached file: {_fp.name} ---\n{_content}")
+                    log.info("uploaded_file_injected", file=_fp.name, chars=len(_content))
+                except Exception as _fexc:
+                    log.warning("uploaded_file_read_failed", file=_fp.name, error=str(_fexc))
+        if _file_parts:
+            _file_block = "\n\n".join(_file_parts)
+            user_flow_instructions = (
+                (user_flow_instructions + "\n\n" + _file_block)
+                if user_flow_instructions
+                else _file_block
+            )
+            # Persist back so _augment_context_from_task also sees it
+            if task.metadata is not None:
+                task.metadata["user_flow_instructions"] = user_flow_instructions
+
+    # ── Tier-aware quality override ─────────────────────────────────────────
+    # Standard tier ($1 budget, 3-5 min target) must use faster/cheaper models.
+    # - Economy tier uses DeepSeek/GPT-4o-mini which are 3-5x faster than Sonnet.
+    # - Deep tier keeps user's chosen quality (or balanced).
+    # - Only override if user hasn't explicitly requested higher quality.
+    if tier == "standard" and quality_tier == "balanced":
+        quality_tier = "economy"
+        log.info("quality_tier_downgraded_for_standard", original="balanced", new="economy")
+        # Persist so spawn_model picks it up via metadata
+        if task.metadata:
+            task.metadata["quality_tier"] = quality_tier
     # dont_kill_branches is threaded via ResearchSessionData (built per iteration)
 
     if user_flow_instructions:
@@ -270,20 +310,21 @@ async def run(
 
             system_prompt = (
                 "You are Mariana, an elite AI research assistant. "
-                "Answer the user directly and concisely. "
+                "Answer the user's question directly and concisely. "
                 "If the user is just greeting or testing, respond warmly and briefly. "
                 "If the user asks a factual question, answer it with citations where possible. "
+                "Provide your response in the 'answer' field as plain text or markdown. "
                 "Never refuse. Always be helpful."
             )
             fast_output, fast_session = await _fast_spawn(
-                task_type=TaskType.HYPOTHESIS_GENERATION,
+                task_type=TaskType.FAST_PATH,
                 context=_build_context({
                     "task_id": task.id,
                     "topic": task.topic,
                     "budget_remaining": cost_tracker.budget_remaining,
                     "system_override": system_prompt,
                 }),
-                output_schema=HypothesisGenerationOutput,
+                output_schema=FastPathOutput,
                 branch_id=None,
                 db=db,
                 cost_tracker=cost_tracker,
@@ -292,16 +333,8 @@ async def run(
             )
             task.ai_call_counter += 1
 
-            # Extract the answer text from the output
-            answer_text = ""
-            if hasattr(fast_output, "hypotheses") and fast_output.hypotheses:
-                answer_text = "\n\n".join(
-                    h.statement for h in fast_output.hypotheses if hasattr(h, "statement")
-                )
-            if not answer_text and hasattr(fast_output, "score_rationale"):
-                answer_text = fast_output.score_rationale
-            if not answer_text:
-                answer_text = str(fast_output)
+            # Extract the answer text from the lightweight FastPathOutput
+            answer_text = fast_output.answer if hasattr(fast_output, "answer") else str(fast_output)
 
             _emit_progress(redis_client, task.id, {
                 "type": "text",
@@ -312,7 +345,6 @@ async def run(
                 "state": "HALT",
                 "message": "Complete.",
             })
-            # BUG-S5-02 fix: mark as COMPLETED only on success (set below)
             fast_success = True
         except Exception as fast_exc:
             fast_success = False
@@ -327,9 +359,6 @@ async def run(
                 "message": "Failed.",
             })
 
-        # BUG-S5-02 fix: mark task FAILED on error, not COMPLETED.
-        # Previously the code unconditionally set status=COMPLETED even
-        # when the fast path raised an exception.
         task.current_state = State.HALT
         task.status = TaskStatus.COMPLETED if fast_success else TaskStatus.FAILED
         if not fast_success:
@@ -398,9 +427,16 @@ async def run(
                         "SELECT status FROM research_tasks WHERE id = $1",
                         task.id,
                     )
-                    if _db_status == "HALTED":
-                        log.info("external_kill_detected", task_id=task.id)
-                        task.status = TaskStatus.HALTED
+                    if _db_status is None:
+                        # Task was deleted from the DB (user deleted investigation)
+                        log.info("task_deleted_externally", task_id=task.id)
+                        task.status = TaskStatus.FAILED
+                        task.current_state = State.HALT
+                        task.error_message = "Investigation deleted by user"
+                        break
+                    if _db_status in ("HALTED", "FAILED"):
+                        log.info("external_kill_detected", task_id=task.id, db_status=_db_status)
+                        task.status = TaskStatus.HALTED if _db_status == "HALTED" else TaskStatus.FAILED
                         task.current_state = State.HALT
                         _emit_progress(redis_client, task.id, {
                             "type": "text",
@@ -554,6 +590,7 @@ async def run(
                         db=db,
                         cost_tracker=cost_tracker,
                         config=config,
+                        tier=tier,
                     )
                     log.info("intelligence_after_evaluate_complete_hook", **{
                         k: v for k, v in _intel_eval_result.items()
@@ -563,34 +600,13 @@ async def run(
                     log.warning("intelligence_after_evaluate_hook_failed", error=str(_intel_exc))
 
             # before_report fires when entering REPORT state
+            # NOTE: handle_report() internally calls before_report via the
+            # intelligence engine, so we only enable finalization_mode here
+            # to ensure the budget isn't blocking.  We do NOT call
+            # before_report again to avoid duplicate executive-summary work.
             if next_state == State.REPORT and _prev_state != State.REPORT:
-                # Enable finalization mode so intelligence hooks can run
-                # even if the main loop nearly exhausted the budget.
                 cost_tracker.finalization_mode = True
-                try:
-                    from mariana.orchestrator.intelligence.engine import before_report as _intel_before_report_hook  # noqa: PLC0415
-                    _intel_report_result = await _intel_before_report_hook(
-                        task_id=task.id,
-                        topic=task.topic,
-                        db=db,
-                        cost_tracker=cost_tracker,
-                        config=config,
-                    )
-                    log.info("intelligence_before_report_complete_hook", **{
-                        k: v for k, v in _intel_report_result.items()
-                        if not isinstance(v, (dict, list)) and k != "one_liner"
-                    })
-                    # Store in task metadata for report generator
-                    _meta = task.meta if task.meta else {}
-                    _meta["intelligence_report_context"] = {
-                        "audit_passed": _intel_report_result.get("audit_passed", False),
-                        "audit_score": _intel_report_result.get("audit_score", 0.0),
-                        "perspectives_count": _intel_report_result.get("perspectives_generated", 0),
-                        "one_liner": _intel_report_result.get("one_liner", ""),
-                    }
-                    task.meta = _meta
-                except Exception as _intel_exc:
-                    log.warning("intelligence_before_report_hook_failed", error=str(_intel_exc))
+                log.info("finalization_mode_enabled_for_report")
 
             # before_halt: when entering HALT, run after_evaluate + before_report
             # to ensure intelligence data is always generated (even without REPORT phase)
@@ -609,6 +625,7 @@ async def run(
                             db=db,
                             cost_tracker=cost_tracker,
                             config=config,
+                            tier=tier,
                         )
                         log.info("intelligence_after_evaluate_on_halt", **{
                             k: v for k, v in _halt_eval.items()
@@ -617,22 +634,28 @@ async def run(
                     except Exception as _intel_exc:
                         log.warning("intelligence_after_evaluate_on_halt_failed", error=str(_intel_exc))
 
-                # Always run before_report on halt to generate summaries
-                try:
-                    from mariana.orchestrator.intelligence.engine import before_report as _intel_halt_report  # noqa: PLC0415
-                    _halt_report = await _intel_halt_report(
-                        task_id=task.id,
-                        topic=task.topic,
-                        db=db,
-                        cost_tracker=cost_tracker,
-                        config=config,
-                    )
-                    log.info("intelligence_before_report_on_halt", **{
-                        k: v for k, v in _halt_report.items()
-                        if not isinstance(v, (dict, list)) and k != "one_liner"
-                    })
-                except Exception as _intel_exc:
-                    log.warning("intelligence_before_report_on_halt_failed", error=str(_intel_exc))
+                # Run before_report on halt ONLY if we didn't come from
+                # REPORT state (handle_report already called before_report).
+                if _prev_state != State.REPORT:
+                    try:
+                        from mariana.orchestrator.intelligence.engine import before_report as _intel_halt_report  # noqa: PLC0415
+                        _halt_report = await _intel_halt_report(
+                            task_id=task.id,
+                            topic=task.topic,
+                            db=db,
+                            cost_tracker=cost_tracker,
+                            config=config,
+                            quality_tier=(task.metadata or {}).get("quality_tier"),
+                            tier=tier,
+                        )
+                        log.info("intelligence_before_report_on_halt", **{
+                            k: v for k, v in _halt_report.items()
+                            if not isinstance(v, (dict, list)) and k != "one_liner"
+                        })
+                    except Exception as _intel_exc:
+                        log.warning("intelligence_before_report_on_halt_failed", error=str(_intel_exc))
+                else:
+                    log.info("before_report_on_halt_skipped", reason="already_ran_in_handle_report")
 
             # --------------------------------------------------------- #
             # 6. Continuous mode: restart instead of halting
@@ -1172,10 +1195,25 @@ async def handle_init(
     hypothesis_output: HypothesisGenerationOutput = parsed_output  # type: ignore[assignment]
     import uuid as _uuid  # noqa: PLC0415
     created_hypotheses = []
+
+    # ── Tier-aware hypothesis cap ─────────────────────────────────────────
+    # Standard tier: cap at 3 branches to keep research phase under 3 min.
+    # Deep tier: use all generated hypotheses (typically 4-6).
+    _tier = (task.metadata or {}).get("tier", "standard")
+    _hyp_cap = {"instant": 1, "quick": 1, "standard": 3, "deep": 10}.get(_tier, 3)
+    _all_hyps = hypothesis_output.hypotheses[:_hyp_cap]
+    if len(hypothesis_output.hypotheses) > _hyp_cap:
+        log.info(
+            "hypothesis_cap_applied",
+            tier=_tier,
+            generated=len(hypothesis_output.hypotheses),
+            capped_to=_hyp_cap,
+        )
+
     # BUG-023: Wrap hypothesis + branch insertion in a transaction to avoid partial state
     async with db.acquire() as _conn:
         async with _conn.transaction():
-            for gen_hyp in hypothesis_output.hypotheses:
+            for gen_hyp in _all_hyps:
                 hyp = Hypothesis(
                     id=str(_uuid.uuid4()),
                     task_id=task.id,
@@ -1391,19 +1429,20 @@ async def handle_search(
                 log.warning("perplexity_search_failed", error=str(exc))
     # ─────────────────────────────────────────────────────────────────────
 
-    for branch in active:
-        if branch.status != BranchStatus.ACTIVE:
-            continue
+    # ── Parallel evidence extraction across all active branches ─────────
+    # Running all branches concurrently saves ~2x wall-clock time for standard
+    # tier (from ~2.5 min sequential to ~50s parallel with 3 branches).
+    _budget_exhausted = False
 
+    async def _extract_branch(branch: Branch) -> None:
+        nonlocal _budget_exhausted
         try:
-            # BUG-002: Fetch actual hypothesis statement instead of using the UUID
             _hyp_row = await db.fetchrow(
                 "SELECT statement FROM hypotheses WHERE id = $1",
                 branch.hypothesis_id,
             )
             _hyp_statement = _hyp_row["statement"] if _hyp_row else ""
 
-            # Inject Perplexity results as additional page_content if available
             page_content = perplexity_context.get(branch.id, "")
 
             extraction_output, ai_session = await spawn_model(
@@ -1424,14 +1463,8 @@ async def handle_search(
                 config=config,
                 quality_tier=(task.metadata or {}).get("quality_tier"),
             )
-            # spawn_model already records cost internally — do NOT double-count
             task.ai_call_counter += 1
 
-            # BUG-R3-01 fix: persist each extracted evidence item as a Finding record.
-            # The EvidenceExtractionOutput was previously discarded with `_`,
-            # meaning no findings were ever saved to the DB.  Without DB rows,
-            # session_data.recent_findings is always empty, STRONG_FINDINGS_EXIST
-            # never triggers, and handle_report generates an empty report.
             _evidence_out: EvidenceExtractionOutput = extraction_output  # type: ignore[assignment]
             for _item in _evidence_out.evidence_items:
                 _finding = Finding(
@@ -1442,7 +1475,7 @@ async def handle_search(
                     content_language=_evidence_out.language_detected or "en",
                     confidence=_item.confidence,
                     evidence_type=_item.evidence_type,
-                    source_ids=[],  # no formal Source record for AI-synthesised content
+                    source_ids=[],
                     metadata={
                         "quote": _item.quote,
                         "data_point": _item.data_point,
@@ -1483,10 +1516,6 @@ async def handle_search(
                             _finding.raw_content_path,
                             json.dumps(_finding.metadata),
                         )
-                    # BUG-R4-01 fix: write finding node + evidence edge to knowledge graph.
-                    # Previously findings were persisted to the findings table but never
-                    # added to graph_nodes/graph_edges, so the knowledge graph was always
-                    # empty and the SSE graph stream never received finding events.
                     try:
                         await graph_writer.add_finding_node(db, task.id, _finding, redis_client)
                         await graph_writer.add_evidence_edge(
@@ -1510,10 +1539,16 @@ async def handle_search(
             )
 
         except BudgetExhaustedError:
+            _budget_exhausted = True
             log.warning("search_budget_exhausted", branch_id=branch.id)
-            raise
 
-    log.info("search_batch_complete", branches_searched=len(active))
+    _active_branches = [b for b in active if b.status == BranchStatus.ACTIVE]
+    if _active_branches:
+        await asyncio.gather(*[_extract_branch(b) for b in _active_branches])
+    if _budget_exhausted:
+        raise BudgetExhaustedError("Budget exhausted during parallel evidence extraction")
+
+    log.info("search_batch_complete", branches_searched=len(_active_branches))
 
     # ── Intelligence Engine: after_search hook ────────────────────────────
     # Collect all newly persisted findings + sources for intelligence processing.
@@ -1574,6 +1609,7 @@ async def handle_search(
                 cost_tracker=cost_tracker,
                 config=config,
                 quality_tier=(task.metadata or {}).get("quality_tier"),
+                tier=(task.metadata or {}).get("tier", "standard"),
             )
             log.info("intelligence_after_search_complete", **{
                 k: v for k, v in _intel_result.items() if not isinstance(v, (dict, list))
@@ -2416,6 +2452,7 @@ async def handle_report(
             cost_tracker=cost_tracker,
             config=config,
             quality_tier=(task.metadata or {}).get("quality_tier"),
+            tier=(task.metadata or {}).get("tier", "standard"),
         )
         log.info(
             "intelligence_before_report_complete",
@@ -2496,6 +2533,7 @@ async def handle_report(
             db=db,
             cost_tracker=cost_tracker,
             report_dir=config.reports_dir,
+            config=config,
         )
         task.output_pdf_path = pdf_path
         task.output_docx_path = docx_path
@@ -2714,6 +2752,13 @@ async def _build_session_data(
     _force_report = bool(_meta.get("force_report_on_halt", False))
     _skip_skeptic = bool(_meta.get("skip_skeptic", False))
     _skip_tribunal = bool(_meta.get("skip_tribunal", False))
+
+    # Tier-based overrides: standard tier skips tribunal + skeptic to stay under 5 min.
+    # Only deep tier runs the full tribunal/skeptic pipeline.
+    _tier = _meta.get("tier", "standard")
+    if _tier in ("instant", "quick", "standard"):
+        _skip_tribunal = True
+        _skip_skeptic = True
     _user_directives = _meta.get("user_directives", {})
     if not isinstance(_user_directives, dict):
         _user_directives = {}
