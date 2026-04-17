@@ -766,6 +766,12 @@ async def _require_investigation_owner(
     current_user: dict[str, str] = Depends(_get_current_user),
 ) -> dict[str, str]:
     """Dependency that restricts a task-scoped endpoint to its owner or admin."""
+    # ADV-FIX: Validate task_id is a proper UUID before hitting the database.
+    # Null bytes, URL-encoded garbage, etc. would otherwise cause 500.
+    try:
+        uuid.UUID(task_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid task ID format")
     db = _get_db()
     row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
     if row is None:
@@ -871,6 +877,10 @@ async def _require_investigation_owner_header_or_query(
     current_user: dict[str, str] = Depends(_get_current_user_from_header_or_query),
 ) -> dict[str, str]:
     """SSE-friendly ownership dependency for task-scoped endpoints."""
+    try:
+        uuid.UUID(task_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid task ID format")
     db = _get_db()
     row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
     if row is None:
@@ -897,6 +907,11 @@ async def _authenticate_stream_token_or_header(
     ``POST /api/investigations/{task_id}/stream-token``.
     The full JWT is never sent in the query string.
     """
+    # ADV-FIX: Validate UUID before any processing.
+    try:
+        uuid.UUID(task_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid task ID format")
     if stream_token:
         # Verify the stream token (short-lived, single-purpose)
         user_id = _verify_stream_token(stream_token, task_id)
@@ -1034,7 +1049,10 @@ async def get_config(
     tags=["Investigations"],
     summary="Classify a research request into a tier",
 )
-async def classify_request(body: ClassifyRequest) -> ClassifyResponse:
+async def classify_request(
+    body: ClassifyRequest,
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> ClassifyResponse:
     """
     Classify a research topic into a tier (instant / standard / deep)
     and return estimated duration, credits, and a plan summary.
@@ -1362,6 +1380,12 @@ async def get_conversation(
     authorization: str | None = Header(None),
     current_user: dict[str, str] = Depends(_get_current_user),
 ) -> ConversationDetailResponse:
+    # BUG-P2-04: Validate conversation_id is a valid UUID to avoid 500 from Supabase
+    try:
+        uuid.UUID(conversation_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid conversation ID format")
+
     cfg = _get_config()
     user_id = current_user["user_id"]
     user_token = authorization.split(" ", 1)[1].strip() if authorization and authorization.startswith("Bearer ") else None
@@ -1448,6 +1472,10 @@ async def update_conversation(
     authorization: str | None = Header(None),
     current_user: dict[str, str] = Depends(_get_current_user),
 ) -> dict:
+    try:
+        uuid.UUID(conversation_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid conversation ID format")
     cfg = _get_config()
     user_id = current_user["user_id"]
     user_token = authorization.split(" ", 1)[1].strip() if authorization and authorization.startswith("Bearer ") else None
@@ -1472,6 +1500,10 @@ async def delete_conversation(
     authorization: str | None = Header(None),
     current_user: dict[str, str] = Depends(_get_current_user),
 ) -> dict:
+    try:
+        uuid.UUID(conversation_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid conversation ID format")
     cfg = _get_config()
     user_id = current_user["user_id"]
     user_token = authorization.split(" ", 1)[1].strip() if authorization and authorization.startswith("Bearer ") else None
@@ -1842,6 +1874,11 @@ async def get_investigation(
 
     BUG-S2-12 fix: Added auth — only the investigation owner or admin can view.
     """
+    # ADV-FIX: Validate UUID format before DB query.
+    try:
+        uuid.UUID(task_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid task ID format")
     db = _get_db()
     row = await db.fetchrow(
         """
@@ -4652,7 +4689,7 @@ async def submit_feedback(
 )
 async def get_feedback(
     task_id: str,
-    current_user: dict[str, str] = Depends(_get_current_user),
+    current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
     """Fetch all feedback events for a specific investigation."""
     db = _get_db()
@@ -4726,7 +4763,7 @@ async def trigger_extraction(
 )
 async def get_outcome(
     task_id: str,
-    current_user: dict[str, str] = Depends(_get_current_user),
+    current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> OutcomeResponse:
     """Get the automated outcome record for an investigation."""
     db = _get_db()
@@ -4768,7 +4805,7 @@ async def get_outcome(
 )
 async def get_claims(
     task_id: str,
-    current_user: dict[str, str] = Depends(_get_current_user),
+    current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
     """Fetch all atomic claims extracted from research findings."""
     db = _get_db()
@@ -4784,7 +4821,7 @@ async def get_claims(
 )
 async def get_claims_summary(
     task_id: str,
-    current_user: dict[str, str] = Depends(_get_current_user),
+    current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
     """Fetch summary statistics for the evidence ledger."""
     db = _get_db()
@@ -4800,7 +4837,7 @@ async def get_claims_summary(
 )
 async def get_source_scores(
     task_id: str,
-    current_user: dict[str, str] = Depends(_get_current_user),
+    current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
     """Fetch credibility scores for all sources in an investigation."""
     db = _get_db()
@@ -4817,7 +4854,7 @@ async def get_source_scores(
 )
 async def get_contradictions(
     task_id: str,
-    current_user: dict[str, str] = Depends(_get_current_user),
+    current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
     """Fetch detected contradictions between claims."""
     db = _get_db()
@@ -4833,7 +4870,7 @@ async def get_contradictions(
 )
 async def get_hypothesis_rankings(
     task_id: str,
-    current_user: dict[str, str] = Depends(_get_current_user),
+    current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
     """Fetch Bayesian posterior rankings for all hypotheses."""
     db = _get_db()
@@ -4850,7 +4887,7 @@ async def get_hypothesis_rankings(
 )
 async def get_gaps(
     task_id: str,
-    current_user: dict[str, str] = Depends(_get_current_user),
+    current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
     """Fetch the latest gap analysis (missing evidence, completeness score)."""
     db = _get_db()
@@ -4868,7 +4905,7 @@ async def get_gaps(
 )
 async def get_temporal(
     task_id: str,
-    current_user: dict[str, str] = Depends(_get_current_user),
+    current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
     """Fetch temporal coverage and timeline of claims."""
     db = _get_db()
@@ -4904,7 +4941,7 @@ async def get_temporal(
 )
 async def get_perspectives(
     task_id: str,
-    current_user: dict[str, str] = Depends(_get_current_user),
+    current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
     """Fetch multi-perspective synthesis (bull/bear/skeptic/expert views)."""
     db = _get_db()
@@ -4934,7 +4971,7 @@ async def get_perspectives(
 )
 async def get_audit(
     task_id: str,
-    current_user: dict[str, str] = Depends(_get_current_user),
+    current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
     """Fetch the latest reasoning chain audit results."""
     db = _get_db()
@@ -4952,7 +4989,7 @@ async def get_audit(
 )
 async def get_executive_summary(
     task_id: str,
-    current_user: dict[str, str] = Depends(_get_current_user),
+    current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
     """Fetch executive summaries at all compression levels."""
     db = _get_db()
@@ -4970,7 +5007,7 @@ async def get_executive_summary(
 )
 async def get_diversity(
     task_id: str,
-    current_user: dict[str, str] = Depends(_get_current_user),
+    current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
     """Fetch source diversity assessment for an investigation."""
     db = _get_db()
@@ -4986,7 +5023,7 @@ async def get_diversity(
 )
 async def get_intelligence_overview(
     task_id: str,
-    current_user: dict[str, str] = Depends(_get_current_user),
+    current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
     """Comprehensive intelligence overview: claims, credibility, contradictions,
     Bayesian rankings, gaps, audit, perspectives, and executive summary — all in one call."""
@@ -5067,8 +5104,34 @@ async def get_intelligence_overview(
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    """Return a structured JSON body for Pydantic validation errors."""
+    """Return a structured JSON body for Pydantic validation errors.
+
+    ADV-FIX: exc.errors() can contain bytes or other non-serializable types
+    (e.g. when body has null bytes or invalid encoding).  We sanitize the
+    errors list so JSONResponse never crashes with TypeError.
+    """
+    import json as _json
+
+    def _sanitize(obj: object) -> object:
+        if isinstance(obj, bytes):
+            return obj.decode("utf-8", errors="replace")
+        if isinstance(obj, dict):
+            return {k: _sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_sanitize(i) for i in obj]
+        # Fallback: force str for anything else non-serializable
+        try:
+            _json.dumps(obj)
+            return obj
+        except (TypeError, ValueError):
+            return str(obj)
+
+    try:
+        errors = _sanitize(exc.errors())
+    except Exception:
+        errors = [{"msg": "Validation error", "type": "value_error"}]
+
     return JSONResponse(
         status_code=422,
-        content={"detail": exc.errors(), "type": "validation_error"},
+        content={"detail": errors, "type": "validation_error"},
     )

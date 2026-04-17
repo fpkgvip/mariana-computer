@@ -412,6 +412,8 @@ export default function Chat() {
   const [memoryOpen, setMemoryOpen] = useState(false);
   const [memoryFacts, setMemoryFacts] = useState<Array<{ fact: string; category: string }>>([]);
   const [memoryPrefs, setMemoryPrefs] = useState<Record<string, string>>({});
+  const deletingFactsRef = useRef<Set<string>>(new Set());
+  const deletingPrefsRef = useRef<Set<string>>(new Set());
   const [memoryLoading, setMemoryLoading] = useState(false);
 
   // Stable ref to current messages — prevents stale closure in switchInvestigation.
@@ -485,6 +487,8 @@ export default function Chat() {
   }, []);
 
   const deleteMemoryFact = useCallback(async (fact: string) => {
+    if (deletingFactsRef.current.has(fact)) return;
+    deletingFactsRef.current.add(fact);
     try {
       const token = await getAccessToken();
       if (!token) {
@@ -505,10 +509,14 @@ export default function Chat() {
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
       toast.error("Failed to delete memory entry", { description: message });
+    } finally {
+      deletingFactsRef.current.delete(fact);
     }
   }, []);
 
   const deleteMemoryPref = useCallback(async (key: string) => {
+    if (deletingPrefsRef.current.has(key)) return;
+    deletingPrefsRef.current.add(key);
     try {
       const token = await getAccessToken();
       if (!token) {
@@ -533,6 +541,8 @@ export default function Chat() {
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
       toast.error("Failed to delete preference", { description: message });
+    } finally {
+      deletingPrefsRef.current.delete(key);
     }
   }, []);
 
@@ -761,7 +771,7 @@ export default function Chat() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [messages, timelineSteps]);
 
   /* ---------------------------------------------------------------- */
   /*  Cleanup on unmount                                              */
@@ -1078,6 +1088,12 @@ export default function Chat() {
 
   const startPolling = useCallback(
     (taskId: string, _initialToken: string) => {
+      // BUG-FE-C4 fix: Clear any existing poll interval before starting a new one
+      // to prevent duplicate concurrent poll loops
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
       connectedTaskIdRef.current = taskId;
       const poll = async () => {
         if (connectedTaskIdRef.current !== taskId || activeTaskIdRef.current !== taskId) {
@@ -1264,9 +1280,21 @@ export default function Chat() {
         // Fallback: use JWT directly (backward compat with older backends)
       }
 
+      // BUG-FE-C3 fix: After async stream-token mint, check if the user has
+      // already switched to a different task. If so, bail out to avoid creating
+      // a zombie EventSource for a stale task.
+      if (connectedTaskIdRef.current !== taskId) {
+        return;
+      }
+
       const url = `${API_URL}/api/investigations/${taskId}/logs?token=${encodeURIComponent(streamToken)}`;
 
       try {
+        // BUG-FE-C3 fix: Close any existing EventSource before creating a new one
+        if (eventSourceRef.current) {
+          eventSourceRef.current.close();
+          eventSourceRef.current = null;
+        }
         const es = new EventSource(url);
         eventSourceRef.current = es;
 
@@ -1662,6 +1690,10 @@ export default function Chat() {
     setInput("");
     setIsClassifying(true);
 
+    // BUG-FE-C2 fix: Wrap entire body in try/finally to guarantee ref reset
+    // on ALL exit paths (missing reset caused "Send button does nothing" bug)
+    try {
+
     // Save current investigation messages before starting new
     if (activeTaskId && messagesRef.current.length > 0) {
       messageStoreRef.current[activeTaskId] = [...messagesRef.current];
@@ -1813,6 +1845,11 @@ export default function Chat() {
         estimated_credits: 100,
         _convId: convId || undefined,
       });
+    }
+
+    // BUG-FE-C2 fix: end of try/finally wrapper
+    } finally {
+      isClassifyingRef.current = false;
     }
   // BUG-C3-06 fix: startInvestigation accessed via startInvestigationRef.current
   // so handleSend always calls the latest version (avoids stale uploadSessionUuid).
