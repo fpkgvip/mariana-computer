@@ -200,15 +200,36 @@ export function parseStructuredEvent(event: StructuredEvent, existingSteps: Time
       };
     }
 
-    case "status_change":
+    case "status_change": {
+      // Map internal state-machine values to user-friendly labels
+      const FRIENDLY_STATE: Record<string, string | null> = {
+        INIT: null,           // suppress — initializing already shown
+        HALT: null,           // suppress — completion shown separately
+        COMPLETED: null,
+        HALTED: null,
+        PENDING: null,
+        RUNNING: null,
+        SEARCHING: "Searching the web...",
+        EVALUATING: "Evaluating findings...",
+        REPORTING: "Generating report...",
+        DEEP_DIVE: "Conducting deep dive...",
+        CHECKPOINT: "Checkpoint — reviewing progress...",
+        PIVOT: "Adjusting research direction...",
+        TRIBUNAL: "Running adversarial review...",
+        SKEPTIC_REVIEW: "Skeptic review in progress...",
+      };
+      const rawState = (event.state || "").toUpperCase();
+      const friendlyLabel = event.message || (rawState in FRIENDLY_STATE ? FRIENDLY_STATE[rawState] : `State: ${event.state || "Unknown"}`);
+      if (!friendlyLabel) return null; // suppress internal-only states
       return {
         id: makeEventInstanceId("state", event.state),
         type: "status_change",
-        label: event.message || `State: ${event.state || "Unknown"}`,
+        label: friendlyLabel,
         icon: stateToIcon(event.state || ""),
         status: "complete",
         timestamp: Date.now(),
       };
+    }
 
     case "file_attached":
       return {

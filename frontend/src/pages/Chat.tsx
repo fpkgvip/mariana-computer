@@ -118,10 +118,13 @@ interface PersistedMessage {
 /** Pending research plan to show in the chat before approval */
 interface ResearchPlan {
   topic: string;
-  tier: ClassifyResponse["tier"];
+  tier: ClassifyResponse["tier"] | string;
   plan_summary: string;
   estimated_duration_hours: number;
   estimated_credits: number;
+  /** Carried from chat/respond so handleApprovePlan can forward them */
+  _userInstructions?: string;
+  _convId?: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -347,6 +350,10 @@ export default function Chat() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [isClassifying, setIsClassifying] = useState(false);
+  const isClassifyingRef = useRef(false);
+  // BUG-D4-01: Sync ref with state — ref was set to true in handleSend but
+  // never reset, permanently blocking subsequent sends.
+  useEffect(() => { isClassifyingRef.current = isClassifying; }, [isClassifying]);
   const [retryPayload, setRetryPayload] = useState<{ topic: string } | null>(null);
 
   // Pending research plan awaiting user approval
@@ -1116,15 +1123,35 @@ export default function Chat() {
           // BUG-R2-02: Backend returns TaskSummary — use "id", "current_state" not "task_id", "status_message"
           const data: InvestigationPollResponse = await res.json();
 
-          // Show current_state as a progress message (backend state-machine string)
+          // Show current_state as a progress message — map internal states to user-friendly text
           if (data.current_state) {
-            appendMessage({
-              role: "system",
-              content: data.current_state,
-              type: "status",
-              id: `poll-state-${data.current_state}`,
-              _id: makeMessageId(),
-            });
+            const STATE_LABELS: Record<string, string | null> = {
+              INIT: null,           // suppress — "Initializing" already shown
+              HALT: null,           // suppress — completion message shown separately
+              COMPLETED: null,      // suppress — handled by status === "COMPLETED" branch
+              HALTED: null,         // suppress — handled by status === "HALTED" branch
+              PENDING: null,        // suppress — not useful
+              RUNNING: null,        // suppress — not useful
+              SEARCHING: "Searching the web...",
+              EVALUATING: "Evaluating findings...",
+              REPORTING: "Generating report...",
+              DEEP_DIVE: "Conducting deep dive...",
+              CHECKPOINT: "Checkpoint — reviewing progress...",
+              PIVOT: "Adjusting research direction...",
+              TRIBUNAL: "Running adversarial review...",
+              SKEPTIC_REVIEW: "Skeptic review in progress...",
+            };
+            const stateKey = data.current_state.toUpperCase();
+            const label = stateKey in STATE_LABELS ? STATE_LABELS[stateKey] : data.current_state;
+            if (label) {
+              appendMessage({
+                role: "system",
+                content: label,
+                type: "status",
+                id: `poll-state-${data.current_state}`,
+                _id: makeMessageId(),
+              });
+            }
           }
 
           if (data.status === "RUNNING") {
@@ -1149,6 +1176,33 @@ export default function Chat() {
             stopAllConnections();
             // BUG-018: Refresh credit balance after investigation completes
             refreshUser();
+
+            // Fetch executive summary for inline display (polling path)
+            (async () => {
+              try {
+                const sumToken = await getAccessToken();
+                if (!sumToken) return;
+                const sumRes = await fetch(`${API_URL}/api/intelligence/${taskId}/executive-summary`, {
+                  headers: { Authorization: `Bearer ${sumToken}` },
+                });
+                if (!sumRes.ok) return;
+                const sumData = await sumRes.json();
+                const execSummary = sumData?.summary?.executive_summary
+                  || sumData?.summary?.one_liner
+                  || sumData?.summary?.summary
+                  || (typeof sumData?.summary === "string" ? sumData.summary : null);
+                if (execSummary && typeof execSummary === "string" && execSummary.trim()) {
+                  appendMessage({
+                    role: "assistant",
+                    content: execSummary.trim(),
+                    type: "text",
+                    _id: makeMessageId(),
+                  });
+                }
+              } catch {
+                // Non-critical — user can still download the full report
+              }
+            })();
           } else if (data.status === "FAILED" || data.status === "HALTED") {
             updateInvestigationStatus(taskId, data.status as InvestigationStatus);
             const errMsg = data.error ?? `The investigation ${data.status.toLowerCase()}. Please try again.`;
@@ -1251,6 +1305,33 @@ export default function Chat() {
                   });
                   stopAllConnections();
                   refreshUser();
+
+                  // Fetch executive summary for inline display
+                  (async () => {
+                    try {
+                      const sumToken = await getAccessToken();
+                      if (!sumToken) return;
+                      const sumRes = await fetch(`${API_URL}/api/intelligence/${taskId}/executive-summary`, {
+                        headers: { Authorization: `Bearer ${sumToken}` },
+                      });
+                      if (!sumRes.ok) return;
+                      const sumData = await sumRes.json();
+                      const execSummary = sumData?.summary?.executive_summary
+                        || sumData?.summary?.one_liner
+                        || sumData?.summary?.summary
+                        || (typeof sumData?.summary === "string" ? sumData.summary : null);
+                      if (execSummary && typeof execSummary === "string" && execSummary.trim()) {
+                        appendMessage({
+                          role: "assistant",
+                          content: execSummary.trim(),
+                          type: "text",
+                          _id: makeMessageId(),
+                        });
+                      }
+                    } catch {
+                      // Non-critical — user can still download the full report
+                    }
+                  })();
                 } else if (state === "HALTED") {
                   updateInvestigationStatus(taskId, "HALTED");
                   appendMessage({
@@ -1552,13 +1633,17 @@ export default function Chat() {
    */
   const handleSend = useCallback(async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (isSending || isClassifying) return;
+    if (isSending || isClassifying || isClassifyingRef.current) return;
 
     const topic = input.trim() || retryPayload?.topic || "";
     if (!topic) return;
 
+    // Lock IMMEDIATELY via ref to prevent rapid double-sends (React state
+    // batching means useState won't be visible to a second click yet)
+    isClassifyingRef.current = true;
     setRetryPayload(null);
     setInput("");
+    setIsClassifying(true);
 
     // Save current investigation messages before starting new
     if (activeTaskId && messagesRef.current.length > 0) {
@@ -1635,10 +1720,17 @@ export default function Chat() {
       }
 
       if (!chatRes.ok) {
-        // Chat endpoint failed — fall back to direct investigation
-        console.warn("[Chat] chat/respond failed, starting investigation directly.");
+        // Chat endpoint failed — show fallback plan for approval
+        console.warn("[Chat] chat/respond failed, showing fallback plan.");
         setIsClassifying(false);
-        await startInvestigationRef.current(topic, token, true, undefined, undefined, convId || undefined);
+        setPendingPlan({
+          topic,
+          tier: "standard",
+          plan_summary: `Standard investigation: ${topic}`,
+          estimated_duration_hours: 0.1,
+          estimated_credits: 100,
+          _convId: convId || undefined,
+        });
         return;
       }
 
@@ -1675,23 +1767,35 @@ export default function Chat() {
         }
       }
 
-      if (tier === "deep") {
-        // Deep tier needs user approval
-        setPendingPlan({
-          topic: researchTopic,
-          tier: "deep",
-          plan_summary: `Deep investigation: ${researchTopic}`,
-          estimated_duration_hours: 0.5,
-          estimated_credits: 500,
-        });
-      } else {
-        // Quick/standard — auto-launch, pass tier so backend doesn't re-classify
-        await startInvestigationRef.current(researchTopic, token, true, tier, chatData.user_instructions || undefined, convId || undefined);
-      }
+      // Always show the research plan for human approval before starting
+      const tierMeta: Record<string, { label: string; credits: number; duration: string; hours: number }> = {
+        instant: { label: "Instant lookup", credits: 5, duration: "~10 seconds", hours: 0.003 },
+        quick:   { label: "Quick research", credits: 20, duration: "~30 seconds", hours: 0.01 },
+        standard:{ label: "Standard investigation", credits: 100, duration: "~5 minutes", hours: 0.1 },
+        deep:    { label: "Deep investigation", credits: 500, duration: "15–45 minutes", hours: 0.5 },
+      };
+      const meta = tierMeta[tier] || tierMeta.standard;
+      setPendingPlan({
+        topic: researchTopic,
+        tier,
+        plan_summary: `${meta.label}: ${researchTopic}`,
+        estimated_duration_hours: meta.hours,
+        estimated_credits: meta.credits,
+        _userInstructions: chatData.user_instructions || undefined,
+        _convId: convId || undefined,
+      });
     } catch (err) {
       setIsClassifying(false);
-      console.warn("[Chat] Chat error, starting investigation directly:", err);
-      await startInvestigationRef.current(topic, token, true, undefined, undefined, convId || undefined);
+      console.warn("[Chat] Chat error, showing fallback plan:", err);
+      // Even on error, show a plan for approval — never auto-launch without consent
+      setPendingPlan({
+        topic,
+        tier: "standard",
+        plan_summary: `Standard investigation: ${topic}`,
+        estimated_duration_hours: 0.1,
+        estimated_credits: 100,
+        _convId: convId || undefined,
+      });
     }
   // BUG-C3-06 fix: startInvestigation accessed via startInvestigationRef.current
   // so handleSend always calls the latest version (avoids stale uploadSessionUuid).
@@ -1849,6 +1953,9 @@ export default function Chat() {
         _id: makeMessageId(),
       });
 
+      // Refresh credit balance — reservation was deducted at submit time
+      refreshUser();
+
       // Clear upload state after investigation starts
       setUploadedFiles([]);
       setUploadSessionUuid(null);
@@ -1869,7 +1976,7 @@ export default function Chat() {
       });
       setIsSending(false);
     }
-  }, [user, selectedTier, continuousMode, dontKillBranches, userFlowInstructions, uploadSessionUuid, appendMessage, startTimer, startSSE, navigate]);
+  }, [user, selectedTier, continuousMode, dontKillBranches, userFlowInstructions, uploadSessionUuid, appendMessage, refreshUser, startTimer, startSSE, navigate]);
 
   // BUG-C3-06 fix: Ref to hold the latest startInvestigation so handleSend
   // (defined before startInvestigation) always calls the current version,
@@ -1900,7 +2007,14 @@ export default function Chat() {
       }
 
       setPendingPlan(null);
-      await startInvestigationRef.current(planToApprove.topic, token, true, planToApprove.tier, undefined, activeConversationIdRef.current || undefined);
+      await startInvestigationRef.current(
+        planToApprove.topic,
+        token,
+        true,
+        planToApprove.tier,
+        planToApprove._userInstructions,
+        planToApprove._convId || activeConversationIdRef.current || undefined,
+      );
     } finally {
       setIsClassifying(false);
     }
@@ -2124,10 +2238,15 @@ export default function Chat() {
                         if (res.ok || res.status === 204) {
                           setConversations((prev) => prev.filter((c) => c.id !== conv.id));
                           if (activeConversationId === conv.id) {
+                            stopAllConnections();
                             setActiveConversationId(null);
                             setActiveTaskId(null);
                             setMessages([]);
                             setTimelineSteps([]);
+                            setPendingPlan(null);
+                            setUploadedFiles([]);
+                            setUploadSessionUuid(null);
+                            setElapsedSeconds(0);
                           }
                           toast.success("Conversation deleted");
                         } else {
@@ -2599,7 +2718,11 @@ export default function Chat() {
                 <div className="flex items-center gap-3 text-xs">
                   <div className="flex items-center gap-2 text-blue-400">
                     <Loader2 size={12} className="animate-spin" />
-                    <span>Mariana is researching...</span>
+                    <span>
+                      {timelineSteps.length === 0
+                        ? "Mariana is setting up the investigation..."
+                        : "Mariana is researching..."}
+                    </span>
                   </div>
                   {activeTaskId && (
                     // BUG-F2-03: Added isStopping guard to prevent multiple concurrent

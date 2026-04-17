@@ -1112,7 +1112,13 @@ For the tier field when action is "research":
 - "standard" = moderate analysis, takes 3-5 minutes (e.g. "compare X and Y", "what happened with Z?")
 - "deep" = exhaustive multi-angle investigation, takes 15-45 minutes (only when the user explicitly asks for deep research, thorough analysis, or a comprehensive report)
 
-Default to "standard" if unsure. Only use "deep" when explicitly requested.
+IMPORTANT: If the user specifies a time constraint, choose the tier that best fits:
+- "keep it quick" / "1-2 minutes" / "just a quick look" → use "quick"
+- "spend about 3-5 minutes" / "moderate" → use "standard"
+- "take your time" / "thorough" / "deep dive" → use "deep"
+The user's time preference overrides the default complexity-based tier selection.
+
+Default to "standard" if unsure and no time preference is given. Only use "deep" when explicitly requested.
 
 For user_instructions: Extract the user's FULL intent about HOW to research. Examples:
 - "focus on emerging markets" → user_instructions: "Focus the research on emerging markets specifically"
@@ -1120,6 +1126,8 @@ For user_instructions: Extract the user's FULL intent about HOW to research. Exa
 - "I don't care if the hypothesis is bad just continue" → user_instructions: "Do not kill hypotheses even if they seem weak. Continue researching all angles regardless of initial quality."
 - "make it a bear case analysis" → user_instructions: "Frame the research from a bear/pessimistic perspective"
 - "research this but be contrarian" → user_instructions: "Take a contrarian stance. Challenge consensus views."
+- "just 3-5 minutes" or "keep it short" → user_instructions: "Keep the research brief. Target 3-5 minutes of research time."
+- "make me a pdf" or "write a report" → user_instructions: "Produce a PDF report with the findings."
 If the user gives no special instructions, set user_instructions to null.
 
 For conversational replies: be warm, concise (1-3 sentences), professional.
