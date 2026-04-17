@@ -345,6 +345,12 @@ async def run(
                 "state": "HALT",
                 "message": "Complete.",
             })
+            # BUG-D6-01: Persist the fast-path answer in task metadata so it can
+            # be replayed by the SSE endpoint if the frontend connects after the
+            # pub/sub events have already been emitted and lost.
+            if task.metadata is None:
+                task.metadata = {}
+            task.metadata["fast_path_answer"] = answer_text
             fast_success = True
         except Exception as fast_exc:
             fast_success = False

@@ -1054,6 +1054,7 @@ async def classify_request(body: ClassifyRequest) -> ClassifyResponse:
 )
 async def chat_respond(
     body: ChatRequest,
+    authorization: str | None = Header(None),
     current_user: dict[str, str] = Depends(_get_current_user),
 ) -> ChatResponse:
     """
@@ -1083,6 +1084,12 @@ require looking up real-world facts or research — REPLY CONVERSATIONALLY.
 RULE 2: If the message is a question that requires researching real-world facts, data,
 news, analysis, or investigation — signal that you want to launch a research investigation.
 
+RULE 2b: If the user's question refers to something said EARLIER in this conversation
+(e.g. "what did I say?", "what was my X?", "summarize what we discussed", "what's my
+favorite X?", or any recall/follow-up about prior messages) — REPLY CONVERSATIONALLY
+using the conversation history provided. Do NOT launch a research investigation for
+questions that can be answered from the chat history.
+
 RULE 3 (CRITICAL): If the user provides ANY specific instructions about HOW to research,
 what methodology to use, what to focus on, what to avoid, what tone to use, what format
 to produce, or any other customization — you MUST extract those instructions into the
@@ -1095,6 +1102,9 @@ Examples of CONVERSATION (reply directly):
 - "tell me about yourself"
 - "thanks" / "cool" / "ok"
 - "can you help me?" / "what are you good at?"
+- "what did I just say?" / "what was my question?"
+- "what is my favorite color?" (when they told you earlier in the conversation)
+- "summarize our conversation" / "what have we discussed so far?"
 
 Examples of RESEARCH (launch investigation):
 - "What is the current state of AI regulation in the EU?"
@@ -1134,6 +1144,47 @@ For conversational replies: be warm, concise (1-3 sentences), professional.
 Introduce yourself briefly if it's a first greeting.
 If they ask what you can do, explain you're an AI that can have normal conversations AND launch deep research investigations on any topic."""
 
+    # ── BUG-D5-02: Fetch conversation history for context ──────────────
+    # Without this, the LLM has no idea what was said earlier in the
+    # conversation, causing generic/confused responses to follow-ups.
+    # BUG-D7-01: Pass user_token so RLS allows the read (service key is
+    # not configured, so anon-key queries return 0 rows).
+    user_token = (
+        authorization.split(" ", 1)[1].strip()
+        if authorization and authorization.startswith("Bearer ")
+        else None
+    )
+    history_messages: list[dict[str, str]] = []
+    if body.conversation_id:
+        try:
+            hist_resp = await _supabase_rest(
+                cfg, "GET", "/conversation_messages",
+                params={
+                    "conversation_id": f"eq.{body.conversation_id}",
+                    "select": "role,content,type",
+                    "order": "created_at.asc",
+                    "limit": "50",
+                },
+                user_token=user_token,
+            )
+            if hist_resp.status_code == 200:
+                for m in hist_resp.json():
+                    role = m.get("role", "user")
+                    content = m.get("content", "")
+                    msg_type = m.get("type", "text")
+                    # Only include text messages (skip status/system messages)
+                    if msg_type in ("text", None) and role in ("user", "assistant") and content.strip():
+                        history_messages.append({"role": role, "content": content})
+        except Exception as hist_err:
+            logger.warning("chat_history_fetch_error", error=str(hist_err))
+
+    # Build the messages array: system prompt + history + current message
+    llm_messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    # Include up to last 20 messages of history for context (avoid token overflow)
+    if history_messages:
+        llm_messages.extend(history_messages[-20:])
+    llm_messages.append({"role": "user", "content": body.message})
+
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
@@ -1141,10 +1192,7 @@ If they ask what you can do, explain you're an AI that can have normal conversat
                 headers={"Authorization": f"Bearer {cfg.LLM_GATEWAY_API_KEY}"},
                 json={
                     "model": "gpt-4o-mini",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": body.message},
-                    ],
+                    "messages": llm_messages,
                     "max_tokens": 512,
                     "temperature": 0.3,
                 },
@@ -1158,7 +1206,16 @@ If they ask what you can do, explain you're an AI that can have normal conversat
             # Strip markdown code fences if present
             if raw.startswith("```"):
                 raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            parsed = _json.loads(raw)
+
+            # BUG-D7-02: When conversation history is included, the LLM
+            # sometimes responds as plain text instead of JSON (it "forgets"
+            # the format instruction and just answers naturally). If JSON
+            # parsing fails, treat the raw text as a conversational reply.
+            try:
+                parsed = _json.loads(raw)
+            except (ValueError, TypeError):
+                logger.info("chat_respond_plain_text_fallback", raw_preview=raw[:200])
+                return ChatResponse(reply=raw, action="chat")
 
             action = parsed.get("action", "chat")
             reply = parsed.get("reply", "")
@@ -2424,6 +2481,35 @@ async def stream_logs(
             pubsub = _redis.pubsub()
             await pubsub.subscribe(f"logs:{task_id}")
             try:
+                # BUG-D6-01: Replay fast-path answer if the task completed before
+                # the SSE subscription was established.  Quick-tier fast-path events
+                # are emitted via pub/sub (transient) and may be lost if the frontend
+                # connects after the orchestrator finishes.  The answer is persisted
+                # in task.metadata["fast_path_answer"] by the orchestrator.
+                _initial_replay_done = False
+                if _db_pool is not None:
+                    try:
+                        _replay_row = await _db_pool.fetchrow(
+                            "SELECT status, metadata FROM research_tasks WHERE id = $1",
+                            task_id,
+                        )
+                        if _replay_row is not None and _replay_row["status"] in ("COMPLETED", "FAILED", "HALTED"):
+                            _replay_meta = _replay_row.get("metadata") or {}
+                            if isinstance(_replay_meta, str):
+                                _replay_meta = json.loads(_replay_meta)
+                            _fast_answer = _replay_meta.get("fast_path_answer")
+                            if _fast_answer:
+                                yield {"data": json.dumps({"type": "text", "content": _fast_answer}), "event": "log"}
+                            yield {
+                                "data": json.dumps({"task_id": task_id, "final_status": _replay_row["status"]}),
+                                "event": "done",
+                            }
+                            _initial_replay_done = True
+                    except Exception:
+                        pass  # Non-fatal — fall through to normal pub/sub loop
+                if _initial_replay_done:
+                    return
+
                 while True:
                     if await request.is_disconnected():
                         break

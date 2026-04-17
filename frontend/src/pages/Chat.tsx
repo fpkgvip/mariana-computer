@@ -909,6 +909,13 @@ export default function Chat() {
           type: "text",
           _id: makeMessageId(),
         });
+        // BUG-D6-02: Persist research findings to conversation so follow-up
+        // messages have context. Without this, /api/chat/respond only sees the
+        // original user/assistant messages and not the research output.
+        const convId = activeConversationIdRef.current;
+        if (convId) {
+          persistMessage(convId, "assistant", textContent, "text");
+        }
       }
     }
 
@@ -984,7 +991,7 @@ export default function Chat() {
         _id: makeMessageId(),
       });
     }
-  }, [appendMessage]);
+  }, [appendMessage, persistMessage]);
 
   /* ---------------------------------------------------------------- */
   /*  Update investigation status locally and in Supabase             */
@@ -1198,6 +1205,11 @@ export default function Chat() {
                     type: "text",
                     _id: makeMessageId(),
                   });
+                  // BUG-D6-02: Persist executive summary so follow-up context works
+                  const convId = activeConversationIdRef.current;
+                  if (convId) {
+                    persistMessage(convId, "assistant", execSummary.trim(), "text");
+                  }
                 }
               } catch {
                 // Non-critical — user can still download the full report
@@ -1225,7 +1237,7 @@ export default function Chat() {
       poll();
       pollIntervalRef.current = setInterval(poll, 5000);
     },
-    [appendMessage, navigate, refreshUser, stopAllConnections, updateInvestigationStatus]
+    [appendMessage, navigate, persistMessage, refreshUser, stopAllConnections, updateInvestigationStatus]
   );
 
   /* ---------------------------------------------------------------- */
@@ -1327,6 +1339,11 @@ export default function Chat() {
                           type: "text",
                           _id: makeMessageId(),
                         });
+                        // BUG-D6-02: Persist executive summary so follow-up context works
+                        const convId = activeConversationIdRef.current;
+                        if (convId) {
+                          persistMessage(convId, "assistant", execSummary.trim(), "text");
+                        }
                       }
                     } catch {
                       // Non-critical — user can still download the full report
@@ -1544,7 +1561,7 @@ export default function Chat() {
         startPolling(taskId, token);
       }
     },
-    [appendMessage, navigate, processStructuredEvent, refreshUser, startPolling, stopAllConnections, updateInvestigationStatus]
+    [appendMessage, navigate, persistMessage, processStructuredEvent, refreshUser, startPolling, stopAllConnections, updateInvestigationStatus]
   );
 
   /* ---------------------------------------------------------------- */
@@ -2775,24 +2792,34 @@ export default function Chat() {
                   </span>
                 </div>
                 {/* BUG-007: Use programmatic fetch with auth header instead of bare <a href> */}
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    onClick={() => handleDownload("pdf")}
-                    className="inline-flex items-center gap-1.5 rounded-md bg-green-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-green-700 transition-colors"
-                  >
-                    <Download size={12} />
-                    Download PDF Report
-                  </button>
-                  {activeInvestigation?.output_docx_path && (
-                    <button
-                      onClick={() => handleDownload("docx")}
-                      className="inline-flex items-center gap-1.5 rounded-md border border-green-600/50 px-3 py-1.5 text-xs font-medium text-green-400 hover:bg-green-600/10 transition-colors"
-                    >
-                      <Download size={12} />
-                      Download Word Report
-                    </button>
-                  )}
-                </div>
+                {/* BUG-D5-01: Only show download buttons when a report was actually generated.
+                    Quick-tier investigations use fast-path and skip report generation. */}
+                {(activeInvestigation?.output_pdf_path || activeInvestigation?.output_docx_path) ? (
+                  <div className="flex flex-wrap gap-2">
+                    {activeInvestigation?.output_pdf_path && (
+                      <button
+                        onClick={() => handleDownload("pdf")}
+                        className="inline-flex items-center gap-1.5 rounded-md bg-green-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-green-700 transition-colors"
+                      >
+                        <Download size={12} />
+                        Download PDF Report
+                      </button>
+                    )}
+                    {activeInvestigation?.output_docx_path && (
+                      <button
+                        onClick={() => handleDownload("docx")}
+                        className="inline-flex items-center gap-1.5 rounded-md border border-green-600/50 px-3 py-1.5 text-xs font-medium text-green-400 hover:bg-green-600/10 transition-colors"
+                      >
+                        <Download size={12} />
+                        Download Word Report
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Research findings are displayed above.
+                  </p>
+                )}
               </div>
             )}
 

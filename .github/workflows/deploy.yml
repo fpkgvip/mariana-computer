@@ -24,13 +24,14 @@ jobs:
             set -euo pipefail
             cd /opt/mariana
 
-            # Pull latest code
-            git pull origin master
+            # Force-sync to latest master (local modifications are expected)
+            git fetch origin master
+            git reset --hard origin/master
+            git clean -fd --exclude=.env
 
-            # Build and restart
-            docker compose build --no-cache
-            docker compose down
-            docker compose up -d
+            # Build and restart (only api + orchestrator, keep DB/Redis running)
+            docker compose build --no-cache mariana-api mariana-orchestrator
+            docker compose up -d --force-recreate mariana-api mariana-orchestrator
 
             # Wait for health
             for i in $(seq 1 12); do
