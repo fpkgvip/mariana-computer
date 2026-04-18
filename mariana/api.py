@@ -300,6 +300,9 @@ app = FastAPI(
 limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+if _SLOWAPI_AVAILABLE:
+    from slowapi.middleware import SlowAPIMiddleware  # noqa: PLC0415
+    app.add_middleware(SlowAPIMiddleware)
 
 # BUG-027: CORS origins read from config so the hardcoded Vercel URL can be
 # updated via environment variable without a code change.
