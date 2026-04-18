@@ -290,9 +290,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# BUG-API-039: Rate limiting. Default limit applies globally; individual
-# expensive endpoints carry tighter decorators via ``@limiter.limit(...)``.
-limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
+# BUG-API-039: Rate limiting via slowapi middleware.
+# NOTE: Per-endpoint @limiter.limit() decorators are NOT used because they
+# are incompatible with ``from __future__ import annotations`` (they wrap the
+# function signature and break FastAPI's parameter introspection, causing 422
+# on all decorated POST endpoints).  The global default_limits applies to
+# all endpoints uniformly.  For tighter per-route limits, configure at the
+# reverse-proxy / ingress layer (nginx, Cloudflare, etc.).
+limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -1231,7 +1236,6 @@ async def get_config(
     tags=["Investigations"],
     summary="Classify a research request into a tier",
 )
-@limiter.limit("30/minute")
 async def classify_request(
     request: Request,
     body: ClassifyRequest,
@@ -1254,7 +1258,6 @@ async def classify_request(
     tags=["Chat"],
     summary="Smart chat: replies conversationally or signals a research launch",
 )
-@limiter.limit("20/minute")
 async def chat_respond(
     request: Request,
     body: ChatRequest,
@@ -1890,7 +1893,6 @@ async def save_message(
     status_code=202,
     tags=["Investigations"],
 )
-@limiter.limit("10/minute")
 async def start_investigation(
     request: Request,
     body: StartInvestigationRequest,
@@ -3548,7 +3550,6 @@ def _validate_upload_session_uuid(session_uuid: str) -> str:
     tags=["Uploads"],
     summary="Upload files to an existing investigation",
 )
-@limiter.limit("30/minute")
 async def upload_investigation_files(
     request: Request,
     task_id: str,
@@ -3662,7 +3663,6 @@ async def upload_investigation_files(
     tags=["Uploads"],
     summary="Upload files before creating an investigation",
 )
-@limiter.limit("30/minute")
 async def upload_pending_files(
     request: Request,
     files: Annotated[list[UploadFile], File()],
