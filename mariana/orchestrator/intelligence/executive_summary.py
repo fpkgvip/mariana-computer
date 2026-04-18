@@ -14,6 +14,7 @@ needs structure and citations.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import structlog
 from typing import Any
@@ -25,6 +26,11 @@ from mariana.data.models import TaskType
 
 logger = structlog.get_logger(__name__)
 
+# BUG-AUD-12 fix: per-call timeout for executive-summary generation.  Each
+# compression level (one-liner / paragraph / page) is capped so a hung
+# LLM call can't stall finalisation indefinitely.
+_EXEC_SUMMARY_CALL_TIMEOUT_SEC = 60.0
+
 
 # ---------------------------------------------------------------------------
 # Pydantic schemas
@@ -32,8 +38,12 @@ logger = structlog.get_logger(__name__)
 
 class OneLinerOutput(BaseModel):
     """The single most important insight."""
+    # BUG-AUD-11 fix: drop min_length=10.  A valid one-liner can be shorter
+    # (e.g. "Rates cut.") and a rigid minimum caused pydantic validation
+    # errors that collapsed to an empty string downstream, masking what was
+    # actually a usable answer.
     one_liner: str = Field(
-        ..., min_length=10, max_length=1000,
+        ..., max_length=1000,
         description="Single sentence capturing THE key insight",
     )
     confidence: float = Field(
@@ -151,76 +161,99 @@ async def generate_executive_summaries(
         f"Sources: {source_row['cnt']}, Avg credibility: {float(source_row['avg_cred'] or 0):.2f}"
     ) if source_row else ""
 
+    # BUG-AUD-11/12 fix: track per-level errors and wrap each spawn_model
+    # call in a hard timeout.  Empty strings on failure masked generation
+    # problems; explicit markers make them visible.
+    summary_errors: dict[str, str] = {}
+
     # === Generate One-Liner ===
     one_liner = ""
     try:
-        out1, _ = await spawn_model(
-            task_type=TaskType.EXECUTIVE_SUMMARY,
-            context={
-                "task_id": task_id,
-                "research_topic": research_topic,
-                "compression_level": "one_liner",
-                "evidence": evidence[:2000],
-                "hypotheses": hypotheses,
-            },
-            output_schema=OneLinerOutput,
-            db=db,
-            cost_tracker=cost_tracker,
-            config=config,
-            quality_tier=quality_tier,
+        out1, _ = await asyncio.wait_for(
+            spawn_model(
+                task_type=TaskType.EXECUTIVE_SUMMARY,
+                context={
+                    "task_id": task_id,
+                    "research_topic": research_topic,
+                    "compression_level": "one_liner",
+                    "evidence": evidence[:2000],
+                    "hypotheses": hypotheses,
+                },
+                output_schema=OneLinerOutput,
+                db=db,
+                cost_tracker=cost_tracker,
+                config=config,
+                quality_tier=quality_tier,
+            ),
+            timeout=_EXEC_SUMMARY_CALL_TIMEOUT_SEC,
         )
         one_liner = out1.one_liner  # type: ignore[attr-defined]
     except Exception as exc:
-        log.warning("one_liner_generation_failed", error=str(exc))
+        exc_class = type(exc).__name__
+        log.warning("one_liner_generation_failed", error=str(exc), error_class=exc_class)
+        one_liner = f"[generation failed: {exc_class}]"
+        summary_errors["one_liner"] = exc_class
 
     # === Generate Paragraph Summary ===
     paragraph = ""
     try:
-        out2, _ = await spawn_model(
-            task_type=TaskType.EXECUTIVE_SUMMARY,
-            context={
-                "task_id": task_id,
-                "research_topic": research_topic,
-                "compression_level": "paragraph",
-                "evidence": evidence[:4000],
-                "hypotheses": hypotheses,
-                "perspectives": perspectives[:2000],
-                "unresolved_contradictions": contra_count or 0,
-            },
-            output_schema=ParagraphSummaryOutput,
-            db=db,
-            cost_tracker=cost_tracker,
-            config=config,
-            quality_tier=quality_tier,
+        out2, _ = await asyncio.wait_for(
+            spawn_model(
+                task_type=TaskType.EXECUTIVE_SUMMARY,
+                context={
+                    "task_id": task_id,
+                    "research_topic": research_topic,
+                    "compression_level": "paragraph",
+                    "evidence": evidence[:4000],
+                    "hypotheses": hypotheses,
+                    "perspectives": perspectives[:2000],
+                    "unresolved_contradictions": contra_count or 0,
+                },
+                output_schema=ParagraphSummaryOutput,
+                db=db,
+                cost_tracker=cost_tracker,
+                config=config,
+                quality_tier=quality_tier,
+            ),
+            timeout=_EXEC_SUMMARY_CALL_TIMEOUT_SEC,
         )
         paragraph = out2.summary  # type: ignore[attr-defined]
     except Exception as exc:
-        log.warning("paragraph_generation_failed", error=str(exc))
+        exc_class = type(exc).__name__
+        log.warning("paragraph_generation_failed", error=str(exc), error_class=exc_class)
+        paragraph = f"[generation failed: {exc_class}]"
+        summary_errors["paragraph"] = exc_class
 
     # === Generate Page Summary ===
     page_summary = ""
     try:
-        out3, _ = await spawn_model(
-            task_type=TaskType.EXECUTIVE_SUMMARY,
-            context={
-                "task_id": task_id,
-                "research_topic": research_topic,
-                "compression_level": "page",
-                "evidence": evidence,
-                "hypotheses": hypotheses,
-                "perspectives": perspectives,
-                "source_info": source_info,
-                "unresolved_contradictions": contra_count or 0,
-            },
-            output_schema=PageSummaryOutput,
-            db=db,
-            cost_tracker=cost_tracker,
-            config=config,
-            quality_tier=quality_tier,
+        out3, _ = await asyncio.wait_for(
+            spawn_model(
+                task_type=TaskType.EXECUTIVE_SUMMARY,
+                context={
+                    "task_id": task_id,
+                    "research_topic": research_topic,
+                    "compression_level": "page",
+                    "evidence": evidence,
+                    "hypotheses": hypotheses,
+                    "perspectives": perspectives,
+                    "source_info": source_info,
+                    "unresolved_contradictions": contra_count or 0,
+                },
+                output_schema=PageSummaryOutput,
+                db=db,
+                cost_tracker=cost_tracker,
+                config=config,
+                quality_tier=quality_tier,
+            ),
+            timeout=_EXEC_SUMMARY_CALL_TIMEOUT_SEC,
         )
         page_summary = out3.summary  # type: ignore[attr-defined]
     except Exception as exc:
-        log.warning("page_summary_generation_failed", error=str(exc))
+        exc_class = type(exc).__name__
+        log.warning("page_summary_generation_failed", error=str(exc), error_class=exc_class)
+        page_summary = f"[generation failed: {exc_class}]"
+        summary_errors["page_summary"] = exc_class
 
     # 6. Persist
     try:
@@ -245,6 +278,9 @@ async def generate_executive_summaries(
                 "claims_count": len(claims_rows),
                 "sources_count": source_row["cnt"] if source_row else 0,
                 "unresolved_contradictions": contra_count or 0,
+                # BUG-AUD-11 fix: surface per-level errors in compression_metadata
+                # so downstream diagnostics can attribute empty summaries.
+                "errors": summary_errors,
             }),
         )
     except Exception as exc:

@@ -331,7 +331,7 @@ async def run(
                 config=config,
                 quality_tier=(task.metadata or {}).get("quality_tier"),
             )
-            task.ai_call_counter += 1
+            # BUG-AUD-07 fix: removed manual task.ai_call_counter increment; _sync_cost() is the single source of truth.
 
             # Extract the answer text from the lightweight FastPathOutput
             answer_text = fast_output.answer if hasattr(fast_output, "answer") else str(fast_output)
@@ -451,6 +451,26 @@ async def run(
                         break
                 except Exception as _kill_exc:  # noqa: BLE001
                     log.debug("kill_check_failed", error=str(_kill_exc))
+
+                # BUG-AUD-27 fix: also honour the Redis-based stop flag in
+                # single-run (non-continuous) mode.  Previously the
+                # stop:{task_id} key was only inspected on continuous-mode
+                # restart, so a Redis stop request against a single-run
+                # task was a no-op.
+                try:
+                    _redis_stopped = await _check_manual_stop(redis_client, task.id)
+                except Exception as _stop_exc:  # noqa: BLE001
+                    log.debug("manual_stop_check_failed", error=str(_stop_exc))
+                    _redis_stopped = False
+                if _redis_stopped:
+                    log.info("manual_stop_detected", task_id=task.id)
+                    task.status = TaskStatus.HALTED
+                    task.current_state = State.HALT
+                    _emit_progress(redis_client, task.id, {
+                        "type": "text",
+                        "content": "Investigation stopped by user.",
+                    })
+                    break
 
             iteration += 1
             log.debug(
@@ -858,6 +878,30 @@ async def run(
         await _persist_task(task, db)
         raise
 
+    finally:
+        # BUG-AUD-28 fix: cancel and await any outstanding fire-and-forget
+        # progress publish tasks so they don't outlive run() and emit events
+        # on a torn-down SSE connection (or a closed Redis client), which
+        # previously generated noisy error logs.  gather() with
+        # return_exceptions=True swallows CancelledError from the cancelled
+        # publishes without raising.
+        _pending = list(_background_tasks)
+        if _pending:
+            for _bg in _pending:
+                try:
+                    _bg.cancel()
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                await asyncio.gather(*_pending, return_exceptions=True)
+            except Exception:  # noqa: BLE001
+                # gather() with return_exceptions=True shouldn't raise,
+                # but guard against pathological loop state on shutdown.
+                pass
+        # BUG-AUD-20 fix: evict this task's handoff-phase cache entry
+        # so a subsequent run (e.g. retry) starts from a clean slate.
+        _last_handoff_phase.pop(task.id, None)
+
 
 # ===========================================================================
 # Trigger computation
@@ -1061,6 +1105,32 @@ async def _trigger_for_tribunal(
         # handler has written any result.  Return TRIBUNAL_CONFIRMED as the
         # safest neutral fallback — it keeps the loop advancing instead of
         # destroying the current branch on a race-condition miss.
+        #
+        # BUG-AUD-14 fix: distinguish "handler never ran" from "handler
+        # ran and wrote nothing (race)".  We compare the counter in
+        # task.metadata["_tribunal_run_counter"] to the snapshot taken
+        # when we entered this state.  If the counter is unchanged,
+        # handle_tribunal never fired for this state; returning
+        # TRIBUNAL_CONFIRMED would falsely endorse an unreviewed
+        # finding, so we fall back to TRIBUNAL_WEAKENED which routes
+        # the loop back into SEARCH without the confidence inflation.
+        _meta = session_data.task.metadata or {}
+        _run_counter = int(_meta.get("_tribunal_run_counter", 0))
+        _seen_counter = int(_meta.get("_tribunal_run_counter_seen", 0))
+        if _run_counter == _seen_counter:
+            logger.warning(
+                "no_tribunal_result_handler_did_not_run",
+                task_id=session_data.task.id,
+                run_counter=_run_counter,
+            )
+            # Mark that we've observed this counter so a later genuine
+            # race (handler ran, row not visible yet) still gets a chance.
+            return TransitionTrigger.TRIBUNAL_WEAKENED
+        # Handler ran at least once since last check -> assume DB race
+        # and update our snapshot.
+        if session_data.task.metadata is None:
+            session_data.task.metadata = {}
+        session_data.task.metadata["_tribunal_run_counter_seen"] = _run_counter
         logger.warning("no_tribunal_result", task_id=session_data.task.id)
         return TransitionTrigger.TRIBUNAL_CONFIRMED
 
@@ -1093,6 +1163,27 @@ async def _trigger_for_skeptic(
         # immediate HALT on first entry into the SKEPTIC state before the
         # handle_skeptic action has written any result.  Return a neutral
         # trigger that keeps the loop progressing instead.
+        #
+        # BUG-AUD-13 fix: distinguish "handler never ran" from "handler
+        # ran but row not yet visible".  We track
+        # task.metadata["_skeptic_run_counter"] (incremented each time
+        # handle_skeptic completes) and compare to the last-seen value.
+        # If unchanged, the handler never ran — signal
+        # SKEPTIC_QUESTIONS_RESOLVED to try to move forward rather than
+        # endorsing "researchable exists" on an empty pipeline.
+        _meta = session_data.task.metadata or {}
+        _run_counter = int(_meta.get("_skeptic_run_counter", 0))
+        _seen_counter = int(_meta.get("_skeptic_run_counter_seen", 0))
+        if _run_counter == _seen_counter:
+            logger.warning(
+                "no_skeptic_result_handler_did_not_run",
+                task_id=session_data.task.id,
+                run_counter=_run_counter,
+            )
+            return TransitionTrigger.SKEPTIC_QUESTIONS_RESOLVED
+        if session_data.task.metadata is None:
+            session_data.task.metadata = {}
+        session_data.task.metadata["_skeptic_run_counter_seen"] = _run_counter
         logger.warning("no_skeptic_result", task_id=session_data.task.id)
         return TransitionTrigger.SKEPTIC_RESEARCHABLE_EXIST
 
@@ -1115,6 +1206,8 @@ async def handle_init(
     db: Any,
     redis_client: Any,
     config: Any,
+    *,
+    pivot: bool = False,
 ) -> None:
     """Multi-step INIT: research architecture → hypothesis generation.
 
@@ -1122,16 +1215,31 @@ async def handle_init(
     research plan, hypotheses to test, data sources, timeline).
     Step 2: Generate specific hypotheses informed by the architecture.
     This ensures investigations are focused and cost-effective.
+
+    Parameters
+    ----------
+    pivot:
+        BUG-AUD-30 fix: explicit flag the state machine sets when it
+        emits SPAWN_AI(HYPOTHESIS_GENERATION, pivot=True) from the PIVOT
+        state.  Previously the PIVOT signal was inferred solely from
+        ``task.current_state == State.PIVOT``; passing it explicitly here
+        makes the intent survive any future refactor that decouples the
+        handler from current_state.
     """
-    log = logger.bind(task_id=task.id, handler="init")
+    log = logger.bind(task_id=task.id, handler="init", pivot=pivot)
 
     # BUG-R5-03 fix: pivots and continuous-mode restarts intentionally enter
     # handle_init() again to generate a fresh research cycle.  Without retiring
     # the prior ACTIVE branches / hypotheses first, every restart silently
     # accumulates duplicate root hypotheses and duplicate active branches.
+    #
+    # BUG-AUD-30 fix: accept the explicit pivot kwarg in addition to the
+    # current_state check so the signal is preserved even if the caller
+    # doesn't first update task.current_state.
     _init_reset_mode = (task.metadata or {}).pop("_init_reset_mode", None)
     _should_reset_existing = (
-        task.current_state == State.PIVOT
+        pivot
+        or task.current_state == State.PIVOT
         or _init_reset_mode == "continuous_restart"
     )
     if _should_reset_existing:
@@ -1209,7 +1317,7 @@ async def handle_init(
         config=config,
         quality_tier=(task.metadata or {}).get("quality_tier"),
     )
-    task.ai_call_counter += 1
+    # BUG-AUD-07 fix: removed manual task.ai_call_counter increment; _sync_cost() is the single source of truth.
 
     architecture: ResearchArchitectureOutput = arch_output  # type: ignore[assignment]
     log.info(
@@ -1252,7 +1360,7 @@ async def handle_init(
     )
     # spawn_model already records cost internally via _record_cost — do NOT
     # call cost_tracker.record_call() again here (would double-count).
-    task.ai_call_counter += 1
+    # BUG-AUD-07 fix: removed manual task.ai_call_counter increment; _sync_cost() is the single source of truth.
 
     # Use the parsed HypothesisGenerationOutput to persist hypotheses and
     # create branches.  spawn_model does NOT write hypotheses to the DB —
@@ -1528,7 +1636,7 @@ async def handle_search(
                 config=config,
                 quality_tier=(task.metadata or {}).get("quality_tier"),
             )
-            task.ai_call_counter += 1
+            # BUG-AUD-07 fix: removed manual task.ai_call_counter increment; _sync_cost() is the single source of truth.
 
             _evidence_out: EvidenceExtractionOutput = extraction_output  # type: ignore[assignment]
             for _item in _evidence_out.evidence_items:
@@ -1761,7 +1869,7 @@ async def handle_evaluate(
                 quality_tier=(task.metadata or {}).get("quality_tier"),
             )
             # spawn_model already records cost internally — do NOT double-count
-            task.ai_call_counter += 1
+            # BUG-AUD-07 fix: removed manual task.ai_call_counter increment; _sync_cost() is the single source of truth.
 
             # Use the score directly from the parsed EvaluationOutput
             new_score = float(eval_output.score)
@@ -1891,7 +1999,7 @@ async def handle_deepen(
                 quality_tier=(task.metadata or {}).get("quality_tier"),
             )
             # spawn_model already records cost internally — do NOT double-count
-            task.ai_call_counter += 1
+            # BUG-AUD-07 fix: removed manual task.ai_call_counter increment; _sync_cost() is the single source of truth.
 
             # BUG-R3-01 fix (deepen path): persist deepened evidence items as Finding records.
             # Same pattern as handle_search — output was previously discarded with `_`.
@@ -2096,6 +2204,15 @@ async def handle_tribunal(
         "message": "Running adversarial tribunal review...",
     })
 
+    # BUG-AUD-14 fix: bump a per-task run counter the instant this handler
+    # fires so _trigger_for_tribunal can distinguish "handler never ran"
+    # from a DB write race.
+    if task.metadata is None:
+        task.metadata = {}
+    task.metadata["_tribunal_run_counter"] = int(
+        task.metadata.get("_tribunal_run_counter", 0)
+    ) + 1
+
     # Find the highest-confidence finding to put on trial
     # BUG-AUD-25 fix: Exclude findings that already have a tribunal session
     # to prevent the same finding from being retried repeatedly.
@@ -2164,7 +2281,7 @@ async def handle_tribunal(
         branch_id=None, db=db, cost_tracker=cost_tracker, config=config,
         quality_tier=_quality_tier,
     )
-    task.ai_call_counter += 1
+    # BUG-AUD-07 fix: removed manual task.ai_call_counter increment; _sync_cost() is the single source of truth.
     total_tribunal_cost += _plaintiff_session.cost_usd
     _plaintiff_text = _format_arg(_plaintiff_parsed)  # type: ignore[arg-type]
 
@@ -2183,7 +2300,7 @@ async def handle_tribunal(
         branch_id=None, db=db, cost_tracker=cost_tracker, config=config,
         quality_tier=_quality_tier,
     )
-    task.ai_call_counter += 1
+    # BUG-AUD-07 fix: removed manual task.ai_call_counter increment; _sync_cost() is the single source of truth.
     total_tribunal_cost += _defendant_session.cost_usd
     _defendant_text = _format_arg(_defendant_parsed)  # type: ignore[arg-type]
 
@@ -2203,7 +2320,7 @@ async def handle_tribunal(
         branch_id=None, db=db, cost_tracker=cost_tracker, config=config,
         quality_tier=_quality_tier,
     )
-    task.ai_call_counter += 1
+    # BUG-AUD-07 fix: removed manual task.ai_call_counter increment; _sync_cost() is the single source of truth.
     total_tribunal_cost += _rebuttal_session.cost_usd
     _rebuttal_text = _format_arg(_rebuttal_parsed)  # type: ignore[arg-type]
 
@@ -2223,7 +2340,7 @@ async def handle_tribunal(
         branch_id=None, db=db, cost_tracker=cost_tracker, config=config,
         quality_tier=_quality_tier,
     )
-    task.ai_call_counter += 1
+    # BUG-AUD-07 fix: removed manual task.ai_call_counter increment; _sync_cost() is the single source of truth.
     total_tribunal_cost += _counter_session.cost_usd
     _counter_text = _format_arg(_counter_parsed)  # type: ignore[arg-type]
 
@@ -2245,7 +2362,7 @@ async def handle_tribunal(
         branch_id=None, db=db, cost_tracker=cost_tracker, config=config,
         quality_tier=_quality_tier,
     )
-    task.ai_call_counter += 1
+    # BUG-AUD-07 fix: removed manual task.ai_call_counter increment; _sync_cost() is the single source of truth.
     total_tribunal_cost += judge_session.cost_usd
 
     # BUG-R3-02: Persist the TribunalSession to the DB so that
@@ -2343,6 +2460,15 @@ async def handle_skeptic(
     """
     log = logger.bind(task_id=task.id, handler="skeptic")
 
+    # BUG-AUD-13 fix: bump a per-task run counter the instant this handler
+    # fires so _trigger_for_skeptic can distinguish "handler never ran"
+    # from a DB write race.
+    if task.metadata is None:
+        task.metadata = {}
+    task.metadata["_skeptic_run_counter"] = int(
+        task.metadata.get("_skeptic_run_counter", 0)
+    ) + 1
+
     # Fetch the top finding for context (same as tribunal uses)
     _top_finding_row = await db.fetchrow(
         """
@@ -2393,9 +2519,33 @@ async def handle_skeptic(
             if isinstance(_s_unanswered_questions, str) and _s_unanswered_questions.startswith("["):
                 import json as _json_uq  # noqa: PLC0415
                 try:
-                    _s_unanswered_questions = "\n".join(_json_uq.loads(_s_unanswered_questions))
-                except (ValueError, TypeError):
-                    pass
+                    _parsed_uq = _json_uq.loads(_s_unanswered_questions)
+                    # Coerce each entry to str (list may contain dicts if an
+                    # older schema leaked through).
+                    _s_unanswered_questions = "\n".join(
+                        str(q) for q in _parsed_uq
+                    )
+                except (ValueError, TypeError) as _uq_exc:
+                    # BUG-AUD-29 fix: previously the silent pass left the
+                    # raw Python-repr / malformed string in the LLM prompt.
+                    # Fall back to splitting on newlines so the skeptic
+                    # still receives something meaningful.
+                    log.warning(
+                        "unanswered_questions_json_decode_failed",
+                        error=str(_uq_exc),
+                        raw_prefix=_s_unanswered_questions[:200],
+                    )
+                    _s_unanswered_questions = "\n".join(
+                        line.strip().lstrip("[").rstrip("]").strip("'\"")
+                        for line in _s_unanswered_questions.splitlines()
+                        if line.strip()
+                    )
+            # Case: DB returned a list directly (asyncpg JSONB can decode
+            # to a Python list).  Normalise to a newline-delimited string.
+            elif isinstance(_s_unanswered_questions, list):
+                _s_unanswered_questions = "\n".join(
+                    str(q) for q in _s_unanswered_questions
+                )
 
     skeptic_output, ai_session = await spawn_model(
         task_type=TaskType.SKEPTIC_QUESTIONS,
@@ -2416,7 +2566,7 @@ async def handle_skeptic(
         quality_tier=(task.metadata or {}).get("quality_tier"),
     )
     # spawn_model already records cost internally — do NOT double-count
-    task.ai_call_counter += 1
+    # BUG-AUD-07 fix: removed manual task.ai_call_counter increment; _sync_cost() is the single source of truth.
 
     # BUG-R3-03: Persist the SkepticResult so that _trigger_for_skeptic()
     # can read the question counts on the next iteration.
@@ -2619,7 +2769,7 @@ async def handle_report(
         task.output_pdf_path = pdf_path
         task.output_docx_path = docx_path
         # generate_report internally calls spawn_model twice; bump counters
-        task.ai_call_counter += 2
+        # BUG-AUD-07 fix: removed manual task.ai_call_counter increment; _sync_cost() is the single source of truth.
         log.info("report_compiled", pdf=pdf_path, docx=docx_path)
     except Exception as exc:  # noqa: BLE001
         # BUG-005: Re-raise so the outer handler marks task FAILED
@@ -2677,7 +2827,14 @@ async def _execute_action(
                     # no PIVOT case here, causing a silent "spawn_ai_unhandled_state" warning
                     # and pivot hypothesis generation to be silently dropped.  Pivots need
                     # new hypotheses and branches just like INIT, so handle_init() is correct.
-                    await handle_init(task, session_data, cost_tracker, db, redis_client, config)
+                    # BUG-AUD-30 fix: pass the pivot flag explicitly so handle_init()
+                    # can consume it without relying on task.current_state.  Read from
+                    # action.params which the state machine populates with pivot=True.
+                    _pivot_flag = bool(action.params.get("pivot", True))
+                    await handle_init(
+                        task, session_data, cost_tracker, db, redis_client, config,
+                        pivot=_pivot_flag,
+                    )
                 case State.CHECKPOINT:
                     # BUG-AUD-02 fix: CHECKPOINT+STRONG_FINDINGS_EXIST with skip_tribunal
                     # emits SPAWN_AI(task_type='SKEPTIC_QUESTIONS'), but task.current_state
@@ -2729,25 +2886,57 @@ async def _execute_action(
             score_band = action.params.get("score_band", "score7")
             # BUG-D1-01 fix: score8 → $50 grant, score7 → $20 grant, minimal → $2 keep-alive
             if score_band == "score8":
-                amount = 50.0
+                total_amount = 50.0
+                _threshold = 0.8
             elif score_band == "score7":
-                amount = 20.0
+                total_amount = 20.0
+                _threshold = 0.7
             else:
                 # "minimal" (dont_kill_branches keep-alive) — intentionally small
-                amount = 2.0
+                total_amount = 2.0
+                _threshold = None  # minimal grants always target the best branch
             active = session_data.active_branches
             if active:
-                best = max(
-                    active,
-                    key=lambda b: b.latest_score if b.latest_score is not None else 0.0,
+                # BUG-AUD-22 fix: instead of funding only the single
+                # highest-scoring branch, fund every branch at or above
+                # the score-band threshold.  Budget is split evenly
+                # across eligible branches so the total grant amount is
+                # preserved.  Ties no longer starve equally-strong peers.
+                if _threshold is not None:
+                    eligible = [
+                        b for b in active
+                        if b.latest_score is not None and b.latest_score >= _threshold
+                    ]
+                else:
+                    eligible = []
+
+                if not eligible:
+                    # Fall back to the previous behaviour — fund the single
+                    # best-scoring branch.  Preserves minimal-band intent
+                    # and handles edge cases where no branch meets the
+                    # nominal threshold but the band itself says grant.
+                    best = max(
+                        active,
+                        key=lambda b: b.latest_score if b.latest_score is not None else 0.0,
+                    )
+                    eligible = [best]
+
+                per_branch_amount = total_amount / len(eligible)
+                for _branch in eligible:
+                    await grant_budget(
+                        branch_id=_branch.id,
+                        amount=per_branch_amount,
+                        db=db,
+                        cost_tracker=cost_tracker,
+                    )
+                log.info(
+                    "grant_budget_action",
+                    score_band=score_band,
+                    total_amount=total_amount,
+                    per_branch_amount=per_branch_amount,
+                    branch_ids=[b.id for b in eligible],
+                    eligible_count=len(eligible),
                 )
-                await grant_budget(
-                    branch_id=best.id,
-                    amount=amount,
-                    db=db,
-                    cost_tracker=cost_tracker,
-                )
-                log.info("grant_budget_action", branch_id=best.id, amount=amount)
 
         case "SAVE_CHECKPOINT":
             await handle_checkpoint(
@@ -2847,7 +3036,23 @@ async def _build_session_data(
     # Tier-based overrides: standard tier skips tribunal + skeptic to stay under 5 min.
     # Only deep tier runs the full tribunal/skeptic pipeline.
     _tier = _meta.get("tier", "standard")
+    # BUG-AUD-19 fix: log when the tier forces a skip override on top of
+    # the user's explicit setting so operators can audit unexpected
+    # behaviour.  Note: user-supplied True values are honoured as-is and
+    # never overridden to False by this path.
+    _user_skip_tribunal = bool(_meta.get("skip_tribunal", False))
+    _user_skip_skeptic = bool(_meta.get("skip_skeptic", False))
     if _tier in ("instant", "quick", "standard"):
+        if not _user_skip_tribunal or not _user_skip_skeptic:
+            logger.info(
+                "tier_forced_skip",
+                task_id=task.id,
+                tier=_tier,
+                user_skip_tribunal=_user_skip_tribunal,
+                user_skip_skeptic=_user_skip_skeptic,
+                forced_skip_tribunal=True,
+                forced_skip_skeptic=True,
+            )
         _skip_tribunal = True
         _skip_skeptic = True
     _user_directives = _meta.get("user_directives", {})
@@ -2964,11 +3169,34 @@ async def _emergency_checkpoint(
     except Exception:  # noqa: BLE001
         dead = []
 
+    # BUG-AUD-26 fix: previously this path hardcoded findings=[], so a
+    # checkpoint resume would observe zero findings even when the DB
+    # clearly had them — silently stalling the pipeline in SEARCH.  Fetch
+    # findings best-effort (same schema as handle_report).  Any failure
+    # still falls back to an empty list, preserving the previous
+    # best-effort semantics.
+    try:
+        finding_rows = await db.fetch(
+            """
+            SELECT id, task_id, hypothesis_id, content, content_en, content_language,
+                   source_ids, confidence, evidence_type, is_compressed,
+                   raw_content_path, created_at, metadata
+            FROM findings WHERE task_id = $1
+            """,
+            task.id,
+        )
+        findings = [
+            Finding.model_validate({**_row_to_dict(r), "evidence_type": EvidenceType(r["evidence_type"])})
+            for r in finding_rows
+        ]
+    except Exception:  # noqa: BLE001
+        findings = []
+
     await checkpoint_module.save_checkpoint(
         task=task,
         active_branches=active,
         killed_branches=dead,
-        findings=[],
+        findings=findings,
         current_state=task.current_state,
         cost_tracker=cost_tracker,
         db=db,
@@ -3016,6 +3244,13 @@ async def _check_user_credits(user_id: str, config: Any) -> int | None:
 # "Task was destroyed but it is pending!" warnings otherwise.
 _background_tasks: set[Any] = set()
 
+# BUG-AUD-20 fix: cache last-written handoff phase per task_id.  The handoff
+# writer issues up to 4 DB round-trips; skipping redundant writes when the
+# phase hasn't changed since the previous call eliminates O(iterations) DB
+# load during normal operation.  The cache only stores the phase string so
+# memory use is negligible even for very long-running processes.
+_last_handoff_phase: dict[str, str] = {}
+
 
 async def _write_handoff_context(
     task: "ResearchTask",
@@ -3038,6 +3273,19 @@ async def _write_handoff_context(
     BUG-D1-02 fix: previously this function only wrote to in-memory task.metadata.
     rotation.read_handoff() queries orchestrator_handoffs, which was always empty.
     """
+    # BUG-AUD-20 fix: skip the expensive handoff write when the phase hasn't
+    # changed since the last invocation for this task.  State transitions
+    # within the same phase (e.g. SEARCH->EVALUATE->SEARCH) don't need a
+    # fresh handoff record — the last one is still valid.
+    _prev_phase = _last_handoff_phase.get(task.id)
+    if _prev_phase == phase_name and not findings_summary:
+        logger.debug(
+            "handoff_context_skip_same_phase",
+            task_id=task.id,
+            phase=phase_name,
+        )
+        return
+
     handoff: dict[str, Any] = {
         "phase_completed": phase_name,
         "total_spent_usd": round(cost_tracker.total_spent, 4),
@@ -3116,6 +3364,10 @@ async def _write_handoff_context(
             },
         )
         await rotation.write_handoff(db, ctx)
+
+    # BUG-AUD-20 fix: record the phase we just handed off so repeat calls
+    # with the same phase can be short-circuited above.
+    _last_handoff_phase[task.id] = phase_name
 
     logger.debug(
         "handoff_context_written",

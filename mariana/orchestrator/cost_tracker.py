@@ -93,6 +93,14 @@ class CostTracker:
         self.finalization_mode: bool = False
         self.call_count: int = 0
 
+        # BUG-AUD-04 fix: Dedup ledger. If a caller supplies a session_id
+        # (typically AISession.id) to record_call / record_branch_spend we
+        # remember it here and ignore repeat charges for the same session_id.
+        # This protects against the double-count footgun where record_call
+        # and record_branch_spend are both invoked for the same underlying
+        # cost (docstring-only guarantee is not enough in practice).
+        self._seen_session_ids: set[str] = set()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -101,6 +109,7 @@ class CostTracker:
         self,
         session: AISession,
         branch_id: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         """Record the cost from a completed AI session.
 
@@ -114,6 +123,10 @@ class CostTracker:
         branch_id:
             If provided, the cost is also charged to this branch's
             sub-ledger and the branch hard-cap is checked.
+        session_id:
+            Optional unique identifier for the cost event.  When
+            provided, duplicate calls with the same ``session_id`` are
+            logged and ignored (BUG-AUD-04 dedup ledger).
 
         Raises
         ------
@@ -122,6 +135,20 @@ class CostTracker:
             the cost (i.e., the call itself was the straw that broke the
             camel's back).
         """
+        # BUG-AUD-04 fix: dedup ledger — refuse to charge the same
+        # session_id twice.  This prevents the common footgun where both
+        # record_call() and record_branch_spend() attempt to charge for
+        # the same underlying AI session.
+        if session_id is not None:
+            if session_id in self._seen_session_ids:
+                logger.warning(
+                    "cost_record_duplicate_session_id",
+                    session_id=session_id,
+                    branch_id=branch_id,
+                )
+                return
+            self._seen_session_ids.add(session_id)
+
         cost = session.cost_usd
 
         # Accumulate totals
@@ -171,7 +198,12 @@ class CostTracker:
             branch_id=branch_id,
         )
 
-    def record_branch_spend(self, branch_id: str, amount: float) -> None:
+    def record_branch_spend(
+        self,
+        branch_id: str,
+        amount: float,
+        session_id: str | None = None,
+    ) -> None:
         """Manually charge *amount* USD to *branch_id* without an AISession.
 
         Updates both the per-branch sub-ledger AND ``total_spent`` so that
@@ -184,9 +216,26 @@ class CostTracker:
             Branch to charge.
         amount:
             USD amount (must be ≥ 0).
+        session_id:
+            Optional unique identifier for the cost event.  When
+            provided, duplicate calls with the same ``session_id`` are
+            logged and ignored (BUG-AUD-04 dedup ledger).
         """
         if amount < 0:
             raise ValueError(f"amount must be non-negative, got {amount!r}")
+        # BUG-AUD-04 fix: dedup ledger.  If the same session_id was already
+        # charged (likely via record_call), silently no-op instead of
+        # double-adding to both per_branch and total_spent.
+        if session_id is not None:
+            if session_id in self._seen_session_ids:
+                logger.warning(
+                    "branch_spend_duplicate_session_id",
+                    session_id=session_id,
+                    branch_id=branch_id,
+                    amount=amount,
+                )
+                return
+            self._seen_session_ids.add(session_id)
         self.per_branch[branch_id] = self.per_branch.get(branch_id, 0.0) + amount
         self.total_spent += amount
         logger.debug(

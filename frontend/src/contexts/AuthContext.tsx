@@ -7,6 +7,7 @@ import {
   ReactNode,
 } from "react";
 import { toast } from "sonner";
+import { useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase";
 import type { Session } from "@supabase/supabase-js";
 
@@ -86,6 +87,10 @@ function buildUser(session: Session, profile: ProfileRow | null): User {
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  // BUG-FE-138 fix: Access the shared react-query client so we can clear cached
+  // queries on logout. Otherwise the next user to sign in on the same tab could
+  // briefly see the previous user's cached data.
+  const queryClient = useQueryClient();
 
   /**
    * Given a session (or null), load the profile and update state.
@@ -98,10 +103,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return;
     }
     try {
-      // Retry up to 3 times with 500ms delays — profile trigger may not have
-      // fired immediately after signup (BUG-R2C-11).
+      // Retry up to 5 times with 500ms delays (2.5 s total) — profile trigger
+      // may not have fired immediately after signup (BUG-R2C-11).
+      // BUG-FE-131 fix: Extended from 3 to 5 attempts to cover cold/free-tier
+      // Supabase instances where the trigger occasionally exceeds 1.5s.
       let profile: ProfileRow | null = null;
-      for (let attempt = 0; attempt < 3; attempt++) {
+      for (let attempt = 0; attempt < 5; attempt++) {
         profile = await fetchProfile(session.user.id);
         if (profile) break;
         await new Promise((r) => setTimeout(r, 500));
@@ -205,6 +212,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // Clear local state anyway — better to be logged out locally than stuck
     }
     setUser(null);
+    // BUG-FE-138 fix: Clear react-query cache so the next user on this tab does
+    // not briefly observe the previous user's cached responses.
+    try {
+      queryClient.clear();
+    } catch (err) {
+      console.warn("[AuthContext] queryClient.clear() failed:", err);
+    }
   };
 
   /**

@@ -28,8 +28,10 @@ For the prototype DOCX generation is skipped; the function returns
 from __future__ import annotations
 
 import os
+import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -45,6 +47,36 @@ from mariana.data.models import (
 )
 
 logger = structlog.get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# BUG-AUD-18 fix: dedicated ThreadPoolExecutor for WeasyPrint PDF rendering.
+# WeasyPrint is CPU/IO-heavy and synchronous; offloading it to the default
+# asyncio executor starves other I/O-bound tasks (DB, AI calls).  Use a
+# small dedicated pool so concurrent renders don't monopolise the default
+# pool.
+# ---------------------------------------------------------------------------
+_MAX_RENDER_WORKERS = int(os.environ.get("MARIANA_MAX_PDF_WORKERS", "4"))
+_render_pool: ThreadPoolExecutor = ThreadPoolExecutor(
+    max_workers=_MAX_RENDER_WORKERS,
+    thread_name_prefix="mariana-pdf-render",
+)
+
+# BUG-AUD-10 fix: strip HTML tags (<script>, <iframe>, raw <div>) that an LLM
+# may emit inside what should be plain-text fields.  WeasyPrint renders HTML
+# so leaving raw tags in could break layout or inject unintended markup.
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html_tags(value: Any) -> Any:
+    """Return *value* with any HTML-looking tags removed.
+
+    Non-string values are returned unchanged.  Templates expect plain strings
+    in section content / titles; any markup in there is almost certainly LLM
+    hallucination that would render badly.
+    """
+    if not isinstance(value, str):
+        return value
+    return _HTML_TAG_RE.sub("", value)
 
 
 # ---------------------------------------------------------------------------
@@ -192,69 +224,123 @@ async def generate_report(
     log.info("report_pass", pass_num=2, task_type=TaskType.REPORT_FINAL_EDIT.value)
     t0 = time.monotonic()
 
-    final_parsed, edit_session = await spawn_model(
-        task_type=TaskType.REPORT_FINAL_EDIT,
-        context={
-            "task_id": task.id,           # BUG-A03 fix: include task_id for AISession cost attribution
-            "draft": draft_output.model_dump_json(indent=2),
-            "all_sources": sources_block,
-        },
-        output_schema=ReportDraftOutput,
-        db=db,
-        cost_tracker=cost_tracker,
-        config=config,
-        quality_tier=_quality_tier,
-    )
-    final_output: ReportDraftOutput = final_parsed
+    # BUG-AUD-17 fix: if Pass-2 polish fails (API error, schema validation,
+    # timeout), fall back to the Pass-1 draft output rather than abandoning
+    # the whole report.  The draft is already high-quality; a failed polish
+    # should degrade, not destroy.
+    final_output: ReportDraftOutput
+    edit_cost_usd: float = 0.0
+    try:
+        final_parsed, edit_session = await spawn_model(
+            task_type=TaskType.REPORT_FINAL_EDIT,
+            context={
+                "task_id": task.id,           # BUG-A03 fix: include task_id for AISession cost attribution
+                "draft": draft_output.model_dump_json(indent=2),
+                "all_sources": sources_block,
+            },
+            output_schema=ReportDraftOutput,
+            db=db,
+            cost_tracker=cost_tracker,
+            config=config,
+            quality_tier=_quality_tier,
+        )
+        final_output = final_parsed
+        edit_cost_usd = edit_session.cost_usd
+        log.info(
+            "report_edit_done",
+            cost_usd=edit_cost_usd,
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+        )
+    except Exception as _edit_exc:
+        log.warning(
+            "report_edit_failed_using_draft",
+            error=str(_edit_exc),
+            error_class=type(_edit_exc).__name__,
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+        )
+        final_output = draft_output
 
-    log.info(
-        "report_edit_done",
-        cost_usd=edit_session.cost_usd,
-        elapsed_ms=int((time.monotonic() - t0) * 1000),
-    )
-
-    total_ai_cost = draft_session.cost_usd + edit_session.cost_usd
+    total_ai_cost = draft_session.cost_usd + edit_cost_usd
 
     # ── Compute word counts ───────────────────────────────────────────────────
     for section in final_output.sections:
         section.word_count_en = len((section.content_en or "").split())
 
+    # ── BUG-AUD-23 fix: warn + DB fallback when total_spent is zero but
+    # we clearly *did* make AI calls.  This masks an earlier bug where a
+    # branch-only cost path never wrote to total_spent.
+    _total_cost_usd = cost_tracker.total_spent if cost_tracker is not None else 0.0
+    if (
+        cost_tracker is not None
+        and _total_cost_usd == 0.0
+        and getattr(cost_tracker, "call_count", 0) > 0
+    ):
+        try:
+            async with db.acquire() as _conn:
+                _db_sum = await _conn.fetchval(
+                    "SELECT COALESCE(SUM(cost_usd), 0) FROM ai_sessions WHERE task_id = $1",
+                    task.id,
+                )
+            _total_cost_usd = float(_db_sum or 0.0)
+            log.warning(
+                "cost_tracker_zero_with_calls_db_fallback",
+                db_sum_usd=_total_cost_usd,
+                call_count=cost_tracker.call_count,
+            )
+        except Exception as _exc:
+            log.warning(
+                "cost_tracker_zero_fallback_failed",
+                error=str(_exc),
+                call_count=getattr(cost_tracker, "call_count", 0),
+            )
+
     # ── Build template data dict ──────────────────────────────────────────────
+    # BUG-AUD-10 fix: strip HTML tags from LLM-produced content before
+    # passing to the Jinja/WeasyPrint template.
     report_data: dict[str, Any] = {
-        "title_en": final_output.title_en,
-        "title_zh": final_output.title_zh,
-        "executive_summary_en": final_output.executive_summary_en,
-        "executive_summary_zh": final_output.executive_summary_zh,
+        "title_en": _strip_html_tags(final_output.title_en),
+        "title_zh": _strip_html_tags(final_output.title_zh),
+        "executive_summary_en": _strip_html_tags(final_output.executive_summary_en),
+        "executive_summary_zh": _strip_html_tags(final_output.executive_summary_zh),
         "sections": [
             {
                 "section_id": s.section_id,
-                "title_en": s.title_en,
-                "title_zh": s.title_zh,
-                "content_en": s.content_en,
-                "content_zh": s.content_zh,
+                "title_en": _strip_html_tags(s.title_en),
+                "title_zh": _strip_html_tags(s.title_zh),
+                "content_en": _strip_html_tags(s.content_en),
+                "content_zh": _strip_html_tags(s.content_zh),
                 "citations": s.citations,
                 "word_count_en": s.word_count_en,
             }
             for s in final_output.sections
         ],
-        "conclusion_en": final_output.conclusion_en,
-        "conclusion_zh": final_output.conclusion_zh,
-        "disclaimer_en": final_output.disclaimer_en,
-        "disclaimer_zh": final_output.disclaimer_zh,
+        "conclusion_en": _strip_html_tags(final_output.conclusion_en),
+        "conclusion_zh": _strip_html_tags(final_output.conclusion_zh),
+        "disclaimer_en": _strip_html_tags(final_output.disclaimer_en),
+        "disclaimer_zh": _strip_html_tags(final_output.disclaimer_zh),
         "generated_at": datetime.now(timezone.utc),
         "task_topic": task.topic,
         # BUG-019 fix: guard against cost_tracker being None before accessing
         # .total_spent — the parameter is typed Any and may be None.
-        "total_cost_usd": cost_tracker.total_spent if cost_tracker is not None else 0.0,
+        # BUG-AUD-23 fix: use DB-fallback-aware value.
+        "total_cost_usd": _total_cost_usd,
         "total_sources": len(all_sources),
         "total_findings": len(confirmed_findings),
     }
 
     # ── Render to PDF ─────────────────────────────────────────────────────────
     template_dir = str(Path(__file__).parent / "templates")
+    # BUG-AUD-09 fix: ASCII-only filename sanitization.  The previous filter
+    # kept non-ASCII alnum characters (e.g. CJK) which breaks some
+    # filesystems and HTTP content-disposition headers.  Force ASCII
+    # alphanumeric + dash/underscore only; collapse runs of underscores.
+    _raw_topic = task.topic[:60] if task.topic else ""
     safe_topic = "".join(
-        c if c.isalnum() or c in "-_" else "_" for c in task.topic[:60]
+        c if (c.isascii() and (c.isalnum() or c in "-_")) else "_"
+        for c in _raw_topic
     )
+    # Collapse runs of underscores and strip leading/trailing ones.
+    safe_topic = re.sub(r"_+", "_", safe_topic).strip("_") or "report"
     pdf_filename = f"mariana_{safe_topic}_{report_id[:8]}.pdf"
     pdf_path = str(out_dir / pdf_filename)
 
@@ -264,11 +350,23 @@ async def generate_report(
     import asyncio as _asyncio  # noqa: PLC0415
     try:
         # BUG-004 fix: use get_running_loop() instead of deprecated get_event_loop().
+        # BUG-AUD-18 fix: use dedicated ThreadPoolExecutor so WeasyPrint does
+        # not starve the default asyncio executor.
         await _asyncio.get_running_loop().run_in_executor(
-            None, render_pdf, report_data, template_dir, pdf_path
+            _render_pool, render_pdf, report_data, template_dir, pdf_path
         )
     except Exception as exc:
         log.error("report_render_failed", pdf_path=pdf_path, error=str(exc))
+        # BUG-AUD-08 fix: clean up any half-written PDF on render failure so
+        # downstream code can't pick up a corrupted file.
+        try:
+            Path(pdf_path).unlink(missing_ok=True)
+        except Exception as _unlink_exc:
+            log.warning(
+                "report_render_cleanup_failed",
+                pdf_path=pdf_path,
+                error=str(_unlink_exc),
+            )
         # BUG-023 fix: wrap the DB status update in its own try/except so that
         # a DB failure does not replace the original render exception.
         try:

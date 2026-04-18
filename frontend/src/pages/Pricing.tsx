@@ -109,6 +109,12 @@ export default function Pricing() {
 
     setLoadingPlanId(planId);
 
+    // BUG-FE-121 fix: Open the navigation target synchronously on click so
+    // Safari honors the user-gesture context. Assigning window.location.href
+    // after an await can be silently blocked in Safari because the gesture
+    // has expired by then. We open _self so there's no popup-blocker issue.
+    const popup = window.open("", "_self");
+
     try {
       const { data: { session } } = await supabase.auth.getSession();
       const token = session?.access_token;
@@ -142,7 +148,12 @@ export default function Pricing() {
       if (!data.checkout_url) {
         throw new Error("No checkout URL received from server");
       }
-      window.location.href = data.checkout_url;
+      // BUG-FE-121: Navigate the pre-opened window (or fall back to current).
+      if (popup) {
+        popup.location.href = data.checkout_url;
+      } else {
+        window.location.href = data.checkout_url;
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";
       toast.error("Could not start checkout", { description: msg });

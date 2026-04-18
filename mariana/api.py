@@ -48,7 +48,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Annotated, Any, AsyncIterator, List, Literal
 from urllib.parse import quote as _url_quote, urlsplit, urlunsplit
 
 import asyncpg
@@ -59,8 +59,41 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, 
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sse_starlette.sse import EventSourceResponse
+
+# BUG-API-039: Rate limiting via slowapi. Import is guarded so that the
+# module still loads on environments where slowapi is not installed; in
+# that case the limiter decorators become no-ops.
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    _SLOWAPI_AVAILABLE = True
+except ImportError:  # pragma: no cover - slowapi is an optional hardening dep
+    _SLOWAPI_AVAILABLE = False
+
+    class RateLimitExceeded(Exception):  # type: ignore[no-redef]
+        """Fallback exception type when slowapi is not installed."""
+
+    def get_remote_address(request: Any) -> str:  # type: ignore[no-redef]
+        return getattr(getattr(request, "client", None), "host", "") or ""
+
+    def _rate_limit_exceeded_handler(request: Any, exc: Exception):  # type: ignore[no-redef]
+        return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+
+    class _NoopLimiter:
+        """No-op limiter used when slowapi is not installed."""
+
+        def __init__(self, *_a: Any, **_kw: Any) -> None:
+            pass
+
+        def limit(self, *_a: Any, **_kw: Any):
+            def _decorator(func):
+                return func
+            return _decorator
+
+    Limiter = _NoopLimiter  # type: ignore[misc,assignment]
 
 from mariana.config import AppConfig, load_config
 from mariana.data.db import create_pool, init_schema
@@ -101,6 +134,50 @@ _VERSION = "0.1.0"
 
 #: Hardcoded admin user UUID — matches the Supabase profile with role='admin'.
 ADMIN_USER_ID = "a34a319e-a046-4df2-8c98-9b83f6d512a0"
+
+# BUG-API-024: Allow-list of valid task status values. Clients that pass
+# anything outside this set receive a 400 instead of an empty result.
+_VALID_TASK_STATUSES: frozenset[str] = frozenset({
+    "PENDING",
+    "RUNNING",
+    "COMPLETED",
+    "FAILED",
+    "HALTED",
+    "CANCELLED",
+})
+
+
+def _normalize_bearer_auth_header(raw: str | None) -> str:
+    """Normalize a raw Authorization header value for forwarding.
+
+    BUG-API-030 / BUG-API-048: admin endpoints forward the caller's
+    Authorization header to Supabase. Strip surrounding whitespace, verify a
+    single ``Bearer <token>`` form, and raise 500 on empty/malformed values
+    so we never relay nonsense credentials to Supabase.
+    """
+    if not raw:
+        raise HTTPException(
+            status_code=500,
+            detail="Internal error: admin endpoint called without authorization header",
+        )
+    value = raw.strip()
+    if not value:
+        raise HTTPException(
+            status_code=500,
+            detail="Internal error: authorization header is empty",
+        )
+    if not value.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=500,
+            detail="Internal error: expected Bearer authorization header",
+        )
+    token = value.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(
+            status_code=500,
+            detail="Internal error: empty Bearer token",
+        )
+    return f"Bearer {token}"
 
 # ---------------------------------------------------------------------------
 # Module-level singletons (populated during lifespan startup)
@@ -213,13 +290,36 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# BUG-API-039: Rate limiting. Default limit applies globally; individual
+# expensive endpoints carry tighter decorators via ``@limiter.limit(...)``.
+limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # BUG-027: CORS origins read from config so the hardcoded Vercel URL can be
 # updated via environment variable without a code change.
-_DEFAULT_CORS_ORIGINS = [
+_DEFAULT_PROD_CORS_ORIGINS = [
     "https://frontend-tau-navy-80.vercel.app",
+]
+_DEFAULT_DEV_CORS_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:3000",
 ]
+# Preserve the old name for backwards compatibility with external imports.
+_DEFAULT_CORS_ORIGINS = _DEFAULT_PROD_CORS_ORIGINS + _DEFAULT_DEV_CORS_ORIGINS
+
+def _is_dev_environment() -> bool:
+    """Return True when we should allow localhost-style CORS origins.
+
+    BUG-API-027: Only permit localhost origins in development / debug
+    deployments. Production deployments should never accept requests from
+    ``http://localhost:*``.
+    """
+    env = (os.environ.get("APP_ENV") or os.environ.get("ENV") or "").lower()
+    if env in {"dev", "development", "local", "test"}:
+        return True
+    debug = os.environ.get("DEBUG", "").lower()
+    return debug in {"1", "true", "yes", "on"}
 
 def _get_cors_origins() -> list[str]:
     """Return CORS allowed origins from env var, falling back to defaults.
@@ -230,11 +330,16 @@ def _get_cors_origins() -> list[str]:
     dead code that silently dropped operator-configured origins.  Now we read
     directly from ``os.environ`` (which IS available at import time) so the
     env var is always honoured.
+
+    BUG-API-027: Localhost entries in the default list are only returned
+    when the service is running in a DEV/DEBUG environment.
     """
     extra = os.environ.get("CORS_ALLOWED_ORIGINS", "")
     if extra:
         return [o.strip() for o in extra.split(",") if o.strip()]
-    return _DEFAULT_CORS_ORIGINS
+    if _is_dev_environment():
+        return list(_DEFAULT_PROD_CORS_ORIGINS) + list(_DEFAULT_DEV_CORS_ORIGINS)
+    return list(_DEFAULT_PROD_CORS_ORIGINS)
 
 app.add_middleware(
     CORSMiddleware,
@@ -267,6 +372,34 @@ def _get_config() -> AppConfig:
 # ---------------------------------------------------------------------------
 # Pydantic request / response models
 # ---------------------------------------------------------------------------
+
+
+# BUG-API-014: Max serialized size for free-form dict request fields. Prevents
+# callers from shipping megabyte-scale JSON blobs in ``metadata`` / ``content``
+# / ``user_directives`` — a memory-exhaustion and DB-bloat vector.
+_REQUEST_DICT_MAX_BYTES = 32 * 1024  # 32 KB
+
+
+def _validate_dict_size(value: dict | None, *, max_bytes: int = _REQUEST_DICT_MAX_BYTES) -> dict | None:
+    """Reject dicts whose JSON serialization exceeds ``max_bytes``.
+
+    Returns the dict unchanged on success. Raises ``ValueError`` (which
+    Pydantic converts to a 422) if the serialization is too large or the
+    dict cannot be serialized.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("metadata must be a JSON object")
+    try:
+        serialized = _json.dumps(value, default=str)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"metadata is not JSON-serializable: {exc}") from exc
+    if len(serialized.encode("utf-8")) > max_bytes:
+        raise ValueError(
+            f"metadata exceeds maximum size of {max_bytes} bytes (serialized)"
+        )
+    return value
 
 
 class HealthResponse(BaseModel):
@@ -341,6 +474,12 @@ class SaveMessageRequest(BaseModel):
     type: str = Field("text", pattern=r"^(text|code|status|error|plan)$")
     metadata: dict | None = None
 
+    @field_validator("metadata")
+    @classmethod
+    def _cap_metadata_size(cls, value: dict | None) -> dict | None:
+        # BUG-API-014: reject oversize metadata blobs to avoid memory/DB bloat.
+        return _validate_dict_size(value)
+
 
 class SaveMessageResponse(BaseModel):
     id: str
@@ -387,6 +526,12 @@ class StartInvestigationRequest(BaseModel):
     skip_tribunal: bool = Field(False, description="If true, skip the adversarial tribunal review")
     user_directives: dict | None = Field(None, description="Freeform user directives dict for custom flow control")
     tier: str | None = Field(None, description="Override tier: instant, quick, standard, deep. If omitted, auto-classified.")
+
+    @field_validator("user_directives")
+    @classmethod
+    def _cap_user_directives_size(cls, value: dict | None) -> dict | None:
+        # BUG-API-014: user_directives can reach the task payload and DB; cap it.
+        return _validate_dict_size(value)
 
 
 class ClassifyRequest(BaseModel):
@@ -605,16 +750,35 @@ class AdminUserSummary(BaseModel):
 
 
 class AdminSetCreditsRequest(BaseModel):
-    """Request body for POST /api/admin/users/{user_id}/credits."""
+    """Request body for POST /api/admin/users/{user_id}/credits.
 
-    credits: int = Field(..., ge=0, description="New absolute credits balance (use delta for increments)")
+    BUG-API-013: ``credits`` is now validated via a model_validator so it
+    can be negative when ``delta=True`` (admin wants to subtract credits)
+    but remains ≥ 0 when ``delta=False`` (setting an absolute balance).
+    """
+
+    credits: int = Field(..., description="New absolute credits balance, or delta when delta=True")
     delta: bool = Field(False, description="If True, treat credits as a delta to add/subtract")
+
+    @model_validator(mode="after")
+    def _validate_credits_sign(self) -> "AdminSetCreditsRequest":
+        # Absolute balance must be non-negative; deltas may be negative.
+        if not self.delta and self.credits < 0:
+            raise ValueError(
+                "credits must be >= 0 when delta=False (absolute set). "
+                "Pass delta=True to subtract."
+            )
+        return self
 
 
 class AdminStatsResponse(BaseModel):
     """System-wide statistics for the admin dashboard."""
 
     total_users: int
+    # BUG-API-025: indicate when the total_users value could not be
+    # retrieved (e.g. Supabase RPC failure) so the dashboard can display
+    # "unknown" rather than a misleading 0.
+    total_users_available: bool = True
     total_investigations: int
     running_investigations: int
     completed_investigations: int
@@ -867,8 +1031,11 @@ def _verify_stream_token(token: str, task_id: str) -> str:
         # Verify task_id matches
         if tok_task_id != task_id:
             raise ValueError("task mismatch")
-        # Verify not expired
-        if int(exp_str) < int(time.time()):
+        # Verify not expired. BUG-API-038: allow a small clock-skew grace so
+        # tokens minted on node A don't fail on node B when B's wall-clock is
+        # a few seconds ahead.
+        _CLOCK_SKEW_GRACE_SECONDS = 5
+        if int(exp_str) + _CLOCK_SKEW_GRACE_SECONDS < int(time.time()):
             raise ValueError("expired")
         return user_id
     except Exception:
@@ -924,20 +1091,29 @@ async def _authenticate_stream_token_or_header(
         return {"user_id": user_id}
     elif authorization and authorization.startswith("Bearer "):
         raw_token = authorization.split(" ", 1)[1].strip()
-        if raw_token:
-            user = await _authenticate_supabase_token(raw_token)
-            # Verify ownership
-            db = _get_db()
-            row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
-            if row is None:
-                raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
-            if user["user_id"] != ADMIN_USER_ID:
-                metadata = row.get("metadata") or {}
-                if isinstance(metadata, str):
+        # BUG-API-015: reject explicitly empty Bearer tokens with a clear 400
+        # instead of falling through to the generic 401 below.
+        if not raw_token:
+            raise HTTPException(
+                status_code=400,
+                detail="Authorization header has empty Bearer token",
+            )
+        user = await _authenticate_supabase_token(raw_token)
+        # Verify ownership
+        db = _get_db()
+        row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        if user["user_id"] != ADMIN_USER_ID:
+            metadata = row.get("metadata") or {}
+            if isinstance(metadata, str):
+                try:
                     metadata = json.loads(metadata)
-                if metadata.get("user_id") != user["user_id"]:
-                    raise HTTPException(status_code=403, detail="You do not own this investigation")
-            return user
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+            if metadata.get("user_id") != user["user_id"]:
+                raise HTTPException(status_code=403, detail="You do not own this investigation")
+        return user
     raise HTTPException(status_code=401, detail="Missing or invalid authorization credentials")
 
 
@@ -1055,7 +1231,9 @@ async def get_config(
     tags=["Investigations"],
     summary="Classify a research request into a tier",
 )
+@limiter.limit("30/minute")
 async def classify_request(
+    request: Request,
     body: ClassifyRequest,
     current_user: dict[str, str] = Depends(_get_current_user),
 ) -> ClassifyResponse:
@@ -1076,7 +1254,9 @@ async def classify_request(
     tags=["Chat"],
     summary="Smart chat: replies conversationally or signals a research launch",
 )
+@limiter.limit("20/minute")
 async def chat_respond(
+    request: Request,
     body: ChatRequest,
     authorization: str | None = Header(None),
     current_user: dict[str, str] = Depends(_get_current_user),
@@ -1286,6 +1466,17 @@ If they ask what you can do, explain you're an AI that can have normal conversat
 # ════════════════════════════════════════════════════════════════════════════
 
 
+# BUG-API-050: idempotent methods that are safe to retry on transient
+# network / 5xx errors. PATCH and DELETE are included only when the caller
+# targets a specific primary key (filtered via params) so the replay is
+# still idempotent — callers that issue bulk PATCH/DELETE should pass
+# ``allow_retry=False`` explicitly.
+_SUPABASE_RETRY_IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "PATCH", "DELETE", "PUT"})
+_SUPABASE_RETRY_MAX_ATTEMPTS = 3
+_SUPABASE_RETRY_BASE_DELAY = 0.25  # seconds; exponential 0.25, 0.5, 1.0
+_SUPABASE_RETRYABLE_STATUSES = frozenset({502, 503, 504})
+
+
 async def _supabase_rest(
     cfg: AppConfig,
     method: str,
@@ -1295,8 +1486,17 @@ async def _supabase_rest(
     params: dict[str, str] | None = None,
     headers_extra: dict[str, str] | None = None,
     user_token: str | None = None,
+    allow_retry: bool | None = None,
 ) -> httpx.Response:
-    """Low-level Supabase REST helper. Uses service key for admin ops, or user token for RLS-respecting ops."""
+    """Low-level Supabase REST helper. Uses service key for admin ops, or user token for RLS-respecting ops.
+
+    BUG-API-050: for idempotent requests (GET/HEAD, or PATCH/DELETE/PUT with a
+    PK-shaped filter), transparently retry on connection errors, read timeouts,
+    and 502/503/504 upstream errors with exponential backoff.  Non-idempotent
+    requests (POST) are never retried because they could produce duplicate
+    writes.  Callers that know their PATCH/DELETE is non-idempotent (e.g. bulk
+    updates without a PK filter) can opt out by passing ``allow_retry=False``.
+    """
     api_key = _supabase_api_key(cfg)
     if not api_key:
         raise HTTPException(status_code=503, detail="Supabase not configured")
@@ -1310,9 +1510,69 @@ async def _supabase_rest(
     if headers_extra:
         headers.update(headers_extra)
     url = f"{cfg.SUPABASE_URL}/rest/v1{path}"
+
+    method_upper = method.upper()
+    if allow_retry is None:
+        # Auto-detect: PATCH/DELETE/PUT are only retried when a filter param
+        # (e.g. ``id=eq.<uuid>``) is present, indicating a PK-targeted request.
+        if method_upper in ("GET", "HEAD"):
+            allow_retry = True
+        elif method_upper in ("PATCH", "DELETE", "PUT") and params:
+            allow_retry = any(
+                isinstance(v, str) and v.startswith("eq.")
+                for v in params.values()
+            )
+        else:
+            allow_retry = False
+
+    max_attempts = _SUPABASE_RETRY_MAX_ATTEMPTS if allow_retry and method_upper in _SUPABASE_RETRY_IDEMPOTENT_METHODS else 1
+    last_exc: Exception | None = None
     async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.request(method, url, json=json, params=params, headers=headers)
-    return resp
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = await client.request(
+                    method_upper, url, json=json, params=params, headers=headers
+                )
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
+                last_exc = exc
+                if attempt >= max_attempts:
+                    logger.warning(
+                        "supabase_rest_retry_exhausted",
+                        method=method_upper,
+                        path=path,
+                        attempts=attempt,
+                        error=str(exc),
+                    )
+                    raise
+                delay = _SUPABASE_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.info(
+                    "supabase_rest_retry",
+                    method=method_upper,
+                    path=path,
+                    attempt=attempt,
+                    delay=delay,
+                    error=str(exc),
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if resp.status_code in _SUPABASE_RETRYABLE_STATUSES and attempt < max_attempts:
+                delay = _SUPABASE_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.info(
+                    "supabase_rest_retry_status",
+                    method=method_upper,
+                    path=path,
+                    attempt=attempt,
+                    status=resp.status_code,
+                    delay=delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            return resp
+
+    # Unreachable — either returned or raised above.
+    assert last_exc is not None
+    raise last_exc
 
 
 @app.post(
@@ -1431,20 +1691,40 @@ async def get_conversation(
     )
     msgs: list[ConversationMessageOut] = []
     if msg_resp.status_code == 200:
+        # BUG-API-049: use .get(...) with defensive defaults so that a
+        # partially-populated row (e.g. a race where created_at is NULL, or
+        # a schema drift) does not raise KeyError and 500 the entire
+        # conversation fetch.  Rows missing required fields are skipped.
         for m in msg_resp.json():
+            if not isinstance(m, dict):
+                continue
             raw_meta = m.get("metadata")
             if isinstance(raw_meta, str):
                 try:
                     raw_meta = _json.loads(raw_meta)
                 except (ValueError, TypeError):
                     raw_meta = None
+            msg_id = m.get("id")
+            msg_role = m.get("role")
+            msg_content = m.get("content", "")
+            msg_created_at = m.get("created_at")
+            # Skip rows missing any field that downstream consumers require.
+            if not msg_id or not msg_role or not msg_created_at:
+                logger.warning(
+                    "conversation_message_skipped_missing_fields",
+                    conversation_id=conversation_id,
+                    have_id=bool(msg_id),
+                    have_role=bool(msg_role),
+                    have_created_at=bool(msg_created_at),
+                )
+                continue
             msgs.append(ConversationMessageOut(
-                id=m["id"],
-                role=m["role"],
-                content=m["content"],
+                id=msg_id,
+                role=msg_role,
+                content=msg_content if isinstance(msg_content, str) else str(msg_content),
                 type=m.get("type") or "text",
                 metadata=raw_meta if isinstance(raw_meta, dict) else None,
-                created_at=m["created_at"],
+                created_at=msg_created_at,
             ))
 
     # Fetch linked investigation task_ids
@@ -1546,6 +1826,13 @@ async def save_message(
     user_id = current_user["user_id"]
     user_token = authorization.split(" ", 1)[1].strip() if authorization and authorization.startswith("Bearer ") else None
 
+    # BUG-API-028: Validate conversation_id as a UUID to avoid confusing
+    # PostgREST 400/500s when a client sends a malformed id.
+    try:
+        uuid.UUID(body.conversation_id)
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid conversation_id format") from exc
+
     # Verify conversation ownership first
     check = await _supabase_rest(
         cfg, "GET", "/conversations",
@@ -1603,7 +1890,9 @@ async def save_message(
     status_code=202,
     tags=["Investigations"],
 )
+@limiter.limit("10/minute")
 async def start_investigation(
+    request: Request,
     body: StartInvestigationRequest,
     current_user: dict[str, str] = Depends(_get_current_user),
 ) -> StartInvestigationResponse:
@@ -1666,22 +1955,27 @@ async def start_investigation(
     )
     reserved_credits = 0
     if estimated_credits_needed > 0:
+        # BUG-API-005: Three-state result. Distinguish insufficient-credits
+        # (402) from transient RPC errors (503) so we never 402 a user whose
+        # problem is actually service availability.
         reserved = await _supabase_deduct_credits(current_user["user_id"], estimated_credits_needed, cfg)
-        if not reserved:
+        if reserved == "insufficient":
             user_tokens = await _supabase_get_user_tokens(current_user["user_id"], cfg)
-            if user_tokens is None:
-                raise HTTPException(status_code=503, detail="Credit service unavailable")
-            if user_tokens < estimated_credits_needed:
-                raise HTTPException(
-                    status_code=402,
-                    detail=(
-                        f"Insufficient credits: you have {user_tokens} tokens but this "
-                        f"investigation requires an estimated {estimated_credits_needed} tokens "
-                        f"(budget ${effective_budget_usd:.2f} + 20% markup). "
-                        "Please add credits or reduce the budget."
-                    ),
-                )
-            raise HTTPException(status_code=503, detail="Credit reservation unavailable")
+            available = user_tokens if user_tokens is not None else 0
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    f"Insufficient credits: you have {available} tokens but this "
+                    f"investigation requires an estimated {estimated_credits_needed} tokens "
+                    f"(budget ${effective_budget_usd:.2f} + 20% markup). "
+                    "Please add credits or reduce the budget."
+                ),
+            )
+        if reserved == "error":
+            raise HTTPException(
+                status_code=503,
+                detail="Credit service unavailable; please retry shortly.",
+            )
         reserved_credits = estimated_credits_needed
 
     try:
@@ -1767,23 +2061,85 @@ async def start_investigation(
             reserved_credits=reserved_credits,
         )
 
-        # Link investigation to conversation in Supabase if conversation_id provided
+        # BUG-API-012: Verify the caller owns this conversation before linking
+        # the task to it; otherwise a user could link their task to another
+        # user's conversation, leaking graph/context into the wrong UI. We
+        # query Supabase filtered by both id and user_id; ownership is
+        # confirmed iff the query returns exactly one row.
         if body.conversation_id:
+            conversation_owned = False
             try:
-                await _supabase_rest(
-                    cfg, "PATCH", "/investigations",
-                    json={"conversation_id": body.conversation_id},
-                    params={"task_id": f"eq.{task_id}"},
+                # Validate UUID shape before hitting PostgREST (avoids confusing 400s).
+                uuid.UUID(body.conversation_id)
+                ownership_resp = await _supabase_rest(
+                    cfg, "GET", "/conversations",
+                    params={
+                        "id": f"eq.{body.conversation_id}",
+                        "user_id": f"eq.{current_user['user_id']}",
+                        "select": "id",
+                        "limit": "1",
+                    },
                 )
-            except Exception as link_err:
-                logger.warning("investigation_conversation_link_failed", error=str(link_err))
+                if ownership_resp.status_code == 200:
+                    rows = ownership_resp.json()
+                    conversation_owned = bool(rows)
+                else:
+                    logger.warning(
+                        "investigation_conversation_ownership_check_failed",
+                        status=ownership_resp.status_code,
+                    )
+            except ValueError:
+                logger.warning(
+                    "investigation_conversation_invalid_uuid",
+                    conversation_id=body.conversation_id,
+                )
+            except Exception as ownership_err:  # noqa: BLE001
+                logger.warning(
+                    "investigation_conversation_ownership_check_failed",
+                    error=str(ownership_err),
+                )
+
+            if conversation_owned:
+                try:
+                    await _supabase_rest(
+                        cfg, "PATCH", "/investigations",
+                        json={"conversation_id": body.conversation_id},
+                        params={"task_id": f"eq.{task_id}"},
+                    )
+                except Exception as link_err:  # noqa: BLE001
+                    logger.warning("investigation_conversation_link_failed", error=str(link_err))
+            else:
+                logger.warning(
+                    "investigation_conversation_link_rejected",
+                    conversation_id=body.conversation_id,
+                    user_id=current_user["user_id"],
+                    reason="conversation_not_owned_by_user",
+                )
     except HTTPException:
+        # BUG-API-035: Wrap refund in inner try/except so a refund failure
+        # never masks the original HTTPException the user was about to see.
         if reserved_credits > 0:
-            await _supabase_add_credits(current_user["user_id"], reserved_credits, cfg)
+            try:
+                await _supabase_add_credits(current_user["user_id"], reserved_credits, cfg)
+            except Exception as refund_err:  # noqa: BLE001
+                logger.error(
+                    "refund_after_http_exception_failed",
+                    user_id=current_user["user_id"],
+                    amount=reserved_credits,
+                    error=str(refund_err),
+                )
         raise
     except OSError as exc:
         if reserved_credits > 0:
-            await _supabase_add_credits(current_user["user_id"], reserved_credits, cfg)
+            try:
+                await _supabase_add_credits(current_user["user_id"], reserved_credits, cfg)
+            except Exception as refund_err:  # noqa: BLE001
+                logger.error(
+                    "refund_after_oserror_failed",
+                    user_id=current_user["user_id"],
+                    amount=reserved_credits,
+                    error=str(refund_err),
+                )
         logger.error("task_write_failed", error=str(exc))
         raise HTTPException(
             status_code=500,
@@ -1791,7 +2147,15 @@ async def start_investigation(
         ) from exc
     except Exception:
         if reserved_credits > 0:
-            await _supabase_add_credits(current_user["user_id"], reserved_credits, cfg)
+            try:
+                await _supabase_add_credits(current_user["user_id"], reserved_credits, cfg)
+            except Exception as refund_err:  # noqa: BLE001
+                logger.error(
+                    "refund_after_unexpected_exception_failed",
+                    user_id=current_user["user_id"],
+                    amount=reserved_credits,
+                    error=str(refund_err),
+                )
         raise
 
     return StartInvestigationResponse(
@@ -1821,6 +2185,20 @@ async def list_investigations(
     db = _get_db()
     offset = (page - 1) * page_size
     user_id = current_user["user_id"]
+
+    # BUG-API-024: Validate the status filter against known values so callers
+    # get a helpful 400 instead of a silent 0-result response.
+    if status:
+        normalized_status = status.upper()
+        if normalized_status not in _VALID_TASK_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid status {status!r}. Must be one of: "
+                    f"{sorted(_VALID_TASK_STATUSES)}"
+                ),
+            )
+        status = normalized_status
 
     if status:
         total: int = await db.fetchval(
@@ -2417,8 +2795,66 @@ async def upsert_investigation_graph(
     """
     db = _get_db()
 
+    # BUG-API-042: cap batch sizes so a malicious or buggy client cannot
+    # flood the graph tables in one request. 500 is generous for a UI batch
+    # but well under Postgres statement / payload limits.
+    _MAX_GRAPH_BATCH = 500
+    if len(body.nodes) > _MAX_GRAPH_BATCH or len(body.edges) > _MAX_GRAPH_BATCH:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Graph upsert batch too large: max {_MAX_GRAPH_BATCH} nodes "
+                f"and {_MAX_GRAPH_BATCH} edges per request "
+                f"(got {len(body.nodes)} nodes, {len(body.edges)} edges)."
+            ),
+        )
+
+    # BUG-API-034: before ON CONFLICT overwrites, verify that any existing
+    # nodes/edges with the submitted IDs already belong to this task_id.
+    # Otherwise a caller could supply an ID that collides with a node/edge
+    # owned by a different investigation and clobber it, bypassing the
+    # per-task ownership check enforced by ``_require_investigation_owner``.
+    _node_ids = [n.id for n in body.nodes]
+    _edge_ids = [e.id for e in body.edges]
+
     async with db.acquire() as conn:
         async with conn.transaction():
+            # BUG-API-034: cross-task ownership preflight.
+            if _node_ids:
+                conflict_rows = await conn.fetch(
+                    """
+                    SELECT id FROM graph_nodes
+                    WHERE id = ANY($1::text[]) AND task_id <> $2
+                    """,
+                    _node_ids,
+                    task_id,
+                )
+                if conflict_rows:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "One or more node IDs already exist under a "
+                            "different investigation and cannot be overwritten."
+                        ),
+                    )
+            if _edge_ids:
+                conflict_rows = await conn.fetch(
+                    """
+                    SELECT id FROM graph_edges
+                    WHERE id = ANY($1::text[]) AND task_id <> $2
+                    """,
+                    _edge_ids,
+                    task_id,
+                )
+                if conflict_rows:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "One or more edge IDs already exist under a "
+                            "different investigation and cannot be overwritten."
+                        ),
+                    )
+
             # ── Upsert nodes ───────────────────────────────────────────────
             for node in body.nodes:
                 await conn.execute(
@@ -2552,6 +2988,11 @@ async def stream_logs(
 
     async def _event_generator() -> AsyncIterator[dict[str, str]]:
         last_auth_check = time.monotonic()
+        # BUG-API-008: throttle DB status polls in the SSE pub/sub loop so that
+        # each idle subscriber no longer produces ~1 query/second against the
+        # pool. We still send heartbeats every ``timeout`` seconds.
+        last_db_check = 0.0
+        db_poll_interval_seconds = 10.0
         if _redis is not None:
             # ── Redis pub/sub path ──────────────────────────────────────
             pubsub = _redis.pubsub()
@@ -2590,6 +3031,10 @@ async def stream_logs(
                     if await request.is_disconnected():
                         break
                     if time.monotonic() - last_auth_check >= auth_recheck_interval_seconds:
+                        # BUG-API-009: distinguish permanent auth failures (task
+                        # deleted / revoked owner) from transient DB errors; on
+                        # transient errors we log and retry on the next cycle
+                        # instead of swallowing silently.
                         try:
                             db = _get_db()
                             row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
@@ -2598,19 +3043,45 @@ async def stream_logs(
                                 break
                             meta = row.get("metadata") or {}
                             if isinstance(meta, str):
-                                meta = json.loads(meta)
+                                try:
+                                    meta = json.loads(meta)
+                                except (json.JSONDecodeError, TypeError):
+                                    meta = {}
                             if _sse_user_id != ADMIN_USER_ID and meta.get("user_id") != _sse_user_id:
                                 yield {"data": json.dumps({"error": "authentication_revoked"}), "event": "error"}
                                 break
-                        except Exception:
-                            pass  # Transient DB issue — skip re-check, retry next cycle
+                        except HTTPException as exc:
+                            # _get_db() raises HTTPException(503) when the pool is
+                            # missing — treat as transient and retry next cycle.
+                            logger.warning(
+                                "sse_auth_recheck_transient",
+                                task_id=task_id,
+                                user_id=_sse_user_id,
+                                status=exc.status_code,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "sse_auth_recheck_failed",
+                                task_id=task_id,
+                                user_id=_sse_user_id,
+                                error=str(exc),
+                            )
                         last_auth_check = time.monotonic()
                     message = await pubsub.get_message(
                         ignore_subscribe_messages=True,
                         timeout=1.0,
                     )
                     if message is not None:
+                        # BUG-API-026: defensively coerce to str in case the Redis
+                        # client was constructed without decode_responses=True.
                         raw_data = message.get("data", "")
+                        if isinstance(raw_data, (bytes, bytearray)):
+                            try:
+                                raw_data = raw_data.decode("utf-8")
+                            except UnicodeDecodeError:
+                                raw_data = raw_data.decode("utf-8", errors="replace")
+                        elif not isinstance(raw_data, str):
+                            raw_data = str(raw_data)
                         if use_legacy:
                             # Convert structured JSON events to plain text
                             try:
@@ -2633,19 +3104,23 @@ async def stream_logs(
                         if _db_pool is None:
                             yield {"data": json.dumps({"error": "database_unavailable"}), "event": "error"}
                             break
-                        # Periodically check if the task has reached a terminal state.
-                        status_row = await _db_pool.fetchrow(
-                            "SELECT status FROM research_tasks WHERE id = $1",
-                            task_id,
-                        )
-                        if status_row is not None and status_row["status"] in (
-                            "COMPLETED", "FAILED", "HALTED"
-                        ):
-                            yield {
-                                "data": json.dumps({"task_id": task_id, "final_status": status_row["status"]}),
-                                "event": "done",
-                            }
-                            break
+                        # BUG-API-008: only poll the DB every ``db_poll_interval_seconds``
+                        # to avoid hammering the pool with idle subscribers.
+                        now_mono = time.monotonic()
+                        if now_mono - last_db_check >= db_poll_interval_seconds:
+                            last_db_check = now_mono
+                            status_row = await _db_pool.fetchrow(
+                                "SELECT status FROM research_tasks WHERE id = $1",
+                                task_id,
+                            )
+                            if status_row is not None and status_row["status"] in (
+                                "COMPLETED", "FAILED", "HALTED"
+                            ):
+                                yield {
+                                    "data": json.dumps({"task_id": task_id, "final_status": status_row["status"]}),
+                                    "event": "done",
+                                }
+                                break
                         yield {"data": json.dumps({"heartbeat": True}), "event": "ping"}
                     await asyncio.sleep(0.1)
             finally:
@@ -2663,6 +3138,8 @@ async def stream_logs(
                 if await request.is_disconnected():
                     break
                 if time.monotonic() - last_auth_check >= auth_recheck_interval_seconds:
+                    # BUG-API-010 / BUG-API-009: log transient errors so they
+                    # are not silently masked; retry on the next cycle.
                     try:
                         row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
                         if row is None:
@@ -2670,12 +3147,20 @@ async def stream_logs(
                             break
                         meta = row.get("metadata") or {}
                         if isinstance(meta, str):
-                            meta = json.loads(meta)
+                            try:
+                                meta = json.loads(meta)
+                            except (json.JSONDecodeError, TypeError):
+                                meta = {}
                         if _sse_user_id != ADMIN_USER_ID and meta.get("user_id") != _sse_user_id:
                             yield {"data": json.dumps({"error": "authentication_revoked"}), "event": "error"}
                             break
-                    except Exception:
-                        pass  # Transient DB issue — skip re-check
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "sse_auth_recheck_failed",
+                            task_id=task_id,
+                            user_id=_sse_user_id,
+                            error=str(exc),
+                        )
                     last_auth_check = time.monotonic()
                 row = await db.fetchrow(
                     "SELECT status, current_state, total_spent_usd, "
@@ -2772,12 +3257,18 @@ async def download_report_pdf(
             detail="Report PDF file is not available. It may still be generating or was removed.",
         )
 
+    # BUG-API-047: `FileResponse` already emits a correctly-encoded
+    # Content-Disposition header when ``filename`` is passed (it uses
+    # RFC 5987 / RFC 6266 filename* encoding for non-ASCII names).  The
+    # previous explicit ``headers=`` override re-inserted the filename
+    # unquoted, which breaks for names containing spaces, quotes, or
+    # non-ASCII characters.  We drop the manual header and rely on
+    # Starlette's built-in encoding instead.
     filename = resolved.name
     return FileResponse(
         path=str(resolved),
         media_type="application/pdf",
         filename=filename,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -3057,9 +3548,11 @@ def _validate_upload_session_uuid(session_uuid: str) -> str:
     tags=["Uploads"],
     summary="Upload files to an existing investigation",
 )
+@limiter.limit("30/minute")
 async def upload_investigation_files(
+    request: Request,
     task_id: str,
-    files: list[UploadFile] = File(...),
+    files: Annotated[list[UploadFile], File()],
     current_user: dict[str, str] = Depends(_get_current_user),
 ) -> UploadResponse:
     """Upload files to an existing investigation.
@@ -3120,12 +3613,22 @@ async def upload_investigation_files(
                     detail=f"File type {suffix!r} not supported. Allowed: {', '.join(sorted(_UPLOAD_ALLOWED_EXTENSIONS))}",
                 )
 
-            content = await upload_file.read()
-            if len(content) > _UPLOAD_MAX_FILE_SIZE:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024*1024)}MB limit",
-                )
+            # BUG-API-007: Stream read in chunks; abort as soon as size exceeds
+            # the cap to avoid memory exhaustion from large uploads.
+            size = 0
+            chunks: list[bytes] = []
+            while True:
+                chunk = await upload_file.read(65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > _UPLOAD_MAX_FILE_SIZE:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024*1024)}MB limit",
+                    )
+                chunks.append(chunk)
+            content = b"".join(chunks)
 
             # P1-FIX-46: Sanitize filename — strip path components first,
             # then reject dotfiles and traversal names.
@@ -3159,8 +3662,10 @@ async def upload_investigation_files(
     tags=["Uploads"],
     summary="Upload files before creating an investigation",
 )
+@limiter.limit("30/minute")
 async def upload_pending_files(
-    files: list[UploadFile] = File(...),
+    request: Request,
+    files: Annotated[list[UploadFile], File()],
     session_uuid: str | None = Form(None),
     current_user: dict[str, str] = Depends(_get_current_user),
 ) -> UploadResponse:
@@ -3185,21 +3690,42 @@ async def upload_pending_files(
     pending_dir = Path(cfg.DATA_ROOT) / "uploads" / "pending" / normalized_session_uuid
     pending_dir.mkdir(parents=True, exist_ok=True)
 
-    # Bind upload session to the authenticated user via ownership metadata.
-    # If a different user tries to upload into this session, reject it.
+    # BUG-API-003 / BUG-API-040: Serialize the owner-binding check and file
+    # writes inside a single lock so two concurrent requests cannot both pass
+    # the ".exists()" check and stomp each other's ownership claim. We also
+    # use os.open(O_CREAT|O_EXCL) so the ownership file creation is atomic
+    # even across processes sharing the filesystem.
     owner_meta = pending_dir / ".owner"
-    if owner_meta.exists():
-        existing_owner = owner_meta.read_text(encoding="utf-8").strip()
-        if existing_owner != current_user["user_id"]:
-            raise HTTPException(
-                status_code=403,
-                detail="Upload session belongs to another user",
-            )
-    else:
-        owner_meta.write_text(current_user["user_id"], encoding="utf-8")
 
-    # SEC-E3-R1-02: Serialize count-check-and-write to prevent TOCTOU race
+    # SEC-E3-R1-02 / BUG-API-003: Serialize owner-binding, count-check and writes
     async with _get_upload_lock(f"pending-{normalized_session_uuid}"):
+        # Atomic ownership binding: try to create the owner file exclusively;
+        # if it already exists, read it and verify the caller is the owner.
+        user_id_str = current_user["user_id"]
+        try:
+            fd = os.open(
+                str(owner_meta),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+            try:
+                os.write(fd, user_id_str.encode("utf-8"))
+            finally:
+                os.close(fd)
+        except FileExistsError:
+            try:
+                existing_owner = owner_meta.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to verify upload session ownership",
+                ) from exc
+            if existing_owner != user_id_str:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Upload session belongs to another user",
+                )
+
         existing_count = sum(1 for f in pending_dir.iterdir() if f.is_file() and f.name != ".owner")
         if existing_count + len(files) > _UPLOAD_MAX_FILES_PER_INVESTIGATION:
             raise HTTPException(
@@ -3221,12 +3747,22 @@ async def upload_pending_files(
                     detail=f"File type {suffix!r} not supported. Allowed: {', '.join(sorted(_UPLOAD_ALLOWED_EXTENSIONS))}",
                 )
 
-            content = await upload_file.read()
-            if len(content) > _UPLOAD_MAX_FILE_SIZE:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024*1024)}MB limit",
-                )
+            # BUG-API-007: Stream read in chunks; abort as soon as size exceeds
+            # the cap to avoid memory exhaustion from large uploads.
+            size = 0
+            chunks: list[bytes] = []
+            while True:
+                chunk = await upload_file.read(65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > _UPLOAD_MAX_FILE_SIZE:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024*1024)}MB limit",
+                    )
+                chunks.append(chunk)
+            content = b"".join(chunks)
 
             # P1-FIX-46b: Same path-traversal protection as upload_investigation_files
             safe_name = os.path.basename(re.sub(r"[^\w\-.]", "_", filename))
@@ -3275,6 +3811,22 @@ async def list_connectors(
     """
     cfg = _get_config()
 
+    # BUG-API-006: ``available`` for Redis only reflects whether the client
+    # object was constructed at startup. If Redis becomes unreachable at
+    # runtime, we would otherwise still report available=True. Do a
+    # best-effort liveness probe and log a warning when the client is
+    # present but unreachable.
+    _redis_reachable = _redis is not None
+    if _redis_reachable:
+        try:
+            await _redis.ping()  # type: ignore[union-attr]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "redis_ping_failed_but_client_present",
+                error=str(exc),
+            )
+            _redis_reachable = False
+
     connectors: list[ConnectorStatus] = [
         ConnectorStatus(
             name="polygon_io",
@@ -3308,7 +3860,7 @@ async def list_connectors(
         ),
         ConnectorStatus(
             name="redis",
-            available=_redis is not None,
+            available=_redis_reachable,
             api_key_set=True,
             note="Redis pub/sub and caching layer",
         ),
@@ -3339,7 +3891,27 @@ def _classify_topic(topic: str) -> ClassifyResponse:
     4. Quick-tier: short questions, simple lookups, single-fact queries.
     5. Standard-tier: moderate research requiring structured analysis.
     6. Default: quick (safe default — avoids overkill on simple tasks).
+
+    BUG-API-045: The ``explicit_hours`` branch chooses the tier purely from the
+    duration keyword and uses the fixed ``_TIER_CREDITS`` entry for that tier.
+    Credits are NOT linearly scaled by the requested hours — a user asking for
+    "100 hours" pays the same ``deep`` credits as one asking for "3 hours".
+    This is intentional: credit pricing reflects research depth/tier, not a
+    clock-based budget.  If per-hour billing is ever desired, scale here.
     """
+    # BUG-API-033: handle None / empty / whitespace-only topics so that callers
+    # passing an empty message (e.g. an accidental empty webhook payload) get a
+    # deterministic "instant" classification instead of falling through to the
+    # default quick tier, which would incorrectly charge quick-tier credits.
+    if not topic or not topic.strip():
+        return ClassifyResponse(
+            tier="instant",
+            estimated_duration_hours=0.0,
+            estimated_credits=_TIER_CREDITS["instant"],
+            plan_summary="Empty topic — nothing to investigate.",
+            requires_approval=False,
+        )
+
     topic_lower = topic.lower().strip()
     word_count = len(topic_lower.split())
 
@@ -3806,6 +4378,14 @@ async def _handle_subscription_updated(
     status: str = sub_obj.get("status", "unknown")
 
     if not stripe_customer_id:
+        # BUG-API-032: log when event arrives without a customer ID so that
+        # malformed / unexpected Stripe payloads are surfaced instead of
+        # silently dropped.
+        logger.warning(
+            "subscription_updated_missing_customer_id",
+            subscription_id=sub_obj.get("id"),
+            status=status,
+        )
         return
 
     if not cfg.SUPABASE_URL or not _supabase_api_key(cfg):
@@ -3838,6 +4418,11 @@ async def _handle_subscription_deleted(
     stripe_customer_id: str | None = sub_obj.get("customer")
 
     if not stripe_customer_id:
+        # BUG-API-032: log when event arrives without a customer ID.
+        logger.warning(
+            "subscription_deleted_missing_customer_id",
+            subscription_id=sub_obj.get("id"),
+        )
         return
 
     if not cfg.SUPABASE_URL or not _supabase_api_key(cfg):
@@ -4034,19 +4619,26 @@ async def _supabase_deduct_credits(
     user_id: str,
     amount: int,
     cfg: AppConfig,
-) -> bool:
+) -> Literal["ok", "insufficient", "error"]:
     """Deduct credits from a user's Supabase profile via RPC.
 
     Calls the ``deduct_credits`` RPC function.
 
-    Returns True on success, False on failure. If the RPC is unavailable we do
-    not attempt a read-modify-write fallback, because that sequence is not
-    atomic and allows concurrent investigation submissions to overspend credits.
+    BUG-API-005: Returns a three-state result so callers can distinguish:
+      - ``"ok"``          — credits were deducted successfully
+      - ``"insufficient"`` — user did not have enough credits (RPC returned 402
+                             or similar business-logic rejection)
+      - ``"error"``       — RPC unavailable / configuration missing / network
+                             failure; callers should surface 503 rather than 402
+
+    If the RPC is unavailable we do not attempt a read-modify-write fallback,
+    because that sequence is not atomic and would allow concurrent
+    investigation submissions to overspend credits.
     """
     api_key = _supabase_api_key(cfg)
     if not cfg.SUPABASE_URL or not api_key:
         logger.warning("supabase_not_configured_skip_deduct")
-        return False
+        return "error"
 
     rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/deduct_credits"
     headers = {
@@ -4054,23 +4646,57 @@ async def _supabase_deduct_credits(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post(
-            rpc_url,
-            json={"target_user_id": user_id, "amount": amount},
-            headers=headers,
-        )
-        if resp.status_code == 200:
-            logger.info("credits_deducted_via_rpc", user_id=user_id, amount=amount)
-            return True
-
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                rpc_url,
+                json={"target_user_id": user_id, "amount": amount},
+                headers=headers,
+            )
+    except httpx.HTTPError as exc:
         logger.error(
-            "deduct_credits_rpc_required",
+            "deduct_credits_rpc_network_error",
+            user_id=user_id,
+            amount=amount,
+            error=str(exc),
+        )
+        return "error"
+
+    if resp.status_code == 200:
+        # The RPC returns a JSON boolean / object; treat a truthy response
+        # as success and a falsy one as insufficient funds.
+        try:
+            data = resp.json()
+        except ValueError:
+            data = True
+        if data is False or (isinstance(data, dict) and data.get("success") is False):
+            logger.info(
+                "deduct_credits_insufficient",
+                user_id=user_id,
+                amount=amount,
+            )
+            return "insufficient"
+        logger.info("credits_deducted_via_rpc", user_id=user_id, amount=amount)
+        return "ok"
+
+    # 402 / 400 from the RPC indicate insufficient balance (business-logic
+    # error); everything else is a transient service error.
+    if resp.status_code in (400, 402, 409):
+        logger.info(
+            "deduct_credits_insufficient",
             user_id=user_id,
             amount=amount,
             status=resp.status_code,
         )
-        return False
+        return "insufficient"
+
+    logger.error(
+        "deduct_credits_rpc_error",
+        user_id=user_id,
+        amount=amount,
+        status=resp.status_code,
+    )
+    return "error"
 
 
 async def _record_webhook_event_once(event_id: str, event_type: str) -> bool:
@@ -4148,8 +4774,12 @@ async def admin_list_users(
     if not cfg.SUPABASE_URL:
         raise HTTPException(status_code=503, detail="Supabase not configured")
 
-    # Forward the caller's JWT so the RPC function can verify admin role
-    auth_header = request.headers.get("authorization", "")
+    # Forward the caller's JWT so the RPC function can verify admin role.
+    # BUG-API-030 / BUG-API-048: normalize the header so we never forward
+    # whitespace-only or malformed values.
+    auth_header = _normalize_bearer_auth_header(
+        request.headers.get("authorization") or request.headers.get("Authorization")
+    )
     anon_key = cfg.SUPABASE_ANON_KEY or ""
 
     url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/admin_list_profiles"
@@ -4197,6 +4827,19 @@ async def admin_list_investigations(
     """List every investigation in the system regardless of owner. Admin only."""
     db = _get_db()
     offset = (page - 1) * page_size
+
+    # BUG-API-024: validate status filter against known values.
+    if status:
+        normalized_status = status.upper()
+        if normalized_status not in _VALID_TASK_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid status {status!r}. Must be one of: "
+                    f"{sorted(_VALID_TASK_STATUSES)}"
+                ),
+            )
+        status = normalized_status
 
     if status:
         total: int = await db.fetchval(
@@ -4261,7 +4904,10 @@ async def admin_set_credits(
     if not cfg.SUPABASE_URL:
         raise HTTPException(status_code=503, detail="Supabase not configured")
 
-    auth_header = request.headers.get("authorization", "")
+    # BUG-API-030 / BUG-API-048: normalize auth header before forwarding.
+    auth_header = _normalize_bearer_auth_header(
+        request.headers.get("authorization") or request.headers.get("Authorization")
+    )
     anon_key = cfg.SUPABASE_ANON_KEY or ""
 
     url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/admin_set_credits"
@@ -4314,10 +4960,16 @@ async def admin_stats(
     cfg = _get_config()
 
     # --- Total users via SECURITY DEFINER RPC (no service key needed) ---
+    # BUG-API-025: track availability so the response can signal when
+    # total_users is unreliable rather than defaulting to 0.
     total_users = 0
+    total_users_available = True
     if cfg.SUPABASE_URL:
         try:
-            auth_header = request.headers.get("authorization", "")
+            # BUG-API-030 / BUG-API-048: normalize auth header before forwarding.
+            auth_header = _normalize_bearer_auth_header(
+                request.headers.get("authorization") or request.headers.get("Authorization")
+            )
             anon_key = cfg.SUPABASE_ANON_KEY or ""
             headers = {
                 "apikey": anon_key,
@@ -4332,8 +4984,17 @@ async def admin_stats(
                 )
                 if resp.status_code == 200:
                     total_users = int(resp.json())
+                else:
+                    total_users_available = False
+                    logger.warning(
+                        "admin_stats_supabase_non_200",
+                        status=resp.status_code,
+                    )
         except Exception as e:
+            total_users_available = False
             logger.warning("admin_stats_supabase_error", error=str(e))
+    else:
+        total_users_available = False
 
     total_investigations: int = await db.fetchval("SELECT COUNT(*) FROM research_tasks") or 0
     running: int = await db.fetchval(
@@ -4364,6 +5025,7 @@ async def admin_stats(
 
     return AdminStatsResponse(
         total_users=total_users,
+        total_users_available=total_users_available,
         total_investigations=total_investigations,
         running_investigations=running,
         completed_investigations=completed,
@@ -4414,8 +5076,10 @@ async def graceful_shutdown(
         except Exception as exc:  # noqa: BLE001
             logger.error("shutdown_halt_failed", error=str(exc))
 
-    # Schedule OS-level exit after a brief delay to let the response flush
-    asyncio.get_running_loop().call_later(1.0, _exit_process)
+    # Schedule OS-level exit after a brief delay to let the response flush.
+    # BUG-API-031: increased from 1s to 3s to give downstream proxies/clients
+    # more time to consume the final response body before the process exits.
+    asyncio.get_running_loop().call_later(3.0, _exit_process)
     return ShutdownResponse(message="Graceful shutdown initiated")
 
 
@@ -4723,6 +5387,15 @@ class FeedbackRequest(BaseModel):
     event_type: str = Field(..., description="One of: rating, feedback, correction, preference")
     category: str | None = Field(None, description="Category: report_quality, search_depth, branch_decision, general")
     content: dict = Field(..., description="Structured feedback payload")
+
+    @field_validator("content")
+    @classmethod
+    def _cap_content_size(cls, value: dict) -> dict:
+        # BUG-API-014: structured feedback can be very large; enforce a cap.
+        validated = _validate_dict_size(value)
+        # _validate_dict_size returns None only when input was None; content is required so that should never happen.
+        assert validated is not None
+        return validated
 
 
 class FeedbackResponse(BaseModel):

@@ -230,24 +230,41 @@ function AuthVideo({ src, ext, className }: { src: string; ext: string; classNam
  * All content is HTML-escaped (& < >) before any markdown substitution, making the
  * current set of transformations safe for dangerouslySetInnerHTML use.
  */
-function renderMarkdown(text: string): string {
+// BUG-FE-119 fix: Memoize renderMarkdown output. Message content is
+// immutable once appended, so a WeakMap / Map keyed by the raw text lets us
+// skip repeated regex work on every re-render of the message list.
+const renderMarkdownCache = new Map<string, string>();
+const RENDER_MARKDOWN_CACHE_MAX = 500;
+
+// Placeholder tokens that cannot appear in the escaped user content.
+const PRE_OPEN_TOKEN = "\u0000PRE_OPEN\u0000";
+const PRE_CLOSE_TOKEN = "\u0000PRE_CLOSE\u0000";
+
+function renderMarkdownImpl(text: string): string {
   // Escape HTML first to prevent XSS from content
   let html = text
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 
-  // Fenced code blocks: split on ``` boundaries to avoid ReDoS
-  // Only process if the string contains at least two ``` markers
+  // Preserve literal newlines inside <pre> blocks by isolating them. We emit
+  // placeholder tokens around pre-block content, run the rest of the markdown
+  // transforms, then restore the tokens at the very end — after the
+  // newline-to-<br/> replacement.
+  // BUG-FE-129 fix: Previously the trailing `\n -> <br />` replace was applied
+  // AFTER <pre> construction, so code-block content had <br /> tags injected
+  // between every line, doubling visual line breaks inside <pre>.
+  const preservedBlocks: string[] = [];
   if (html.includes("```")) {
     const parts = html.split("```");
     html = parts
       .map((part, idx) => {
         if (idx % 2 === 0) return part; // outside code block
-        // Inside code block: first line may be language hint
         const newlineIdx = part.indexOf("\n");
         const code = newlineIdx !== -1 ? part.slice(newlineIdx + 1) : part;
-        return `<pre class="my-2 rounded-md bg-zinc-900 px-4 py-3 text-xs leading-relaxed overflow-x-auto"><code>${code.trim()}</code></pre>`;
+        const rendered = `<pre class="my-2 rounded-md bg-zinc-900 px-4 py-3 text-xs leading-relaxed overflow-x-auto"><code>${code.trim()}</code></pre>`;
+        preservedBlocks.push(rendered);
+        return `${PRE_OPEN_TOKEN}${preservedBlocks.length - 1}${PRE_CLOSE_TOKEN}`;
       })
       .join("");
   }
@@ -268,17 +285,44 @@ function renderMarkdown(text: string): string {
         const safeText = linkText.replace(/["'`]/g, (c) => `&#${c.charCodeAt(0)};`);
         return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-0.5 text-primary/80 hover:text-primary text-xs underline decoration-primary/30">${safeText}<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="inline ml-0.5"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg></a>`;
       })
-    // Newlines
+    // Newlines — applies only to content outside <pre> blocks, which are
+    // temporarily replaced with opaque tokens above.
     .replace(/\n/g, "<br />");
 
+  // Restore preserved <pre> blocks now that newline conversion is complete.
+  if (preservedBlocks.length > 0) {
+    const tokenRe = new RegExp(`${PRE_OPEN_TOKEN}(\\d+)${PRE_CLOSE_TOKEN}`, "g");
+    html = html.replace(tokenRe, (_m, idx) => preservedBlocks[Number(idx)] || "");
+  }
+
   return html;
+}
+
+function renderMarkdown(text: string): string {
+  const cached = renderMarkdownCache.get(text);
+  if (cached !== undefined) return cached;
+  const rendered = renderMarkdownImpl(text);
+  if (renderMarkdownCache.size >= RENDER_MARKDOWN_CACHE_MAX) {
+    // Simple FIFO eviction: drop oldest entries to keep cache bounded.
+    const firstKey = renderMarkdownCache.keys().next().value;
+    if (firstKey !== undefined) renderMarkdownCache.delete(firstKey);
+  }
+  renderMarkdownCache.set(text, rendered);
+  return rendered;
 }
 
 /**
  * Extract all citation URLs from a text string.
  * Returns unique {text, url} pairs from markdown-style links.
  */
+// BUG-FE-119 fix: Memoize citation extraction — same content is re-parsed on
+// every render of the message list without this cache.
+const extractCitationsCache = new Map<string, Array<{ text: string; url: string }>>();
+const EXTRACT_CITATIONS_CACHE_MAX = 500;
+
 function extractCitations(text: string): Array<{ text: string; url: string }> {
+  const cached = extractCitationsCache.get(text);
+  if (cached !== undefined) return cached;
   const citations: Array<{ text: string; url: string }> = [];
   const seen = new Set<string>();
   const re = /\[([^\]]{1,200})\]\((https?:\/\/[^)]{1,500})\)/g;
@@ -290,6 +334,11 @@ function extractCitations(text: string): Array<{ text: string; url: string }> {
       citations.push({ text: match[1], url });
     }
   }
+  if (extractCitationsCache.size >= EXTRACT_CITATIONS_CACHE_MAX) {
+    const firstKey = extractCitationsCache.keys().next().value;
+    if (firstKey !== undefined) extractCitationsCache.delete(firstKey);
+  }
+  extractCitationsCache.set(text, citations);
   return citations;
 }
 
@@ -341,7 +390,14 @@ export default function Chat() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const activeConversationIdRef = useRef<string | null>(null);
-  activeConversationIdRef.current = activeConversationId;
+  // BUG-FE-124 fix: Sync via useEffect (post-commit) instead of at render time,
+  // so refs reflect committed state under React 18 concurrent rendering. Callers
+  // that need a synchronous pre-effect sync (e.g. conversation switch onClick)
+  // still assign the ref directly before dispatching; the effect below is a
+  // safety-net that keeps the ref consistent with the committed state.
+  useEffect(() => {
+    activeConversationIdRef.current = activeConversationId;
+  }, [activeConversationId]);
   const [conversationLoading, setConversationLoading] = useState(false);
 
   // Messages for the currently viewed conversation
@@ -364,12 +420,28 @@ export default function Chat() {
   const [userFlowInstructions, setUserFlowInstructions] = useState("");
   // Stop button guard — prevents multiple concurrent stop requests
   const [isStopping, setIsStopping] = useState(false);
+  // BUG-FE-122 fix: Hold an AbortController for the in-flight POST /stop so
+  // handleCancelPlan can abort it if the user cancels before it returns.
+  const stopAbortRef = useRef<AbortController | null>(null);
 
   // Investigation management
   const [investigations, setInvestigations] = useState<Investigation[]>([]);
+  // BUG-FE-105 fix: Ref mirror so loadConversationMessages (and later re-attach
+  // effects) always see the latest investigations list without the useCallback
+  // needing investigations in its deps (which would cause it to be re-created
+  // on every investigation status update).
+  const investigationsRef = useRef<Investigation[]>([]);
+  useEffect(() => {
+    investigationsRef.current = investigations;
+  }, [investigations]);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const activeTaskIdRef = useRef<string | null>(activeTaskId);
-  activeTaskIdRef.current = activeTaskId;
+  // BUG-FE-124 fix: Sync in useEffect for concurrent-mode safety. Call sites
+  // that need a synchronous sync (e.g. handleSend -> startSSE) assign the ref
+  // directly before using it.
+  useEffect(() => {
+    activeTaskIdRef.current = activeTaskId;
+  }, [activeTaskId]);
   const connectedTaskIdRef = useRef<string | null>(null);
 
   // Timer state — elapsed time only
@@ -401,10 +473,13 @@ export default function Chat() {
   // Timeline steps for structured progress events
   const [timelineSteps, setTimelineSteps] = useState<TimelineStep[]>([]);
   const timelineStoreRef = useRef<Record<string, TimelineStep[]>>({});
-  // BUG-C3-04 fix: Ref to always read the latest timelineSteps in
-  // switchInvestigation without adding timelineSteps to its deps.
+  // BUG-C3-04 fix: Ref to always read the latest timelineSteps without adding
+  // timelineSteps to dep arrays of callbacks that consume it.
+  // BUG-FE-124 fix: Sync in useEffect for concurrent-mode safety.
   const timelineStepsRef = useRef<TimelineStep[]>([]);
-  timelineStepsRef.current = timelineSteps;
+  useEffect(() => {
+    timelineStepsRef.current = timelineSteps;
+  }, [timelineSteps]);
 
   // File viewer state
   const [viewingFile, setViewingFile] = useState<FileAttachment | null>(null);
@@ -416,6 +491,10 @@ export default function Chat() {
   // Credit animation state
   const [creditAnimating, setCreditAnimating] = useState(false);
   const prevTokensRef = useRef<number>(user?.tokens ?? 0);
+  // BUG-FE-109 fix: Track whether this is the very first render so we only
+  // skip the animation on initial mount — NOT on the first increase from zero.
+  // New users going 0 → N should see the animation on their first purchase.
+  const firstRenderRef = useRef(true);
 
   // Memory panel state
   const [memoryOpen, setMemoryOpen] = useState(false);
@@ -425,12 +504,14 @@ export default function Chat() {
   const deletingPrefsRef = useRef<Set<string>>(new Set());
   const [memoryLoading, setMemoryLoading] = useState(false);
 
-  // Stable ref to current messages — prevents stale closure in switchInvestigation.
-  // BUG-R2-11: Assign directly during render instead of via useEffect.
-  // React docs explicitly sanction writing to a ref during render for this synchronization
-  // pattern, and it avoids an unnecessary effect + potential lint warnings.
+  // Stable ref to current messages — prevents stale closure in callbacks.
+  // BUG-FE-124 fix: Move ref sync from render-time to useEffect for React 18
+  // concurrent-mode safety. Writing to a ref during render is technically allowed
+  // but can observe values from an interrupted render if useTransition is used.
   const messagesRef = useRef<Message[]>([]);
-  messagesRef.current = messages;
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   /* ---------------------------------------------------------------- */
   /*  Auth guard                                                      */
@@ -456,7 +537,15 @@ export default function Chat() {
 
   useEffect(() => {
     if (currentTokenCount == null) return;
-    if (prevTokensRef.current !== currentTokenCount && prevTokensRef.current > 0) {
+    // BUG-FE-109 fix: Use firstRenderRef instead of a `> 0` guard. The old
+    // guard silently swallowed the animation the first time a user's balance
+    // transitioned from zero — exactly the moment the reinforcement matters.
+    if (firstRenderRef.current) {
+      firstRenderRef.current = false;
+      prevTokensRef.current = currentTokenCount;
+      return;
+    }
+    if (prevTokensRef.current !== currentTokenCount) {
       setCreditAnimating(true);
       const timer = setTimeout(() => setCreditAnimating(false), 1500);
       prevTokensRef.current = currentTokenCount;
@@ -563,19 +652,26 @@ export default function Chat() {
   const userId = user?.id;
   useEffect(() => {
     if (!userId) return;
+    // BUG-FE-115 fix: Use an AbortController so a rapid userId change (logout +
+    // immediate login) cancels the prior fetch. Without this, a late-arriving
+    // response from the previous user could overwrite the current user's state.
+    const ac = new AbortController();
     const loadInvestigations = async () => {
       // BUG-011 fix: Use the backend API as the source of truth for investigation
       // status. Previously loaded from Supabase which could have stale PENDING
       // statuses if the user closed the tab before the investigation completed.
       try {
         const session = await supabase.auth.getSession();
+        if (ac.signal.aborted) return;
         const token = session.data.session?.access_token;
         if (!token) throw new Error("No auth token");
         const res = await fetch(`${API_URL}/api/investigations`, {
           headers: { Authorization: `Bearer ${token}` },
+          signal: ac.signal,
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const json = await res.json();
+        if (ac.signal.aborted) return;
         const items = json.items ?? json;
         if (Array.isArray(items)) {
           // Map backend fields to frontend Investigation shape
@@ -589,6 +685,7 @@ export default function Chat() {
             output_pdf_path: inv.output_pdf_path ?? null,
             output_docx_path: inv.output_docx_path ?? null,
           }));
+          if (ac.signal.aborted) return;
           setInvestigations(mapped as Investigation[]);
           // Also sync statuses back to Supabase for consistency
           for (const inv of mapped) {
@@ -617,14 +714,19 @@ export default function Chat() {
           return;
         }
       } catch (err) {
+        if (ac.signal.aborted) return;
+        // Ignore AbortError — deliberate cancellation from cleanup.
+        if (err instanceof DOMException && err.name === "AbortError") return;
         console.warn("[Chat] Backend API unavailable, falling back to Supabase:", err);
       }
+      if (ac.signal.aborted) return;
       // Fallback: load from Supabase if backend API is unavailable
       const { data, error } = await supabase
         .from("investigations")
         .select("task_id, topic, status, created_at, duration_hours, budget_usd, output_pdf_path, output_docx_path")
         .eq("user_id", userId)
         .order("created_at", { ascending: false });
+      if (ac.signal.aborted) return;
       if (error) {
         console.error("[Chat] Failed to load investigations:", error.message);
         toast.error("Failed to load investigations", { description: error.message });
@@ -633,6 +735,9 @@ export default function Chat() {
       setInvestigations((data as Investigation[]) ?? []);
     };
     loadInvestigations();
+    return () => {
+      ac.abort();
+    };
   }, [userId]);
 
   /* ---------------------------------------------------------------- */
@@ -665,15 +770,24 @@ export default function Chat() {
 
   const loadConversationMessages = useCallback(async (conversationId: string) => {
     setConversationLoading(true);
+    // BUG-FE-123 fix: Only clear the loading flag if we are still on the
+    // conversation that initiated this load. Otherwise a slow request for
+    // conversation A would clear the loading spinner the user is currently
+    // seeing for the newly-selected conversation B.
+    const clearLoadingIfStillCurrent = () => {
+      if (activeConversationIdRef.current === conversationId) {
+        setConversationLoading(false);
+      }
+    };
     try {
       const token = await getAccessToken();
-      if (!token) { setConversationLoading(false); return; }
+      if (!token) { clearLoadingIfStillCurrent(); return; }
       const res = await fetch(`${API_URL}/api/conversations/${conversationId}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      if (!res.ok) { setConversationLoading(false); return; }
+      if (!res.ok) { clearLoadingIfStillCurrent(); return; }
       // Guard against stale responses from rapid conversation switching
-      if (activeConversationIdRef.current !== conversationId) { setConversationLoading(false); return; }
+      if (activeConversationIdRef.current !== conversationId) { return; }
       const data = await res.json();
       const restored: Message[] = (data.messages || []).map((m: PersistedMessage) => ({
         role: m.role as Message["role"],
@@ -684,8 +798,12 @@ export default function Chat() {
       setMessages(restored);
 
       // If there are linked investigations, find them and set the latest running one as active
+      // BUG-FE-105 fix: Read from investigationsRef (live) rather than the closed-over
+      // `investigations` state. The re-attach useEffect below handles the case where
+      // investigations are still loading when the user clicks into the conversation.
       if (data.investigations && data.investigations.length > 0) {
-        const runningInv = investigations.find(
+        const currentInvestigations = investigationsRef.current;
+        const runningInv = currentInvestigations.find(
           (inv) => data.investigations.includes(inv.task_id) && (inv.status === "RUNNING" || inv.status === "PENDING")
         );
         if (runningInv) {
@@ -708,7 +826,9 @@ export default function Chat() {
             switchGenerationRef.current !== myGeneration ||
             activeConversationIdRef.current !== conversationId
           ) {
-            setConversationLoading(false);
+            // Do not clear loading flag here — if the conversation changed,
+            // the new load owns the flag; the finally block's
+            // clearLoadingIfStillCurrent() will no-op correctly.
             return;
           }
           if (token2) {
@@ -717,7 +837,7 @@ export default function Chat() {
           }
         } else {
           // Set the most recent investigation as active (for download buttons etc.)
-          const lastInv = investigations.find((inv) => data.investigations.includes(inv.task_id));
+          const lastInv = currentInvestigations.find((inv) => data.investigations.includes(inv.task_id));
           if (lastInv) {
             setActiveTaskId(lastInv.task_id);
             // Restore timeline steps from cache
@@ -731,10 +851,9 @@ export default function Chat() {
     } catch (err) {
       console.warn("[Chat] Failed to load conversation messages:", err);
     } finally {
-      setConversationLoading(false);
+      clearLoadingIfStillCurrent();
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [investigations]);
+  }, []);
 
   /* ---------------------------------------------------------------- */
   /*  Save a message to the backend                                   */
@@ -839,11 +958,48 @@ export default function Chat() {
     const origin = fromTime ? new Date(fromTime).getTime() : Date.now();
     startTimeRef.current = origin;
     setElapsedSeconds(Math.max(0, Math.floor((Date.now() - origin) / 1000)));
+    // BUG-FE-139 fix: Don't schedule the interval if the tab is currently
+    // hidden — background interval throttling in modern browsers produces
+    // drifty updates anyway, and the visibilitychange handler below will
+    // resume the interval (and update the display immediately) on return.
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      return;
+    }
     timerRef.current = setInterval(() => {
       if (startTimeRef.current) {
         setElapsedSeconds(Math.floor((Date.now() - startTimeRef.current) / 1000));
       }
     }, 1000);
+  }, []);
+
+  // BUG-FE-139 fix: Pause the elapsed-timer interval when the tab is hidden,
+  // then resume (with an immediate sync of the displayed value) when visible.
+  // Also avoids the Page Visibility / interval throttling jank that causes the
+  // counter to appear frozen or jump in large increments when returning.
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const onVisibilityChange = () => {
+      if (startTimeRef.current == null) return; // timer not running
+      if (document.visibilityState === "hidden") {
+        if (timerRef.current) {
+          clearInterval(timerRef.current);
+          timerRef.current = null;
+        }
+      } else {
+        // Sync the display immediately on return so the user doesn't see a
+        // stale value, then restart the ticking interval.
+        setElapsedSeconds(Math.floor((Date.now() - startTimeRef.current) / 1000));
+        if (!timerRef.current) {
+          timerRef.current = setInterval(() => {
+            if (startTimeRef.current) {
+              setElapsedSeconds(Math.floor((Date.now() - startTimeRef.current) / 1000));
+            }
+          }, 1000);
+        }
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
   }, []);
 
   const stopTimer = useCallback(() => {
@@ -860,7 +1016,11 @@ export default function Chat() {
   /* ---------------------------------------------------------------- */
 
   const appendMessage = useCallback((msg: Message) => {
-    const msgId = msg.id || `${msg.role}-${msg.content}`;
+    // BUG-FE-113 fix: When no explicit id is provided, include the current
+    // size of seenStatusIds to make the key unique across identical
+    // role/content pairs. Previously a message like {role:"user", content:"yes"}
+    // sent twice in a row had the same dedup key and the second was dropped.
+    const msgId = msg.id || `${msg.role}-${msg.content}-${seenStatusIds.current.size}`;
     if (msg.type === "status" && seenStatusIds.current.has(msgId)) return;
     if (msg.type === "status") {
       seenStatusIds.current.add(msgId);
@@ -968,7 +1128,7 @@ export default function Chat() {
         // original user/assistant messages and not the research output.
         const convId = activeConversationIdRef.current;
         if (convId) {
-          persistMessage(convId, "assistant", textContent, "text");
+          persistMessage(convId, "assistant", textContent, "text").catch((e) => console.warn("[Chat] persistMessage failed:", e));
         }
       }
     }
@@ -1266,7 +1426,7 @@ export default function Chat() {
             });
             stopAllConnections();
             // BUG-018: Refresh credit balance after investigation completes
-            refreshUser();
+            refreshUser().catch((e) => console.warn("[Chat] refreshUser failed:", e));
 
             // Fetch executive summary for inline display (polling path)
             (async () => {
@@ -1292,7 +1452,10 @@ export default function Chat() {
                   // BUG-D6-02: Persist executive summary so follow-up context works
                   const convId = activeConversationIdRef.current;
                   if (convId) {
-                    persistMessage(convId, "assistant", execSummary.trim(), "text");
+                    // BUG-FE-111 fix: Guard unawaited promise rejection.
+                    persistMessage(convId, "assistant", execSummary.trim(), "text").catch((e) =>
+                      console.warn("[Chat] persistMessage failed:", e)
+                    );
                   }
                 }
               } catch {
@@ -1311,7 +1474,7 @@ export default function Chat() {
             toast.error(`Investigation ${data.status.toLowerCase()}`, { description: errMsg });
             stopAllConnections();
             // BUG-018: Refresh credit balance after investigation completes
-            refreshUser();
+            refreshUser().catch((e) => console.warn("[Chat] refreshUser failed:", e));
           }
         } catch (err) {
           console.error("[Chat] Polling error:", err);
@@ -1400,6 +1563,11 @@ export default function Chat() {
 
         // BUG-002: Guard against multiple fallback polling loops
         let hasFailedOver = false;
+        // BUG-FE-116 fix: Track consecutive SSE errors so a single transient
+        // network blip does not permanently demote the stream to polling.
+        // Reconnect with exponential backoff; only fail over after 3 strikes.
+        let sseErrorCount = 0;
+        let sseReconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
         // BUG-R5-01: The main handler processes both unnamed "message" events
         // (es.onmessage) and named "log" events (es.addEventListener("log")).
@@ -1444,7 +1612,7 @@ export default function Chat() {
                     _id: makeMessageId(),
                   });
                   stopAllConnections();
-                  refreshUser();
+                  refreshUser().catch((e) => console.warn("[Chat] refreshUser failed:", e));
 
                   // Fetch executive summary for inline display
                   (async () => {
@@ -1470,7 +1638,10 @@ export default function Chat() {
                         // BUG-D6-02: Persist executive summary so follow-up context works
                         const convId = activeConversationIdRef.current;
                         if (convId) {
-                          persistMessage(convId, "assistant", execSummary.trim(), "text");
+                          // BUG-FE-111 fix: Guard unawaited promise rejection.
+                          persistMessage(convId, "assistant", execSummary.trim(), "text").catch((e) =>
+                            console.warn("[Chat] persistMessage failed:", e)
+                          );
                         }
                       }
                     } catch {
@@ -1487,7 +1658,7 @@ export default function Chat() {
                     _id: makeMessageId(),
                   });
                   stopAllConnections();
-                  refreshUser();
+                  refreshUser().catch((e) => console.warn("[Chat] refreshUser failed:", e));
                 }
               }
               return;
@@ -1531,7 +1702,7 @@ export default function Chat() {
                 _id: makeMessageId(),
               });
               stopAllConnections();
-              refreshUser();
+              refreshUser().catch((e) => console.warn("[Chat] refreshUser failed:", e));
             } else if (status === "FAILED" || status === "HALTED") {
               updateInvestigationStatus(taskId, status as InvestigationStatus);
               appendMessage({
@@ -1541,7 +1712,7 @@ export default function Chat() {
                 _id: makeMessageId(),
               });
               stopAllConnections();
-              refreshUser();
+              refreshUser().catch((e) => console.warn("[Chat] refreshUser failed:", e));
             }
           } catch {
             // Plain text SSE event — add as legacy status message
@@ -1583,7 +1754,7 @@ export default function Chat() {
                 _id: makeMessageId(),
               });
               stopAllConnections();
-              refreshUser();
+              refreshUser().catch((e) => console.warn("[Chat] refreshUser failed:", e));
             } else if (finalStatus === "FAILED" || finalStatus === "HALTED") {
               updateInvestigationStatus(taskId, finalStatus as InvestigationStatus);
               appendMessage({
@@ -1593,7 +1764,7 @@ export default function Chat() {
                 _id: makeMessageId(),
               });
               stopAllConnections();
-              refreshUser();
+              refreshUser().catch((e) => console.warn("[Chat] refreshUser failed:", e));
             }
           } catch {
             // Non-JSON done event — treat as completion signal
@@ -1606,7 +1777,7 @@ export default function Chat() {
               _id: makeMessageId(),
             });
             stopAllConnections();
-            refreshUser();
+            refreshUser().catch((e) => console.warn("[Chat] refreshUser failed:", e));
           }
         });
 
@@ -1647,7 +1818,7 @@ export default function Chat() {
               _id: makeMessageId(),
             });
             stopAllConnections();
-            refreshUser();
+            refreshUser().catch((e) => console.warn("[Chat] refreshUser failed:", e));
           } catch {
             // Not a server-named error — let es.onerror handle connection errors
           }
@@ -1658,13 +1829,41 @@ export default function Chat() {
         });
 
         // BUG-002: hasFailedOver flag prevents multiple concurrent polling loops
+        // BUG-FE-116 fix: Reset error counter on any successful open so we only
+        // fall over after consecutive failures.
+        es.onopen = () => {
+          sseErrorCount = 0;
+        };
         es.onerror = async () => {
           if (connectedTaskIdRef.current !== taskId || activeTaskIdRef.current !== taskId) {
             return;
           }
           if (hasFailedOver) return;
+
+          // BUG-FE-116 fix: EventSource auto-reconnects on its own; only
+          // escalate to polling fallover after 3 distinct error events.
+          sseErrorCount += 1;
+          if (sseErrorCount < 3) {
+            // Let EventSource attempt its own reconnect. Log for diagnostics.
+            console.warn(
+              `[Chat] SSE connection error (attempt ${sseErrorCount}/3). Allowing EventSource auto-reconnect.`
+            );
+            // Clear any previously scheduled reset so it matches latest attempt
+            if (sseReconnectTimer) clearTimeout(sseReconnectTimer);
+            // Exponential backoff reset: after this window, if no new error,
+            // treat the channel as healthy again.
+            const resetDelay = Math.min(1000 * 2 ** sseErrorCount, 10000);
+            sseReconnectTimer = setTimeout(() => {
+              sseErrorCount = 0;
+            }, resetDelay);
+            return;
+          }
+          if (sseReconnectTimer) {
+            clearTimeout(sseReconnectTimer);
+            sseReconnectTimer = null;
+          }
           hasFailedOver = true;
-          console.warn("[Chat] SSE connection error, falling back to polling.");
+          console.warn("[Chat] SSE connection error persisted \u2014 falling back to polling.");
           es.close();
           // P1-FIX-21: Only null eventSourceRef.current if it STILL points at this
           // specific EventSource instance. Without this identity check, an OLD
@@ -1709,87 +1908,79 @@ export default function Chat() {
   );
 
   /* ---------------------------------------------------------------- */
-  /*  Switch active investigation                                     */
+  /*  Re-attach running investigation when investigations list loads  */
   /* ---------------------------------------------------------------- */
+  // BUG-FE-107 fix: The previous `switchInvestigation` useCallback was dead
+  // code (zero call sites — the sidebar onClick handlers are inlined). It has
+  // been removed to eliminate divergence risk.
+  //
+  // BUG-FE-105 fix: When the user lands directly on a conversation route
+  // before `loadInvestigations()` has resolved, `loadConversationMessages`
+  // runs with an empty `investigationsRef.current` and cannot re-attach SSE.
+  // This effect watches for the moment when `investigations` populates (or
+  // changes) and re-attaches to any running investigation bound to the
+  // current conversation that isn't already active.
+  const reattachAttemptedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const convId = activeConversationIdRef.current;
+    if (!convId) return;
+    if (investigations.length === 0) return;
+    // If we already have an active running SSE, nothing to do
+    if (activeTaskIdRef.current && eventSourceRef.current) return;
 
-  const switchInvestigation = useCallback(
-    (taskId: string) => {
-      // BUG-004: Use messagesRef.current instead of messages from closure
-      // to avoid stale snapshot and unnecessary re-creation on every message append
-      if (activeTaskId && messagesRef.current.length > 0) {
-        messageStoreRef.current[activeTaskId] = [...messagesRef.current];
-      }
-      // Save timeline steps for current investigation
-      // BUG-C3-04 fix: Use ref instead of closure value to avoid stale data.
-      if (activeTaskId) {
-        timelineStoreRef.current[activeTaskId] = [...timelineStepsRef.current];
-      }
-
-      // Stop any active connections
-      stopAllConnections();
-      setElapsedSeconds(0);
-
-      // Dismiss any pending plan when switching investigations
-      setPendingPlan(null);
-
-      // Clear file upload state when switching
-      setUploadedFiles([]);
-      setUploadSessionUuid(null);
-
-      // Load stored messages for the target investigation
-      // BUG-R2-06: Fall back to messages currently shown if no store entry
-      // (e.g. investigation loaded from Supabase on mount but never viewed this session)
-      const stored = messageStoreRef.current[taskId];
-      const targetMessages = stored || [];
-      setMessages(targetMessages);
-      setActiveTaskId(taskId);
-      setSidebarOpen(false);
-
-      // Restore timeline steps for target investigation
-      setTimelineSteps(timelineStoreRef.current[taskId] || []);
-
-      // BUG-R2-06: Reseed seenStatusIds from the messages we're about to display.
-      // Must happen after clear() so we don't leave stale IDs from the previous investigation.
-      seenStatusIds.current.clear();
-      targetMessages.forEach((m) => {
-        if (m.id) seenStatusIds.current.add(m.id);
-      });
-
-      // If investigation is still running, reconnect SSE
-      const inv = investigations.find((i) => i.task_id === taskId);
-      if (inv && (inv.status === "RUNNING" || inv.status === "PENDING")) {
+    let cancelled = false;
+    (async () => {
+      try {
+        const token = await getAccessToken();
+        if (cancelled || !token) return;
+        // Fetch linked investigations for this conversation (already cached server-side)
+        const res = await fetch(`${API_URL}/api/conversations/${convId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (cancelled || !res.ok) return;
+        if (activeConversationIdRef.current !== convId) return;
+        const data = await res.json();
+        const linkedIds: string[] = data.investigations || [];
+        if (linkedIds.length === 0) return;
+        const runningInv = investigationsRef.current.find(
+          (inv) => linkedIds.includes(inv.task_id) && (inv.status === "RUNNING" || inv.status === "PENDING")
+        );
+        if (!runningInv) return;
+        // Avoid repeated re-attach attempts for the same task
+        if (reattachAttemptedRef.current.has(runningInv.task_id)) return;
+        reattachAttemptedRef.current.add(runningInv.task_id);
+        if (activeTaskIdRef.current === runningInv.task_id && eventSourceRef.current) return;
+        setActiveTaskId(runningInv.task_id);
         setIsSending(true);
-        // P1-FIX-22: Bump the switch generation and capture it. If another
-        // switchInvestigation or loadConversationMessages runs before
-        // getAccessToken resolves, the captured generation will be stale and
-        // this callback will bail out — preventing two concurrent startSSE calls.
+        const cachedTimeline = timelineStoreRef.current[runningInv.task_id];
+        if (cachedTimeline && cachedTimeline.length > 0) {
+          setTimelineSteps(cachedTimeline);
+        }
         switchGenerationRef.current += 1;
         const myGeneration = switchGenerationRef.current;
-        getAccessToken().then((token) => {
-          // P1-FIX-22: Bail if another switch has happened or we unmounted.
-          if (
-            !mountedRef.current ||
-            switchGenerationRef.current !== myGeneration ||
-            activeTaskIdRef.current !== taskId
-          ) {
-            return;
-          }
-          if (token) {
-            startTimer(inv.created_at);
-            startSSE(taskId, token);
-          } else {
-            setIsSending(false);
-            toast.error("Session expired", { description: "Please sign in again." });
-            navigate("/login");
-          }
-        }).catch(() => {
-          setIsSending(false);
-        });
+        const token2 = await getAccessToken();
+        if (
+          cancelled ||
+          !mountedRef.current ||
+          switchGenerationRef.current !== myGeneration ||
+          activeConversationIdRef.current !== convId
+        ) {
+          return;
+        }
+        if (token2) {
+          startTimer(runningInv.created_at);
+          startSSE(runningInv.task_id, token2);
+        }
+      } catch (err) {
+        console.warn("[Chat] Re-attach running investigation failed:", err);
       }
-    },
-    // messages and timelineSteps removed from deps — using refs instead
-    [activeTaskId, investigations, navigate, stopAllConnections, startSSE, startTimer]
-  );
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [investigations, activeConversationId]);
 
   /* ---------------------------------------------------------------- */
   /*  Classify topic and start investigation flow                     */
@@ -1853,14 +2044,20 @@ export default function Chat() {
 
     // Persist the user message to the backend
     if (convId) {
-      persistMessage(convId, "user", topic, "text");
+      // BUG-FE-111 fix: Guard unawaited promise rejection.
+      persistMessage(convId, "user", topic, "text").catch((e) =>
+        console.warn("[Chat] persistMessage failed:", e)
+      );
       // Move this conversation to top of sidebar (most recently active)
       setConversations((prev) => {
         const idx = prev.findIndex((c) => c.id === convId);
         if (idx <= 0) return prev; // already at top or not found
         const updated = [...prev];
-        const [moved] = updated.splice(idx, 1);
-        moved.updated_at = new Date().toISOString();
+        const [original] = updated.splice(idx, 1);
+        // BUG-FE-125 fix: Clone the conversation before mutating `updated_at`
+        // so we never mutate the object referenced by the previous state
+        // snapshot (React may still hold it for a concurrent re-render).
+        const moved: Conversation = { ...original, updated_at: new Date().toISOString() };
         return [moved, ...updated];
       });
     }
@@ -1925,7 +2122,7 @@ export default function Chat() {
         ]);
         // Persist the assistant reply
         if (convId) {
-          persistMessage(convId, "assistant", chatData.reply, "text");
+          persistMessage(convId, "assistant", chatData.reply, "text").catch((e) => console.warn("[Chat] persistMessage failed:", e));
         }
         return;
       }
@@ -1942,7 +2139,7 @@ export default function Chat() {
         ]);
         // Persist the assistant reply
         if (convId) {
-          persistMessage(convId, "assistant", chatData.reply, "text");
+          persistMessage(convId, "assistant", chatData.reply, "text").catch((e) => console.warn("[Chat] persistMessage failed:", e));
         }
       }
 
@@ -2094,7 +2291,33 @@ export default function Chat() {
         throw new Error(`HTTP ${res.status}: ${errorText}`);
       }
 
-      const data: CreateInvestigationResponse = await res.json();
+      // BUG-FE-108 fix: Narrow try/catch specifically around JSON parsing.
+      // If the server returns 200 with a malformed/empty body, res.json()
+      // rejects. The outer catch would have shown a generic error, but the
+      // backend may have already deducted a credit reservation. Surface a
+      // specific notice so the user knows to refresh their balance rather
+      // than assuming nothing was charged.
+      let data: CreateInvestigationResponse;
+      try {
+        data = await res.json();
+      } catch (parseErr) {
+        console.error("[Chat] Failed to parse startInvestigation response:", parseErr);
+        setIsSending(false);
+        setRetryPayload({ topic });
+        // Best-effort: refresh user so any deducted reservation is visible
+        refreshUser().catch(() => {});
+        appendMessage({
+          role: "system",
+          content: "Server returned an unreadable response. Credits may have been reserved \u2014 please refresh your balance and retry if the investigation did not start.",
+          type: "error",
+          id: `start-parse-error-${Date.now()}`,
+          _id: makeMessageId(),
+        });
+        toast.error("Unreadable response from server", {
+          description: "Credits may have been reserved. Refresh your balance before retrying.",
+        });
+        return;
+      }
       const taskId = data.task_id;
 
       // Create investigation record
@@ -2144,7 +2367,7 @@ export default function Chat() {
       });
 
       // Refresh credit balance — reservation was deducted at submit time
-      refreshUser();
+      refreshUser().catch((e) => console.warn("[Chat] refreshUser failed:", e));
 
       // Clear upload state after investigation starts
       setUploadedFiles([]);
@@ -2221,6 +2444,12 @@ export default function Chat() {
 
   const handleCancelPlan = useCallback(() => {
     setPendingPlan(null);
+    // BUG-FE-122 fix: Cancel any in-flight POST /stop so it does not settle
+    // after handleCancelPlan resets the UI (would flip isStopping toggles).
+    if (stopAbortRef.current) {
+      stopAbortRef.current.abort();
+      stopAbortRef.current = null;
+    }
     // Remove the plan from the chat — keep messages from conversation history
     setTimelineSteps([]);
     setActiveTaskId(null);
@@ -2281,7 +2510,11 @@ export default function Chat() {
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(url), 100);
+      // BUG-FE-117 fix: Some browsers (Safari, mobile Chrome) need more time
+      // between anchor click and URL revocation before the download actually
+      // starts. 100ms raced the download on slow devices and produced a silent
+      // failure. 5000ms is ample for all mainstream browsers.
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";
       toast.error("Download failed", { description: msg });
@@ -2296,7 +2529,17 @@ export default function Chat() {
   const isRunning = activeInvestigation?.status === "RUNNING" || activeInvestigation?.status === "PENDING";
   const isCompleted = activeInvestigation?.status === "COMPLETED";
   const latestAnnouncement = useMemo(() => {
-    const lastNonUserMessage = [...messages].reverse().find((msg) => msg.role !== "user");
+    // BUG-FE-128 fix: Avoid cloning the whole messages array just to find the
+    // last non-user entry. Iterate backwards instead — O(1) memory, typically
+    // O(1) time since the target is almost always near the end of the list.
+    let lastNonUserMessage: Message | undefined;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg.role !== "user") {
+        lastNonUserMessage = msg;
+        break;
+      }
+    }
     if (lastNonUserMessage?.content) return lastNonUserMessage.content;
     if (pendingPlan) return "Research plan ready for review.";
     if (isClassifying) return "Analyzing your question.";
@@ -2442,6 +2685,11 @@ export default function Chat() {
                   <button
                     onClick={async (e) => {
                       e.stopPropagation();
+                      // BUG-FE-137: TODO — replace native confirm() with a Radix
+                      // AlertDialog for visual consistency with the rest of the
+                      // app (native confirm cannot be styled and blocks the JS
+                      // thread on slow machines). Tracked for UI-polish sprint;
+                      // keep `confirm` as a functional stopgap.
                       if (!confirm("Delete this conversation? This cannot be undone.")) return;
                       const token = await getAccessToken();
                       if (!token) return;
@@ -2507,7 +2755,12 @@ export default function Chat() {
             </div>
             <div className="flex items-center gap-1">
               <button
-                onClick={() => { setMemoryOpen(true); loadMemory(); }}
+                onClick={() => {
+                  setMemoryOpen(true);
+                  // BUG-FE-133 fix: Guard unawaited promise rejection so a
+                  // network error doesn't surface as an unhandledrejection.
+                  loadMemory().catch((e) => console.warn("[Chat] loadMemory failed:", e));
+                }}
                 className="rounded-md p-1.5 text-muted-foreground/50 hover:text-primary hover:bg-secondary/50 transition-colors"
                 title="Memory"
                 aria-label="Open memory panel"
@@ -2741,13 +2994,26 @@ export default function Chat() {
                         );
                       }
                       if (parsed.type === "cost_summary") {
+                        // BUG-FE-126 fix: Guard against non-numeric values so the
+                        // summary does not render "$NaN" / "NaN credits used" when
+                        // the backend omits or malforms these fields.
+                        const creditsUsedRaw = parsed.credits_used;
+                        const creditsUsedText =
+                          typeof creditsUsedRaw === "number" && Number.isFinite(creditsUsedRaw)
+                            ? creditsUsedRaw.toLocaleString()
+                            : "\u2014";
+                        const spentRaw = parsed.spent_usd;
+                        const spentText =
+                          typeof spentRaw === "number" && Number.isFinite(spentRaw)
+                            ? spentRaw.toFixed(2)
+                            : "\u2014";
                         return (
                           <div className="rounded-md border border-border bg-card/50 px-3 py-2 text-xs text-muted-foreground">
                             <span className="font-medium text-foreground">
-                              {Number(parsed.credits_used).toLocaleString()} credits used
+                              {creditsUsedText} credits used
                             </span>
                             {" "}
-                            (${Number(parsed.spent_usd).toFixed(2)} incl. fees)
+                            (${spentText} incl. fees)
                           </div>
                         );
                       }
@@ -2962,19 +3228,29 @@ export default function Chat() {
                         const token = await getAccessToken();
                         if (!token || !activeTaskId) return;
                         setIsStopping(true);
+                        // BUG-FE-122 fix: Wire AbortController so handleCancelPlan
+                        // can interrupt the in-flight request cleanly.
+                        const ac = new AbortController();
+                        stopAbortRef.current = ac;
                         try {
                           const res = await fetch(`${API_URL}/api/investigations/${activeTaskId}/stop`, {
                             method: "POST",
                             headers: { Authorization: `Bearer ${token}` },
+                            signal: ac.signal,
                           });
                           if (!res.ok) {
                             const errText = await res.text().catch(() => res.statusText);
                             throw new Error(`HTTP ${res.status}: ${errText}`);
                           }
                           toast.info("Stop requested", { description: "Investigation will stop after the current cycle." });
-                        } catch {
-                          toast.error("Failed to stop investigation");
+                        } catch (err) {
+                          if (err instanceof DOMException && err.name === "AbortError") {
+                            // Aborted intentionally by handleCancelPlan — no user-facing error.
+                          } else {
+                            toast.error("Failed to stop investigation");
+                          }
                         } finally {
+                          if (stopAbortRef.current === ac) stopAbortRef.current = null;
                           setIsStopping(false);
                         }
                       }}

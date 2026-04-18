@@ -5,6 +5,8 @@ import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AuthProvider } from "@/contexts/AuthContext";
 import AppErrorBoundary from "@/components/AppErrorBoundary";
+import { supabaseConfigError } from "@/lib/supabase";
+import { AlertTriangle } from "lucide-react";
 
 import Index from "./pages/Index";
 import Research from "./pages/Research";
@@ -22,7 +24,18 @@ import Skills from "./pages/Skills";
 import InvestigationGraph from "./pages/InvestigationGraph";
 import NotFound from "./pages/NotFound";
 
-const queryClient = new QueryClient();
+// BUG-FE-134 fix: Configure sensible defaults so react-query doesn't refetch
+// aggressively on every window focus or mount. staleTime = 30s keeps data fresh
+// for a reasonable window; refetchOnWindowFocus is disabled to prevent flicker
+// and wasted API calls when users briefly switch tabs.
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      refetchOnWindowFocus: false,
+      staleTime: 30_000,
+    },
+  },
+});
 
 /**
  * BUG-029: BrowserRouter now wraps AuthProvider so AuthProvider (and any
@@ -31,7 +44,38 @@ const queryClient = new QueryClient();
  * BUG-010: Added /reset-password route so the password-reset email link
  * from Login.tsx actually lands on a page instead of the 404.
  */
-const App = () => (
+// BUG-FE-132 fix: If Supabase env vars are missing, render a friendly
+// configuration error screen instead of blanking out the app. This used to
+// throw at module import time, which the ErrorBoundary could not catch.
+const ConfigErrorScreen = ({ message }: { message: string }) => (
+  <div className="flex min-h-screen items-center justify-center bg-background px-6 py-12">
+    <div className="w-full max-w-md rounded-2xl border border-border bg-card p-8 shadow-sm">
+      <div className="flex items-start gap-3">
+        <div className="rounded-full bg-red-500/10 p-2 text-red-400">
+          <AlertTriangle size={20} />
+        </div>
+        <div>
+          <h1 className="text-lg font-semibold text-foreground">Configuration error</h1>
+          <p className="mt-2 text-sm leading-6 text-muted-foreground">
+            Mariana could not start because a required environment variable is missing.
+          </p>
+          <pre className="mt-3 rounded-md bg-muted px-3 py-2 text-xs text-foreground overflow-x-auto">
+            {message}
+          </pre>
+          <p className="mt-3 text-xs text-muted-foreground">
+            Check the deployment configuration and ensure Supabase credentials are set.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+);
+
+const App = () => {
+  if (supabaseConfigError) {
+    return <ConfigErrorScreen message={supabaseConfigError} />;
+  }
+  return (
   <AppErrorBoundary>
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
@@ -64,6 +108,7 @@ const App = () => (
       </TooltipProvider>
     </QueryClientProvider>
   </AppErrorBoundary>
-);
+  );
+};
 
 export default App;

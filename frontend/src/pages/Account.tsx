@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
@@ -37,6 +37,9 @@ export default function Account() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const [isOpeningPortal, setIsOpeningPortal] = useState(false);
+  // BUG-FE-120 fix: Track the in-flight portal fetch so we can abort on unmount
+  // and avoid state updates after the component is gone.
+  const portalAbortRef = useRef<AbortController | null>(null);
 
   // BUG-R1-10: Add a 500ms grace period before redirecting, matching Chat.tsx.
   // Supabase token refresh briefly sets user=null; without the delay, users
@@ -48,7 +51,32 @@ export default function Account() {
     }
   }, [user, navigate]);
 
-  if (!user) return null;
+  // BUG-FE-120 fix: Abort any in-flight portal fetch on unmount.
+  useEffect(() => {
+    return () => {
+      portalAbortRef.current?.abort();
+    };
+  }, []);
+
+  // BUG-FE-120 fix: Render a lightweight loading skeleton instead of `return null`
+  // during the brief grace-period window. This keeps the page visually stable while
+  // Supabase refreshes tokens, and prevents child components from unmounting and
+  // losing state (e.g. an in-flight billing-portal fetch).
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-background">
+        <Navbar />
+        <section className="px-6 pt-32 pb-16 md:pt-40 md:pb-24">
+          <div className="mx-auto max-w-lg">
+            <div className="h-8 w-32 animate-pulse rounded bg-muted" />
+            <div className="mt-8 h-64 animate-pulse rounded-lg border border-border bg-card/50" />
+            <div className="mt-6 h-10 animate-pulse rounded-md bg-muted" />
+          </div>
+        </section>
+        <Footer />
+      </div>
+    );
+  }
 
   // BUG-R2-16: Make async and await logout() so navigation doesn't fire
   // before supabase.auth.signOut() completes and setUser(null) runs.
@@ -60,6 +88,18 @@ export default function Account() {
 
   const handleManageSubscription = async () => {
     setIsOpeningPortal(true);
+
+    // BUG-FE-121 fix: Open the window synchronously on click so Safari treats
+    // it as a user-gesture navigation. Safari blocks window.open / location
+    // assignments issued after an `await` because the gesture context has
+    // expired by then.
+    const popup = window.open("", "_self");
+
+    // BUG-FE-120 fix: Track the fetch with an AbortController so unmount can cancel it.
+    const ac = new AbortController();
+    portalAbortRef.current?.abort();
+    portalAbortRef.current = ac;
+
     try {
       const { data: { session } } = await supabase.auth.getSession();
       const token = session?.access_token;
@@ -71,6 +111,7 @@ export default function Account() {
 
       const res = await fetch(`${API_URL}/api/billing/portal`, {
         headers: { Authorization: `Bearer ${token}` },
+        signal: ac.signal,
       });
 
       if (!res.ok) {
@@ -83,8 +124,17 @@ export default function Account() {
       if (!data.portal_url) {
         throw new Error("No portal URL received from server");
       }
-      window.location.href = data.portal_url;
+      // BUG-FE-121: Navigate the pre-opened window (or current if popup is null).
+      if (popup) {
+        popup.location.href = data.portal_url;
+      } else {
+        window.location.href = data.portal_url;
+      }
     } catch (err) {
+      // Don't toast on deliberate abort (e.g. unmount).
+      if (err instanceof DOMException && err.name === "AbortError") {
+        return;
+      }
       const msg = err instanceof Error ? err.message : "Unknown error";
       toast.error("Could not open billing portal", { description: msg });
       setIsOpeningPortal(false);
