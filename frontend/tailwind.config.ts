@@ -1,7 +1,6 @@
 import type { Config } from "tailwindcss";
 
 export default {
-  darkMode: "class",
   content: ["./pages/**/*.{ts,tsx}", "./components/**/*.{ts,tsx}", "./app/**/*.{ts,tsx}", "./src/**/*.{ts,tsx}"],
   prefix: "",
   theme: {
@@ -14,7 +13,8 @@ export default {
     },
     extend: {
       fontFamily: {
-        sans: ["Satoshi", "system-ui", "sans-serif"],
+        serif: ["Playfair Display", "Georgia", "serif"],
+        sans: ["Inter", "system-ui", "sans-serif"],
         mono: ["JetBrains Mono", "monospace"],
       },
       colors: {
@@ -81,7 +81,7 @@ export default {
           "50%": { opacity: "0" },
         },
         "fade-in": {
-          from: { opacity: "0", transform: "translateY(16px)" },
+          from: { opacity: "0", transform: "translateY(12px)" },
           to: { opacity: "1", transform: "translateY(0)" },
         },
         "slide-up": {
@@ -102,16 +102,8 @@ export default {
         },
         "credit-pulse": {
           "0%": { color: "hsl(var(--foreground))" },
-          "25%": { color: "hsl(190, 70%, 50%)" },
+          "25%": { color: "hsl(45, 93%, 58%)" },
           "100%": { color: "hsl(var(--foreground))" },
-        },
-        "float": {
-          "0%, 100%": { transform: "translateY(0)" },
-          "50%": { transform: "translateY(-6px)" },
-        },
-        "pulse-glow": {
-          "0%, 100%": { opacity: "0.4" },
-          "50%": { opacity: "0.8" },
         },
       },
       animation: {
@@ -124,8 +116,6 @@ export default {
         "scale-in": "scale-in 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards",
         "slide-in-right": "slide-in-right 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards",
         "credit-pulse": "credit-pulse 1.5s ease-out",
-        "float": "float 4s ease-in-out infinite",
-        "pulse-glow": "pulse-glow 3s ease-in-out infinite",
       },
     },
   },

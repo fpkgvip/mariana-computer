@@ -77,6 +77,9 @@ export default function Checkout() {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
+        // BUG-R2-S2-02: Must send success_url and cancel_url per API contract.
+        // Pricing.tsx sends both; Checkout.tsx was missing them, causing the backend
+        // to reject the request or use broken default redirect URLs.
         body: JSON.stringify({
           plan_id: planId,
           success_url: `${window.location.origin}/chat?checkout=success`,
@@ -89,6 +92,9 @@ export default function Checkout() {
         throw new Error(`HTTP ${res.status}: ${errText}`);
       }
 
+      // BUG-R2-S2-01: Backend returns { checkout_url, session_id } — not { url }.
+      // Pricing.tsx already used the correct field; Checkout.tsx was using the wrong one,
+      // causing a redirect to "undefined" after successful checkout creation.
       const data: { checkout_url: string; session_id: string } = await res.json();
       window.location.href = data.checkout_url;
     } catch (err) {
@@ -105,7 +111,7 @@ export default function Checkout() {
       <section className="px-6 pt-32 pb-16 md:pt-40 md:pb-24">
         <div className="mx-auto max-w-4xl">
           <ScrollReveal>
-            <h1 className="text-2xl font-bold text-foreground sm:text-3xl">
+            <h1 className="font-serif text-2xl font-semibold text-foreground sm:text-3xl">
               Choose a plan
             </h1>
             <p className="mt-2 text-sm text-muted-foreground">
@@ -119,10 +125,10 @@ export default function Checkout() {
             </div>
           ) : plans.length === 0 ? (
             <ScrollReveal>
-              <div className="mt-12 rounded-xl border border-border bg-card p-8 text-center">
+              <div className="mt-12 rounded-lg border border-border bg-card p-8 text-center">
                 <p className="text-sm text-muted-foreground">
                   No plans available at the moment. Please check back later or{" "}
-                  <a href="/contact" className="font-semibold text-primary hover:underline">
+                  <a href="/contact" className="text-foreground underline underline-offset-2">
                     contact us
                   </a>
                   .
@@ -133,11 +139,11 @@ export default function Checkout() {
             <div className="mt-10 grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
               {plans.map((plan, i) => (
                 <ScrollReveal key={plan.id} delay={i * 80}>
-                  <div className="flex h-full flex-col rounded-xl border border-border bg-card p-6 shadow-sm transition-all hover:shadow-md">
-                    <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">
+                  <div className="flex h-full flex-col rounded-lg bg-card p-6 shadow-sm ring-1 ring-border">
+                    <p className="text-xs font-medium uppercase tracking-[0.15em] text-muted-foreground">
                       {plan.name}
                     </p>
-                    <h2 className="mt-3 text-3xl font-bold text-foreground">
+                    <h2 className="mt-3 font-serif text-3xl font-semibold text-foreground">
                       ${plan.price_usd.toLocaleString()}
                       <span className="text-base font-normal text-muted-foreground">/month</span>
                     </h2>
@@ -152,12 +158,12 @@ export default function Checkout() {
                         {plan.features.map((feature) => (
                           <li
                             key={feature}
-                            className="flex items-start gap-2.5 text-sm text-foreground"
+                            className="flex items-start gap-2.5 text-[14px] text-foreground"
                           >
                             <Check
                               size={14}
-                              className="mt-0.5 shrink-0 text-primary"
-                              strokeWidth={2.5}
+                              className="mt-0.5 shrink-0 text-accent"
+                              strokeWidth={2}
                             />
                             {feature}
                           </li>
@@ -166,14 +172,14 @@ export default function Checkout() {
                     )}
 
                     {plan.coming_soon ? (
-                      <div className="mt-6 flex w-full items-center justify-center gap-2 rounded-lg border border-border px-4 py-2.5 text-sm font-semibold text-muted-foreground cursor-not-allowed">
+                      <div className="mt-6 flex w-full items-center justify-center gap-2 rounded-md border border-border px-4 py-2.5 text-sm font-medium text-muted-foreground cursor-not-allowed">
                         Coming Soon
                       </div>
                     ) : (
                       <button
                         onClick={() => handleSubscribe(plan.id)}
                         disabled={loadingPlanId !== null}
-                        className="mt-6 flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground shadow-md transition-all hover:opacity-90 hover:shadow-lg disabled:opacity-60"
+                        className="mt-6 flex w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition-all hover:bg-primary/90 disabled:opacity-60"
                       >
                         {loadingPlanId === plan.id ? (
                           <Loader2 size={14} className="animate-spin" />

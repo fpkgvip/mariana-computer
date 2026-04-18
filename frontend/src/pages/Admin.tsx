@@ -62,9 +62,9 @@ interface AdminInvestigation {
 
 function StatCard({ label, value, sub }: { label: string; value: string | number; sub?: string }) {
   return (
-    <div className="rounded-xl border border-border bg-card p-5">
-      <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">{label}</p>
-      <p className="mt-2 text-2xl font-bold text-foreground">{value}</p>
+    <div className="rounded-lg border border-border bg-card p-5">
+      <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">{label}</p>
+      <p className="mt-2 font-serif text-2xl font-semibold text-foreground">{value}</p>
       {sub && <p className="mt-0.5 text-xs text-muted-foreground">{sub}</p>}
     </div>
   );
@@ -236,11 +236,11 @@ export default function Admin() {
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <ShieldCheck size={22} className="text-primary" />
-            <h1 className="text-2xl font-bold text-foreground">Admin Panel</h1>
+            <h1 className="font-serif text-2xl font-semibold text-foreground">Admin Panel</h1>
           </div>
           <button
             onClick={() => { fetchStats(); fetchUsers(); fetchInvestigations(); }}
-            className="flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-foreground hover:bg-secondary transition-colors"
+            className="flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs text-foreground hover:bg-secondary transition-colors"
           >
             <RefreshCw size={12} /> Refresh
           </button>
@@ -308,7 +308,7 @@ export default function Admin() {
             <button
               type="submit"
               disabled={isAddingCredits}
-              className="flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground shadow-md transition-all hover:opacity-90 hover:shadow-lg disabled:opacity-60"
+              className="flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-60"
             >
               {isAddingCredits ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
               Add credits
@@ -337,16 +337,16 @@ export default function Admin() {
                 <Loader2 size={14} className="animate-spin" /> Loading users...
               </div>
             ) : (
-              <div className="overflow-x-auto rounded-xl border border-border">
+              <div className="overflow-x-auto rounded-lg border border-border">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-border bg-card/50">
-                      <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-widest text-muted-foreground">Name</th>
-                      <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-widest text-muted-foreground">Email</th>
-                      <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-widest text-muted-foreground">Role</th>
-                      <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-widest text-muted-foreground">Plan</th>
-                      <th className="px-4 py-3 text-right text-xs font-bold uppercase tracking-widest text-muted-foreground">Credits</th>
-                      <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-widest text-muted-foreground">ID</th>
+                      <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">Name</th>
+                      <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">Email</th>
+                      <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">Role</th>
+                      <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">Plan</th>
+                      <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wider text-muted-foreground">Credits</th>
+                      <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">ID</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border">
@@ -409,15 +409,15 @@ export default function Admin() {
                 <Loader2 size={14} className="animate-spin" /> Loading investigations...
               </div>
             ) : (
-              <div className="overflow-x-auto rounded-xl border border-border">
+              <div className="overflow-x-auto rounded-lg border border-border">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-border bg-card/50">
-                      <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-widest text-muted-foreground">Topic</th>
-                      <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-widest text-muted-foreground">Status</th>
-                      <th className="px-4 py-3 text-right text-xs font-bold uppercase tracking-widest text-muted-foreground">Spent</th>
-                      <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-widest text-muted-foreground">Created</th>
-                      <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-widest text-muted-foreground">ID</th>
+                      <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">Topic</th>
+                      <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">Status</th>
+                      <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wider text-muted-foreground">Spent</th>
+                      <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">Created</th>
+                      <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider text-muted-foreground">ID</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border">

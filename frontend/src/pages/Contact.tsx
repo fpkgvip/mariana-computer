@@ -26,6 +26,7 @@ export default function Contact() {
   const update = (field: string, value: string) => setForm((f) => ({ ...f, [field]: value }));
 
   // BUG-011: Actually send the form data to the backend instead of a setTimeout stub.
+  // Falls back to a mailto link if the API endpoint is unavailable.
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSending(true);
@@ -41,6 +42,7 @@ export default function Contact() {
       });
       setForm({ name: "", email: "", subject: subjects[0], message: "" });
     } catch {
+      // If the backend contact endpoint isn't available, instruct the user to email directly
       toast.error("Could not send message", {
         description: "Please email us directly at support@mariana.co",
       });
@@ -56,25 +58,23 @@ export default function Contact() {
       <section className="px-6 pt-32 pb-16 md:pt-40 md:pb-24">
         <div className="mx-auto max-w-5xl">
           <ScrollReveal>
-            <h1 className="text-3xl font-bold text-foreground sm:text-4xl md:text-5xl">
+            <h1 className="font-serif text-3xl font-semibold text-foreground sm:text-4xl md:text-5xl">
               Get in touch
             </h1>
-            <p className="mt-4 max-w-xl text-base leading-relaxed text-muted-foreground md:text-lg">
+            <p className="mt-4 max-w-xl text-base text-muted-foreground md:text-lg">
               Whether you're exploring Mariana for your firm or need help with your account, we're here.
             </p>
           </ScrollReveal>
 
-          <div className="mt-12 grid gap-12 md:mt-16 lg:grid-cols-2 lg:gap-16">
+          <div className="mt-12 grid gap-12 md:mt-16 lg:grid-cols-2 lg:gap-20">
             {/* Contact info */}
             <ScrollReveal>
               <div className="space-y-6">
                 {contactInfo.map((item) => (
-                  <div key={item.label} className="flex gap-4 rounded-xl border border-border bg-card p-4 transition-colors hover:border-primary/20">
-                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-                      <item.icon size={16} />
-                    </div>
+                  <div key={item.label} className="flex gap-4">
+                    <item.icon size={18} className="mt-0.5 shrink-0 text-muted-foreground" />
                     <div>
-                      <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
                         {item.label}
                       </p>
                       <p className="mt-1 whitespace-pre-line text-sm text-foreground">{item.value}</p>
@@ -86,20 +86,20 @@ export default function Contact() {
 
             {/* Form */}
             <ScrollReveal>
-              <form onSubmit={handleSubmit} className="space-y-5 rounded-xl border border-border bg-card p-6">
+              <form onSubmit={handleSubmit} className="space-y-5">
                 <div className="grid gap-5 sm:grid-cols-2">
                   <div>
-                    <label htmlFor="contact-name" className="mb-1.5 block text-xs font-semibold text-muted-foreground">Name</label>
+                    <label htmlFor="contact-name" className="mb-1.5 block text-xs font-medium text-muted-foreground">Name</label>
                     <Input id="contact-name" value={form.name} onChange={(e) => update("name", e.target.value)} required placeholder="Your name" />
                   </div>
                   <div>
-                    <label htmlFor="contact-email" className="mb-1.5 block text-xs font-semibold text-muted-foreground">Email</label>
+                    <label htmlFor="contact-email" className="mb-1.5 block text-xs font-medium text-muted-foreground">Email</label>
                     <Input id="contact-email" type="email" value={form.email} onChange={(e) => update("email", e.target.value)} required placeholder="you@firm.com" />
                   </div>
                 </div>
 
                 <div>
-                  <label htmlFor="contact-subject" className="mb-1.5 block text-xs font-semibold text-muted-foreground">Subject</label>
+                  <label htmlFor="contact-subject" className="mb-1.5 block text-xs font-medium text-muted-foreground">Subject</label>
                   <select
                     id="contact-subject"
                     value={form.subject}
@@ -113,7 +113,7 @@ export default function Contact() {
                 </div>
 
                 <div>
-                  <label htmlFor="contact-message" className="mb-1.5 block text-xs font-semibold text-muted-foreground">Message</label>
+                  <label htmlFor="contact-message" className="mb-1.5 block text-xs font-medium text-muted-foreground">Message</label>
                   <textarea
                     id="contact-message"
                     value={form.message}

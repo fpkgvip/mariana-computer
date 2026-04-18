@@ -156,10 +156,10 @@ export default function Pricing() {
 
       <div className="mx-auto max-w-7xl px-6 pb-24 pt-32 md:pt-40">
         <ScrollReveal>
-          <h1 className="text-3xl font-bold leading-[1.08] tracking-tight text-foreground sm:text-4xl md:text-5xl">
+          <h1 className="font-serif text-3xl font-semibold leading-[1.08] tracking-[-0.02em] text-foreground sm:text-4xl md:text-5xl lg:text-[3.5rem]">
             Simple, transparent pricing.
           </h1>
-          <p className="mt-4 max-w-lg text-lg leading-relaxed text-muted-foreground">
+          <p className="mt-6 max-w-lg text-lg leading-[1.7] text-muted-foreground">
             Choose the plan that fits your research volume. Credits refresh monthly.
           </p>
         </ScrollReveal>
@@ -169,29 +169,29 @@ export default function Pricing() {
           {plans.map((plan, i) => (
             <ScrollReveal key={plan.id} delay={i * 100}>
               <div
-                className={`relative flex h-full flex-col rounded-xl p-8 shadow-sm transition-all ${
+                className={`relative flex h-full flex-col rounded-lg p-8 shadow-sm ring-1 ${
                   plan.highlighted
-                    ? "border-2 border-primary bg-card"
-                    : "border border-border bg-card"
-                } ${plan.comingSoon ? "opacity-70 pointer-events-none" : "hover:shadow-md"}`}
+                    ? "bg-primary/5 ring-primary/30"
+                    : "bg-card ring-border"
+                } ${plan.comingSoon ? "opacity-75 pointer-events-none" : ""}`}
                 aria-disabled={plan.comingSoon}
               >
                 {plan.comingSoon && (
-                  <div className="absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-background/60 backdrop-blur-[2px]">
-                    <div className="rounded-full border border-primary/30 bg-primary/10 px-5 py-2">
-                      <span className="text-sm font-bold text-primary">Coming Soon</span>
+                  <div className="absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-background/60 backdrop-blur-[2px]">
+                    <div className="rounded-full border border-accent/40 bg-accent/10 px-5 py-2">
+                      <span className="font-serif text-lg font-semibold text-accent">Coming Soon</span>
                     </div>
                   </div>
                 )}
                 {plan.highlighted && (
-                  <p className="mb-3 inline-block self-start rounded-full bg-primary/10 px-3 py-1 text-xs font-bold text-primary">
+                  <p className="mb-3 inline-block self-start rounded-full bg-primary/10 px-3 py-0.5 text-[11px] font-medium text-primary">
                     Most popular
                   </p>
                 )}
-                <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">
+                <p className="text-xs font-medium uppercase tracking-[0.15em] text-muted-foreground">
                   {plan.name}
                 </p>
-                <h2 className="mt-4 text-4xl font-bold text-foreground">
+                <h2 className="mt-4 font-serif text-4xl font-semibold text-foreground">
                   ${plan.price.toLocaleString()}
                   <span className="text-lg font-normal text-muted-foreground">/month</span>
                 </h2>
@@ -203,8 +203,8 @@ export default function Pricing() {
 
                 <ul className="flex-1 space-y-3">
                   {plan.features.map((f) => (
-                    <li key={f} className="flex items-start gap-2.5 text-sm text-foreground">
-                      <Check size={15} className="mt-0.5 shrink-0 text-primary" strokeWidth={2.5} />
+                    <li key={f} className="flex items-start gap-2.5 text-[15px] text-foreground">
+                      <Check size={15} className="mt-0.5 shrink-0 text-accent" strokeWidth={2} />
                       {f}
                     </li>
                   ))}
@@ -213,14 +213,14 @@ export default function Pricing() {
                 <div className="mt-8">
                   {plan.comingSoon ? (
                     <div
-                      className="flex w-full items-center justify-center gap-2 rounded-lg border border-border px-4 py-3 text-sm font-semibold text-muted-foreground cursor-not-allowed"
+                      className="flex w-full items-center justify-center gap-2 rounded-md border border-border px-4 py-3 text-sm font-medium text-muted-foreground cursor-not-allowed"
                     >
                       Coming Soon
                     </div>
-                  ) : plan.id === "enterprise" ? (
+                  ) : /* This branch activates when comingSoon is removed from Enterprise */ plan.id === "enterprise" ? (
                     <Link
                       to="/contact"
-                      className="flex w-full items-center justify-center gap-2 rounded-lg border border-border px-4 py-3 text-sm font-semibold text-foreground transition-all hover:bg-secondary hover:shadow-sm"
+                      className="flex w-full items-center justify-center gap-2 rounded-md border border-border px-4 py-3 text-sm font-medium text-foreground transition-all hover:bg-secondary"
                     >
                       Contact Sales <ArrowRight size={15} />
                     </Link>
@@ -228,7 +228,7 @@ export default function Pricing() {
                     <button
                       onClick={() => handleSubscribe(plan.id)}
                       disabled={loadingPlanId !== null}
-                      className="flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-4 py-3 text-sm font-semibold text-primary-foreground shadow-md transition-all hover:opacity-90 hover:shadow-lg disabled:opacity-60"
+                      className="flex w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-3 text-sm font-medium text-primary-foreground transition-all hover:bg-primary/90 disabled:opacity-60"
                     >
                       {loadingPlanId === plan.id ? (
                         <Loader2 size={14} className="animate-spin" />
@@ -249,7 +249,7 @@ export default function Pricing() {
         <ScrollReveal>
           <div className="mt-8 text-center text-sm text-muted-foreground">
             Not sure which plan fits?{" "}
-            <Link to="/contact" className="font-semibold text-primary hover:underline transition-colors">
+            <Link to="/contact" className="text-foreground underline underline-offset-2 hover:text-accent transition-colors">
               Contact us
             </Link>{" "}
             and we'll help you choose.
@@ -259,17 +259,17 @@ export default function Pricing() {
         {/* How it works */}
         <div className="mt-24">
           <ScrollReveal>
-            <h2 className="text-2xl font-bold text-foreground md:text-3xl">
+            <h2 className="font-serif text-2xl font-semibold text-foreground md:text-3xl">
               How it works
             </h2>
           </ScrollReveal>
           <ScrollReveal delay={100}>
-            <div className="mt-8 grid gap-4 sm:grid-cols-3">
+            <div className="mt-8 grid gap-6 sm:grid-cols-3">
               {howItWorks.map((s) => (
-                <div key={s.step} className="rounded-xl border border-border bg-card p-6 shadow-sm">
-                  <span className="font-mono text-xs font-bold text-primary">{s.step}</span>
-                  <h3 className="mt-2 text-sm font-bold text-foreground">{s.title}</h3>
-                  <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{s.desc}</p>
+                <div key={s.step} className="rounded-lg bg-card p-6 shadow-sm ring-1 ring-border">
+                  <span className="font-mono text-xs text-accent">{s.step}</span>
+                  <h3 className="mt-2 text-[15px] font-semibold text-foreground">{s.title}</h3>
+                  <p className="mt-2 text-sm leading-[1.7] text-muted-foreground">{s.desc}</p>
                 </div>
               ))}
             </div>
@@ -279,16 +279,16 @@ export default function Pricing() {
         {/* FAQ */}
         <div className="mt-24">
           <ScrollReveal>
-            <h2 className="text-2xl font-bold text-foreground md:text-3xl">
+            <h2 className="font-serif text-2xl font-semibold text-foreground md:text-3xl">
               Common questions
             </h2>
           </ScrollReveal>
           <div className="mt-8 divide-y divide-border">
             {faqs.map((faq, i) => (
-              <ScrollReveal key={faq.q} delay={i * 50}>
+              <ScrollReveal key={faq.q} delay={i * 60}>
                 <div className="py-6">
-                  <h3 className="text-sm font-bold text-foreground">{faq.q}</h3>
-                  <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
+                  <h3 className="text-[15px] font-semibold text-foreground">{faq.q}</h3>
+                  <p className="mt-2 text-sm leading-[1.7] text-muted-foreground">
                     {faq.a}
                   </p>
                 </div>
