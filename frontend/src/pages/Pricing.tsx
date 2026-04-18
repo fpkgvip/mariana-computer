@@ -138,6 +138,10 @@ export default function Pricing() {
       }
 
       const data: { checkout_url: string; session_id: string } = await res.json();
+      // P1-FIX-82: Guard against missing checkout_url
+      if (!data.checkout_url) {
+        throw new Error("No checkout URL received from server");
+      }
       window.location.href = data.checkout_url;
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";

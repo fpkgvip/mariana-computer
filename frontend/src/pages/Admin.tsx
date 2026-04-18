@@ -104,7 +104,9 @@ export default function Admin() {
       }, 500);
       return () => clearTimeout(timer);
     }
-    if (user.role !== "admin") {
+    // P1-FIX-71: Guard against null user — the check above sets a timer but
+    // doesn't return early from the effect, so user.role would crash.
+    if (user && user.role !== "admin") {
       navigate("/chat", { replace: true });
     }
   }, [user, navigate]);

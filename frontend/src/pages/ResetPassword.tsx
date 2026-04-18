@@ -80,6 +80,10 @@ export default function ResetPassword() {
         description: "You can now sign in with your new password.",
       });
       navigate("/login");
+    } catch (err) {
+      // P1-FIX-85: Handle network errors from updateUser
+      const msg = err instanceof Error ? err.message : "Network error";
+      toast.error("Failed to update password", { description: msg });
     } finally {
       setIsLoading(false);
     }

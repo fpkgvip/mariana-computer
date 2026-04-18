@@ -781,7 +781,10 @@ async def _require_investigation_owner(
 
     metadata = row.get("metadata") or {}
     if isinstance(metadata, str):
-        metadata = json.loads(metadata)
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
     if metadata.get("user_id") != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
     return current_user
@@ -890,7 +893,10 @@ async def _require_investigation_owner_header_or_query(
 
     metadata = row.get("metadata") or {}
     if isinstance(metadata, str):
-        metadata = json.loads(metadata)
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
     if metadata.get("user_id") != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
     return current_user
@@ -2036,14 +2042,22 @@ async def delete_investigation(
     _log = logger.bind(task_id=task_id, user_id=user_id)
 
     # Verify the investigation exists and belongs to this user
+    # P0-FIX-1: Use metadata->>'user_id' (canonical owner source) instead of
+    # the top-level user_id column, which can be empty for legacy rows.
     row = await pool.fetchrow(
-        "SELECT id, status, user_id FROM research_tasks WHERE id = $1",
+        "SELECT id, status, metadata FROM research_tasks WHERE id = $1",
         task_id,
     )
     if not row:
         raise HTTPException(status_code=404, detail="Investigation not found")
 
-    row_user_id = str(row["user_id"]).strip() if row["user_id"] else ""
+    metadata = row["metadata"] or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    row_user_id = str(metadata.get("user_id", "")).strip()
     # Allow deletion if: (a) user owns the task, (b) user is admin, or
     # (c) task has no recorded owner (legacy tasks created before user_id tracking).
     if row_user_id and row_user_id != user_id and user_id != ADMIN_USER_ID:
@@ -3053,9 +3067,15 @@ async def upload_investigation_files(
                     detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024*1024)}MB limit",
                 )
 
-            # Sanitize filename (keep only safe characters)
-            safe_name = re.sub(r"[^\w\-.]", "_", filename)
+            # P1-FIX-46: Sanitize filename — strip path components first,
+            # then reject dotfiles and traversal names.
+            safe_name = os.path.basename(re.sub(r"[^\w\-.]", "_", filename))
+            if not safe_name or safe_name.startswith(".") or safe_name in (".", ".."):
+                raise HTTPException(status_code=400, detail=f"Invalid filename: {filename!r}")
             dest = upload_dir / safe_name
+            # Ensure resolved path is within the upload directory
+            if not str(dest.resolve()).startswith(str(upload_dir.resolve())):
+                raise HTTPException(status_code=400, detail=f"Invalid filename: {filename!r}")
             dest.write_bytes(content)
 
             uploaded.append(UploadedFileInfo(
@@ -3148,8 +3168,13 @@ async def upload_pending_files(
                     detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024*1024)}MB limit",
                 )
 
-            safe_name = re.sub(r"[^\w\-.]", "_", filename)
+            # P1-FIX-46b: Same path-traversal protection as upload_investigation_files
+            safe_name = os.path.basename(re.sub(r"[^\w\-.]", "_", filename))
+            if not safe_name or safe_name.startswith(".") or safe_name in (".", ".."):
+                raise HTTPException(status_code=400, detail=f"Invalid filename: {filename!r}")
             dest = pending_dir / safe_name
+            if not str(dest.resolve()).startswith(str(pending_dir.resolve())):
+                raise HTTPException(status_code=400, detail=f"Invalid filename: {filename!r}")
             dest.write_bytes(content)
 
             uploaded.append(UploadedFileInfo(
@@ -4528,8 +4553,11 @@ async def delete_skill(
         raise HTTPException(status_code=404, detail=f"Skill {skill_id!r} not found")
     if skill.category == "built-in":
         raise HTTPException(status_code=403, detail="Cannot delete built-in skills")
-    if skill.owner_id and skill.owner_id != current_user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized to delete this skill")
+    # P0-FIX-6: Require explicit ownership match; don't allow deletion of
+    # orphaned skills (owner_id=None) by any user — only admin can clean those up.
+    if current_user["user_id"] != ADMIN_USER_ID:
+        if not skill.owner_id or skill.owner_id != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Not authorized to delete this skill")
 
     mgr.delete_skill(skill_id, owner_id=current_user["user_id"])
     return {"status": "deleted"}
@@ -4667,6 +4695,21 @@ async def submit_feedback(
 
     if body.event_type not in ("rating", "feedback", "correction", "preference"):
         raise HTTPException(status_code=400, detail="event_type must be one of: rating, feedback, correction, preference")
+
+    # P0-FIX-4: Verify the task belongs to the current user before accepting feedback.
+    if body.task_id:
+        row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", body.task_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Investigation not found")
+        if current_user["user_id"] != ADMIN_USER_ID:
+            meta = row.get("metadata") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except (json.JSONDecodeError, TypeError):
+                    meta = {}
+            if meta.get("user_id") != current_user["user_id"]:
+                raise HTTPException(status_code=403, detail="Not authorized to submit feedback for this investigation")
 
     event_id = await record_feedback(
         user_id=current_user["user_id"],

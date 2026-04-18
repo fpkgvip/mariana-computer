@@ -382,6 +382,15 @@ export default function Chat() {
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const seenStatusIds = useRef<Set<string>>(new Set());
 
+  // P1-FIX-21: Track mount state to bail out of async startSSE tasks after unmount,
+  // preventing a zombie EventSource from being created post-cleanup.
+  const mountedRef = useRef(true);
+
+  // P1-FIX-22: Monotonic switch generation counter. Every time a switch or start
+  // flow begins, we increment this and capture the current value; any async
+  // continuation whose captured generation is stale must bail out.
+  const switchGenerationRef = useRef(0);
+
   // Auto-scroll
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -687,7 +696,21 @@ export default function Chat() {
           if (cachedTimeline && cachedTimeline.length > 0) {
             setTimelineSteps(cachedTimeline);
           }
+          // P1-FIX-22: Bump generation before the async token fetch so a concurrent
+          // switch will cause this branch to bail out.
+          switchGenerationRef.current += 1;
+          const myGeneration = switchGenerationRef.current;
           const token2 = await getAccessToken();
+          // P1-FIX-21 / P1-FIX-22: Bail if unmounted, another switch began, or
+          // the conversation was swapped out while we awaited the token.
+          if (
+            !mountedRef.current ||
+            switchGenerationRef.current !== myGeneration ||
+            activeConversationIdRef.current !== conversationId
+          ) {
+            setConversationLoading(false);
+            return;
+          }
           if (token2) {
             startTimer(runningInv.created_at);
             startSSE(runningInv.task_id, token2);
@@ -769,8 +792,23 @@ export default function Chat() {
   /*  Auto-scroll on new messages                                     */
   /* ---------------------------------------------------------------- */
 
+  // P1-FIX-25: Only auto-scroll when the user is already near the bottom
+  // (within 150px). If they've scrolled up to read earlier content, new
+  // events must NOT yank the viewport back down. We read scroll position
+  // synchronously from the container ref; when the container hasn't mounted
+  // yet (first paint) we fall back to scrolling so the initial view anchors
+  // at the latest message.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const container = messagesContainerRef.current;
+    if (!container) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      return;
+    }
+    const distanceFromBottom =
+      container.scrollHeight - container.scrollTop - container.clientHeight;
+    if (distanceFromBottom <= 150) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
   }, [messages, timelineSteps]);
 
   /* ---------------------------------------------------------------- */
@@ -778,7 +816,13 @@ export default function Chat() {
   /* ---------------------------------------------------------------- */
 
   useEffect(() => {
+    // P1-FIX-21: Ensure mountedRef starts true on mount (handles React 18 StrictMode
+    // double-invocation — the second mount would otherwise inherit mountedRef=false
+    // from the first unmount).
+    mountedRef.current = true;
     return () => {
+      // P1-FIX-21: Flip mount flag first so any in-flight startSSE await can bail out.
+      mountedRef.current = false;
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
       if (eventSourceRef.current) eventSourceRef.current.close();
       if (timerRef.current) clearInterval(timerRef.current);
@@ -1262,6 +1306,11 @@ export default function Chat() {
 
   const startSSE = useCallback(
     async (taskId: string, token: string) => {
+      // P1-FIX-22: Capture the current generation at entry. Any rapid switch
+      // increments switchGenerationRef, causing this invocation to bail out
+      // of async continuations and avoid creating a zombie EventSource.
+      const myGeneration = switchGenerationRef.current;
+
       connectedTaskIdRef.current = taskId;
       // SEC-E3-R1-01: Mint a short-lived stream token instead of exposing
       // the full JWT in the SSE query string. The stream token is HMAC-signed,
@@ -1272,18 +1321,37 @@ export default function Chat() {
           method: "POST",
           headers: { Authorization: `Bearer ${token}` },
         });
+        // P1-FIX-21 / P1-FIX-22: After every await, verify the component is still
+        // mounted AND the switch generation is still current. If either changed,
+        // do NOT create an EventSource — it would leak past cleanup / duplicate.
+        if (!mountedRef.current || switchGenerationRef.current !== myGeneration) {
+          return;
+        }
         if (res.ok) {
           const data = await res.json();
+          // P1-FIX-21 / P1-FIX-22: Re-check after the second await (json parse).
+          if (!mountedRef.current || switchGenerationRef.current !== myGeneration) {
+            return;
+          }
           streamToken = data.stream_token;
         }
       } catch {
         // Fallback: use JWT directly (backward compat with older backends)
+        // P1-FIX-21 / P1-FIX-22: Even in the catch path we may have awaited — re-check.
+        if (!mountedRef.current || switchGenerationRef.current !== myGeneration) {
+          return;
+        }
       }
 
       // BUG-FE-C3 fix: After async stream-token mint, check if the user has
       // already switched to a different task. If so, bail out to avoid creating
       // a zombie EventSource for a stale task.
-      if (connectedTaskIdRef.current !== taskId) {
+      // P1-FIX-21 / P1-FIX-22: Also guard on mounted + generation.
+      if (
+        connectedTaskIdRef.current !== taskId ||
+        !mountedRef.current ||
+        switchGenerationRef.current !== myGeneration
+      ) {
         return;
       }
 
@@ -1566,10 +1634,26 @@ export default function Chat() {
           hasFailedOver = true;
           console.warn("[Chat] SSE connection error, falling back to polling.");
           es.close();
-          eventSourceRef.current = null;
+          // P1-FIX-21: Only null eventSourceRef.current if it STILL points at this
+          // specific EventSource instance. Without this identity check, an OLD
+          // EventSource whose onerror fires late can wipe a freshly-created
+          // EventSource stored by a subsequent startSSE call.
+          if (eventSourceRef.current === es) {
+            eventSourceRef.current = null;
+          }
           // BUG-R1-02: Fetch fresh token for polling fallover — the SSE token
           // may have been created some time ago and could be near expiry.
           const freshToken = await getAccessToken();
+          // P1-FIX-21 / P1-FIX-22: After await, bail if unmounted, generation
+          // changed, or another task took over.
+          if (
+            !mountedRef.current ||
+            switchGenerationRef.current !== myGeneration ||
+            connectedTaskIdRef.current !== taskId ||
+            activeTaskIdRef.current !== taskId
+          ) {
+            return;
+          }
           if (!freshToken) {
             // Token refresh failed — session expired
             stopAllConnections();
@@ -1643,8 +1727,19 @@ export default function Chat() {
       const inv = investigations.find((i) => i.task_id === taskId);
       if (inv && (inv.status === "RUNNING" || inv.status === "PENDING")) {
         setIsSending(true);
+        // P1-FIX-22: Bump the switch generation and capture it. If another
+        // switchInvestigation or loadConversationMessages runs before
+        // getAccessToken resolves, the captured generation will be stale and
+        // this callback will bail out — preventing two concurrent startSSE calls.
+        switchGenerationRef.current += 1;
+        const myGeneration = switchGenerationRef.current;
         getAccessToken().then((token) => {
-          if (activeTaskIdRef.current !== taskId) {
+          // P1-FIX-22: Bail if another switch has happened or we unmounted.
+          if (
+            !mountedRef.current ||
+            switchGenerationRef.current !== myGeneration ||
+            activeTaskIdRef.current !== taskId
+          ) {
             return;
           }
           if (token) {
@@ -1744,6 +1839,9 @@ export default function Chat() {
       toast.error("Not authenticated", {
         description: "Please sign in.",
       });
+      // P0-FIX-16: Reset isClassifying before navigating to prevent UI lock
+      // if navigation bounces or fails.
+      setIsClassifying(false);
       navigate("/login");
       return;
     }
@@ -2014,6 +2112,11 @@ export default function Chat() {
       setUploadedFiles([]);
       setUploadSessionUuid(null);
 
+      // P1-FIX-22: Bump switch generation so that any prior in-flight startSSE
+      // (from a previous investigation) that still has pending awaits will bail
+      // out when it resumes.
+      switchGenerationRef.current += 1;
+
       // Start timer and SSE
       startTimer(newInvestigation.created_at);
       startSSE(taskId, token);
@@ -2207,6 +2310,8 @@ export default function Chat() {
                 timelineStoreRef.current[activeTaskId] = [...timelineStepsRef.current];
               }
               stopAllConnections();
+              // P1-FIX-22: Bump generation to invalidate any in-flight startSSE.
+              switchGenerationRef.current += 1;
               setActiveTaskId(null);
               setActiveConversationId(null);
               setMessages([]);
@@ -2217,7 +2322,12 @@ export default function Chat() {
               setDontKillBranches(false);
               setUserFlowInstructions("");
               setUploadedFiles([]);
-              setUploadSessionUuid(null);
+              setUploadSessionUuid(null); // P1-FIX-39: reset upload session on new chat
+              // P1-FIX-34: Reset transient UI state on new chat.
+              setRetryPayload(null);
+              setIsClassifying(false);
+              isClassifyingRef.current = false;
+              setIsStopping(false);
               seenStatusIds.current.clear();
               setSidebarOpen(false);
             }}
@@ -2256,6 +2366,9 @@ export default function Chat() {
                         timelineStoreRef.current[activeTaskId] = [...timelineStepsRef.current];
                       }
                       stopAllConnections();
+                      // P1-FIX-22: Bump generation to invalidate any in-flight startSSE
+                      // from the previous conversation.
+                      switchGenerationRef.current += 1;
                       setActiveTaskId(null);
                       setActiveConversationId(conv.id);
                       setIsSending(false);
@@ -2263,8 +2376,15 @@ export default function Chat() {
                       setTimelineSteps([]);
                       setPendingPlan(null);
                       setUploadedFiles([]);
-                      setUploadSessionUuid(null);
+                      setUploadSessionUuid(null); // P1-FIX-39: reset upload session on conv switch
                       setElapsedSeconds(0);
+                      // P1-FIX-34: Reset transient UI state so a retry banner,
+                      // classify spinner, or stop-in-flight indicator from the
+                      // previous conversation does not bleed into the new one.
+                      setRetryPayload(null);
+                      setIsClassifying(false);
+                      isClassifyingRef.current = false;
+                      setIsStopping(false);
                       setConversationLoading(true); // Set BEFORE async call to prevent welcome screen flash
                       seenStatusIds.current.clear();
                       setSidebarOpen(false);
@@ -2292,15 +2412,28 @@ export default function Chat() {
                         if (res.ok || res.status === 204) {
                           setConversations((prev) => prev.filter((c) => c.id !== conv.id));
                           if (activeConversationId === conv.id) {
+                            // P1-FIX-35: Cancel any live SSE/polling for an
+                            // investigation running under the deleted conversation.
+                            // stopAllConnections() closes the EventSource and clears
+                            // poll intervals; bumping the generation invalidates any
+                            // in-flight startSSE awaits so they cannot resurrect.
                             stopAllConnections();
+                            switchGenerationRef.current += 1;
                             setActiveConversationId(null);
                             setActiveTaskId(null);
                             setMessages([]);
                             setTimelineSteps([]);
                             setPendingPlan(null);
                             setUploadedFiles([]);
-                            setUploadSessionUuid(null);
+                            setUploadSessionUuid(null); // P1-FIX-39: reset upload session
                             setElapsedSeconds(0);
+                            // P1-FIX-34: Reset transient UI state so the next
+                            // conversation starts clean.
+                            setRetryPayload(null);
+                            setIsClassifying(false);
+                            isClassifyingRef.current = false;
+                            setIsStopping(false);
+                            seenStatusIds.current.clear();
                           }
                           toast.success("Conversation deleted");
                         } else {

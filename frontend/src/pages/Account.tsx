@@ -79,6 +79,10 @@ export default function Account() {
       }
 
       const data: { portal_url: string } = await res.json();
+      // P1-FIX-82b: Guard against missing portal_url
+      if (!data.portal_url) {
+        throw new Error("No portal URL received from server");
+      }
       window.location.href = data.portal_url;
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";

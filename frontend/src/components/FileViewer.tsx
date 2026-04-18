@@ -110,14 +110,45 @@ function renderMarkdownContent(text: string): string {
   return html;
 }
 
+// P1-FIX-83: RFC-aware CSV field parser — handles quoted fields with commas.
+function parseCsvLine(line: string): string[] {
+  const fields: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (i + 1 < line.length && line[i + 1] === '"') {
+          current += '"';
+          i++; // skip escaped quote
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        current += ch;
+      }
+    } else {
+      if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === ",") {
+        fields.push(current.trim());
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
+  }
+  fields.push(current.trim());
+  return fields;
+}
+
 function CsvTable({ content }: { content: string }) {
-  const lines = content.trim().split("\n");
+  const lines = content.trim().split(/\r?\n/);
   if (lines.length === 0) return <p className="text-xs text-muted-foreground">Empty CSV</p>;
 
-  const headers = lines[0].split(",").map((h) => h.trim().replace(/^"|"$/g, ""));
-  const rows = lines.slice(1).map((line) =>
-    line.split(",").map((cell) => cell.trim().replace(/^"|"$/g, ""))
-  );
+  const headers = parseCsvLine(lines[0]);
+  const rows = lines.slice(1).filter(l => l.trim()).map(parseCsvLine);
 
   return (
     <div className="overflow-x-auto">
@@ -284,12 +315,14 @@ function FileContent({ file, apiUrl }: { file: FileAttachment; apiUrl: string })
   // Plain text
   if (isText && content != null) {
     if (ext === "html") {
+      // P0-FIX-2: Removed allow-same-origin from sandbox to prevent XSS.
+      // Uploaded HTML must not share origin with the app.
       return (
         <iframe
           srcDoc={content}
           title={file.filename}
           className="h-[600px] w-full rounded bg-white"
-          sandbox="allow-same-origin"
+          sandbox=""
         />
       );
     }
