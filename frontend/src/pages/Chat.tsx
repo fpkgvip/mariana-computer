@@ -1070,23 +1070,47 @@ export default function Chat() {
         // BUG-R15-03: Catch network-level rejections to prevent unhandled promise rejection
         .catch((err) => console.error("[Chat] Failed to update investigation status (network):", err));
 
-      // BUG-R13-01: When completing, re-fetch output paths from Supabase so the
-      // DOCX download button is correctly enabled even when the SSE event didn't
-      // carry the paths (only the poll response does).
-      if (status === "COMPLETED" && !extra?.output_docx_path) {
-        const { data: row } = await supabase
-          .from("investigations")
-          .select("output_pdf_path, output_docx_path")
-          .eq("task_id", taskId)
-          .single();
-        if (row && (row.output_pdf_path || row.output_docx_path)) {
-          setInvestigations((prev) =>
-            prev.map((inv) =>
-              inv.task_id === taskId
-                ? { ...inv, output_pdf_path: row.output_pdf_path, output_docx_path: row.output_docx_path }
-                : inv
-            )
-          );
+      // BUG-R13-01 + BUG-ZBA-05: When completing, re-fetch output paths.
+      // First try backend API (canonical source of truth for research_tasks),
+      // then fall back to Supabase investigations table.
+      // BUG-FE-110 fix: Check both PDF and DOCX paths — refetch if either is missing
+      const needRefetch = status === "COMPLETED" && (!extra?.output_pdf_path || !extra?.output_docx_path);
+      if (needRefetch) {
+        try {
+          const token = (await supabase.auth.getSession())?.data?.session?.access_token;
+          if (token) {
+            const res = await fetch(`${API_URL}/api/investigations/${taskId}`, {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            // BUG-FE-102 fix: throw on non-ok so Supabase fallback fires in catch
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            if (data.output_pdf_path || data.output_docx_path) {
+              setInvestigations((prev) =>
+                prev.map((inv) =>
+                  inv.task_id === taskId
+                    ? { ...inv, output_pdf_path: data.output_pdf_path, output_docx_path: data.output_docx_path }
+                    : inv
+                )
+              );
+            }
+          }
+        } catch {
+          // Fallback: try Supabase investigations table
+          const { data: row } = await supabase
+            .from("investigations")
+            .select("output_pdf_path, output_docx_path")
+            .eq("task_id", taskId)
+            .single();
+          if (row && (row.output_pdf_path || row.output_docx_path)) {
+            setInvestigations((prev) =>
+              prev.map((inv) =>
+                inv.task_id === taskId
+                  ? { ...inv, output_pdf_path: row.output_pdf_path, output_docx_path: row.output_docx_path }
+                  : inv
+              )
+            );
+          }
         }
       }
     },
@@ -1294,8 +1318,16 @@ export default function Chat() {
         }
       };
 
-      poll();
-      pollIntervalRef.current = setInterval(poll, 5000);
+      // BUG-FE-103 fix: Use self-rescheduling setTimeout instead of setInterval
+      // to prevent overlapping polls when a single poll() takes > 5 s.
+      const tick = async () => {
+        await poll();
+        // Only schedule next tick if this task is still the active connection
+        if (connectedTaskIdRef.current === taskId && activeTaskIdRef.current === taskId) {
+          pollIntervalRef.current = setTimeout(tick, 5000) as unknown as ReturnType<typeof setInterval>;
+        }
+      };
+      tick();
     },
     [appendMessage, navigate, persistMessage, refreshUser, stopAllConnections, updateInvestigationStatus]
   );
@@ -1946,8 +1978,11 @@ export default function Chat() {
     }
 
     // BUG-FE-C2 fix: end of try/finally wrapper
+    // BUG-FE-101 fix: ALWAYS reset both the ref AND the state in finally.
+    // Without setIsClassifying(false) here, a hanging fetch permanently locks the UI.
     } finally {
       isClassifyingRef.current = false;
+      setIsClassifying(false);
     }
   // BUG-C3-06 fix: startInvestigation accessed via startInvestigationRef.current
   // so handleSend always calls the latest version (avoids stale uploadSessionUuid).
@@ -2073,6 +2108,9 @@ export default function Chat() {
       };
 
       setInvestigations((prev) => [newInvestigation, ...prev]);
+      // BUG-FE-106 fix: Set ref synchronously BEFORE startSSE so early SSE events
+      // are not dropped by the activeTaskIdRef guard in the SSE handler.
+      activeTaskIdRef.current = taskId;
       setActiveTaskId(taskId);
 
       // BUG-005: Guard against null user before Supabase insert
@@ -2370,6 +2408,9 @@ export default function Chat() {
                       // from the previous conversation.
                       switchGenerationRef.current += 1;
                       setActiveTaskId(null);
+                      // BUG-FE-130 fix: Set ref synchronously before loadConversationMessages
+                      // so the guard inside loadConversationMessages sees the correct conversationId.
+                      activeConversationIdRef.current = conv.id;
                       setActiveConversationId(conv.id);
                       setIsSending(false);
                       setMessages([]);
@@ -2987,7 +3028,8 @@ export default function Chat() {
                   </div>
                 ) : (
                   <p className="text-xs text-muted-foreground">
-                    Research findings are displayed above.
+                    Report is being generated or was not produced for this investigation.
+                    Check the conversation above for findings.
                   </p>
                 )}
               </div>

@@ -1223,7 +1223,11 @@ If they ask what you can do, explain you're an AI that can have normal conversat
             )
             resp.raise_for_status()
             data = resp.json()
-            raw = data["choices"][0]["message"]["content"].strip()
+            # BUG-API-046: Guard against empty/missing choices from LLM gateway
+            choices = data.get("choices") or []
+            if not choices or not choices[0].get("message", {}).get("content"):
+                raise ValueError("LLM gateway returned empty choices")
+            raw = choices[0]["message"]["content"].strip()
 
             # Parse the JSON response from the LLM
             import json as _json  # noqa: PLC0415
@@ -1902,7 +1906,10 @@ async def get_investigation(
     # Verify ownership
     metadata = row.get("metadata") or {}
     if isinstance(metadata, str):
-        metadata = json.loads(metadata)
+        try:  # BUG-API-036: Guard against malformed JSON in metadata
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
     task_user_id = metadata.get("user_id", "")
     if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
@@ -1926,6 +1933,7 @@ async def kill_investigation(
     on its next loop iteration.
     """
     db = _get_db()
+    task_id = _validate_task_id(task_id)  # BUG-API-001: reject non-UUID before DB
 
     # BUG-S3-01 fix: Verify ownership before allowing kill.
     row = await db.fetchrow(
@@ -1936,7 +1944,10 @@ async def kill_investigation(
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
     metadata = row.get("metadata") or {}
     if isinstance(metadata, str):
-        metadata = json.loads(metadata)
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
     task_user_id = metadata.get("user_id", "")
     if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
@@ -1985,20 +1996,32 @@ async def stop_investigation(
     to finish rather than interrupting mid-cycle.
     """
     db = _get_db()
+    task_id = _validate_task_id(task_id)  # BUG-API-001: reject non-UUID before DB
 
     # Verify ownership
     row = await db.fetchrow(
-        "SELECT metadata FROM research_tasks WHERE id = $1",
+        "SELECT metadata, status FROM research_tasks WHERE id = $1",
         task_id,
     )
     if row is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
     metadata = row.get("metadata") or {}
     if isinstance(metadata, str):
-        metadata = json.loads(metadata)
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
     task_user_id = metadata.get("user_id", "")
     if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
+
+    # BUG-API-011: Return 409 when task is already in a terminal state (matches kill_investigation behavior)
+    current_status = row.get("status", "")
+    if current_status not in ("RUNNING", "PENDING"):
+        return KillTaskResponse(
+            message=f"Investigation is already {current_status}; stop signal is a no-op",
+            task_id=task_id,
+        )
 
     # Set the Redis stop flag with a 24-hour TTL so the event loop
     # will not restart the continuous loop on its next HALT.
@@ -2039,6 +2062,7 @@ async def delete_investigation(
     """
     pool = _get_db()
     user_id = current_user["user_id"]
+    task_id = _validate_task_id(task_id)  # BUG-API-001: reject non-UUID before DB
     _log = logger.bind(task_id=task_id, user_id=user_id)
 
     # Verify the investigation exists and belongs to this user
@@ -2058,9 +2082,9 @@ async def delete_investigation(
         except (json.JSONDecodeError, TypeError):
             metadata = {}
     row_user_id = str(metadata.get("user_id", "")).strip()
-    # Allow deletion if: (a) user owns the task, (b) user is admin, or
-    # (c) task has no recorded owner (legacy tasks created before user_id tracking).
-    if row_user_id and row_user_id != user_id and user_id != ADMIN_USER_ID:
+    # BUG-API-017 fix: Treat missing owner as admin-only. Previously, empty
+    # user_id let anyone delete legacy tasks.
+    if user_id != ADMIN_USER_ID and row_user_id != user_id:
         raise HTTPException(status_code=403, detail="Not authorized to delete this investigation")
 
     # If still running, kill it first
@@ -2243,7 +2267,8 @@ async def get_cost_breakdown(
         """,
         task_id,
     )
-    per_model = {r["model_used"]: float(r["total_cost"] or 0.0) for r in model_rows}
+    # BUG-API-044: model_used may be NULL — use "unknown" as key to avoid JSON serialization error
+    per_model = {(r["model_used"] or "unknown"): float(r["total_cost"] or 0.0) for r in model_rows}
 
     # Per-branch breakdown
     branch_rows = await db.fetch(
@@ -2653,7 +2678,8 @@ async def stream_logs(
                         pass  # Transient DB issue — skip re-check
                     last_auth_check = time.monotonic()
                 row = await db.fetchrow(
-                    "SELECT status, current_state, total_spent_usd "
+                    "SELECT status, current_state, total_spent_usd, "
+                    "output_pdf_path, output_docx_path "
                     "FROM research_tasks WHERE id = $1",
                     task_id,
                 )
@@ -2672,13 +2698,20 @@ async def stream_logs(
                             "status": row["status"],
                             "state": current_state,
                             "total_spent_usd": float(row["total_spent_usd"] or 0.0),
+                            "output_pdf_path": row.get("output_pdf_path"),
+                            "output_docx_path": row.get("output_docx_path"),
                             "ts": datetime.now(tz=timezone.utc).isoformat(),
                         }),
                         "event": "state_change",
                     }
                 if row["status"] in ("COMPLETED", "FAILED", "HALTED"):
                     yield {
-                        "data": json.dumps({"task_id": task_id, "final_status": row["status"]}),
+                        "data": json.dumps({
+                            "task_id": task_id,
+                            "final_status": row["status"],
+                            "output_pdf_path": row.get("output_pdf_path"),
+                            "output_docx_path": row.get("output_docx_path"),
+                        }),
                         "event": "done",
                     }
                     break
@@ -2844,6 +2877,7 @@ async def list_investigation_files(
     """List all files (analysis, data, snapshots) produced by an investigation."""
     cfg = _get_config()
     db = _get_db()
+    task_id = _validate_task_id(task_id)  # BUG-API-001: reject non-UUID before DB/Path
 
     # Verify user owns the investigation
     row = await db.fetchrow(
@@ -2855,7 +2889,10 @@ async def list_investigation_files(
 
     metadata = row.get("metadata") or {}
     if isinstance(metadata, str):
-        metadata = json.loads(metadata)
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
     task_user_id = metadata.get("user_id", "")
     if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
@@ -2866,15 +2903,18 @@ async def list_investigation_files(
 
     result: list[FileAttachmentInfo] = []
     for f in sorted(files_dir.iterdir()):
-        if f.is_file():
-            stat = f.stat()
-            suffix = f.suffix.lower()
-            result.append(FileAttachmentInfo(
-                filename=f.name,
-                size=stat.st_size,
-                mime=_MIME_MAP.get(suffix, "application/octet-stream"),
-                created_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
-            ))
+        try:  # BUG-API-037: guard against OSError if file vanishes between iterdir() and stat()
+            if f.is_file():
+                stat = f.stat()
+                suffix = f.suffix.lower()
+                result.append(FileAttachmentInfo(
+                    filename=f.name,
+                    size=stat.st_size,
+                    mime=_MIME_MAP.get(suffix, "application/octet-stream"),
+                    created_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                ))
+        except OSError:
+            continue  # file disappeared between iterdir() and stat()
     return result
 
 
@@ -2891,6 +2931,7 @@ async def download_investigation_file(
     """Download a specific file from an investigation's artifacts."""
     cfg = _get_config()
     db = _get_db()
+    task_id = _validate_task_id(task_id)  # BUG-API-001: reject non-UUID before DB/Path
 
     # Verify user owns the investigation
     row = await db.fetchrow(
@@ -2902,7 +2943,10 @@ async def download_investigation_file(
 
     metadata = row.get("metadata") or {}
     if isinstance(metadata, str):
-        metadata = json.loads(metadata)
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
     task_user_id = metadata.get("user_id", "")
     if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
@@ -2987,6 +3031,18 @@ class UploadResponse(BaseModel):
     session_uuid: str | None = None
 
 
+def _validate_task_id(task_id: str) -> str:
+    """Validate that a task_id is a proper UUID.  Raises 400 otherwise.
+
+    BUG-API-001 fix: Several task-scoped endpoints passed raw task_id to
+    asyncpg without UUID validation, causing 500 on malformed inputs.
+    """
+    try:
+        return str(uuid.UUID(task_id))
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid task ID format") from exc
+
+
 def _validate_upload_session_uuid(session_uuid: str) -> str:
     """Validate and normalize a pending-upload session UUID."""
     try:
@@ -3013,6 +3069,7 @@ async def upload_investigation_files(
     """
     cfg = _get_config()
     db = _get_db()
+    task_id = _validate_task_id(task_id)  # BUG-API-001: reject non-UUID before DB/Path
 
     # Verify user owns the investigation
     row = await db.fetchrow(
@@ -3024,7 +3081,10 @@ async def upload_investigation_files(
 
     metadata = row.get("metadata") or {}
     if isinstance(metadata, str):
-        metadata = json.loads(metadata)
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
     task_user_id = metadata.get("user_id", "")
     if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
@@ -3508,6 +3568,9 @@ async def create_checkout(
         user_id=current_user["user_id"],
         plan_id=body.plan_id,
     )
+    # BUG-API-004: Stripe can return null session.url in edge cases
+    if not session.url:
+        raise HTTPException(status_code=502, detail="Stripe did not return a checkout URL")
     return CreateCheckoutResponse(
         checkout_url=session.url,
         session_id=session.id,
@@ -3559,7 +3622,9 @@ async def stripe_webhook(request: Request) -> JSONResponse:
         raise HTTPException(status_code=400, detail="Webhook parse error") from exc
 
     event_id: str | None = event.get("id")
-    event_type: str = event["type"]
+    event_type: str | None = event.get("type")  # BUG-API-029: use .get() to avoid KeyError on malformed webhooks
+    if not event_type:
+        raise HTTPException(status_code=400, detail="Webhook event missing type")
     log = logger.bind(event_type=event_type, event_id=event_id)
 
     if not event_id:
@@ -3608,9 +3673,14 @@ async def stripe_webhook(request: Request) -> JSONResponse:
             content={"status": "handler_error_retriable"},
         )
     except Exception as exc:  # noqa: BLE001
-        log.error("stripe_webhook_handler_failed", error=str(exc))
-        # Return 200 to prevent Stripe from retrying a handler bug
-        return JSONResponse(content={"status": "handler_error", "error": str(exc)})
+        log.error("stripe_webhook_handler_failed", error=str(exc), exc_info=True)
+        # BUG-API-019 fix: Return 500 so Stripe retries.  Idempotency guard
+        # (_record_webhook_event_once) prevents double-processing on retry.
+        # Returning 200 on handler errors silently lost credits.
+        return JSONResponse(
+            status_code=500,
+            content={"status": "handler_error", "error": str(exc)},
+        )
 
     return JSONResponse(content={"status": "ok"})
 
@@ -3653,6 +3723,9 @@ async def billing_portal(
         raise HTTPException(status_code=502, detail=f"Stripe error: {exc}") from exc
 
     logger.info("portal_session_created", user_id=user_id)
+    # BUG-API-004: Stripe can return null portal_session.url
+    if not portal_session.url:
+        raise HTTPException(status_code=502, detail="Stripe did not return a portal URL")
     return BillingPortalResponse(portal_url=portal_session.url)
 
 
@@ -3666,11 +3739,13 @@ async def _handle_checkout_completed(
     cfg: AppConfig,
 ) -> None:
     """Process checkout.session.completed: link Stripe customer, add credits."""
+    # BUG-API-043: Stripe may return metadata: null; guard with `or {}`
+    _meta = session_obj.get("metadata") or {}
     user_id: str | None = (
-        session_obj.get("metadata", {}).get("user_id")
+        _meta.get("user_id")
         or session_obj.get("client_reference_id")
     )
-    plan_id: str | None = session_obj.get("metadata", {}).get("plan_id")
+    plan_id: str | None = _meta.get("plan_id")
     stripe_customer_id: str | None = session_obj.get("customer")
     subscription_id: str | None = session_obj.get("subscription")
 
@@ -3687,9 +3762,12 @@ async def _handle_checkout_completed(
     if subscription_id:
         try:
             sub = _stripe.Subscription.retrieve(subscription_id)
-            period_end = datetime.fromtimestamp(
-                sub["current_period_end"], tz=timezone.utc
-            ).isoformat()
+            # BUG-API-021: Use .get() to avoid KeyError on missing field
+            period_end_ts = sub.get("current_period_end")
+            if period_end_ts:
+                period_end = datetime.fromtimestamp(
+                    period_end_ts, tz=timezone.utc
+                ).isoformat()
         except Exception as exc:  # noqa: BLE001
             logger.warning("subscription_retrieve_failed", error=str(exc))
 
@@ -3818,6 +3896,12 @@ async def _supabase_patch_profile(
                 status=resp.status_code,
                 body=resp.text[:200],
             )
+            # BUG-API-020 fix: Raise so the webhook handler can return 500
+            # and Stripe retries, instead of silently losing profile updates.
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase profile patch failed ({resp.status_code})",
+            )
 
 
 async def _supabase_patch_profile_by_customer(
@@ -3848,6 +3932,11 @@ async def _supabase_patch_profile_by_customer(
                 stripe_customer_id=stripe_customer_id,
                 status=resp.status_code,
                 body=resp.text[:200],
+            )
+            # BUG-API-020 fix: Raise so the webhook handler returns 500 and Stripe retries
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase patch by customer failed ({resp.status_code})",
             )
 
 
@@ -4698,7 +4787,8 @@ async def submit_feedback(
 
     # P0-FIX-4: Verify the task belongs to the current user before accepting feedback.
     if body.task_id:
-        row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", body.task_id)
+        validated_task_id = _validate_task_id(body.task_id)  # BUG-API-001
+        row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", validated_task_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Investigation not found")
         if current_user["user_id"] != ADMIN_USER_ID:

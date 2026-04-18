@@ -14,12 +14,12 @@ const API_URL = import.meta.env.VITE_API_URL ?? "";
 interface PlanRow {
   id: string;
   name: string;
-  price_usd: number;
-  credits_per_month: number;
-  features: string[] | null;
+  price_monthly: number;
+  credits_monthly: number;
+  features: Record<string, unknown> | string[] | null;
   sort_order: number;
   is_public: boolean;
-  coming_soon?: boolean;
+  coming_soon: boolean;
 }
 
 export default function Checkout() {
@@ -42,7 +42,7 @@ export default function Checkout() {
     const loadPlans = async () => {
       const { data, error } = await supabase
         .from("plans")
-        .select("id, name, price_usd, credits_per_month, features, sort_order, is_public, coming_soon")
+        .select("id, name, price_monthly, credits_monthly, features, sort_order, is_public, coming_soon")
         .eq("is_public", true)
         .order("sort_order");
 
@@ -144,32 +144,44 @@ export default function Checkout() {
                       {plan.name}
                     </p>
                     <h2 className="mt-3 font-serif text-3xl font-semibold text-foreground">
-                      ${plan.price_usd.toLocaleString()}
+                      ${plan.price_monthly.toLocaleString()}
                       <span className="text-base font-normal text-muted-foreground">/month</span>
                     </h2>
                     <p className="mt-1 text-sm text-muted-foreground">
-                      {plan.credits_per_month.toLocaleString()} credits/month
+                      {plan.credits_monthly.toLocaleString()} credits/month
                     </p>
 
                     <div className="my-5 border-t border-border" />
 
-                    {plan.features && plan.features.length > 0 && (
-                      <ul className="flex-1 space-y-2.5">
-                        {plan.features.map((feature) => (
-                          <li
-                            key={feature}
-                            className="flex items-start gap-2.5 text-[14px] text-foreground"
-                          >
-                            <Check
-                              size={14}
-                              className="mt-0.5 shrink-0 text-accent"
-                              strokeWidth={2}
-                            />
-                            {feature}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
+                    {plan.features && (() => {
+                      // Features may be a string[] or a JSONB object — normalise to string[]
+                      const featureList: string[] = Array.isArray(plan.features)
+                        ? plan.features
+                        : Object.entries(plan.features as Record<string, unknown>)
+                            .filter(([, v]) => v !== false && v !== null && v !== undefined)
+                            .map(([k, v]) => {
+                              const label = k.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+                              if (v === true) return label;
+                              return `${label}: ${String(v)}`;
+                            });
+                      return featureList.length > 0 ? (
+                        <ul className="flex-1 space-y-2.5">
+                          {featureList.map((feature) => (
+                            <li
+                              key={feature}
+                              className="flex items-start gap-2.5 text-[14px] text-foreground"
+                            >
+                              <Check
+                                size={14}
+                                className="mt-0.5 shrink-0 text-accent"
+                                strokeWidth={2}
+                              />
+                              {feature}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null;
+                    })()}
 
                     {plan.coming_soon ? (
                       <div className="mt-6 flex w-full items-center justify-center gap-2 rounded-md border border-border px-4 py-2.5 text-sm font-medium text-muted-foreground cursor-not-allowed">

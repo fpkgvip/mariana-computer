@@ -670,15 +670,28 @@ def _apply_guards(
                 return State.REPORT, actions
 
         if trigger == TransitionTrigger.SKEPTIC_CRITICAL_OPEN:
-            # User directive: force report even with critical open questions
-            if session_data.force_report_on_halt:
+            # BUG-ZBA-01 fix: ALWAYS generate a report when findings exist,
+            # even if critical questions remain open.  The old behaviour skipped
+            # REPORT entirely, marking the task COMPLETED with no PDF — wasting
+            # the user's time and budget.  A partial report with caveats is
+            # infinitely better than no deliverable at all.
+            has_findings = bool(session_data.recent_findings)
+            if has_findings or session_data.force_report_on_halt:
+                reason = "forced_by_user" if session_data.force_report_on_halt else "critical_open_partial"
                 logger.info(
-                    "user_directive_force_report_on_critical_open",
+                    "generating_report_despite_critical_open",
                     state=current_state.value,
+                    reason=reason,
+                    finding_count=len(session_data.recent_findings),
                 )
-                actions.append(Action("GENERATE_REPORT", {"reason": "forced_by_user", "partial": True}))
+                actions.append(Action("GENERATE_REPORT", {"reason": reason, "partial": True}))
                 return State.REPORT, actions
-            actions.append(Action("HALT", {"reason": "critical_open_questions"}))
+            # No findings at all — nothing to report
+            logger.warning(
+                "halt_without_report_no_findings",
+                state=current_state.value,
+            )
+            actions.append(Action("HALT", {"reason": "critical_open_no_findings"}))
             return State.HALT, actions
 
     # ------------------------------------------------------------------

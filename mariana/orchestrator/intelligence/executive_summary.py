@@ -33,7 +33,7 @@ logger = structlog.get_logger(__name__)
 class OneLinerOutput(BaseModel):
     """The single most important insight."""
     one_liner: str = Field(
-        ..., min_length=10, max_length=300,
+        ..., min_length=10, max_length=1000,
         description="Single sentence capturing THE key insight",
     )
     confidence: float = Field(
@@ -45,7 +45,7 @@ class OneLinerOutput(BaseModel):
 class ParagraphSummaryOutput(BaseModel):
     """Top 3-5 insights in paragraph form."""
     summary: str = Field(
-        ..., min_length=100, max_length=2000,
+        ..., min_length=50, max_length=5000,
         description="Paragraph-length summary of the top insights",
     )
     key_points: list[str] = Field(
@@ -57,7 +57,7 @@ class ParagraphSummaryOutput(BaseModel):
 class PageSummaryOutput(BaseModel):
     """Full page summary with citations."""
     summary: str = Field(
-        ..., min_length=500, max_length=10000,
+        ..., min_length=100, max_length=50000,
         description="Page-length summary with structured sections and citations",
     )
     sections: list[str] = Field(

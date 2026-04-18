@@ -642,7 +642,12 @@ async def run(
 
                 # Run before_report on halt ONLY if we didn't come from
                 # REPORT state (handle_report already called before_report).
-                if _prev_state != State.REPORT:
+                # BUG-AUD-15 fix: Also skip when there are zero findings — no point
+                # running perspective synthesis + exec summary on nothing.
+                _halt_finding_count = await db.fetchval(
+                    "SELECT COUNT(*) FROM findings WHERE task_id = $1", task.id
+                )
+                if _prev_state != State.REPORT and _halt_finding_count > 0:
                     try:
                         from mariana.orchestrator.intelligence.engine import before_report as _intel_halt_report  # noqa: PLC0415
                         _halt_report = await _intel_halt_report(
@@ -660,8 +665,10 @@ async def run(
                         })
                     except Exception as _intel_exc:
                         log.warning("intelligence_before_report_on_halt_failed", error=str(_intel_exc))
-                else:
+                elif _prev_state == State.REPORT:
                     log.info("before_report_on_halt_skipped", reason="already_ran_in_handle_report")
+                else:
+                    log.info("before_report_on_halt_skipped", reason="zero_findings")
 
             # --------------------------------------------------------- #
             # 6. Continuous mode: restart instead of halting
@@ -696,6 +703,9 @@ async def run(
                     task.current_state = State.INIT
                     task.status = TaskStatus.RUNNING
                     iteration = 0  # reset iteration counter
+                    # BUG-AUD-21 fix: Reset finalization_mode so budget checks
+                    # are enforced again on the new continuous-mode cycle.
+                    cost_tracker.finalization_mode = False
                     _sync_cost(task, cost_tracker)
                     await _persist_task(task, db)
                     await asyncio.sleep(0)
@@ -713,6 +723,37 @@ async def run(
         # -------------------------------------------------------------- #
         # Loop exit
         # -------------------------------------------------------------- #
+
+        # BUG-ZBA-02 safety net: If we're at HALT without a PDF and the task
+        # has findings, force report generation now.  This catches any code
+        # path (budget exhaustion, max iterations, unknown triggers) that
+        # skipped the REPORT state despite having research output.
+        # BUG-AUD-03 fix: Also run safety net for HALTED tasks (e.g. user pressed
+        # Stop). Only skip for FAILED, which indicates an unrecoverable error.
+        if (
+            task.current_state == State.HALT
+            and not task.output_pdf_path
+            and task.status != TaskStatus.FAILED
+        ):
+            _finding_count = await db.fetchval(
+                "SELECT COUNT(*) FROM findings WHERE task_id = $1",
+                task.id,
+            )
+            if _finding_count and _finding_count > 0:
+                log.warning(
+                    "safety_net_forcing_report",
+                    task_id=task.id,
+                    finding_count=_finding_count,
+                    reason="halt_without_pdf",
+                )
+                cost_tracker.finalization_mode = True
+                try:
+                    session_data = await _build_session_data(task, db)
+                    await handle_report(task, session_data, cost_tracker, db, redis_client, config)
+                    log.info("safety_net_report_generated", task_id=task.id, pdf=task.output_pdf_path)
+                except Exception as _report_exc:
+                    log.error("safety_net_report_failed", error=str(_report_exc))
+
         # Check HALT state before iteration limit (BUG-004)
         if task.current_state == State.HALT:
             # Only mark COMPLETED if not already explicitly HALTED (e.g. by SIGTERM handler)
@@ -778,6 +819,22 @@ async def run(
             cap=exc.cap,
         )
         await _emergency_checkpoint(task, cost_tracker, db, data_root)
+
+        # BUG-ZBA-02b: Even on budget exhaustion, try to produce a report
+        # if findings exist.  The user's credits are spent — they deserve output.
+        if not task.output_pdf_path:
+            try:
+                _finding_count = await db.fetchval(
+                    "SELECT COUNT(*) FROM findings WHERE task_id = $1", task.id,
+                )
+                if _finding_count and _finding_count > 0:
+                    log.info("budget_exhausted_forcing_report", finding_count=_finding_count)
+                    cost_tracker.finalization_mode = True
+                    session_data = await _build_session_data(task, db)
+                    await handle_report(task, session_data, cost_tracker, db, redis_client, config)
+            except Exception as _report_exc:
+                log.error("budget_exhausted_report_failed", error=str(_report_exc))
+
         task.status = TaskStatus.HALTED
         task.error_message = str(exc)
         task.completed_at = datetime.now(timezone.utc)
@@ -970,7 +1027,9 @@ async def _trigger_for_checkpoint(
     if len(high_conf) >= _STRONG_FINDINGS_MIN_COUNT:
         return TransitionTrigger.STRONG_FINDINGS_EXIST
 
-    # No active branches → pivot or halt
+    # BUG-AUD-05 fix: Check not-active BEFORE DR flags. Previously, nonzero
+    # diminishing_flags with zero active branches could route to SEARCH with
+    # nothing to search, creating a no-op loop until _MAX_ITERATIONS.
     if not active:
         return TransitionTrigger.ALL_BRANCHES_EXHAUSTED
 
@@ -1552,7 +1611,11 @@ async def handle_search(
     if _active_branches:
         await asyncio.gather(*[_extract_branch(b) for b in _active_branches])
     if _budget_exhausted:
-        raise BudgetExhaustedError("Budget exhausted during parallel evidence extraction")
+        raise BudgetExhaustedError(
+            scope="task",
+            spent=cost_tracker.total_spent,
+            cap=cost_tracker.task_budget,
+        )
 
     log.info("search_batch_complete", branches_searched=len(_active_branches))
 
@@ -2034,11 +2097,17 @@ async def handle_tribunal(
     })
 
     # Find the highest-confidence finding to put on trial
+    # BUG-AUD-25 fix: Exclude findings that already have a tribunal session
+    # to prevent the same finding from being retried repeatedly.
     top_finding = await db.fetchrow(
         """
-        SELECT id, hypothesis_id FROM findings
-        WHERE task_id = $1
-        ORDER BY confidence DESC
+        SELECT f.id, f.hypothesis_id FROM findings f
+        WHERE f.task_id = $1
+          AND NOT EXISTS (
+            SELECT 1 FROM tribunal_sessions ts
+            WHERE ts.finding_id = f.id AND ts.task_id = $1
+          )
+        ORDER BY f.confidence DESC
         LIMIT 1
         """,
         task.id,
@@ -2483,14 +2552,20 @@ async def handle_report(
 
     # Fetch confirmed / high-confidence findings for the report
     # BUG-047: include metadata column
+    # BUG-AUD-24 fix: Exclude findings that were DESTROYED by tribunal and
+    # filter to confidence >= 0.3 to avoid feeding low-quality scraps to the
+    # drafting LLM. LEFT JOIN ensures findings with no tribunal session pass.
     finding_rows = await db.fetch(
         """
-        SELECT id, task_id, hypothesis_id, content, content_en, content_language,
-               source_ids, confidence, evidence_type, is_compressed,
-               raw_content_path, created_at, metadata
-        FROM findings
-        WHERE task_id = $1
-        ORDER BY confidence DESC
+        SELECT f.id, f.task_id, f.hypothesis_id, f.content, f.content_en,
+               f.content_language, f.source_ids, f.confidence, f.evidence_type,
+               f.is_compressed, f.raw_content_path, f.created_at, f.metadata
+        FROM findings f
+        LEFT JOIN tribunal_sessions ts ON ts.finding_id = f.id AND ts.task_id = f.task_id
+        WHERE f.task_id = $1
+          AND f.confidence >= 0.3
+          AND (ts.verdict IS NULL OR ts.verdict != 'DESTROYED')
+        ORDER BY f.confidence DESC
         """,
         task.id,
     )
@@ -2603,6 +2678,16 @@ async def _execute_action(
                     # and pivot hypothesis generation to be silently dropped.  Pivots need
                     # new hypotheses and branches just like INIT, so handle_init() is correct.
                     await handle_init(task, session_data, cost_tracker, db, redis_client, config)
+                case State.CHECKPOINT:
+                    # BUG-AUD-02 fix: CHECKPOINT+STRONG_FINDINGS_EXIST with skip_tribunal
+                    # emits SPAWN_AI(task_type='SKEPTIC_QUESTIONS'), but task.current_state
+                    # is still CHECKPOINT when actions execute (state advances after all
+                    # actions complete). Without this case, SKEPTIC_QUESTIONS from CHECKPOINT
+                    # fell through to the '_' wildcard and was silently dropped.
+                    if task_type_str == "SKEPTIC_QUESTIONS":
+                        await handle_skeptic(task, session_data, cost_tracker, db, redis_client, config)
+                    else:
+                        log.warning("spawn_ai_unexpected_checkpoint_task", task_type=task_type_str)
                 case State.TRIBUNAL:
                     # BUG-R4-02 fix: TRIBUNAL+TRIBUNAL_CONFIRMED emits SPAWN_AI with
                     # task_type='SKEPTIC_QUESTIONS', but task.current_state is still TRIBUNAL
@@ -2809,12 +2894,14 @@ async def _persist_task(task: ResearchTask, db: Any) -> None:
     event loop itself sets HALTED (via kill check, budget exhaustion, or
     shutdown), the guard passes because in-memory status is already HALTED.
     """
-    # If in-memory status is not HALTED/COMPLETED/FAILED, don't overwrite
-    # an externally-set terminal status in the DB.
-    if task.status == TaskStatus.RUNNING:
-        where_clause = "WHERE id = $12 AND status != 'HALTED'"
-    else:
+    # BUG-AUD-16 fix: Always protect against overwriting an externally-set
+    # HALTED, unless we are intentionally writing HALTED or FAILED ourselves.
+    # Previously, COMPLETED could overwrite HALTED if the kill API set it
+    # between the event loop's last DB poll and the final persist.
+    if task.status in (TaskStatus.HALTED, TaskStatus.FAILED):
         where_clause = "WHERE id = $12"
+    else:
+        where_clause = "WHERE id = $12 AND status != 'HALTED'"
 
     await db.execute(
         f"""

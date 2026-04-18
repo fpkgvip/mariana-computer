@@ -724,7 +724,7 @@ class EvidenceExtractionOutput(BaseModel):
 
     hypothesis_addressed: str = Field(..., min_length=1, description="Hypothesis statement being evaluated")
     evidence_items: list[EvidenceItem] = Field(default_factory=list)
-    page_summary: str = Field(..., min_length=1, max_length=4096, description="Short summary of the page")
+    page_summary: str = Field(..., min_length=1, max_length=16384, description="Short summary of the page")
     page_relevance_score: float = Field(
         ...,
         ge=0.0,
@@ -886,13 +886,13 @@ class ReportDraftOutput(BaseModel):
 
     title_en: str = Field(..., min_length=1, max_length=512)
     title_zh: str = Field(..., min_length=1, max_length=512)
-    executive_summary_en: str = Field(..., min_length=50, max_length=8192)
-    executive_summary_zh: str = Field(..., min_length=50, max_length=8192)
+    executive_summary_en: str = Field(..., min_length=50, max_length=32768)
+    executive_summary_zh: str = Field(..., min_length=50, max_length=32768)
     sections: list[ReportSection] = Field(..., min_length=1)
-    conclusion_en: str = Field(..., min_length=50, max_length=4096)
-    conclusion_zh: str = Field(..., min_length=50, max_length=4096)
-    disclaimer_en: str = Field(..., min_length=10, max_length=2048)
-    disclaimer_zh: str = Field(..., min_length=10, max_length=2048)
+    conclusion_en: str = Field(..., min_length=50, max_length=16384)
+    conclusion_zh: str = Field(..., min_length=50, max_length=16384)
+    disclaimer_en: str = Field(..., min_length=10, max_length=4096)
+    disclaimer_zh: str = Field(..., min_length=10, max_length=4096)
 
 
 class WatchdogOutput(BaseModel):

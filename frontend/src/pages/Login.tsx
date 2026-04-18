@@ -10,6 +10,7 @@ export default function Login() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [isResetting, setIsResetting] = useState(false); // BUG-FE-104
   const { login } = useAuth();
   const navigate = useNavigate();
 
@@ -17,7 +18,8 @@ export default function Login() {
     e.preventDefault();
     setIsLoading(true);
     try {
-      await login(email, password);
+      // BUG-FE-140: Trim whitespace from email to prevent auth failures on paste
+      await login(email.trim(), password);
       navigate("/chat");
     } catch {
       // Error toast already shown by AuthContext.login()
@@ -26,20 +28,28 @@ export default function Login() {
     }
   };
 
+  // BUG-FE-104 fix: Add loading state, error trapping, and double-click guard
   const handleForgot = async () => {
-    if (!email) {
-      toast.info("Enter your email address above, then click Forgot password.");
+    if (!email || isResetting) {
+      if (!email) toast.info("Enter your email address above, then click Forgot password.");
       return;
     }
-    const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: `${window.location.origin}/reset-password`,
-    });
-    if (error) {
-      toast.error("Failed to send reset email", { description: error.message });
-    } else {
-      toast.success("Password reset email sent", {
-        description: "Check your inbox for a reset link.",
+    setIsResetting(true);
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+        redirectTo: `${window.location.origin}/reset-password`,
       });
+      if (error) {
+        toast.error("Failed to send reset email", { description: error.message });
+      } else {
+        toast.success("Password reset email sent", {
+          description: "Check your inbox for a reset link.",
+        });
+      }
+    } catch (err) {
+      toast.error("Failed to send reset email", { description: String(err) });
+    } finally {
+      setIsResetting(false);
     }
   };
 
@@ -86,7 +96,7 @@ export default function Login() {
               type="button"
               onClick={handleForgot}
               className="text-xs text-muted-foreground hover:text-foreground"
-              disabled={isLoading}
+              disabled={isLoading || isResetting}
             >
               Forgot password?
             </button>

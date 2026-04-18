@@ -16,6 +16,13 @@ export default function Signup() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
+    // BUG-FE-136: Validate email format client-side before round trip
+    const trimmedEmail = email.trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
+      toast.error("Invalid email", { description: "Please enter a valid email address." });
+      return;
+    }
+
     // BUG-022: Client-side password length validation
     if (password.length < 8) {
       toast.error("Password too short", {
@@ -26,7 +33,8 @@ export default function Signup() {
 
     setIsLoading(true);
     try {
-      const confirmed = await signup(email, name, password);
+      // BUG-FE-140: Use trimmed email
+      const confirmed = await signup(trimmedEmail, name, password);
       // BUG-R2C-03: Only navigate to /chat when signup returned a live session
       // (email confirmation disabled). When email confirmation is required,
       // signup() returns false and the toast is already shown by AuthContext.
