@@ -21,15 +21,15 @@ function formatPlanName(plan: string): string {
 function formatStatus(status: string): { label: string; className: string } {
   switch (status) {
     case "active":
-      return { label: "Active", className: "bg-green-500/20 text-green-400 ring-green-500/30" };
+      return { label: "Active", className: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 ring-emerald-500/20" };
     case "canceled":
-      return { label: "Canceled", className: "bg-red-500/20 text-red-400 ring-red-500/30" };
+      return { label: "Canceled", className: "bg-red-500/15 text-red-600 dark:text-red-400 ring-red-500/20" };
     case "past_due":
-      return { label: "Past due", className: "bg-amber-500/20 text-amber-400 ring-amber-500/30" };
+      return { label: "Past due", className: "bg-amber-500/15 text-amber-600 dark:text-amber-400 ring-amber-500/20" };
     case "trialing":
-      return { label: "Trialing", className: "bg-blue-500/20 text-blue-400 ring-blue-500/30" };
+      return { label: "Trialing", className: "bg-blue-500/15 text-blue-600 dark:text-blue-400 ring-blue-500/20" };
     default:
-      return { label: "None", className: "bg-zinc-500/20 text-zinc-400 ring-zinc-500/30" };
+      return { label: "None", className: "bg-zinc-500/15 text-zinc-600 dark:text-zinc-400 ring-zinc-500/20" };
   }
 }
 
@@ -39,8 +39,6 @@ export default function Account() {
   const [isOpeningPortal, setIsOpeningPortal] = useState(false);
 
   // BUG-R1-10: Add a 500ms grace period before redirecting, matching Chat.tsx.
-  // Supabase token refresh briefly sets user=null; without the delay, users
-  // navigating to this page during a refresh cycle are incorrectly sent to /login.
   useEffect(() => {
     if (!user) {
       const timer = setTimeout(() => navigate("/login", { replace: true }), 500);
@@ -50,9 +48,6 @@ export default function Account() {
 
   if (!user) return null;
 
-  // BUG-R2-16: Make async and await logout() so navigation doesn't fire
-  // before supabase.auth.signOut() completes and setUser(null) runs.
-  // Without await, the user briefly sees the logged-in navbar state after redirect.
   const handleLogout = async () => {
     await logout();
     navigate("/");
@@ -79,7 +74,6 @@ export default function Account() {
       }
 
       const data: { portal_url: string } = await res.json();
-      // P1-FIX-82b: Guard against missing portal_url
       if (!data.portal_url) {
         throw new Error("No portal URL received from server");
       }
@@ -101,11 +95,11 @@ export default function Account() {
         <div className="mx-auto max-w-lg">
           <ScrollReveal>
             <div className="flex items-center gap-3">
-              <h1 className="font-serif text-2xl font-semibold text-foreground sm:text-3xl">
+              <h1 className="text-2xl font-bold text-foreground sm:text-3xl">
                 Account
               </h1>
               {user.role === "admin" && (
-                <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2.5 py-0.5 text-xs font-medium text-primary ring-1 ring-primary/20">
+                <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2.5 py-0.5 text-xs font-bold text-primary ring-1 ring-primary/20">
                   <ShieldCheck size={11} />
                   Admin
                 </span>
@@ -114,25 +108,25 @@ export default function Account() {
           </ScrollReveal>
 
           <ScrollReveal>
-            <div className="mt-8 rounded-lg border border-border bg-card p-6">
-              <div className="space-y-4">
+            <div className="mt-8 rounded-xl border border-border bg-card p-6">
+              <div className="space-y-5">
                 <div>
-                  <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Name</p>
+                  <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">Name</p>
                   <p className="mt-1 text-sm text-foreground">{user.name}</p>
                 </div>
                 <div>
-                  <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Email</p>
+                  <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">Email</p>
                   <p className="mt-1 text-sm text-foreground">{user.email}</p>
                 </div>
                 <div>
-                  <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Plan</p>
+                  <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">Plan</p>
                   <div className="mt-1 flex items-center gap-2">
-                    <p className="text-sm font-semibold text-foreground">
+                    <p className="text-sm font-bold text-foreground">
                       {formatPlanName(user.subscription_plan)}
                     </p>
                     {user.subscription_status !== "none" && (
                       <span
-                        className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ring-1 ring-inset ${statusBadge.className}`}
+                        className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-bold ring-1 ring-inset ${statusBadge.className}`}
                       >
                         {statusBadge.label}
                       </span>
@@ -140,8 +134,8 @@ export default function Account() {
                   </div>
                 </div>
                 <div>
-                  <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Credits</p>
-                  <p className="mt-1 text-lg font-semibold text-foreground">
+                  <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">Credits</p>
+                  <p className="mt-1 text-lg font-bold text-foreground">
                     {user.tokens.toLocaleString()}
                     <span className="ml-2 text-xs font-normal text-muted-foreground">credits remaining</span>
                   </p>

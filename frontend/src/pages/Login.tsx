@@ -5,6 +5,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
+import { Logo } from "@/components/Logo";
 
 export default function Login() {
   const [email, setEmail] = useState("");
@@ -46,18 +47,18 @@ export default function Login() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-6">
       <div className="w-full max-w-sm">
-        <Link to="/" className="mb-10 block font-serif text-lg font-semibold text-foreground">
-          Mariana
+        <Link to="/" className="mb-10 block">
+          <Logo size="md" />
         </Link>
 
-        <h1 className="font-serif text-2xl font-semibold text-foreground">Sign in</h1>
+        <h1 className="text-2xl font-bold text-foreground">Sign in</h1>
         <p className="mt-2 text-sm text-muted-foreground">
           Access Mariana Computer and your research library.
         </p>
 
         <form onSubmit={handleSubmit} className="mt-8 space-y-4">
           <div>
-            <label htmlFor="email" className="mb-1.5 block text-xs font-medium text-muted-foreground">Email</label>
+            <label htmlFor="email" className="mb-1.5 block text-xs font-semibold text-muted-foreground">Email</label>
             <Input
               id="email"
               type="email"
@@ -69,7 +70,7 @@ export default function Login() {
             />
           </div>
           <div>
-            <label htmlFor="password" className="mb-1.5 block text-xs font-medium text-muted-foreground">Password</label>
+            <label htmlFor="password" className="mb-1.5 block text-xs font-semibold text-muted-foreground">Password</label>
             <Input
               id="password"
               type="password"
@@ -85,7 +86,7 @@ export default function Login() {
             <button
               type="button"
               onClick={handleForgot}
-              className="text-xs text-muted-foreground hover:text-foreground"
+              className="text-xs text-muted-foreground hover:text-primary transition-colors"
               disabled={isLoading}
             >
               Forgot password?
@@ -99,7 +100,7 @@ export default function Login() {
 
         <p className="mt-8 text-center text-xs text-muted-foreground">
           Don't have an account?{" "}
-          <Link to="/signup" className="font-medium text-foreground hover:underline">Sign up</Link>
+          <Link to="/signup" className="font-semibold text-primary hover:underline">Sign up</Link>
         </p>
       </div>
     </div>

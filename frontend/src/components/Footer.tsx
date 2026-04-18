@@ -1,46 +1,77 @@
 import { Link } from "react-router-dom";
+import { Logo } from "@/components/Logo";
 
-const links = [
+const productLinks = [
   { label: "Research", href: "/research" },
   { label: "Mariana", href: "/mariana" },
   { label: "Pricing", href: "/pricing" },
+];
+
+const companyLinks = [
   { label: "Contact", href: "/contact" },
+  { label: "Sign In", href: "/login" },
 ];
 
 export function Footer() {
   return (
-    <footer className="border-t border-border">
-      <div className="mx-auto max-w-7xl px-6 py-10">
-        <div className="flex flex-col gap-8 md:flex-row md:items-start md:justify-between">
+    <footer className="border-t border-border bg-card/50">
+      <div className="mx-auto max-w-7xl px-6 py-12">
+        <div className="grid gap-8 sm:grid-cols-2 lg:grid-cols-4">
           {/* Brand */}
-          <div>
-            <Link to="/" className="font-serif text-sm font-semibold text-foreground">
-              Mariana
-            </Link>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Autonomous financial research.
+          <div className="sm:col-span-2 lg:col-span-2">
+            <Logo size="sm" />
+            <p className="mt-3 max-w-xs text-sm leading-relaxed text-muted-foreground">
+              Autonomous deep financial research powered by frontier AI.
+              An AI with its own computer.
             </p>
-            <a href="mailto:support@mariana.co" className="mt-2 block text-xs text-muted-foreground transition-colors hover:text-foreground">
+            <a
+              href="mailto:support@mariana.co"
+              className="mt-3 inline-block text-sm text-muted-foreground transition-colors hover:text-primary"
+            >
               support@mariana.co
             </a>
           </div>
 
-          {/* Links */}
-          <div className="flex flex-wrap gap-6 text-xs text-muted-foreground">
-            {links.map((link) => (
-              <Link key={link.href} to={link.href} className="transition-colors hover:text-foreground">
-                {link.label}
-              </Link>
-            ))}
-            <Link to="/login" className="transition-colors hover:text-foreground">
-              Sign In
-            </Link>
+          {/* Product */}
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Product
+            </p>
+            <div className="mt-4 flex flex-col gap-2.5">
+              {productLinks.map((link) => (
+                <Link
+                  key={link.href}
+                  to={link.href}
+                  className="text-sm text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  {link.label}
+                </Link>
+              ))}
+            </div>
+          </div>
+
+          {/* Company */}
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Company
+            </p>
+            <div className="mt-4 flex flex-col gap-2.5">
+              {companyLinks.map((link) => (
+                <Link
+                  key={link.href}
+                  to={link.href}
+                  className="text-sm text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  {link.label}
+                </Link>
+              ))}
+            </div>
           </div>
         </div>
 
-        <div className="mt-8 border-t border-border pt-6">
-          <p className="text-xs text-muted-foreground/50">
-            © {new Date().getFullYear()} Mariana Financial Research. All rights reserved.
+        <div className="mt-10 border-t border-border pt-6">
+          <p className="text-xs text-muted-foreground/60">
+            &copy; {new Date().getFullYear()} Mariana. All rights reserved.
           </p>
         </div>
       </div>

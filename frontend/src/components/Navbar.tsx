@@ -2,6 +2,8 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useState, useEffect, useRef } from "react";
 import { Menu, X, User, LogOut, CreditCard, Settings, ShieldCheck } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
+import { Logo } from "@/components/Logo";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 const navLinks = [
   { label: "Research", href: "/research" },
@@ -50,73 +52,75 @@ export function Navbar() {
 
   return (
     <nav
-      className={`fixed top-0 left-0 right-0 z-50 transition-all duration-500 ${
+      className={`fixed top-0 left-0 right-0 z-50 transition-all duration-300 ${
         scrolled
-          ? "bg-background/80 backdrop-blur-xl shadow-[0_1px_0_0_hsl(var(--border))]"
+          ? "bg-background/80 backdrop-blur-xl border-b border-border/50 shadow-sm"
           : "bg-transparent"
       }`}
     >
       <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-6">
         <Link to="/" className="flex items-center gap-2">
-          <span className="font-serif text-lg font-semibold tracking-tight text-foreground">
-            Mariana
-          </span>
+          <Logo size="sm" />
         </Link>
 
         {/* Desktop */}
-        <div className="hidden items-center gap-8 md:flex">
+        <div className="hidden items-center gap-1 md:flex">
           {navLinks.map((link) => (
             <Link
               key={link.href}
               to={link.href}
-              className={`text-[13px] font-medium transition-colors ${
+              className={`rounded-md px-3 py-2 text-sm font-medium transition-colors ${
                 location.pathname === link.href
-                  ? "text-foreground"
-                  : "text-muted-foreground hover:text-foreground"
+                  ? "text-foreground bg-secondary"
+                  : "text-muted-foreground hover:text-foreground hover:bg-secondary/50"
               }`}
             >
               {link.label}
             </Link>
           ))}
 
+          <div className="mx-2 h-4 w-px bg-border" />
+
+          <ThemeToggle />
+
           {user ? (
-            <div className="relative" ref={menuRef}>
+            <div className="relative ml-1" ref={menuRef}>
               <button
                 onClick={() => setUserMenuOpen(!userMenuOpen)}
                 aria-expanded={userMenuOpen}
                 aria-haspopup="menu"
                 onKeyDown={(e) => e.key === "Escape" && setUserMenuOpen(false)}
-                className="flex items-center gap-2 text-[13px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+                className="flex h-8 items-center gap-2 rounded-md bg-secondary px-3 text-sm font-medium text-foreground transition-colors hover:bg-secondary/80"
               >
-                <User size={15} />
+                <User size={14} />
                 <span>{user.name}</span>
               </button>
               {userMenuOpen && (
                 <div role="menu" className="absolute right-0 top-full mt-2 w-56 rounded-lg border border-border bg-card py-1 shadow-lg">
-                  <Link role="menuitem" to="/chat" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
+                  <Link role="menuitem" to="/chat" className="flex items-center gap-2 px-4 py-2.5 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors">
                     Research
                   </Link>
-                  <Link role="menuitem" to="/account" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
+                  <Link role="menuitem" to="/account" className="flex items-center gap-2 px-4 py-2.5 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors">
                     <Settings size={13} /> Account
                   </Link>
-                  <Link role="menuitem" to="/checkout" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
+                  <Link role="menuitem" to="/checkout" className="flex items-center gap-2 px-4 py-2.5 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors">
                     <CreditCard size={13} /> Upgrade plan
                   </Link>
                   {user.role === "admin" && (
-                    <Link role="menuitem" to="/admin" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
+                    <Link role="menuitem" to="/admin" className="flex items-center gap-2 px-4 py-2.5 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors">
                       <ShieldCheck size={13} /> Admin
                     </Link>
                   )}
-                  <div className="mx-4 my-1 border-t border-border" />
+                  <div className="mx-3 my-1 border-t border-border" />
                   <div className="px-4 py-2">
-                    <p className="text-xs text-muted-foreground/60">
+                    <p className="text-xs text-muted-foreground">
                       {user.tokens.toLocaleString()} credits
                     </p>
                   </div>
                   <button
                     role="menuitem"
                     onClick={handleLogout}
-                    className="flex w-full items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground"
+                    className="flex w-full items-center gap-2 px-4 py-2.5 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors"
                   >
                     <LogOut size={13} /> Sign out
                   </button>
@@ -124,31 +128,34 @@ export function Navbar() {
               )}
             </div>
           ) : (
-            <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2 ml-1">
               <Link
                 to="/login"
-                className="text-[13px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+                className="rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground hover:bg-secondary/50"
               >
                 Log in
               </Link>
               <Link
                 to="/signup"
-                className="rounded-md bg-primary px-4 py-2 text-[13px] font-medium text-primary-foreground transition-all hover:bg-primary/90 hover:shadow-lg hover:shadow-primary/10"
+                className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-all hover:opacity-90 shadow-sm hover:shadow-md"
               >
-                Try Mariana
+                Get Started
               </Link>
             </div>
           )}
         </div>
 
         {/* Mobile toggle */}
-        <button
-          onClick={() => setMobileOpen(!mobileOpen)}
-          className="text-foreground md:hidden"
-          aria-label="Toggle menu"
-        >
-          {mobileOpen ? <X size={20} /> : <Menu size={20} />}
-        </button>
+        <div className="flex items-center gap-2 md:hidden">
+          <ThemeToggle />
+          <button
+            onClick={() => setMobileOpen(!mobileOpen)}
+            className="flex h-8 w-8 items-center justify-center rounded-md text-foreground hover:bg-secondary"
+            aria-label="Toggle menu"
+          >
+            {mobileOpen ? <X size={18} /> : <Menu size={18} />}
+          </button>
+        </div>
       </div>
 
       {/* Mobile menu */}
@@ -157,51 +164,51 @@ export function Navbar() {
           mobileOpen ? "max-h-[28rem] border-t border-border" : "max-h-0"
         }`}
       >
-        <div className="bg-background px-6 py-4">
-          <div className="flex flex-col gap-3">
+        <div className="bg-background/95 backdrop-blur-xl px-6 py-4">
+          <div className="flex flex-col gap-1">
             {navLinks.map((link) => (
               <Link
                 key={link.href}
                 to={link.href}
-                className={`py-1 text-sm ${
+                className={`rounded-md px-3 py-2.5 text-sm font-medium transition-colors ${
                   location.pathname === link.href
-                    ? "text-foreground font-medium"
-                    : "text-muted-foreground"
+                    ? "text-foreground bg-secondary"
+                    : "text-muted-foreground hover:text-foreground hover:bg-secondary/50"
                 }`}
               >
                 {link.label}
               </Link>
             ))}
 
-            <div className="my-1 border-t border-border" />
+            <div className="my-2 border-t border-border" />
 
             {user ? (
               <>
-                <Link to="/account" className="py-1 text-sm text-muted-foreground">Account</Link>
-                <Link to="/checkout" className="py-1 text-sm text-muted-foreground">Upgrade plan</Link>
-                <Link to="/chat" className="py-1 text-sm text-muted-foreground">Research</Link>
+                <Link to="/chat" className="rounded-md px-3 py-2.5 text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-secondary/50">Research</Link>
+                <Link to="/account" className="rounded-md px-3 py-2.5 text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-secondary/50">Account</Link>
+                <Link to="/checkout" className="rounded-md px-3 py-2.5 text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-secondary/50">Upgrade plan</Link>
                 {user.role === "admin" && (
-                  <Link to="/admin" className="py-1 text-sm text-muted-foreground">Admin</Link>
+                  <Link to="/admin" className="rounded-md px-3 py-2.5 text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-secondary/50">Admin</Link>
                 )}
-                <div className="my-1 border-t border-border" />
-                <p className="text-xs text-muted-foreground/60">
+                <div className="my-2 border-t border-border" />
+                <p className="px-3 text-xs text-muted-foreground">
                   {user.name} · {user.tokens.toLocaleString()} credits
                 </p>
                 <button
                   onClick={handleLogout}
-                  className="py-1 text-left text-sm text-muted-foreground"
+                  className="rounded-md px-3 py-2.5 text-left text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-secondary/50"
                 >
                   Sign out
                 </button>
               </>
             ) : (
               <>
-                <Link to="/login" className="py-1 text-sm text-muted-foreground">Log in</Link>
+                <Link to="/login" className="rounded-md px-3 py-2.5 text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-secondary/50">Log in</Link>
                 <Link
                   to="/signup"
-                  className="mt-1 rounded-md bg-primary px-4 py-2.5 text-center text-sm font-medium text-primary-foreground"
+                  className="mt-2 rounded-md bg-primary px-4 py-2.5 text-center text-sm font-medium text-primary-foreground"
                 >
-                  Try Mariana
+                  Get Started
                 </Link>
               </>
             )}

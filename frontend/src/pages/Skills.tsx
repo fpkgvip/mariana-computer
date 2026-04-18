@@ -303,12 +303,12 @@ export default function Skills() {
         <div className="mx-auto max-w-3xl">
           <ScrollReveal>
             <div className="flex items-center justify-between">
-              <h1 className="font-serif text-2xl font-semibold text-foreground sm:text-3xl">
+              <h1 className="text-2xl font-bold text-foreground sm:text-3xl">
                 Skills
               </h1>
               <button
                 onClick={() => setShowCreate(true)}
-                className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground shadow-sm transition-all hover:opacity-90 hover:shadow-md"
               >
                 <Plus size={12} />
                 Create Custom Skill
@@ -331,7 +331,7 @@ export default function Skills() {
                 const Icon = CATEGORY_ICONS[skill.id] || Zap;
                 return (
                   <ScrollReveal key={skill.id} delay={i * 60}>
-                    <div className="rounded-lg border border-border bg-card p-5 shadow-sm">
+                    <div className="rounded-xl border border-border bg-card p-5 shadow-sm transition-all hover:border-primary/20 hover:shadow-md">
                       <div className="flex items-start gap-3">
                         <div className="mt-0.5 rounded-md bg-primary/10 p-2">
                           <Icon size={16} className="text-primary" />
@@ -342,7 +342,7 @@ export default function Skills() {
                             <span
                               className={`inline-flex rounded-full px-1.5 py-0.5 text-[9px] font-medium ring-1 ring-inset ${
                                 skill.category === "built-in"
-                                  ? "bg-accent/10 text-accent ring-accent/20"
+                                  ? "bg-primary/10 text-primary ring-primary/20"
                                   : "bg-blue-500/10 text-blue-400 ring-blue-500/20"
                               }`}
                             >

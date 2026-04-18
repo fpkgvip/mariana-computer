@@ -4,6 +4,7 @@ import { supabase } from "@/lib/supabase";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
+import { Logo } from "@/components/Logo";
 
 /**
  * BUG-010: The /reset-password route was missing from App.tsx.
@@ -19,20 +20,7 @@ export default function ResetPassword() {
   const [isReady, setIsReady] = useState(false);
   const [isError, setIsError] = useState(false);
 
-  // Supabase appends the recovery token as a URL hash fragment.
-  // onAuthStateChange fires with event=PASSWORD_RECOVERY when it detects it.
-  // BUG-R1-06: Add a 10-second timeout so users with expired/invalid links
-  // don’t get stuck on "Verifying your reset link…" forever.
-  // BUG-R2-04: Empty deps array — run once on mount only.
-  // isReady was previously in deps, causing the subscription to be torn down and recreated
-  // every time PASSWORD_RECOVERY fired and set isReady=true, creating a leaked subscription.
-  // The timeout callback uses a functional setter so it correctly handles the case where
-  // isReady was already set to true before the timeout fires.
-  // BUG-R2-S2-05: The previous timeout handler checked `prev` (isError) instead of isReady.
-  // If PASSWORD_RECOVERY fires before 10s, clearTimeout prevents it. But if the timeout
-  // callback was already queued (race), it set isError=true even though isReady=true,
-  // showing both the form AND the error banner simultaneously.
-  // Fix: use a ref to track readiness so the timeout callback can check it synchronously.
+  // BUG-R2-S2-05: Use a ref to track readiness so the timeout callback can check it synchronously.
   const isReadyRef = useRef(false);
 
   useEffect(() => {
@@ -55,7 +43,7 @@ export default function ResetPassword() {
       clearTimeout(timeout);
       subscription.unsubscribe();
     };
-  }, []); // no deps — run once on mount
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -81,7 +69,6 @@ export default function ResetPassword() {
       });
       navigate("/login");
     } catch (err) {
-      // P1-FIX-85: Handle network errors from updateUser
       const msg = err instanceof Error ? err.message : "Network error";
       toast.error("Failed to update password", { description: msg });
     } finally {
@@ -92,11 +79,11 @@ export default function ResetPassword() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-6">
       <div className="w-full max-w-sm">
-        <Link to="/" className="mb-10 block font-serif text-lg font-semibold text-foreground">
-          Mariana
+        <Link to="/" className="mb-10 block">
+          <Logo size="md" />
         </Link>
 
-        <h1 className="font-serif text-2xl font-semibold text-foreground">
+        <h1 className="text-2xl font-bold text-foreground">
           Reset your password
         </h1>
         <p className="mt-2 text-sm text-muted-foreground">
@@ -109,10 +96,10 @@ export default function ResetPassword() {
 
         {/* BUG-R1-06: Show error state when token is expired/invalid/missing */}
         {isError && !isReady && (
-          <div className="mt-6 rounded-md border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-400">
+          <div className="mt-6 rounded-lg border border-destructive/20 bg-destructive/10 px-4 py-3 text-sm text-destructive">
             <p>Your password reset link has expired or is invalid.</p>
             <p className="mt-2">
-              <Link to="/login" className="font-medium underline hover:text-red-300">
+              <Link to="/login" className="font-semibold underline hover:opacity-80">
                 Request a new password reset
               </Link>
             </p>
@@ -122,7 +109,7 @@ export default function ResetPassword() {
         {isReady && (
           <form onSubmit={handleSubmit} className="mt-8 space-y-4">
             <div>
-              <label htmlFor="new-password" className="mb-1.5 block text-xs font-medium text-muted-foreground">
+              <label htmlFor="new-password" className="mb-1.5 block text-xs font-semibold text-muted-foreground">
                 New password
               </label>
               <Input
@@ -135,11 +122,10 @@ export default function ResetPassword() {
                 placeholder="••••••••"
                 disabled={isLoading}
               />
-              {/* BUG-R1-16: Show minimum length hint before submission */}
               <p className="mt-1 text-xs text-muted-foreground">Minimum 8 characters</p>
             </div>
             <div>
-              <label htmlFor="confirm-password" className="mb-1.5 block text-xs font-medium text-muted-foreground">
+              <label htmlFor="confirm-password" className="mb-1.5 block text-xs font-semibold text-muted-foreground">
                 Confirm password
               </label>
               <Input
@@ -159,7 +145,7 @@ export default function ResetPassword() {
         )}
 
         <p className="mt-8 text-center text-xs text-muted-foreground">
-          <Link to="/login" className="font-medium text-foreground hover:underline">
+          <Link to="/login" className="font-semibold text-primary hover:underline">
             Back to sign in
           </Link>
         </p>

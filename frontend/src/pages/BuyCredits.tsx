@@ -20,8 +20,6 @@ export default function BuyCredits() {
   const navigate = useNavigate();
 
   // BUG-R1-10: Add a 500ms grace period before redirecting, matching Chat.tsx.
-  // Supabase token refresh briefly sets user=null; without the delay, users
-  // navigating to this page during a refresh cycle are incorrectly sent to /login.
   useEffect(() => {
     if (!user) {
       const timer = setTimeout(() => navigate("/login", { replace: true }), 500);
@@ -38,20 +36,20 @@ export default function BuyCredits() {
       <section className="px-6 pt-32 pb-16 md:pt-40 md:pb-24">
         <div className="mx-auto max-w-lg">
           <ScrollReveal>
-            <h1 className="font-serif text-2xl font-semibold text-foreground sm:text-3xl">
+            <h1 className="text-2xl font-bold text-foreground sm:text-3xl">
               Get credits
             </h1>
             <p className="mt-2 text-sm text-muted-foreground">
               Current balance:{" "}
-              <span className="font-medium text-foreground">
+              <span className="font-semibold text-foreground">
                 {user.tokens.toLocaleString()} credits
               </span>
             </p>
           </ScrollReveal>
 
           <ScrollReveal>
-            <div className="mt-10 rounded-lg border border-border bg-card p-6 space-y-4">
-              <p className="text-sm text-foreground font-medium">
+            <div className="mt-10 rounded-xl border border-border bg-card p-6 space-y-4">
+              <p className="text-sm font-bold text-foreground">
                 Credits &mdash; coming soon
               </p>
               <p className="text-sm text-muted-foreground leading-relaxed">
@@ -60,7 +58,7 @@ export default function BuyCredits() {
               </p>
               <Link
                 to="/contact"
-                className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground shadow-md transition-all hover:opacity-90 hover:shadow-lg"
               >
                 <Mail size={14} />
                 Contact us for credits

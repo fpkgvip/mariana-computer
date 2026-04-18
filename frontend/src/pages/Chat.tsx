@@ -2287,7 +2287,7 @@ export default function Chat() {
         }`}
       >
         <div className="flex h-16 items-center justify-between border-b border-border px-5">
-          <Link to="/" className="font-serif text-sm font-semibold text-foreground">
+          <Link to="/" className="text-sm font-bold text-foreground">
             Mariana
           </Link>
           <button
@@ -2505,7 +2505,7 @@ export default function Chat() {
             </button>
             <Link
               to="/"
-              className="font-serif text-sm font-semibold text-foreground md:hidden"
+              className="text-sm font-bold text-foreground md:hidden"
             >
               Mariana
             </Link>
@@ -2599,7 +2599,7 @@ export default function Chat() {
             {/* Empty state */}
             {messages.length === 0 && !isSending && !pendingPlan && !conversationLoading && (
               <div className="flex flex-col items-center justify-center py-24 text-center">
-                <h2 className="font-serif text-xl font-semibold text-foreground mb-2">
+                <h2 className="text-xl font-bold text-foreground mb-2">
                   What would you like to know?
                 </h2>
                 <p className="text-sm text-muted-foreground max-w-md">
