@@ -526,7 +526,7 @@ class StartInvestigationRequest(BaseModel):
         None, description="Session UUID from pre-submission file uploads (from POST /api/upload)",
     )
     quality_tier: str | None = Field(None, description="Model quality: maximum, high, balanced, economy")
-    user_flow_instructions: str | None = Field(None, description="User's custom instructions for how AI should conduct research")
+    user_flow_instructions: str | None = Field(None, max_length=8192, description="User's custom instructions for how AI should conduct research")
     continuous_mode: bool = Field(False, description="If true, run in continuous loop until user manually stops")
     dont_kill_branches: bool = Field(False, description="If true, never auto-kill branches regardless of score")
     force_report_on_halt: bool = Field(False, description="If true, generate report instead of halting on critical failures")
