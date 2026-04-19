@@ -811,6 +811,7 @@ export default function InvestigationGraph() {
     const drag = d3
       .drag<SVGGElement, GraphNode>()
       .filter((event) => !event.button && !linkModeRef.current)
+      .clickDistance(5)
       .on("start", (event, d) => {
         if (!event.active) simulation.alphaTarget(0.3).restart();
         wasPinned.set(d.id, d.fx != null);
@@ -1043,7 +1044,10 @@ export default function InvestigationGraph() {
     const pad = 80;
     const dx = maxX - minX + pad * 2;
     const dy = maxY - minY + pad * 2;
-    const scale = Math.min(width / dx, height / dy, 2);
+    // BUG-GRAPH-ZOOM: Enforce minimum scale of 0.6 so node labels remain
+    // readable after auto-fit.  Previously, large graphs with spread-out
+    // clusters would zoom out so far that labels became invisible.
+    const scale = Math.max(0.6, Math.min(width / dx, height / dy, 2));
     const cx = (minX + maxX) / 2;
     const cy = (minY + maxY) / 2;
 
