@@ -1,4 +1,5 @@
 import { Link } from "react-router-dom";
+import { useAuth } from "../contexts/AuthContext";
 
 const links = [
   { label: "Research", href: "/research" },
@@ -8,6 +9,8 @@ const links = [
 ];
 
 export function Footer() {
+  const { user } = useAuth();
+
   return (
     <footer className="border-t border-border">
       <div className="mx-auto max-w-7xl px-6 py-10">
@@ -32,9 +35,15 @@ export function Footer() {
                 {link.label}
               </Link>
             ))}
-            <Link to="/login" className="transition-colors hover:text-foreground">
-              Sign In
-            </Link>
+            {user ? (
+              <Link to="/account" className="transition-colors hover:text-foreground">
+                Account
+              </Link>
+            ) : (
+              <Link to="/login" className="transition-colors hover:text-foreground">
+                Sign In
+              </Link>
+            )}
           </div>
         </div>
 
