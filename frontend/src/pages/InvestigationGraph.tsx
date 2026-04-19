@@ -297,6 +297,8 @@ export default function InvestigationGraph() {
   // BUG-R2A-02: Ref so D3 click handler reads linkSourceId without stale closure
   const linkSourceIdRef = useRef<string | null>(linkSourceId);
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
+  // Track whether the initial auto-fit has been performed after data loads
+  const initialFitDoneRef = useRef(false);
 
   // Keep refs in sync
   nodesRef.current = nodes;
@@ -535,6 +537,7 @@ export default function InvestigationGraph() {
     setSearchTerm("");
     setFilterType("all");
     setLinkMode(false);
+    initialFitDoneRef.current = false;
     setLinkSourceId(null);
     setContextMenu({ visible: false, x: 0, y: 0, nodeId: null });
     setGraphError(null);
@@ -798,11 +801,12 @@ export default function InvestigationGraph() {
         d3
           .forceLink<GraphNode, GraphEdge>()
           .id((d) => d.id)
-          .distance(160)
+          .distance(100)
       )
-      .force("charge", d3.forceManyBody().strength(-400))
-      .force("center", d3.forceCenter(width / 2, height / 2))
-      .force("collision", d3.forceCollide().radius(NODE_RADIUS + 20));
+      .force("charge", d3.forceManyBody().strength(-120))
+      .force("x", d3.forceX(width / 2).strength(0.05))
+      .force("y", d3.forceY(height / 2).strength(0.05))
+      .force("collision", d3.forceCollide().radius(NODE_RADIUS + 6));
 
     simulationRef.current = simulation;
 
@@ -858,23 +862,10 @@ export default function InvestigationGraph() {
         .attr("transform", (d) => `translate(${d.x ?? 0},${d.y ?? 0})`);
     });
 
-    // Auto-fit the graph once the simulation stabilizes so nodes are visible
-    // on first load without requiring the user to click "Fit graph".
-    let initialFitDone = false;
-    simulation.on("end", () => {
-      if (!initialFitDone && simulationRef.current === simulation) {
-        initialFitDone = true;
-        fitGraph();
-      }
-    });
-    // Fallback: fit after 1.5s even if simulation hasn't fully converged —
-    // positions will be close enough and the user shouldn't see an empty canvas.
-    const fitTimer = setTimeout(() => {
-      if (!initialFitDone && simulationRef.current === simulation) {
-        initialFitDone = true;
-        fitGraph();
-      }
-    }, 1500);
+    // Note: Initial auto-fit is handled by a separate effect that watches
+    // `nodes` for the first non-empty data load.  The simulation starts with
+    // 0 nodes and would converge instantly, so calling fitGraph here would be
+    // a no-op that falsely sets the "done" flag.
 
     // Click on background to deselect / close context menu
     d3.select(svg).on("click", () => {
@@ -882,7 +873,6 @@ export default function InvestigationGraph() {
     });
 
     return () => {
-      clearTimeout(fitTimer);
       simulation.on("tick", null); // BUG-R2A-03: detach tick before stopping
       simulation.on("end", null);
       simulation.stop();
@@ -1044,10 +1034,10 @@ export default function InvestigationGraph() {
     const pad = 80;
     const dx = maxX - minX + pad * 2;
     const dy = maxY - minY + pad * 2;
-    // BUG-GRAPH-ZOOM: Enforce minimum scale of 0.6 so node labels remain
-    // readable after auto-fit.  Previously, large graphs with spread-out
-    // clusters would zoom out so far that labels became invisible.
-    const scale = Math.max(0.6, Math.min(width / dx, height / dy, 2));
+    // Scale to fit all nodes, clamped to [0.02, 2].
+    // For large graphs (92+ nodes), the bounding box can be 30k+ units,
+    // requiring very low zoom.  We allow it — users can zoom in for details.
+    const scale = Math.max(0.02, Math.min(width / dx, height / dy, 2));
     const cx = (minX + maxX) / 2;
     const cy = (minY + maxY) / 2;
 
@@ -1058,6 +1048,21 @@ export default function InvestigationGraph() {
 
     d3.select(svg).transition().duration(750).call(zoom.transform, transform);
   }, []);
+
+  // Auto-fit the viewport when graph data first arrives.
+  // We wait 800ms after the first non-empty `nodes` render so the D3
+  // simulation has time to assign reasonable x/y positions.  A second
+  // fit at 2s catches the case where the simulation hasn't converged yet
+  // but positions are close enough for the user to see the graph.
+  useEffect(() => {
+    if (initialFitDoneRef.current) return;
+    if (nodes.length === 0) return;
+    initialFitDoneRef.current = true;
+
+    const t1 = setTimeout(() => fitGraph(), 1500);
+    const t2 = setTimeout(() => fitGraph(), 4000);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
+  }, [nodes.length, fitGraph]);
 
   const autoCluster = useCallback(() => {
     if (clusterTimeoutRef.current) clearTimeout(clusterTimeoutRef.current);
