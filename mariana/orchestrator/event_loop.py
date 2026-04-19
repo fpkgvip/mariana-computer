@@ -885,7 +885,9 @@ async def run(
         # previously generated noisy error logs.  gather() with
         # return_exceptions=True swallows CancelledError from the cancelled
         # publishes without raising.
-        _pending = list(_background_tasks)
+        # Only cancel background tasks belonging to THIS investigation.
+        _task_set = _background_tasks.pop(task.id, set())
+        _pending = list(_task_set)
         if _pending:
             for _bg in _pending:
                 try:
@@ -3242,7 +3244,11 @@ async def _check_user_credits(user_id: str, config: Any) -> int | None:
 # BUG-S2-09 fix: hold references to fire-and-forget tasks to prevent GC from
 # silently dropping them before they complete.  Python's asyncio will log
 # "Task was destroyed but it is pending!" warnings otherwise.
-_background_tasks: set[Any] = set()
+#
+# Keyed by investigation task_id so the finally-block in run() only cancels
+# tasks belonging to its own investigation — not tasks from other concurrent
+# investigations running in the same daemon process.
+_background_tasks: dict[str, set[Any]] = {}
 
 # BUG-AUD-20 fix: cache last-written handoff phase per task_id.  The handoff
 # writer issues up to 4 DB round-trips; skipping redundant writes when the
@@ -3394,8 +3400,10 @@ def _emit_progress(redis_client: Any, task_id: str, event: dict[str, Any]) -> No
         task = loop.create_task(
             redis_client.publish(f"logs:{task_id}", _json_emit.dumps(event))
         )
-        # Hold a strong reference until the task completes
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+        # Hold a strong reference until the task completes, scoped to this
+        # investigation's task_id so concurrent runs don't cross-contaminate.
+        _task_set = _background_tasks.setdefault(task_id, set())
+        _task_set.add(task)
+        task.add_done_callback(_task_set.discard)
     except Exception as exc:
         logger.debug("emit_progress_failed", task_id=task_id, error=str(exc))
