@@ -29,7 +29,10 @@ logger = structlog.get_logger(__name__)
 # BUG-AUD-12 fix: per-call timeout for executive-summary generation.  Each
 # compression level (one-liner / paragraph / page) is capped so a hung
 # LLM call can't stall finalisation indefinitely.
-_EXEC_SUMMARY_CALL_TIMEOUT_SEC = 60.0
+# BUG-TIMEOUT-02 fix: Increased from 60s to 180s.  Deep-tier investigations
+# with 50-100+ findings produce very large prompts that require more time,
+# especially for page-level summaries on Claude Opus.
+_EXEC_SUMMARY_CALL_TIMEOUT_SEC = 180.0
 
 
 # ---------------------------------------------------------------------------
