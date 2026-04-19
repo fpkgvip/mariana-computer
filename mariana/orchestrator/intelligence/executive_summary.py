@@ -259,33 +259,44 @@ async def generate_executive_summaries(
         summary_errors["page_summary"] = exc_class
 
     # 6. Persist
+    # BUG-AUD-06 fix: the executive_summaries table does NOT have a UNIQUE
+    # constraint on task_id (same class of issue as BUG-S2-01 on
+    # report_generations.task_id), so ON CONFLICT (task_id) raised a
+    # PostgreSQL error that was silently swallowed by the outer try/except
+    # and the summary was never persisted.
+    #
+    # Replace the upsert with a DELETE-then-INSERT in a single transaction
+    # to keep "latest summary wins" semantics without relying on a UNIQUE
+    # constraint.  This is idempotent and safe to call multiple times for
+    # the same task (pivot, continuous-mode restart, before_report_on_halt).
+    _metadata_json = json.dumps({
+        "claims_count": len(claims_rows),
+        "sources_count": source_row["cnt"] if source_row else 0,
+        "unresolved_contradictions": contra_count or 0,
+        # BUG-AUD-11 fix: surface per-level errors in compression_metadata
+        # so downstream diagnostics can attribute empty summaries.
+        "errors": summary_errors,
+    })
     try:
-        await db.execute(
-            """
-            INSERT INTO executive_summaries (
-                task_id, one_liner, paragraph, page_summary,
-                compression_metadata
-            ) VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (task_id) DO UPDATE SET
-                one_liner = EXCLUDED.one_liner,
-                paragraph = EXCLUDED.paragraph,
-                page_summary = EXCLUDED.page_summary,
-                compression_metadata = EXCLUDED.compression_metadata,
-                created_at = now()
-            """,
-            task_id,
-            one_liner,
-            paragraph,
-            page_summary,
-            json.dumps({
-                "claims_count": len(claims_rows),
-                "sources_count": source_row["cnt"] if source_row else 0,
-                "unresolved_contradictions": contra_count or 0,
-                # BUG-AUD-11 fix: surface per-level errors in compression_metadata
-                # so downstream diagnostics can attribute empty summaries.
-                "errors": summary_errors,
-            }),
-        )
+        async with db.acquire() as _es_conn:
+            async with _es_conn.transaction():
+                await _es_conn.execute(
+                    "DELETE FROM executive_summaries WHERE task_id = $1",
+                    task_id,
+                )
+                await _es_conn.execute(
+                    """
+                    INSERT INTO executive_summaries (
+                        task_id, one_liner, paragraph, page_summary,
+                        compression_metadata
+                    ) VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    task_id,
+                    one_liner,
+                    paragraph,
+                    page_summary,
+                    _metadata_json,
+                )
     except Exception as exc:
         log.warning("executive_summary_persist_failed", error=str(exc))
 

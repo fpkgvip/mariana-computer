@@ -17,6 +17,7 @@ async def generate_image(
     output_path: Path,
     size: str = "1024x1024",
     timeout: float = 120.0,
+    data_root: Path | None = None,
 ) -> Path:
     """Generate an image and save to disk.
 
@@ -32,6 +33,9 @@ async def generate_image(
         Image dimensions (default ``"1024x1024"``).
     timeout:
         HTTP request timeout in seconds.
+    data_root:
+        Optional sandbox root. When provided, *output_path* must resolve
+        inside this directory (H-04 path-traversal guard).
 
     Returns
     -------
@@ -56,6 +60,16 @@ async def generate_image(
 
     img_b64: str = data["data"][0]["b64_json"]
     img_bytes = base64.b64decode(img_b64)
+
+    # H-04 fix: ensure output_path stays within data_root when provided.
+    if data_root is not None:
+        resolved_root = Path(data_root).resolve()
+        resolved_out = Path(output_path).resolve()
+        if not resolved_out.is_relative_to(resolved_root):
+            raise ValueError(
+                f"Refusing to write image outside data_root: {output_path!r}"
+            )
+        output_path = resolved_out
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(img_bytes)

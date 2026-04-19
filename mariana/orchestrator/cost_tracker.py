@@ -11,6 +11,9 @@ locking is required.  The companion Pydantic model `CostTracker` in
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
+
 import structlog
 
 from mariana.data.models import AISession
@@ -66,6 +69,25 @@ class CostTracker:
         exceeds this cap will be killed regardless of its score.
     """
 
+    # ------------------------------------------------------------------
+    # Safety constants
+    # ------------------------------------------------------------------
+
+    # H-11 fix: even in finalization_mode, spend is capped at this fraction
+    # of the original task budget to prevent unbounded post-investigation
+    # overspend.  15% is enough for report gen + intelligence hooks while
+    # still bounding the blast radius.
+    _FINALIZATION_BUDGET_FRACTION: float = 0.15
+
+    # M-07 fix: cap the dedup set size so long investigations don't grow
+    # memory without bound.  We keep the N most-recent session_ids and
+    # evict oldest when the cap is hit.
+    _DEDUP_MAX_ENTRIES: int = 50_000
+
+    # M-08 fix: upper bound on a single record_raw_spend() call to stop a
+    # runaway code path from charging an absurd value in one shot.
+    _RAW_SPEND_MAX_PER_CALL: float = 100.0
+
     def __init__(
         self,
         task_id: str,
@@ -93,13 +115,48 @@ class CostTracker:
         self.finalization_mode: bool = False
         self.call_count: int = 0
 
+        # H-11 fix: track spend entered while in finalization_mode so the
+        # finalization cap can be enforced separately from the main budget.
+        self.finalization_spent: float = 0.0
+        self.finalization_budget: float = task_budget * self._FINALIZATION_BUDGET_FRACTION
+
+        # H-05 fix: serialise the accumulate-and-check sequence so two
+        # concurrent record_call() invocations can't each individually pass
+        # the cap check and collectively exceed the budget. A threading.Lock
+        # is used (rather than asyncio.Lock) because these methods are
+        # synchronous, get invoked from both asyncio tasks and persistence
+        # callbacks, and the crit-section is short / non-blocking.
+        self._lock: threading.RLock = threading.RLock()
+
         # BUG-AUD-04 fix: Dedup ledger. If a caller supplies a session_id
         # (typically AISession.id) to record_call / record_branch_spend we
         # remember it here and ignore repeat charges for the same session_id.
         # This protects against the double-count footgun where record_call
         # and record_branch_spend are both invoked for the same underlying
         # cost (docstring-only guarantee is not enough in practice).
-        self._seen_session_ids: set[str] = set()
+        # M-07 fix: use a bounded OrderedDict as an LRU set so memory doesn't
+        # grow unbounded across a long-running investigation.
+        self._seen_session_ids: OrderedDict[str, None] = OrderedDict()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _seen_or_mark(self, session_id: str | None) -> bool:
+        """Return True if *session_id* was already recorded; otherwise mark and return False.
+
+        Bounded LRU eviction keeps the dedup ledger from unbounded growth.
+        """
+        if session_id is None:
+            return False
+        if session_id in self._seen_session_ids:
+            self._seen_session_ids.move_to_end(session_id)
+            return True
+        self._seen_session_ids[session_id] = None
+        if len(self._seen_session_ids) > self._DEDUP_MAX_ENTRIES:
+            # Drop the oldest entry.
+            self._seen_session_ids.popitem(last=False)
+        return False
 
     # ------------------------------------------------------------------
     # Public API
@@ -135,58 +192,77 @@ class CostTracker:
             the cost (i.e., the call itself was the straw that broke the
             camel's back).
         """
-        # BUG-AUD-04 fix: dedup ledger — refuse to charge the same
-        # session_id twice.  This prevents the common footgun where both
-        # record_call() and record_branch_spend() attempt to charge for
-        # the same underlying AI session.
-        if session_id is not None:
-            if session_id in self._seen_session_ids:
+        # H-05 fix: dedup, accumulate, and cap-check under a single lock so
+        # concurrent callers can't both race past the cap.
+        with self._lock:
+            # BUG-AUD-04 fix: dedup ledger — refuse to charge the same
+            # session_id twice.
+            if self._seen_or_mark(session_id):
                 logger.warning(
                     "cost_record_duplicate_session_id",
                     session_id=session_id,
                     branch_id=branch_id,
                 )
                 return
-            self._seen_session_ids.add(session_id)
 
-        cost = session.cost_usd
+            cost = session.cost_usd
 
-        # Accumulate totals
-        self.total_spent += cost
-        model_key = session.model_used.value
-        self.per_model[model_key] = self.per_model.get(model_key, 0.0) + cost
-        self.call_count += 1
+            # Accumulate totals
+            self.total_spent += cost
+            if self.finalization_mode:
+                self.finalization_spent += cost
+            model_key = session.model_used.value
+            self.per_model[model_key] = self.per_model.get(model_key, 0.0) + cost
+            self.call_count += 1
 
-        # Branch-level accounting + cap check
-        # BUG-053: Use `is not None` instead of truthiness check to allow empty-string
-        # branch_id (though in practice all IDs are UUIDs or None)
-        if branch_id is not None:
-            self.per_branch[branch_id] = (
-                self.per_branch.get(branch_id, 0.0) + cost
-            )
-            if self.per_branch[branch_id] > self.branch_hard_cap:
+            # Branch-level accounting + cap check
+            # BUG-053: Use `is not None` instead of truthiness check to allow empty-string
+            # branch_id (though in practice all IDs are UUIDs or None)
+            if branch_id is not None:
+                self.per_branch[branch_id] = (
+                    self.per_branch.get(branch_id, 0.0) + cost
+                )
+                if self.per_branch[branch_id] > self.branch_hard_cap:
+                    logger.warning(
+                        "branch_budget_exhausted",
+                        branch_id=branch_id,
+                        branch_spent=self.per_branch[branch_id],
+                        cap=self.branch_hard_cap,
+                    )
+                    raise BudgetExhaustedError(
+                        "branch",
+                        self.per_branch[branch_id],
+                        self.branch_hard_cap,
+                    )
+
+            # H-11 fix: even in finalization_mode, enforce a hard cap on
+            # post-investigation spend (15% of task_budget by default).
+            if (
+                self.finalization_mode
+                and self.finalization_spent > self.finalization_budget
+            ):
                 logger.warning(
-                    "branch_budget_exhausted",
-                    branch_id=branch_id,
-                    branch_spent=self.per_branch[branch_id],
-                    cap=self.branch_hard_cap,
+                    "finalization_budget_exhausted",
+                    finalization_spent=self.finalization_spent,
+                    finalization_budget=self.finalization_budget,
                 )
                 raise BudgetExhaustedError(
-                    "branch",
-                    self.per_branch[branch_id],
-                    self.branch_hard_cap,
+                    "finalization",
+                    self.finalization_spent,
+                    self.finalization_budget,
                 )
 
-        # Task-level cap check (bypassed in finalization mode)
-        if not self.finalization_mode and self.total_spent > self.task_budget:
-            logger.warning(
-                "task_budget_exhausted",
-                total_spent=self.total_spent,
-                task_budget=self.task_budget,
-            )
-            raise BudgetExhaustedError(
-                "task", self.total_spent, self.task_budget
-            )
+            # Task-level cap check (bypassed in finalization mode, but
+            # finalization_budget above still applies).
+            if not self.finalization_mode and self.total_spent > self.task_budget:
+                logger.warning(
+                    "task_budget_exhausted",
+                    total_spent=self.total_spent,
+                    task_budget=self.task_budget,
+                )
+                raise BudgetExhaustedError(
+                    "task", self.total_spent, self.task_budget
+                )
 
         logger.info(
             "cost_recorded",
@@ -223,11 +299,9 @@ class CostTracker:
         """
         if amount < 0:
             raise ValueError(f"amount must be non-negative, got {amount!r}")
-        # BUG-AUD-04 fix: dedup ledger.  If the same session_id was already
-        # charged (likely via record_call), silently no-op instead of
-        # double-adding to both per_branch and total_spent.
-        if session_id is not None:
-            if session_id in self._seen_session_ids:
+        with self._lock:
+            # BUG-AUD-04 fix: dedup ledger.
+            if self._seen_or_mark(session_id):
                 logger.warning(
                     "branch_spend_duplicate_session_id",
                     session_id=session_id,
@@ -235,9 +309,21 @@ class CostTracker:
                     amount=amount,
                 )
                 return
-            self._seen_session_ids.add(session_id)
-        self.per_branch[branch_id] = self.per_branch.get(branch_id, 0.0) + amount
-        self.total_spent += amount
+            self.per_branch[branch_id] = self.per_branch.get(branch_id, 0.0) + amount
+            self.total_spent += amount
+            if self.finalization_mode:
+                self.finalization_spent += amount
+                if self.finalization_spent > self.finalization_budget:
+                    logger.warning(
+                        "finalization_budget_exhausted",
+                        finalization_spent=self.finalization_spent,
+                        finalization_budget=self.finalization_budget,
+                    )
+                    raise BudgetExhaustedError(
+                        "finalization",
+                        self.finalization_spent,
+                        self.finalization_budget,
+                    )
         logger.debug(
             "branch_spend_recorded",
             branch_id=branch_id,
@@ -248,6 +334,10 @@ class CostTracker:
     def record_raw_spend(self, amount: float, label: str = "misc") -> None:
         """Charge *amount* to the task total without a session or branch.
 
+        M-08 fix: enforce a per-call sanity cap and task-level budget cap
+        even for this bypass-style charge path so no code path can silently
+        exceed the configured task budget.
+
         Parameters
         ----------
         amount:
@@ -257,8 +347,31 @@ class CostTracker:
         """
         if amount < 0:
             raise ValueError(f"amount must be non-negative, got {amount!r}")
-        self.total_spent += amount
-        logger.debug("raw_spend_recorded", amount=amount, label=label, total=self.total_spent)
+        if amount > self._RAW_SPEND_MAX_PER_CALL:
+            raise ValueError(
+                f"record_raw_spend amount {amount!r} exceeds per-call cap "
+                f"${self._RAW_SPEND_MAX_PER_CALL}"
+            )
+        with self._lock:
+            self.total_spent += amount
+            if self.finalization_mode:
+                self.finalization_spent += amount
+                if self.finalization_spent > self.finalization_budget:
+                    raise BudgetExhaustedError(
+                        "finalization",
+                        self.finalization_spent,
+                        self.finalization_budget,
+                    )
+            elif self.total_spent > self.task_budget:
+                raise BudgetExhaustedError(
+                    "task", self.total_spent, self.task_budget
+                )
+        logger.debug(
+            "raw_spend_recorded",
+            amount=amount,
+            label=label,
+            total=self.total_spent,
+        )
 
     # ------------------------------------------------------------------
     # Properties
@@ -281,10 +394,11 @@ class CostTracker:
         Returns False when ``finalization_mode`` is active so that
         post-investigation intelligence hooks (perspectives, audit,
         executive summary) can always run even if the main loop
-        consumed the entire budget.
+        consumed the entire budget — unless the finalization cap has
+        also been exhausted (H-11).
         """
         if self.finalization_mode:
-            return False
+            return self.finalization_spent >= self.finalization_budget
         return self.total_spent >= self.task_budget
 
     def branch_remaining(self, branch_id: str) -> float:

@@ -767,9 +767,27 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
     # ── Resume interrupted investigations from .running files ────────────
     # On container restart, any .running files represent investigations that
     # were in progress when the container was stopped.  Resume them.
+    # C-04 / M-13: enforce size limits and reject symlinks that escape the inbox.
+    _DAEMON_FILE_SIZE_CAP = 1_048_576  # 1 MB
+    inbox_resolved = inbox.resolve()
     running_files = sorted(inbox.glob("*.running"))
     for rf in running_files:
         try:
+            rf_resolved = rf.resolve()
+            if not rf_resolved.is_relative_to(inbox_resolved):
+                logger.warning("daemon_resume_symlink_escape", file=rf.name)
+                try:
+                    rf.rename(rf.with_suffix(".error"))
+                except FileNotFoundError:
+                    pass
+                continue
+            try:
+                if rf_resolved.stat().st_size > _DAEMON_FILE_SIZE_CAP:
+                    logger.warning("daemon_resume_oversized", file=rf.name)
+                    rf.rename(rf.with_suffix(".error"))
+                    continue
+            except FileNotFoundError:
+                continue
             resume_claim = rf.with_suffix(".resuming")
             try:
                 rf.rename(resume_claim)
@@ -777,7 +795,16 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
                 logger.warning("daemon_resume_already_claimed", file=rf.name)
                 continue
 
-            raw_resume = resume_claim.read_text(encoding="utf-8")
+            # Re-check after rename (TOCTOU-safe).
+            rc_resolved = resume_claim.resolve()
+            if not rc_resolved.is_relative_to(inbox_resolved):
+                logger.warning("daemon_resume_claim_symlink_escape", file=resume_claim.name)
+                try:
+                    resume_claim.rename(resume_claim.with_suffix(".error"))
+                except FileNotFoundError:
+                    pass
+                continue
+            raw_resume = rc_resolved.read_text(encoding="utf-8")
             resume_data = json.loads(raw_resume)
             normalized_resume = _normalize_daemon_task_payload(resume_data)
             topic_r = normalized_resume["topic"]
@@ -851,8 +878,41 @@ async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
             if _SHUTDOWN.is_set():
                 break
 
+            # C-04 fix: block symlinks that escape the inbox, and reject
+            # oversized JSON (M-13) before reading. Use resolve() to fully
+            # dereference any symlinks before comparing and reading.
             try:
-                raw = tf.read_text(encoding="utf-8")
+                tf_resolved = tf.resolve()
+            except OSError as exc:
+                logger.error("daemon_resolve_failed", file=str(tf), error=str(exc))
+                try:
+                    tf.rename(tf.with_suffix(".error"))
+                except FileNotFoundError:
+                    pass
+                continue
+
+            if not tf_resolved.is_relative_to(inbox_resolved):
+                logger.warning("daemon_symlink_escape", file=str(tf))
+                try:
+                    tf.rename(tf.with_suffix(".error"))
+                except FileNotFoundError:
+                    pass
+                continue
+
+            try:
+                if tf_resolved.stat().st_size > _DAEMON_FILE_SIZE_CAP:
+                    logger.warning(
+                        "daemon_task_file_too_large",
+                        file=str(tf),
+                        size=tf_resolved.stat().st_size,
+                    )
+                    tf.rename(tf.with_suffix(".error"))
+                    continue
+            except FileNotFoundError:
+                continue
+
+            try:
+                raw = tf_resolved.read_text(encoding="utf-8")
                 task_data = json.loads(raw)
             except (OSError, json.JSONDecodeError) as exc:
                 logger.error(

@@ -59,6 +59,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, 
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sse_starlette.sse import EventSourceResponse
 
@@ -133,7 +134,12 @@ _VERSION = "0.1.0"
 # ---------------------------------------------------------------------------
 
 #: Hardcoded admin user UUID — matches the Supabase profile with role='admin'.
-ADMIN_USER_ID = "a34a319e-a046-4df2-8c98-9b83f6d512a0"
+# L-04 fix: load admin user ID from env so it can be rotated without a
+# deploy.  Falls back to the previously hard-coded default to preserve
+# behaviour when ADMIN_USER_ID is not set.
+ADMIN_USER_ID = os.environ.get(
+    "ADMIN_USER_ID", "a34a319e-a046-4df2-8c98-9b83f6d512a0"
+)
 
 # BUG-API-024: Allow-list of valid task status values. Clients that pass
 # anything outside this set receive a 400 instead of an empty result.
@@ -356,6 +362,39 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Security headers middleware
+#
+# Sets a conservative baseline of security headers on every HTTP response.
+# These mitigate common browser-level attacks (clickjacking, MIME sniffing,
+# reflected XSS, protocol-downgrade) and are safe for an API that is only
+# consumed by the trusted frontend. CSP is ``default-src 'self'`` because the
+# API itself never renders HTML that loads third-party assets.
+# ---------------------------------------------------------------------------
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Attach a baseline of browser security headers to every response."""
+
+    _HEADERS = {
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "X-XSS-Protection": "1; mode=block",
+        "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+        "Content-Security-Policy": "default-src 'self'",
+    }
+
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        for header, value in self._HEADERS.items():
+            # Do not overwrite headers the route handler set deliberately.
+            response.headers.setdefault(header, value)
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 
 # ---------------------------------------------------------------------------
@@ -1114,6 +1153,9 @@ async def _authenticate_stream_token_or_header(
             raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
         if user["user_id"] != ADMIN_USER_ID:
             metadata = row.get("metadata") or {}
+            # BUG-API-016: wrap json.loads in try/except so that a malformed
+            # metadata string (rare, but seen when ingesting legacy rows)
+            # doesn't surface as a 500 inside this auth dependency.
             if isinstance(metadata, str):
                 try:
                     metadata = json.loads(metadata)
@@ -2023,6 +2065,15 @@ async def start_investigation(
                     files=uploaded_file_names,
                 )
 
+        # M-09 fix: gate QA-bypass flags on admin role.  We read the role
+        # off the authenticated user context (populated by Supabase auth
+        # middleware) and also match against the configured ADMIN_USER_ID
+        # for environments where the role claim is not yet provisioned.
+        _is_admin: bool = (
+            current_user.get("role") == "admin"
+            or str(current_user.get("user_id", "")) == ADMIN_USER_ID
+        )
+
         task_payload: dict[str, Any] = {
             "id": task_id,
             "topic": body.topic,
@@ -2042,10 +2093,14 @@ async def start_investigation(
             "quality_tier": body.quality_tier or "balanced",
             "user_flow_instructions": body.user_flow_instructions or "",
             "continuous_mode": body.continuous_mode,
-            "dont_kill_branches": body.dont_kill_branches,
-            "force_report_on_halt": body.force_report_on_halt,
-            "skip_skeptic": body.skip_skeptic,
-            "skip_tribunal": body.skip_tribunal,
+            # M-09 fix: the QA-bypass flags (skip_tribunal / skip_skeptic /
+            # dont_kill_branches / force_report_on_halt) skip important
+            # critical-review gates.  Only honour them when the submitting
+            # user is an admin; non-admin submissions get them forced False.
+            "dont_kill_branches": bool(body.dont_kill_branches) if _is_admin else False,
+            "force_report_on_halt": bool(body.force_report_on_halt) if _is_admin else False,
+            "skip_skeptic": bool(body.skip_skeptic) if _is_admin else False,
+            "skip_tribunal": bool(body.skip_tribunal) if _is_admin else False,
             "user_directives": body.user_directives or {},
         }
 
@@ -2145,10 +2200,13 @@ async def start_investigation(
                     amount=reserved_credits,
                     error=str(refund_err),
                 )
+        # M-01 fix: do not leak raw OSError details (which can include file
+        # paths, permission info, disk-space info) to the client.  The full
+        # exception is logged server-side; the client gets a generic message.
         logger.error("task_write_failed", error=str(exc))
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to write task to inbox: {exc}",
+            detail="Failed to submit investigation. Please try again.",
         ) from exc
     except Exception:
         if reserved_credits > 0:
@@ -2502,6 +2560,10 @@ async def delete_investigation(
         "temporal_tags",
         "source_credibility_scores",
     ]
+    # BUG-API-023: table names are interpolated into the SQL string with an
+    # f-string, but come exclusively from the hardcoded allow-list above, so
+    # this is not SQL-injectable. The ``noqa: S608`` annotation documents
+    # that the Bandit finding is intentional.
     for table in intelligence_tables:
         try:
             await pool.execute(f"DELETE FROM {table} WHERE task_id = $1", task_id)  # noqa: S608
@@ -2633,12 +2695,28 @@ async def get_cost_breakdown(
 ) -> CostBreakdown:
     """Return a detailed cost breakdown for an investigation."""
     db = _get_db()
+    # BUG-API-018: The ``_require_investigation_owner`` dependency has already
+    # confirmed the row exists and is owned by the caller. We fetch only the
+    # columns we need here (budget + total spent) and do not repeat the 404
+    # guard — doing so produced a race window where the dep passed 200 but
+    # this endpoint returned 404 if the task vanished in between.
     task_row = await db.fetchrow(
-        "SELECT id, budget_usd, total_spent_usd FROM research_tasks WHERE id = $1",
+        "SELECT budget_usd, total_spent_usd FROM research_tasks WHERE id = $1",
         task_id,
     )
     if task_row is None:
-        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        # Extremely narrow race: row deleted between dep and this query.
+        # Return zeroes rather than 404 so clients don't see inconsistent
+        # status codes from the same request.
+        return CostBreakdown(
+            task_id=task_id,
+            total_spent_usd=0.0,
+            budget_usd=0.0,
+            budget_remaining_usd=0.0,
+            ai_call_count=0,
+            per_model={},
+            per_branch={},
+        )
 
     # Per-model breakdown
     model_rows = await db.fetch(
@@ -3246,8 +3324,23 @@ async def download_report_pdf(
         )
 
     # Protect against path traversal: ensure the resolved path is under DATA_ROOT.
+    # BUG-API-022: explicitly refuse to follow symlinks on the candidate
+    # path. ``resolve()`` transparently follows symlinks, so a symlink
+    # inside DATA_ROOT that points to ``/etc/passwd`` would resolve to
+    # ``/etc/passwd`` — the ``is_relative_to`` check below will catch
+    # that case, but we defend in depth by rejecting any symlink
+    # component before the final resolve to avoid accidentally exposing
+    # host filesystem state even for paths technically under DATA_ROOT
+    # via a symlink that was planted by another process.
     cfg = _get_config()
-    resolved = Path(pdf_path).resolve()
+    candidate = Path(pdf_path)
+    if candidate.is_symlink() or any(p.is_symlink() for p in candidate.parents if p.exists()):
+        logger.warning("pdf_path_is_symlink", task_id=task_id, path=str(candidate))
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: report path contains a symlink",
+        )
+    resolved = candidate.resolve()
     data_root = Path(cfg.DATA_ROOT).resolve()
     if not resolved.is_relative_to(data_root):
         raise HTTPException(
@@ -3309,8 +3402,17 @@ async def download_report_docx(
         )
 
     # Protect against path traversal: ensure the resolved path is under DATA_ROOT.
+    # BUG-API-022: explicit symlink rejection for defense in depth — see
+    # the same comment in ``download_report_pdf`` above.
     cfg = _get_config()
-    resolved = Path(docx_path).resolve()
+    candidate = Path(docx_path)
+    if candidate.is_symlink() or any(p.is_symlink() for p in candidate.parents if p.exists()):
+        logger.warning("docx_path_is_symlink", task_id=task_id, path=str(candidate))
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: report path contains a symlink",
+        )
+    resolved = candidate.resolve()
     data_root = Path(cfg.DATA_ROOT).resolve()
     if not resolved.is_relative_to(data_root):
         raise HTTPException(
@@ -3325,6 +3427,10 @@ async def download_report_docx(
             detail="Report DOCX file is not available. It may still be generating or was removed.",
         )
 
+    # BUG-API-047: trust Starlette's FileResponse to emit the
+    # Content-Disposition header. Removing the manual override avoids
+    # duplicate headers and header-injection via filenames containing
+    # quotes or CRLF.
     filename = resolved.name
     return FileResponse(
         path=str(resolved),
@@ -3332,7 +3438,6 @@ async def download_report_docx(
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         ),
         filename=filename,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -3532,6 +3637,11 @@ def _validate_task_id(task_id: str) -> str:
 
     BUG-API-001 fix: Several task-scoped endpoints passed raw task_id to
     asyncpg without UUID validation, causing 500 on malformed inputs.
+
+    BUG-API-002 fix: Also blocks path traversal via ``task_id`` in
+    endpoints that build ``Path(DATA_ROOT) / "files" / task_id``. A
+    malicious value like ``"../../etc"`` no longer escapes because the
+    UUID parser rejects it here before any ``Path()`` composition.
     """
     try:
         return str(uuid.UUID(task_id))
@@ -4129,13 +4239,19 @@ async def create_checkout(
             client_reference_id=current_user["user_id"],
         )
     except _stripe.StripeError as exc:
+        # M-02 fix: log the raw Stripe error server-side but return a
+        # generic message to the client so we don't leak internal
+        # configuration / price IDs / Stripe diagnostics.
         logger.error(
             "stripe_checkout_failed",
             user_id=current_user["user_id"],
             plan_id=body.plan_id,
             error=str(exc),
         )
-        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}") from exc
+        raise HTTPException(
+            status_code=502,
+            detail="Payment service error. Please try again.",
+        ) from exc
 
     logger.info(
         "checkout_session_created",
@@ -4294,8 +4410,12 @@ async def billing_portal(
             customer=stripe_customer_id,
         )
     except _stripe.StripeError as exc:
+        # M-02 fix: generic client-facing detail, full error logged.
         logger.error("stripe_portal_failed", user_id=user_id, error=str(exc))
-        raise HTTPException(status_code=502, detail=f"Stripe error: {exc}") from exc
+        raise HTTPException(
+            status_code=502,
+            detail="Payment service error. Please try again.",
+        ) from exc
 
     logger.info("portal_session_created", user_id=user_id)
     # BUG-API-004: Stripe can return null portal_session.url
@@ -4707,6 +4827,11 @@ async def _record_webhook_event_once(event_id: str, event_type: str) -> bool:
 
     Returns ``True`` when this is the first time the event ID is seen and the
     handler should proceed, or ``False`` when the event is a replay.
+
+    BUG-API-041: DB failures here propagate to the caller (``stripe_webhook``)
+    where they are translated into 500 so Stripe retries. The ``INSERT 0 1``
+    /``INSERT 0 0`` parsing pattern is well-defined for asyncpg. No action
+    needed beyond the existing implementation.
     """
     db = _get_db()
     result = await db.execute(
@@ -5067,7 +5192,9 @@ async def graceful_shutdown(
     admin_key = getattr(cfg, "ADMIN_SECRET_KEY", "")
     if not admin_key:
         raise HTTPException(status_code=403, detail="Shutdown endpoint disabled (ADMIN_SECRET_KEY not configured)")
-    if x_admin_key != admin_key:
+    # M-11 fix: constant-time comparison to prevent timing-attack recovery of
+    # the admin key byte-by-byte.
+    if not hmac.compare_digest((x_admin_key or "").encode("utf-8"), admin_key.encode("utf-8")):
         raise HTTPException(status_code=401, detail="Unauthorized")
     db: asyncpg.Pool | None = _db_pool
     if db is not None:

@@ -33,6 +33,19 @@ import ProgressTimeline, {
 } from "@/components/ProgressTimeline";
 import FileViewer, { FileCard, type FileAttachment } from "@/components/FileViewer";
 import FileUpload, { type UploadedFile } from "@/components/FileUpload";
+// BUG-FE-137 fix: Use a styled AlertDialog instead of native window.confirm()
+// for delete confirmations. Native confirm() blocks the JS main thread, cannot
+// be styled, and is inconsistent across browsers.
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
@@ -498,6 +511,11 @@ export default function Chat() {
 
   // Memory panel state
   const [memoryOpen, setMemoryOpen] = useState(false);
+
+  // BUG-FE-137 fix: Track which conversation is pending deletion so we can
+  // show a styled AlertDialog instead of native window.confirm().
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const [isDeletingConversation, setIsDeletingConversation] = useState(false);
   const [memoryFacts, setMemoryFacts] = useState<Array<{ fact: string; category: string }>>([]);
   const [memoryPrefs, setMemoryPrefs] = useState<Record<string, string>>({});
   const deletingFactsRef = useRef<Set<string>>(new Set());
@@ -1016,11 +1034,19 @@ export default function Chat() {
   /* ---------------------------------------------------------------- */
 
   const appendMessage = useCallback((msg: Message) => {
+    // BUG-FE-114 fix: Prefix dedup keys with the active task id so dedup is
+    // scoped per-investigation. Previously, switching tasks kept a global
+    // Set; if a cached message with the same id was replayed on reconnect,
+    // it was silently dropped as a "duplicate" even though it belonged to a
+    // different investigation. Task-scoped prefix means messages from task A
+    // and task B never collide in dedup.
+    const taskPrefix = activeTaskIdRef.current ?? "no-task";
     // BUG-FE-113 fix: When no explicit id is provided, include the current
     // size of seenStatusIds to make the key unique across identical
     // role/content pairs. Previously a message like {role:"user", content:"yes"}
     // sent twice in a row had the same dedup key and the second was dropped.
-    const msgId = msg.id || `${msg.role}-${msg.content}-${seenStatusIds.current.size}`;
+    const rawId = msg.id || `${msg.role}-${msg.content}-${seenStatusIds.current.size}`;
+    const msgId = `${taskPrefix}::${rawId}`;
     if (msg.type === "status" && seenStatusIds.current.has(msgId)) return;
     if (msg.type === "status") {
       seenStatusIds.current.add(msgId);
@@ -2077,6 +2103,16 @@ export default function Chat() {
 
     setIsClassifying(true);
 
+    // BUG-FE-101 fix: Wrap /api/chat/respond in an AbortController with a 60s
+    // timeout. Without this, a hanging proxy or stalled backend leaves the
+    // fetch promise unsettled forever, the outer finally fires eventually but
+    // only after no resolution, and — more importantly — a never-resolving
+    // fetch means neither branch below runs, so `setIsClassifying(false)` is
+    // deferred to the outer finally (which now always runs). The timeout
+    // ensures we fail-fast with a clear error rather than leaving the user
+    // with an indefinite spinner.
+    const chatRespondAbort = new AbortController();
+    const chatRespondTimer = setTimeout(() => chatRespondAbort.abort(), 60_000);
     try {
       // ── Step 1: Ask the AI how to handle this message ─────────────────
       const chatRes = await fetch(`${API_URL}/api/chat/respond`, {
@@ -2086,6 +2122,7 @@ export default function Chat() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ message: topic, conversation_id: convId }),
+        signal: chatRespondAbort.signal,
       });
 
       if (chatRes.status === 401) {
@@ -2162,7 +2199,17 @@ export default function Chat() {
       });
     } catch (err) {
       setIsClassifying(false);
-      console.warn("[Chat] Chat error, showing fallback plan:", err);
+      // BUG-FE-101: Distinguish AbortError (our 60s timeout) from other errors
+      // so the user sees a specific timeout message rather than a generic one.
+      const isTimeout = err instanceof DOMException && err.name === "AbortError";
+      if (isTimeout) {
+        console.warn("[Chat] chat/respond timed out after 60s, showing fallback plan.");
+        toast.error("Mariana took too long to respond", {
+          description: "Showing a fallback research plan you can approve.",
+        });
+      } else {
+        console.warn("[Chat] Chat error, showing fallback plan:", err);
+      }
       // Even on error, show a plan for approval — never auto-launch without consent
       setPendingPlan({
         topic,
@@ -2172,6 +2219,10 @@ export default function Chat() {
         estimated_credits: 100,
         _convId: convId || undefined,
       });
+    } finally {
+      // BUG-FE-101: Always clear the 60s timeout so we don't leak a timer
+      // when the fetch completes successfully.
+      clearTimeout(chatRespondTimer);
     }
 
     // BUG-FE-C2 fix: end of try/finally wrapper
@@ -2442,6 +2493,58 @@ export default function Chat() {
   /*  Cancel research plan                                            */
   /* ---------------------------------------------------------------- */
 
+  // BUG-FE-137 fix: Delete-conversation handler invoked by the AlertDialog's
+  // confirm button. Contains the same side-effects as the previous inline
+  // async onClick, but now runs from a styled, non-blocking dialog.
+  const handleConfirmDeleteConversation = useCallback(async () => {
+    const conversationId = deleteConfirmId;
+    if (!conversationId || isDeletingConversation) return;
+    setIsDeletingConversation(true);
+    try {
+      const token = await getAccessToken();
+      if (!token) {
+        toast.error("Session expired", { description: "Please sign in again." });
+        return;
+      }
+      const res = await fetch(`${API_URL}/api/conversations/${conversationId}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok || res.status === 204) {
+        setConversations((prev) => prev.filter((c) => c.id !== conversationId));
+        if (activeConversationIdRef.current === conversationId) {
+          // P1-FIX-35: Cancel any live SSE/polling for an investigation running
+          // under the deleted conversation. Bumping the generation invalidates
+          // any in-flight startSSE awaits so they cannot resurrect.
+          stopAllConnections();
+          switchGenerationRef.current += 1;
+          setActiveConversationId(null);
+          setActiveTaskId(null);
+          setMessages([]);
+          setTimelineSteps([]);
+          setPendingPlan(null);
+          setUploadedFiles([]);
+          setUploadSessionUuid(null);
+          setElapsedSeconds(0);
+          setRetryPayload(null);
+          setIsClassifying(false);
+          isClassifyingRef.current = false;
+          setIsStopping(false);
+          seenStatusIds.current.clear();
+        }
+        toast.success("Conversation deleted");
+      } else {
+        toast.error("Failed to delete conversation");
+      }
+    } catch (err) {
+      console.warn("[Chat] Delete conversation failed:", err);
+      toast.error("Failed to delete conversation");
+    } finally {
+      setIsDeletingConversation(false);
+      setDeleteConfirmId(null);
+    }
+  }, [deleteConfirmId, isDeletingConversation, stopAllConnections]);
+
   const handleCancelPlan = useCallback(() => {
     setPendingPlan(null);
     // BUG-FE-122 fix: Cancel any in-flight POST /stop so it does not settle
@@ -2683,54 +2786,14 @@ export default function Chat() {
                     </div>
                   </button>
                   <button
-                    onClick={async (e) => {
+                    onClick={(e) => {
                       e.stopPropagation();
-                      // BUG-FE-137: TODO — replace native confirm() with a Radix
-                      // AlertDialog for visual consistency with the rest of the
-                      // app (native confirm cannot be styled and blocks the JS
-                      // thread on slow machines). Tracked for UI-polish sprint;
-                      // keep `confirm` as a functional stopgap.
-                      if (!confirm("Delete this conversation? This cannot be undone.")) return;
-                      const token = await getAccessToken();
-                      if (!token) return;
-                      try {
-                        const res = await fetch(`${API_URL}/api/conversations/${conv.id}`, {
-                          method: "DELETE",
-                          headers: { Authorization: `Bearer ${token}` },
-                        });
-                        if (res.ok || res.status === 204) {
-                          setConversations((prev) => prev.filter((c) => c.id !== conv.id));
-                          if (activeConversationId === conv.id) {
-                            // P1-FIX-35: Cancel any live SSE/polling for an
-                            // investigation running under the deleted conversation.
-                            // stopAllConnections() closes the EventSource and clears
-                            // poll intervals; bumping the generation invalidates any
-                            // in-flight startSSE awaits so they cannot resurrect.
-                            stopAllConnections();
-                            switchGenerationRef.current += 1;
-                            setActiveConversationId(null);
-                            setActiveTaskId(null);
-                            setMessages([]);
-                            setTimelineSteps([]);
-                            setPendingPlan(null);
-                            setUploadedFiles([]);
-                            setUploadSessionUuid(null); // P1-FIX-39: reset upload session
-                            setElapsedSeconds(0);
-                            // P1-FIX-34: Reset transient UI state so the next
-                            // conversation starts clean.
-                            setRetryPayload(null);
-                            setIsClassifying(false);
-                            isClassifyingRef.current = false;
-                            setIsStopping(false);
-                            seenStatusIds.current.clear();
-                          }
-                          toast.success("Conversation deleted");
-                        } else {
-                          toast.error("Failed to delete conversation");
-                        }
-                      } catch {
-                        toast.error("Failed to delete conversation");
-                      }
+                      // BUG-FE-137 fix: Open a styled AlertDialog instead of
+                      // calling native window.confirm() inline. The actual
+                      // delete network call fires from the dialog's "Delete"
+                      // action (see AlertDialog markup near the end of the
+                      // component tree).
+                      setDeleteConfirmId(conv.id);
                     }}
                     className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-red-500/10 hover:text-red-500"
                     title="Delete conversation"
@@ -3470,6 +3533,51 @@ export default function Chat() {
         onClose={() => setViewingFile(null)}
         apiUrl={API_URL}
       />
+
+      {/* BUG-FE-137 fix: Styled confirmation dialog that replaces native
+          window.confirm() for conversation deletion. Opens when
+          deleteConfirmId is non-null and closes on cancel or successful
+          delete. */}
+      <AlertDialog
+        open={deleteConfirmId !== null}
+        onOpenChange={(open) => {
+          if (!open && !isDeletingConversation) setDeleteConfirmId(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this conversation?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will permanently delete the conversation and its linked
+              investigations. This action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isDeletingConversation}>
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                // Prevent the default close-on-click behavior so we can await
+                // the async delete before dismissing the dialog.
+                e.preventDefault();
+                handleConfirmDeleteConversation();
+              }}
+              disabled={isDeletingConversation}
+              className="bg-red-600 text-white hover:bg-red-700"
+            >
+              {isDeletingConversation ? (
+                <span className="inline-flex items-center gap-1.5">
+                  <Loader2 size={12} className="animate-spin" />
+                  Deleting…
+                </span>
+              ) : (
+                "Delete"
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

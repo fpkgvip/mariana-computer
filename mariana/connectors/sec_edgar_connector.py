@@ -19,7 +19,13 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-import xml.etree.ElementTree as ET
+# H-08 fix: use defusedxml to disable DTD/entity processing and prevent XXE
+# against SEC EDGAR XML responses.  defusedxml.ElementTree mirrors the
+# stdlib API so fromstring/ParseError continue to work identically.  We
+# keep the stdlib ET around only for ``tostring`` (safe: it serialises an
+# already-parsed tree, no entity expansion).
+import xml.etree.ElementTree as _stdlib_ET
+import defusedxml.ElementTree as ET  # noqa: N814
 from typing import Any
 
 import structlog
@@ -298,7 +304,7 @@ class SecEdgarConnector(BaseConnector):
                 cik_el = content.find(".//{http://www.sec.gov/cgi-bin/browse-edgar}CIK")
                 if cik_el is None:
                     # Fallback: look for text "CIK" pattern in raw text
-                    raw = ET.tostring(content, encoding="unicode")
+                    raw = _stdlib_ET.tostring(content, encoding="unicode")
                     match = re.search(r"<CIK>(\d+)</CIK>", raw, re.IGNORECASE)
                     if match:
                         cik = match.group(1)
@@ -309,7 +315,7 @@ class SecEdgarConnector(BaseConnector):
                     if cik:
                         await self._cache_set(cache_key, cik, ttl=_TTL_FILINGS)
                         return cik
-        except ET.ParseError as exc:
+        except _stdlib_ET.ParseError as exc:
             self._log.warning("lookup_cik_parse_error", ticker=ticker, error=str(exc))
 
         # Last-resort regex on the raw text

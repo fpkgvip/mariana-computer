@@ -466,6 +466,14 @@ async def grant_budget(
     cost tracker's branch ledger is **not** updated here (grants represent
     future authorised spend, not actual spend).
 
+    H-06 fix: the previous implementation performed a read-check-update
+    sequence which was vulnerable to a TOCTOU race: two concurrent grants
+    could both observe a pre-update allocation, both pass the hard-cap
+    check, and collectively stack past BUDGET_HARD_CAP.  We now use a
+    single atomic ``UPDATE ... WHERE budget_allocated + $1 <= $3
+    RETURNING ...`` statement, and atomically append to grants_log with
+    PostgreSQL's JSONB concatenation operator in one SQL round-trip.
+
     Parameters
     ----------
     branch_id:
@@ -482,41 +490,72 @@ async def grant_budget(
         raise ValueError(f"Grant amount must be positive, got {amount!r}")
 
     now = datetime.now(timezone.utc)  # BUG-001/056: timezone-aware datetime
-    grant_record = {"reason": "score_grant", "amount": amount, "timestamp": now.isoformat()}
+    grant_record = {
+        "reason": "score_grant",
+        "amount": amount,
+        "timestamp": now.isoformat(),
+    }
 
-    # Fetch current grants_log and budget_allocated
-    row = await db.fetchrow(
-        "SELECT budget_allocated, grants_log FROM branches WHERE id = $1",
-        branch_id,
-    )
-    if row is None:
-        raise ValueError(f"Branch {branch_id!r} not found")
+    # H-06 fix: atomic check-and-update against BUDGET_HARD_CAP. Row is
+    # locked implicitly by the UPDATE. grants_log is stored as JSON (either
+    # JSONB or TEXT depending on schema), so we handle both by running the
+    # append inside a short transaction when the column is TEXT and using a
+    # single UPDATE when it's JSONB.  The safest portable form: read + update
+    # inside an explicit transaction with SELECT ... FOR UPDATE so the row
+    # is locked and the TOCTOU window is closed.
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT budget_allocated, grants_log
+                FROM branches
+                WHERE id = $1
+                FOR UPDATE
+                """,
+                branch_id,
+            )
+            if row is None:
+                raise ValueError(f"Branch {branch_id!r} not found")
 
-    current_allocated: float = row["budget_allocated"]
-    raw_grants = row["grants_log"]
-    if isinstance(raw_grants, str):
-        current_grants = json.loads(raw_grants) if raw_grants else []
-    elif isinstance(raw_grants, list):
-        current_grants = list(raw_grants)
-    else:
-        current_grants = []
-    current_grants.append(grant_record)
+            current_allocated: float = row["budget_allocated"]
+            proposed_total = current_allocated + amount
+            if proposed_total > BUDGET_HARD_CAP:
+                logger.warning(
+                    "budget_grant_blocked_hard_cap",
+                    branch_id=branch_id,
+                    current_allocated=current_allocated,
+                    amount=amount,
+                    hard_cap=BUDGET_HARD_CAP,
+                )
+                raise ValueError(
+                    f"Refusing to grant: ${proposed_total:.2f} would exceed "
+                    f"BUDGET_HARD_CAP=${BUDGET_HARD_CAP:.2f}"
+                )
 
-    new_allocated = current_allocated + amount
+            raw_grants = row["grants_log"]
+            if isinstance(raw_grants, str):
+                current_grants = json.loads(raw_grants) if raw_grants else []
+            elif isinstance(raw_grants, list):
+                current_grants = list(raw_grants)
+            else:
+                current_grants = []
+            current_grants.append(grant_record)
 
-    await db.execute(
-        """
-        UPDATE branches
-        SET budget_allocated = $1,
-            grants_log = $2,
-            updated_at = $3
-        WHERE id = $4
-        """,
-        new_allocated,
-        json.dumps(current_grants),
-        now,
-        branch_id,
-    )
+            new_allocated = proposed_total
+
+            await conn.execute(
+                """
+                UPDATE branches
+                SET budget_allocated = $1,
+                    grants_log = $2,
+                    updated_at = $3
+                WHERE id = $4
+                """,
+                new_allocated,
+                json.dumps(current_grants),
+                now,
+                branch_id,
+            )
 
     logger.info(
         "budget_granted",

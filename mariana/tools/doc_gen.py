@@ -17,10 +17,24 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 
+def _ensure_within_data_root(output_path: Path, data_root: Path | None) -> Path:
+    """H-04 fix: resolve *output_path* and ensure it stays within *data_root*."""
+    if data_root is None:
+        return Path(output_path)
+    resolved_root = Path(data_root).resolve()
+    resolved_out = Path(output_path).resolve()
+    if not resolved_out.is_relative_to(resolved_root):
+        raise ValueError(
+            f"Refusing to write document outside data_root: {output_path!r}"
+        )
+    return resolved_out
+
+
 async def generate_pptx(
     title: str,
     slides_data: list[dict[str, object]],
     output_path: Path,
+    data_root: Path | None = None,
 ) -> Path:
     """Generate a PowerPoint presentation.
 
@@ -61,9 +75,10 @@ async def generate_pptx(
                     p.text = str(point)
                     p.font.size = Pt(18)
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        prs.save(str(output_path))
-        return output_path
+        safe_out = _ensure_within_data_root(output_path, data_root)
+        safe_out.parent.mkdir(parents=True, exist_ok=True)
+        prs.save(str(safe_out))
+        return safe_out
 
     result = await asyncio.to_thread(_build)
     logger.info("pptx_generated", title=title, slides=len(slides_data), path=str(output_path))
@@ -74,6 +89,7 @@ async def generate_xlsx(
     title: str,
     sheets_data: dict[str, list[list[object]]],
     output_path: Path,
+    data_root: Path | None = None,
 ) -> Path:
     """Generate an Excel workbook.
 
@@ -105,9 +121,10 @@ async def generate_xlsx(
             for row in rows:
                 ws.append(row)
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        wb.save(str(output_path))
-        return output_path
+        safe_out = _ensure_within_data_root(output_path, data_root)
+        safe_out.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(str(safe_out))
+        return safe_out
 
     result = await asyncio.to_thread(_build)
     logger.info("xlsx_generated", title=title, sheets=len(sheets_data), path=str(output_path))
@@ -118,6 +135,7 @@ async def generate_docx(
     title: str,
     sections: list[dict[str, object]],
     output_path: Path,
+    data_root: Path | None = None,
 ) -> Path:
     """Generate a Word document.
 
@@ -159,9 +177,10 @@ async def generate_docx(
                 for bullet in bullets:
                     doc.add_paragraph(str(bullet), style="List Bullet")
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        doc.save(str(output_path))
-        return output_path
+        safe_out = _ensure_within_data_root(output_path, data_root)
+        safe_out.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(str(safe_out))
+        return safe_out
 
     result = await asyncio.to_thread(_build)
     logger.info("docx_generated", title=title, sections=len(sections), path=str(output_path))

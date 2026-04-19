@@ -38,6 +38,13 @@ logger = structlog.get_logger(__name__)
 # Default template filename expected inside template_dir.
 _DEFAULT_TEMPLATE_NAME: str = "report.html.j2"
 
+# H-07 fix: anchor any caller-supplied template_dir to a trusted base so a
+# caller can't escape via ``..`` or a symlink and load arbitrary Jinja2
+# templates from the filesystem.  We use the package root (parent of the
+# ``report`` package) as the project root; this matches the bundled
+# templates directory layout.
+_PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
+
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -157,6 +164,15 @@ def render_pdf(
     if not template_dir_path.is_dir():
         raise FileNotFoundError(
             f"Template directory does not exist: {template_dir_path}"
+        )
+
+    # H-07 fix: reject template directories outside the project root so a
+    # caller can't pass ``..`` or a symlink and have Jinja2 load untrusted
+    # templates from anywhere on the filesystem.
+    if not template_dir_path.is_relative_to(_PROJECT_ROOT):
+        raise ValueError(
+            f"template_dir must be under project root {_PROJECT_ROOT}; "
+            f"refusing to load templates from {template_dir_path}"
         )
 
     # ── Step 1: render HTML ──────────────────────────────────────────────────

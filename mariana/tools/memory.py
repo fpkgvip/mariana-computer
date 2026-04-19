@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,13 +23,63 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
+# H-03: reject any user_id that isn't the plain UUID/alphanumeric shape we
+# actually hand out.  Path separators, NUL, leading dots, etc., are all
+# rejected so the joined directory can't escape DATA_ROOT/memory.
+_USER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,127}$")
+
+# H-02: keep injected context bounded and defanged before it reaches the LLM.
+_MEMORY_CONTEXT_MAX_CHARS = 5000
+_MEMORY_FIELD_MAX_CHARS = 500
+
+_INJECTION_PATTERNS = [
+    re.compile(r"(?i)ignore\s+(?:all\s+)?(?:previous|prior|above)\s+(?:instructions|prompts|directives)[^\n]*"),
+    re.compile(r"(?i)disregard\s+(?:all\s+)?(?:previous|prior|above)\s+(?:instructions|prompts|directives)[^\n]*"),
+    re.compile(r"(?i)forget\s+(?:everything|all)\s+(?:above|before|prior)[^\n]*"),
+    re.compile(r"(?im)^\s*system\s*:\s*"),
+    re.compile(r"(?im)^\s*assistant\s*:\s*"),
+    re.compile(r"(?i)new\s+instructions?\s*:"),
+    re.compile(r"(?i)<\s*/?\s*system\s*>"),
+]
+_FENCE_RE = re.compile(r"```+")
+
+
+def _sanitize_snippet(text: str, max_chars: int = _MEMORY_FIELD_MAX_CHARS) -> str:
+    """Truncate and defang a stored-memory string before embedding in a prompt."""
+    if not text:
+        return ""
+    if not isinstance(text, str):
+        try:
+            text = str(text)
+        except Exception:
+            return ""
+    if len(text) > max_chars:
+        text = text[: max_chars - 3] + "..."
+    for pat in _INJECTION_PATTERNS:
+        text = pat.sub("[filtered]", text)
+    text = _FENCE_RE.sub("'''", text)
+    # Collapse any line that looks like a delimiter break-out attempt.
+    text = text.replace("\x00", "")
+    return text
+
 
 class UserMemory:
     """Per-user persistent memory backed by a JSON file on disk."""
 
     def __init__(self, user_id: str, data_root: Path) -> None:
+        # H-03 fix: validate user_id format, then verify the resolved directory
+        # is still inside DATA_ROOT/memory (defence-in-depth vs. symlinks or
+        # resolver edge cases).
+        if not isinstance(user_id, str) or not _USER_ID_RE.match(user_id):
+            raise ValueError(f"Invalid user_id for memory path: {user_id!r}")
         self.user_id = user_id
-        self.memory_dir = data_root / "memory" / user_id
+
+        memory_root = (data_root / "memory").resolve()
+        memory_dir = (data_root / "memory" / user_id).resolve()
+        if not memory_dir.is_relative_to(memory_root):
+            raise ValueError(f"Resolved memory path escapes DATA_ROOT: {user_id!r}")
+
+        self.memory_dir = memory_dir
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.memory_file = self.memory_dir / "memory.json"
         self._data: dict[str, object] = self._load()
@@ -143,20 +194,37 @@ class UserMemory:
     # ------------------------------------------------------------------
 
     def get_context_for_prompt(self) -> str:
-        """Build a compact context string for LLM prompt injection."""
+        """Build a compact context string for LLM prompt injection.
+
+        H-02 fix: stored user content is sanitised and length-capped before
+        being embedded in a system prompt so a previously-stored malicious
+        fact cannot inject instructions into every future AI session.
+        """
         parts: list[str] = []
 
         prefs = self.get_preferences()
         if prefs:
-            parts.append("User preferences: " + "; ".join(f"{k}: {v}" for k, v in prefs.items()))
+            safe_prefs = [
+                f"{_sanitize_snippet(str(k), 64)}: {_sanitize_snippet(str(v))}"
+                for k, v in list(prefs.items())[:20]
+            ]
+            parts.append("User preferences: " + "; ".join(safe_prefs))
 
         facts = self.get_facts()
         if facts:
-            parts.append("Known facts: " + "; ".join(facts[-10:]))
+            safe_facts = [_sanitize_snippet(f) for f in facts[-10:]]
+            parts.append("Known facts: " + "; ".join(safe_facts))
 
         history: list[dict[str, str]] = self._data.get("history", [])  # type: ignore[assignment]
         if history:
             recent = history[-5:]
-            parts.append("Recent research: " + "; ".join(h["topic"] for h in recent))
+            safe_topics = [_sanitize_snippet(h.get("topic", ""), 120) for h in recent]
+            parts.append("Recent research: " + "; ".join(safe_topics))
 
-        return "\n".join(parts) if parts else ""
+        if not parts:
+            return ""
+
+        joined = "\n".join(parts)
+        if len(joined) > _MEMORY_CONTEXT_MAX_CHARS:
+            joined = joined[: _MEMORY_CONTEXT_MAX_CHARS - 3] + "..."
+        return joined

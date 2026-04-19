@@ -443,6 +443,20 @@ async def _call_gateway(
     if not base_url:
         raise ModelCallError("LLM_GATEWAY_BASE_URL is not configured.")
 
+    # M-03 fix: refuse plain-HTTP LLM Gateway URLs in production.  Sending
+    # API keys and prompt contents over cleartext HTTP is a MITM hazard.
+    # localhost / 127.x / *.local are permitted for dev environments only.
+    _lower = base_url.lower()
+    if not _lower.startswith("https://"):
+        if not any(
+            tok in _lower
+            for tok in ("://localhost", "://127.", "://[::1]", ".local:", ".local/")
+        ):
+            raise ModelCallError(
+                f"LLM_GATEWAY_BASE_URL must use https:// in non-local environments "
+                f"(got {base_url!r})"
+            )
+
     url = f"{base_url}/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",

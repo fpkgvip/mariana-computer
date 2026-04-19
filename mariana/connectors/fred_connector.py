@@ -68,7 +68,15 @@ class FredConnector(BaseConnector):
     # ------------------------------------------------------------------
 
     def _base_params(self, extra: dict | None = None) -> dict:
-        """Return common query params including file_type and optional api_key."""
+        """Return common query params including file_type and optional api_key.
+
+        M-04 note: the FRED REST API only accepts authentication via the
+        ``api_key`` query parameter — there is no Authorization-header
+        equivalent.  To prevent key leakage via logs we rely on the
+        redact-before-log wrapper in :mod:`mariana.connectors.base`
+        (``_redact_url``), which strips query strings before they reach
+        structlog.
+        """
         params: dict = {"file_type": "json"}
         if self._api_key:
             params["api_key"] = self._api_key

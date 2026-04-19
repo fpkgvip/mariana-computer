@@ -375,6 +375,15 @@ class DeepSeekHealthCache:
         We ask for exactly 1 token so the cost is negligible.
         Any 2xx response counts as healthy; timeouts or 5xx = unhealthy.
         """
+        # M-03 fix: refuse plain-HTTP LLM Gateway URLs in production.
+        _gbl = gateway_base_url.rstrip("/").lower()
+        if not _gbl.startswith("https://"):
+            if not any(
+                tok in _gbl
+                for tok in ("://localhost", "://127.", "://[::1]", ".local:", ".local/")
+            ):
+                logger.warning("llm_gateway_base_url_not_https", url=gateway_base_url)
+                return False
         url = f"{gateway_base_url.rstrip('/')}/chat/completions"
         payload = {
             "model": "deepseek-v3.2",

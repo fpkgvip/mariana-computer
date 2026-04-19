@@ -13,10 +13,12 @@ services:
         condition: service_healthy
     networks:
       - mariana-net
-    deploy:
-      resources:
-        limits:
-          memory: 8G
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 8g
 
   mariana-api:
     build: .
@@ -43,10 +45,12 @@ services:
     networks:
       - mariana-net
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 4G
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 4g
 
   postgresql:
     image: pgvector/pgvector:pg16
@@ -65,34 +69,67 @@ services:
       retries: 5
     networks:
       - mariana-net
-    deploy:
-      resources:
-        limits:
-          memory: 8G
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    # Postgres entrypoint needs these to drop privileges from root -> postgres
+    # and to set up /var/lib/postgresql/data permissions on first boot.
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    mem_limit: 8g
 
   redis:
     image: redis:7-alpine
     container_name: mariana-redis
     restart: unless-stopped
     # BUG-S2-14 fix: bind Redis to the internal network only (no port mapping)
-    # and require a password when REDIS_PASSWORD is set in the environment.
-    command: >-
-      redis-server
-      --appendonly yes
-      --appendfsync everysec
-      --maxmemory 4gb
-      --maxmemory-policy allkeys-lru
-      --bind 0.0.0.0
-      --protected-mode no
+    # and require a password. REDIS_PASSWORD must be set in .env and
+    # REDIS_URL must be of the form redis://:<password>@redis:6379/0.
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env or environment}
+    # Use ``sh -c`` so that ${REDIS_PASSWORD} is expanded by the container shell
+    # (redis-server itself does not expand env vars in its CLI flags). The
+    # ``$$`` escape keeps docker-compose from trying to interpolate at compose
+    # parse time, so the literal ``$REDIS_PASSWORD`` makes it into the shell.
+    command:
+      - sh
+      - -c
+      - >-
+        exec redis-server
+        --appendonly yes
+        --appendfsync everysec
+        --maxmemory 4gb
+        --maxmemory-policy allkeys-lru
+        --bind 0.0.0.0
+        --protected-mode yes
+        --requirepass "$$REDIS_PASSWORD"
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 5s
       timeout: 5s
       retries: 5
     networks:
       - mariana-net
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    # Redis entrypoint needs these to drop privileges from root -> redis
+    # and to own /data on first boot.
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    mem_limit: 512m
 
 volumes:
   postgres-data:

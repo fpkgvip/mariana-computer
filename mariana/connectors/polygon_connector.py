@@ -67,11 +67,22 @@ class PolygonConnector(BaseConnector):
     # ------------------------------------------------------------------
 
     def _auth_params(self, extra: dict | None = None) -> dict:
-        """Return base query params including the API key."""
-        params: dict = {"apiKey": self._api_key}
+        """Return base query params (no credentials).
+
+        M-04 fix: the API key is now passed in the Authorization header
+        via :meth:`_auth_headers` so it no longer appears in URL query
+        strings (which leak into proxy/CDN/access logs).
+        """
+        params: dict = {}
         if extra:
             params.update(extra)
         return params
+
+    def _auth_headers(self) -> dict:
+        """Return an Authorization header carrying the Polygon API key."""
+        if not self._api_key:
+            return {}
+        return {"Authorization": f"Bearer {self._api_key}"}
 
     async def _get(self, path: str, params: dict | None = None, ttl: int = _TTL_REFERENCE) -> dict:
         """
@@ -80,9 +91,8 @@ class PolygonConnector(BaseConnector):
         """
         url = f"{_BASE_URL}{path}"
         merged_params = self._auth_params(params)
-        # Exclude API key from cache key to avoid key rotation causing cache storms
-        # and to prevent raw API keys from appearing in cache backend logs
-        cache_params = {k: v for k, v in sorted(merged_params.items()) if k != "apiKey"}
+        # M-04 fix: cache key no longer has to strip apiKey (it's never in params).
+        cache_params = dict(sorted(merged_params.items()))
         cache_key = self._cache_key("polygon", url, str(cache_params))
 
         cached = await self._cache_get(cache_key)
@@ -90,7 +100,9 @@ class PolygonConnector(BaseConnector):
             self._log.debug("cache_hit", url=url)
             return cached
 
-        data = await self._request("GET", url, params=merged_params)
+        data = await self._request(
+            "GET", url, params=merged_params, headers=self._auth_headers()
+        )
         await self._cache_set(cache_key, data, ttl=ttl)
         return data
 

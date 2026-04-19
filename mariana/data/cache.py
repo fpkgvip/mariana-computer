@@ -385,13 +385,27 @@ async def create_redis_client(
     Create and return an async Redis client.
 
     Args:
-        redis_url:       Redis connection URL (e.g. ``redis://redis:6379/0``).
+        redis_url:       Redis connection URL (e.g. ``redis://redis:6379/0``
+                         or ``rediss://...`` for TLS).
         max_connections: Maximum number of connections in the pool.
         socket_timeout:  Socket-level timeout in seconds.
 
     Returns:
         A connected :class:`redis.asyncio.Redis` instance.
+
+    M-05 fix: require ``rediss://`` (TLS) for any non-loopback Redis URL
+    so cached investigation data / user context is not transmitted in
+    cleartext over the network.
     """
+    _u = (redis_url or "").lower()
+    _is_local = any(
+        tok in _u
+        for tok in ("://localhost", "://127.", "://[::1]", "://redis:")
+    )
+    if not _is_local and _u.startswith("redis://"):
+        raise ValueError(
+            "Remote Redis URLs must use rediss:// (TLS) to protect cached data"
+        )
     client: aioredis.Redis = aioredis.from_url(
         redis_url,
         max_connections=max_connections,

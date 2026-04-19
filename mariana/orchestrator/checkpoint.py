@@ -283,6 +283,7 @@ async def load_latest_checkpoint(
     task_id: str,
     db: Any,  # asyncpg.Pool
     data_root: str,
+    user_id: str | None = None,
 ) -> Checkpoint | None:
     """Load the most recent checkpoint for a task, if one exists.
 
@@ -299,12 +300,34 @@ async def load_latest_checkpoint(
         asyncpg connection pool.
     data_root:
         Filesystem root (used to verify the snapshot file exists on disk).
+    user_id:
+        Optional owning user.  When provided (recommended), the underlying
+        ResearchTask is verified to belong to ``user_id`` before the
+        checkpoint is returned (M-14 defence-in-depth authorization).
 
     Returns
     -------
     Checkpoint or None
-        The most recent checkpoint, or ``None`` if no checkpoint exists.
+        The most recent checkpoint, or ``None`` if no checkpoint exists
+        (or the task does not belong to the requested ``user_id``).
     """
+    # M-14 fix: when a user_id is supplied, confirm task ownership before
+    # returning any checkpoint data.  This prevents a buggy or compromised
+    # caller from loading another user's investigation state just by
+    # knowing the task_id.
+    if user_id is not None:
+        owner_row = await db.fetchrow(
+            "SELECT metadata->>'user_id' AS owner FROM research_tasks WHERE id = $1",
+            task_id,
+        )
+        if owner_row is None or owner_row["owner"] != user_id:
+            logger.warning(
+                "checkpoint_load_ownership_mismatch",
+                task_id=task_id,
+                requested_user=user_id,
+            )
+            return None
+
     row = await db.fetchrow(
         """
         SELECT id, task_id, timestamp, state_machine_state,

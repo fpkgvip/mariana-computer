@@ -8,8 +8,11 @@ that all concrete connectors inherit.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
+import socket
 from abc import ABC, abstractmethod
 from typing import Any
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import httpx
 import structlog
@@ -31,6 +34,86 @@ class RateLimitError(ConnectorError):
     """Raised when the upstream API returns HTTP 429."""
 
 
+class SSRFBlockedError(ConnectorError):
+    """Raised when a redirect or request targets an internal/private address."""
+
+
+def _is_internal_host(host: str | None) -> bool:
+    """Return True if the host is a loopback, link-local, or RFC1918 address."""
+    if not host:
+        return True
+    h = host.strip().lower()
+    if h in ("localhost", "ip6-localhost", "ip6-loopback", ""):
+        return True
+    # Try to parse directly as an IP
+    try:
+        ip = ipaddress.ip_address(h.strip("[]"))
+        return (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        )
+    except ValueError:
+        pass
+    # Resolve hostname to IPs and check each one
+    try:
+        infos = socket.getaddrinfo(h, None)
+    except socket.gaierror:
+        # Unresolvable hostname — treat as unsafe by default? No — let the
+        # underlying request fail naturally rather than introduce false positives.
+        return False
+    for info in infos:
+        sockaddr = info[4]
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except (ValueError, IndexError):
+            continue
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return True
+    return False
+
+
+def _redact_url(url: str) -> str:
+    """Redact query parameters from a URL for safe logging. (M-06)"""
+    try:
+        parts = urlsplit(url)
+        redacted = parts._replace(query="[redacted]" if parts.query else "")
+        return urlunsplit(redacted)
+    except Exception:
+        return "[unparsable-url]"
+
+
+async def _ssrf_redirect_hook(response: httpx.Response) -> None:
+    """Block redirects to internal/private addresses (C-01).
+
+    httpx invokes response event hooks for every response in a redirect chain.
+    When it sees a 3xx, we validate the Location header before httpx follows it.
+    """
+    if response.status_code in (301, 302, 303, 307, 308):
+        loc = response.headers.get("location")
+        if not loc:
+            return
+        try:
+            # Resolve relative redirect against the request URL
+            target = httpx.URL(str(response.request.url)).join(loc)
+        except Exception as exc:
+            raise SSRFBlockedError(f"Invalid redirect target: {loc!r}") from exc
+        if _is_internal_host(target.host):
+            raise SSRFBlockedError(
+                f"Redirect to internal address blocked: host={target.host!r}"
+            )
+
+
 class BaseConnector(ABC):
     """
     Abstract base class for all Mariana data connectors.
@@ -47,7 +130,14 @@ class BaseConnector(ABC):
     def __init__(self, config: Any, cache: Any | None = None) -> None:
         self.config = config
         self.cache = cache
-        self.client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        # C-01 fix: Follow redirects but validate each hop via an event hook so
+        # an attacker-controlled 3xx cannot redirect us to internal/private
+        # addresses (AWS metadata, RFC1918, loopback, link-local).
+        self.client = httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+            event_hooks={"response": [_ssrf_redirect_hook]},
+        )
         self._closed: bool = False
         self._log = logger.bind(connector=self.__class__.__name__)
 
@@ -110,7 +200,7 @@ class BaseConnector(ABC):
             httpx.HTTPStatusError: For other non-2xx responses after retries.
             ConnectorError: For non-HTTP failures (network, timeout, etc.).
         """
-        self._log.debug("http_request", method=method, url=url)
+        self._log.debug("http_request", method=method, url=_redact_url(url))
         try:
             resp = await self.client.request(method, url, **kwargs)
         except httpx.TimeoutException as exc:
@@ -127,7 +217,7 @@ class BaseConnector(ABC):
         except httpx.HTTPStatusError:
             self._log.error(
                 "http_error",
-                url=url,
+                url=_redact_url(url),
                 status_code=resp.status_code,
                 body=resp.text[:500],
             )
@@ -149,7 +239,7 @@ class BaseConnector(ABC):
 
         Useful for fetching filing documents, HTML pages, etc.
         """
-        self._log.debug("http_request_text", method=method, url=url)
+        self._log.debug("http_request_text", method=method, url=_redact_url(url))
         try:
             resp = await self.client.request(method, url, **kwargs)
         except httpx.TimeoutException as exc:
@@ -165,7 +255,7 @@ class BaseConnector(ABC):
         except httpx.HTTPStatusError:
             self._log.error(
                 "http_error",
-                url=url,
+                url=_redact_url(url),
                 status_code=resp.status_code,
             )
             raise
