@@ -463,7 +463,7 @@ class ConversationDetailResponse(BaseModel):
 
 
 class CreateConversationRequest(BaseModel):
-    title: str = Field("New conversation", max_length=200)
+    title: str = Field("New conversation", min_length=1, max_length=200)
 
 
 class CreateConversationResponse(BaseModel):
