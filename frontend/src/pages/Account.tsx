@@ -13,7 +13,7 @@ const API_URL = import.meta.env.VITE_API_URL ?? "";
 
 /** Format a subscription plan slug into a display name */
 function formatPlanName(plan: string): string {
-  if (!plan || plan === "none") return "No plan";
+  if (!plan || plan === "none") return "Free";
   return plan.charAt(0).toUpperCase() + plan.slice(1);
 }
 

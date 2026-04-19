@@ -53,6 +53,22 @@ const plans: Plan[] = [
       "White-glove onboarding",
     ],
   },
+  {
+    id: "custom",
+    name: "Custom",
+    price: 0,
+    credits: 0,
+    comingSoon: true,
+    features: [
+      "Unlimited credits",
+      "Everything in Enterprise",
+      "On-premise deployment options",
+      "Custom model fine-tuning",
+      "Dedicated infrastructure",
+      "Bespoke data pipeline integration",
+      "24/7 priority engineering support",
+    ],
+  },
 ];
 
 const faqs = [
@@ -176,7 +192,7 @@ export default function Pricing() {
         </ScrollReveal>
 
         {/* Subscription plans */}
-        <div className="mt-12 grid gap-6 sm:mt-16 md:grid-cols-2 max-w-4xl mx-auto">
+        <div className="mt-12 grid gap-6 sm:mt-16 md:grid-cols-3 max-w-5xl mx-auto">
           {plans.map((plan, i) => (
             <ScrollReveal key={plan.id} delay={i * 100}>
               <div
@@ -203,11 +219,14 @@ export default function Pricing() {
                   {plan.name}
                 </p>
                 <h2 className="mt-4 font-serif text-4xl font-semibold text-foreground">
-                  ${plan.price.toLocaleString()}
-                  <span className="text-lg font-normal text-muted-foreground">/month</span>
+                  {plan.price > 0 ? (
+                    <>${plan.price.toLocaleString()}<span className="text-lg font-normal text-muted-foreground">/month</span></>
+                  ) : (
+                    <span className="text-2xl">Contact us</span>
+                  )}
                 </h2>
                 <p className="mt-2 text-sm text-muted-foreground">
-                  {plan.credits.toLocaleString()} credits/month
+                  {plan.credits > 0 ? `${plan.credits.toLocaleString()} credits/month` : "Custom volume"}
                 </p>
 
                 <div className="my-6 border-t border-border" />

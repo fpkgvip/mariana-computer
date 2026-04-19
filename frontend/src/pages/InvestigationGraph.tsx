@@ -857,13 +857,33 @@ export default function InvestigationGraph() {
         .attr("transform", (d) => `translate(${d.x ?? 0},${d.y ?? 0})`);
     });
 
+    // Auto-fit the graph once the simulation stabilizes so nodes are visible
+    // on first load without requiring the user to click "Fit graph".
+    let initialFitDone = false;
+    simulation.on("end", () => {
+      if (!initialFitDone && simulationRef.current === simulation) {
+        initialFitDone = true;
+        fitGraph();
+      }
+    });
+    // Fallback: fit after 1.5s even if simulation hasn't fully converged —
+    // positions will be close enough and the user shouldn't see an empty canvas.
+    const fitTimer = setTimeout(() => {
+      if (!initialFitDone && simulationRef.current === simulation) {
+        initialFitDone = true;
+        fitGraph();
+      }
+    }, 1500);
+
     // Click on background to deselect / close context menu
     d3.select(svg).on("click", () => {
       setContextMenu((prev) => (prev.visible ? { ...prev, visible: false } : prev));
     });
 
     return () => {
+      clearTimeout(fitTimer);
       simulation.on("tick", null); // BUG-R2A-03: detach tick before stopping
+      simulation.on("end", null);
       simulation.stop();
       d3.select(svg).on(".zoom", null); // BUG-02/08
       d3.select(svg).on("click", null);
