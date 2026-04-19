@@ -196,6 +196,11 @@ async def generate_report(
     # Determine quality_tier from task metadata for economy routing
     _quality_tier = (task.metadata or {}).get("quality_tier") or None
 
+    # BUG-TIMEOUT-01 fix: Report generation for deep-tier investigations with
+    # many findings (50-100+) can exceed the default 300s timeout on Claude Opus.
+    # Use 600s (10 min) timeout for report tasks to handle large prompt sizes.
+    _report_timeout = 600.0
+
     draft_parsed, draft_session = await spawn_model(
         task_type=TaskType.REPORT_DRAFT,
         context={
@@ -210,6 +215,7 @@ async def generate_report(
         cost_tracker=cost_tracker,
         config=config,
         quality_tier=_quality_tier,
+        timeout_seconds=_report_timeout,
     )
     draft_output: ReportDraftOutput = draft_parsed
 
@@ -243,6 +249,7 @@ async def generate_report(
             cost_tracker=cost_tracker,
             config=config,
             quality_tier=_quality_tier,
+            timeout_seconds=_report_timeout,
         )
         final_output = final_parsed
         edit_cost_usd = edit_session.cost_usd

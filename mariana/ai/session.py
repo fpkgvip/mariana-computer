@@ -485,6 +485,7 @@ async def _call_gateway_with_retry(
     model_config: ModelConfig,
     max_tokens: int,
     config: AppConfig,
+    timeout_seconds: float = 300.0,
 ) -> dict[str, Any]:
     """
     Wrap ``_call_gateway`` with exponential-backoff retry logic.
@@ -504,7 +505,7 @@ async def _call_gateway_with_retry(
 
     for attempt in range(_RETRY_MAX_ATTEMPTS):
         try:
-            return await _call_gateway(messages, model_config, max_tokens, config)
+            return await _call_gateway(messages, model_config, max_tokens, config, timeout_seconds=timeout_seconds)
         except ModelCallError as exc:
             # Don't retry non-transient client errors (e.g. 401, 403, 422).
             if exc.status_code is not None and exc.status_code not in _RETRYABLE_STATUS_CODES:
@@ -690,6 +691,7 @@ async def spawn_model(
     cost_tracker: Any = None,  # CostTracker instance
     config: AppConfig | None = None,
     quality_tier: str | None = None,
+    timeout_seconds: float = 300.0,
 ) -> tuple[BaseModel, AISession]:
     """
     Single entry point for ALL AI calls in the Mariana system.
@@ -787,6 +789,7 @@ async def spawn_model(
         model_config=model_cfg,
         max_tokens=effective_max_tokens,
         config=config,
+        timeout_seconds=timeout_seconds,
     )
 
     raw_content = _extract_response_content(response_json)
@@ -823,6 +826,7 @@ async def spawn_model(
             ),
             max_tokens=doubled,
             config=config,
+            timeout_seconds=timeout_seconds,
         )
         raw_content = _extract_response_content(retry_response)
         retry_usage = _extract_usage(retry_response)
