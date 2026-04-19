@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -67,13 +68,21 @@ def get_ttl_for_source_type(source_type: SourceType) -> int:
 _URL_CACHE_PREFIX = "mariana:url:"
 _QUERY_DEDUP_PREFIX = "mariana:qdedup:"
 
+# BUG-0041 fix: strip characters that could be used for Redis key injection.
+_SAFE_KEY_RE = re.compile(r"[^a-zA-Z0-9_:\-.]")
+
+
+def _sanitize_key_component(value: str) -> str:
+    """Remove characters that could be used for Redis key injection."""
+    return _SAFE_KEY_RE.sub("", value)
+
 
 def _url_cache_key(url_hash: str) -> str:
-    return f"{_URL_CACHE_PREFIX}{url_hash}"
+    return f"{_URL_CACHE_PREFIX}{_sanitize_key_component(url_hash)}"
 
 
 def _query_dedup_key(task_id: str) -> str:
-    return f"{_QUERY_DEDUP_PREFIX}{task_id}"
+    return f"{_QUERY_DEDUP_PREFIX}{_sanitize_key_component(task_id)}"
 
 
 # ---------------------------------------------------------------------------

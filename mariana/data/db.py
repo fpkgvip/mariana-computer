@@ -626,14 +626,14 @@ async def insert_research_task(pool: asyncpg.Pool, task: ResearchTask) -> None:
                 created_at, started_at, completed_at, error_message,
                 output_pdf_path, output_docx_path, metadata,
                 quality_tier, user_flow_instructions,
-                continuous_mode, dont_kill_branches, tier
+                continuous_mode, dont_kill_branches
             ) VALUES (
                 $1, $2, $3, $4, $5,
                 $6, $7, $8,
                 $9, $10, $11, $12,
                 $13, $14, $15,
                 $16, $17,
-                $18, $19, $20
+                $18, $19
             )
             ON CONFLICT (id) DO NOTHING
             """,
@@ -656,7 +656,6 @@ async def insert_research_task(pool: asyncpg.Pool, task: ResearchTask) -> None:
             _meta.get("user_flow_instructions", ""),
             bool(_meta.get("continuous_mode", False)),
             bool(_meta.get("dont_kill_branches", False)),
-            _meta.get("tier", "standard"),
         )
     logger.debug("Inserted ResearchTask id=%s", task.id)
 

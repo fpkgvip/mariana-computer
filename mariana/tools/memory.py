@@ -40,8 +40,18 @@ _INJECTION_PATTERNS = [
     re.compile(r"(?im)^\s*assistant\s*:\s*"),
     re.compile(r"(?i)new\s+instructions?\s*:"),
     re.compile(r"(?i)<\s*/?\s*system\s*>"),
+    # BUG-0055 fix: additional model-specific delimiters
+    re.compile(r"<\|im_start\|>"),
+    re.compile(r"<\|im_end\|>"),
+    re.compile(r"\[INST\]"),
+    re.compile(r"\[/INST\]"),
+    re.compile(r"\n\n(?:Human|Assistant)\s*:"),
+    re.compile(r"<<SYS>>"),
+    re.compile(r"<</SYS>>"),
 ]
 _FENCE_RE = re.compile(r"```+")
+# BUG-0055 fix: zero-width characters used to evade pattern detection
+_ZERO_WIDTH_CHARS_RE = re.compile(r"[\u200b\u200c\u200d\ufeff\u2060]")
 
 
 def _sanitize_snippet(text: str, max_chars: int = _MEMORY_FIELD_MAX_CHARS) -> str:
@@ -53,6 +63,8 @@ def _sanitize_snippet(text: str, max_chars: int = _MEMORY_FIELD_MAX_CHARS) -> st
             text = str(text)
         except Exception:
             return ""
+    # BUG-0055 fix: strip zero-width characters before other processing
+    text = _ZERO_WIDTH_CHARS_RE.sub("", text)
     if len(text) > max_chars:
         text = text[: max_chars - 3] + "..."
     for pat in _INJECTION_PATTERNS:

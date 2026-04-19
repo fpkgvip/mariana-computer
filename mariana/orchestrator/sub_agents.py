@@ -140,6 +140,21 @@ class SubAgentManager:
 
         async def _run(task: SubAgentTask) -> SubAgentTask:
             async with self._semaphore:
+                # BUG-0044 fix: check budget before spawning any sub-agent.
+                if self.cost_tracker.is_exhausted:
+                    from mariana.orchestrator.cost_tracker import BudgetExhaustedError  # noqa: PLC0415
+                    task.status = "failed"
+                    task.result = "Budget exhausted before sub-agent could start"
+                    logger.warning(
+                        "sub_agent_budget_exhausted",
+                        task_id=self.parent_task_id,
+                        sub_agent_id=task.id,
+                    )
+                    raise BudgetExhaustedError(
+                        "task",
+                        self.cost_tracker.total_spent,
+                        self.cost_tracker.task_budget,
+                    )
                 task.status = "running"
                 await self._emit(f"Sub-agent [{task.role.value}] started: {task.objective[:60]}")
                 try:

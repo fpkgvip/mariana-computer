@@ -80,12 +80,24 @@ function getMimeType(filename: string): string {
 /*  Inline renderers                                                  */
 /* ------------------------------------------------------------------ */
 
+// FE-CRIT-04 fix: Placeholder tokens for code blocks. Code blocks are extracted
+// FIRST, replaced with opaque tokens, then markdown transforms run on the
+// remaining text. This prevents regex transforms (bold/italic/link) from
+// modifying content inside code blocks — which was the XSS/corruption vector.
+const _FV_PRE_OPEN = "\u0000FV_PRE\u0000";
+const _FV_PRE_CLOSE = "\u0000FV_END\u0000";
+
 function renderMarkdownContent(text: string): string {
+  // Step 1: HTML-escape ALL user content first
   let html = text
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 
+  // Step 2: Extract fenced code blocks into opaque tokens
+  const preservedBlocks: string[] = [];
   if (html.includes("```")) {
     const parts = html.split("```");
     html = parts
@@ -93,11 +105,14 @@ function renderMarkdownContent(text: string): string {
         if (idx % 2 === 0) return part;
         const newlineIdx = part.indexOf("\n");
         const code = newlineIdx !== -1 ? part.slice(newlineIdx + 1) : part;
-        return `<pre class="my-2 rounded-md bg-zinc-900 px-4 py-3 text-xs leading-relaxed overflow-x-auto"><code>${code.trim()}</code></pre>`;
+        const rendered = `<pre class="my-2 rounded-md bg-zinc-900 px-4 py-3 text-xs leading-relaxed overflow-x-auto"><code>${code.trim()}</code></pre>`;
+        preservedBlocks.push(rendered);
+        return `${_FV_PRE_OPEN}${preservedBlocks.length - 1}${_FV_PRE_CLOSE}`;
       })
       .join("");
   }
 
+  // Step 3: Apply markdown transforms ONLY to non-code-block content
   html = html
     .replace(/`([^`]{1,200})`/g, '<code class="rounded bg-zinc-800 px-1.5 py-0.5 text-xs">$1</code>')
     .replace(/\*\*([^\n]{1,200})\*\*/g, "<strong>$1</strong>")
@@ -106,6 +121,12 @@ function renderMarkdownContent(text: string): string {
     .replace(/^## (.+)$/gm, '<h2 class="text-base font-semibold mt-4 mb-2">$1</h2>')
     .replace(/^# (.+)$/gm, '<h1 class="text-lg font-bold mt-4 mb-2">$1</h1>')
     .replace(/\n/g, "<br />");
+
+  // Step 4: Restore code blocks after all transforms are complete
+  if (preservedBlocks.length > 0) {
+    const tokenRe = new RegExp(`${_FV_PRE_OPEN}(\\d+)${_FV_PRE_CLOSE}`, "g");
+    html = html.replace(tokenRe, (_m, idx) => preservedBlocks[Number(idx)] || "");
+  }
 
   return html;
 }
@@ -333,13 +354,16 @@ function FileContent({ file, apiUrl }: { file: FileAttachment; apiUrl: string })
     );
   }
 
-  // PDF
+  // PDF — FE-CRIT-05 fix: Sandbox the PDF iframe. PDFs are served via blob URLs
+  // (same origin) so allow-same-origin is needed for the PDF renderer to work,
+  // but no other permissions (scripts, forms, popups, etc.) are granted.
   if (isPdf && blobUrl) {
     return (
       <iframe
         src={blobUrl}
         title={file.filename}
         className="h-[700px] w-full rounded"
+        sandbox="allow-same-origin"
       />
     );
   }

@@ -80,6 +80,13 @@ function isValidFile(file: globalThis.File): string | null {
   if (!ACCEPTED_EXTENSIONS.includes(ext)) {
     return `Unsupported file type: ${ext || "unknown"}`;
   }
+  // FE-CRIT-08 fix: Actually check the MIME type. The ACCEPTED_MIME_TYPES
+  // constant was defined but never used in validation, making it dead code.
+  // Reject files whose MIME type doesn't match the allowed list (unless the
+  // browser reports an empty string, which happens for some valid file types).
+  if (file.type && !ACCEPTED_MIME_TYPES.includes(file.type)) {
+    return `Unsupported MIME type: ${file.type}`;
+  }
   if (file.size > MAX_FILE_SIZE) {
     return `File too large (${formatBytes(file.size)}). Maximum is 10 MB.`;
   }

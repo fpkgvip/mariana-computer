@@ -96,6 +96,22 @@ export default function Checkout() {
       // Pricing.tsx already used the correct field; Checkout.tsx was using the wrong one,
       // causing a redirect to "undefined" after successful checkout creation.
       const data: { checkout_url: string; session_id: string } = await res.json();
+
+      // FE-CRIT-06 fix: Validate the server-returned checkout URL before navigating.
+      // Only allow same-origin URLs or known payment provider domains (Stripe).
+      // This prevents open redirect attacks via a compromised or malicious backend response.
+      try {
+        const parsed = new URL(data.checkout_url);
+        const isSameOrigin = parsed.origin === window.location.origin;
+        const isStripe = parsed.hostname.endsWith(".stripe.com");
+        if (!isSameOrigin && !isStripe) {
+          throw new Error("Untrusted checkout URL");
+        }
+      } catch {
+        toast.error("Invalid checkout URL received from server");
+        setLoadingPlanId(null);
+        return;
+      }
       window.location.href = data.checkout_url;
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";

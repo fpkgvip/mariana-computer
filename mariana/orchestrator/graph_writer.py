@@ -35,6 +35,10 @@ from mariana.data.models import Branch, Finding, Hypothesis, Source
 
 logger = logging.getLogger(__name__)
 
+# BUG-0043 fix: hard limits on graph size to prevent unbounded growth.
+MAX_NODES: int = 500
+MAX_EDGES: int = 2000
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -77,6 +81,16 @@ async def _upsert_node(
     """
     meta_json = json.dumps(metadata or {})
     async with db.acquire() as conn:
+        # BUG-0043 fix: check node count before inserting to prevent unbounded growth.
+        node_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM graph_nodes WHERE task_id = $1", task_id
+        )
+        if node_count >= MAX_NODES:
+            logger.warning(
+                "graph_node_limit_reached task_id=%s count=%d max=%d",
+                task_id, node_count, MAX_NODES,
+            )
+            return
         await conn.execute(
             """
             INSERT INTO graph_nodes (
@@ -129,6 +143,16 @@ async def _upsert_edge(
     """
     meta_json = json.dumps(metadata or {})
     async with db.acquire() as conn:
+        # BUG-0043 fix: check edge count before inserting to prevent unbounded growth.
+        edge_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM graph_edges WHERE task_id = $1", task_id
+        )
+        if edge_count >= MAX_EDGES:
+            logger.warning(
+                "graph_edge_limit_reached task_id=%s count=%d max=%d",
+                task_id, edge_count, MAX_EDGES,
+            )
+            return
         await conn.execute(
             """
             INSERT INTO graph_edges (

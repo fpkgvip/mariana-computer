@@ -376,12 +376,21 @@ class DeepSeekHealthCache:
         Any 2xx response counts as healthy; timeouts or 5xx = unhealthy.
         """
         # M-03 fix: refuse plain-HTTP LLM Gateway URLs in production.
+        # BUG-0015 fix: parse URL properly instead of substring matching.
         _gbl = gateway_base_url.rstrip("/").lower()
         if not _gbl.startswith("https://"):
-            if not any(
-                tok in _gbl
-                for tok in ("://localhost", "://127.", "://[::1]", ".local:", ".local/")
-            ):
+            from urllib.parse import urlparse as _urlparse  # noqa: PLC0415
+            import ipaddress as _ipaddress  # noqa: PLC0415
+            _parsed = _urlparse(gateway_base_url)
+            _host = (_parsed.hostname or "").lower()
+            _is_local = _host in ("localhost", "::1")
+            if not _is_local and _host:
+                try:
+                    _ip = _ipaddress.ip_address(_host.strip("[]"))
+                    _is_local = _ip.is_loopback
+                except ValueError:
+                    _is_local = _host.endswith(".local")
+            if not _is_local:
                 logger.warning("llm_gateway_base_url_not_https", url=gateway_base_url)
                 return False
         url = f"{gateway_base_url.rstrip('/')}/chat/completions"

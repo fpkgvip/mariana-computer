@@ -36,6 +36,8 @@ interface ProfileRow {
 /** Public API surface of the auth context */
 interface AuthContextType {
   user: User | null;
+  /** True while the initial session is being resolved. Once false, `user` is stable. */
+  loading: boolean;
   login: (email: string, password: string) => Promise<void>;
   signup: (email: string, name: string, password: string) => Promise<boolean>;
   logout: () => Promise<void>;
@@ -219,6 +221,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } catch (err) {
       console.warn("[AuthContext] queryClient.clear() failed:", err);
     }
+    // FE-HIGH-02 fix: Dispatch a custom event so module-scoped caches (outside
+    // React) can clear themselves when the user logs out. This prevents the next
+    // user on the same tab from seeing cached data from the previous session.
+    window.dispatchEvent(new Event("mariana:logout"));
   };
 
   /**
@@ -251,7 +257,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, login, signup, logout, skip, refreshUser }}
+      value={{ user, loading, login, signup, logout, skip, refreshUser }}
     >
       {children}
     </AuthContext.Provider>

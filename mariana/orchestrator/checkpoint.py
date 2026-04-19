@@ -193,6 +193,10 @@ async def save_checkpoint(
     # ------------------------------------------------------------------ #
     # Step 4 – Upsert into DB; only rename temp file if DB insert succeeds
     # ------------------------------------------------------------------ #
+    # BUG-0061 fix: wrap the entire DB-insert + rename sequence in
+    # try/finally so the temp file is always cleaned up on any failure
+    # path (DB error, rename error, or unexpected exception).
+    _tmp_committed = False
     try:
         await db.execute(
             """
@@ -227,17 +231,10 @@ async def save_checkpoint(
             # BUG-R3-05: persist diminishing_result so crash recovery has it
             checkpoint.diminishing_result.value if checkpoint.diminishing_result else None,
         )
-    except Exception:
-        # DB insert failed — remove the orphaned temp file and re-raise
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
 
-    # DB insert succeeded — atomically rename temp file to final path
-    try:
+        # DB insert succeeded — atomically rename temp file to final path
         tmp_path.rename(snapshot_path)
+        _tmp_committed = True
     except OSError as exc:
         logger.error(
             "checkpoint_rename_failed",
@@ -245,11 +242,7 @@ async def save_checkpoint(
             final_path=str(snapshot_path),
             error=str(exc),
         )
-        # BUG-038: Clean up orphaned temp file and clear invalid snapshot_path
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        # Clear invalid snapshot_path in DB
         try:
             await db.execute(
                 "UPDATE checkpoints SET snapshot_path = NULL WHERE id = $1",
@@ -258,6 +251,14 @@ async def save_checkpoint(
         except Exception:  # noqa: BLE001
             pass
         raise
+    finally:
+        # BUG-0061 fix: always clean up the temp file if it wasn't
+        # successfully renamed to the final path.
+        if not _tmp_committed and tmp_path.exists():
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     logger.info(
         "checkpoint_saved",

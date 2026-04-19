@@ -5,6 +5,7 @@ import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AuthProvider } from "@/contexts/AuthContext";
 import AppErrorBoundary from "@/components/AppErrorBoundary";
+import ProtectedRoute from "@/components/ProtectedRoute";
 import { supabaseConfigError } from "@/lib/supabase";
 import { AlertTriangle } from "lucide-react";
 
@@ -83,21 +84,25 @@ const App = () => {
         <Sonner />
         <BrowserRouter>
           <AuthProvider>
+            {/* FE-CRIT-01 fix: Protected routes wrapped with ProtectedRoute
+                to prevent rendering before auth is resolved. Public routes
+                (/, /research, /mariana, /pricing, /contact, /login, /signup,
+                /reset-password) remain unwrapped. */}
             <Routes>
               <Route path="/" element={<Index />} />
               <Route path="/research" element={<Research />} />
               <Route path="/mariana" element={<Mariana />} />
-              <Route path="/chat" element={<Chat />} />
+              <Route path="/chat" element={<ProtectedRoute><Chat /></ProtectedRoute>} />
               <Route path="/pricing" element={<Pricing />} />
               <Route path="/contact" element={<Contact />} />
-              <Route path="/checkout" element={<Checkout />} />
+              <Route path="/checkout" element={<ProtectedRoute><Checkout /></ProtectedRoute>} />
               {/* BUG-legacy: /buy-credits now redirects to /checkout for backward compat */}
-              <Route path="/buy-credits" element={<Checkout />} />
-              <Route path="/account" element={<Account />} />
-              <Route path="/skills" element={<Skills />} />
-              <Route path="/graph" element={<InvestigationGraph />} />
-              <Route path="/graph/:taskId" element={<InvestigationGraph />} />
-              <Route path="/admin" element={<Admin />} />
+              <Route path="/buy-credits" element={<ProtectedRoute><Checkout /></ProtectedRoute>} />
+              <Route path="/account" element={<ProtectedRoute><Account /></ProtectedRoute>} />
+              <Route path="/skills" element={<ProtectedRoute><Skills /></ProtectedRoute>} />
+              <Route path="/graph" element={<ProtectedRoute><InvestigationGraph /></ProtectedRoute>} />
+              <Route path="/graph/:taskId" element={<ProtectedRoute><InvestigationGraph /></ProtectedRoute>} />
+              <Route path="/admin" element={<ProtectedRoute><Admin /></ProtectedRoute>} />
               <Route path="/login" element={<Login />} />
               <Route path="/signup" element={<Signup />} />
               <Route path="/reset-password" element={<ResetPassword />} />

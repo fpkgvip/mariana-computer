@@ -96,6 +96,11 @@ logger = structlog.get_logger(__name__)
 _MAX_ITERATIONS: int = 500
 """Safety ceiling on the main loop to prevent infinite runaway loops."""
 
+# BUG-0037 fix: asyncio.Lock for metadata counter read-modify-write operations.
+# Prevents lost updates when concurrent coroutines increment _tribunal_run_counter
+# or _skeptic_run_counter simultaneously.
+_metadata_lock = asyncio.Lock()
+
 _STRONG_FINDINGS_CONFIDENCE: float = 0.75
 _STRONG_FINDINGS_MIN_COUNT: int = 3
 
@@ -403,18 +408,25 @@ async def run(
         task.current_state = latest_cp.state_machine_state
         task.diminishing_flags = latest_cp.diminishing_flags
         task.ai_call_counter = latest_cp.ai_call_counter
-        # Restore cost tracker totals from checkpoint
-        cost_tracker.total_spent = latest_cp.total_spent
-        # Restore per-branch breakdown from DB (BUG-017)
+        # BUG-0042 fix: rebuild ALL cost state from a SINGLE authoritative
+        # source (ai_sessions table) to avoid inconsistency between
+        # checkpoint snapshot, live DB per-branch totals, and call count.
+        _total_from_db = await db.fetchval(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM ai_sessions WHERE task_id = $1",
+            task.id,
+        )
+        cost_tracker.total_spent = float(_total_from_db)
+        # Restore per-branch breakdown from same source
         branch_rows = await db.fetch(
             "SELECT branch_id, SUM(cost_usd) as total FROM ai_sessions "
             "WHERE task_id = $1 GROUP BY branch_id",
             task.id,
         )
+        cost_tracker.per_branch.clear()
         for _br in branch_rows:
             if _br["branch_id"]:
                 cost_tracker.per_branch[_br["branch_id"]] = float(_br["total"] or 0)
-        # Restore call count
+        # Restore call count from same source
         _call_count = await db.fetchval(
             "SELECT COUNT(*) FROM ai_sessions WHERE task_id = $1", task.id
         )
@@ -551,7 +563,7 @@ async def run(
             # 3. Advance state machine
             # --------------------------------------------------------- #
             try:
-                next_state, actions = transition(
+                next_state, actions = await transition(
                     current_state=task.current_state,
                     trigger=trigger,
                     session_data=session_data,
@@ -742,9 +754,12 @@ async def run(
                     task.current_state = State.INIT
                     task.status = TaskStatus.RUNNING
                     iteration = 0  # reset iteration counter
-                    # BUG-AUD-21 fix: Reset finalization_mode so budget checks
-                    # are enforced again on the new continuous-mode cycle.
-                    cost_tracker.finalization_mode = False
+                    # BUG-0046 fix: reset ALL cost tracker state (total_spent,
+                    # per_branch, call_count, finalization_mode) so the new
+                    # cycle starts with a clean budget.  The old code only
+                    # reset finalization_mode, leaving accumulated spend from
+                    # the prior cycle which caused immediate budget exhaustion.
+                    cost_tracker.reset()
                     _sync_cost(task, cost_tracker)
                     await _persist_task(task, db)
                     await asyncio.sleep(0)
@@ -2228,11 +2243,13 @@ async def handle_tribunal(
     # BUG-AUD-14 fix: bump a per-task run counter the instant this handler
     # fires so _trigger_for_tribunal can distinguish "handler never ran"
     # from a DB write race.
-    if task.metadata is None:
-        task.metadata = {}
-    task.metadata["_tribunal_run_counter"] = int(
-        task.metadata.get("_tribunal_run_counter", 0)
-    ) + 1
+    # BUG-0037 fix: wrap read-modify-write in asyncio.Lock to prevent lost updates.
+    async with _metadata_lock:
+        if task.metadata is None:
+            task.metadata = {}
+        task.metadata["_tribunal_run_counter"] = int(
+            task.metadata.get("_tribunal_run_counter", 0)
+        ) + 1
 
     # Find the highest-confidence finding to put on trial
     # BUG-AUD-25 fix: Exclude findings that already have a tribunal session
@@ -2484,11 +2501,13 @@ async def handle_skeptic(
     # BUG-AUD-13 fix: bump a per-task run counter the instant this handler
     # fires so _trigger_for_skeptic can distinguish "handler never ran"
     # from a DB write race.
-    if task.metadata is None:
-        task.metadata = {}
-    task.metadata["_skeptic_run_counter"] = int(
-        task.metadata.get("_skeptic_run_counter", 0)
-    ) + 1
+    # BUG-0037 fix: wrap read-modify-write in asyncio.Lock to prevent lost updates.
+    async with _metadata_lock:
+        if task.metadata is None:
+            task.metadata = {}
+        task.metadata["_skeptic_run_counter"] = int(
+            task.metadata.get("_skeptic_run_counter", 0)
+        ) + 1
 
     # Fetch the top finding for context (same as tribunal uses)
     _top_finding_row = await db.fetchrow(
@@ -3325,13 +3344,25 @@ async def _atomic_probe_credits(user_id: str, config: Any) -> str:
     if body is False or (isinstance(body, dict) and body.get("success") is False):
         return "insufficient"
 
-    # Refund the 1 probe credit.  Best-effort — if refund fails we at least
-    # logged the probe and users won't notice 1 token missing, but we log
-    # so operators can reconcile if it becomes a pattern.
-    try:
-        await _rpc("add_credits", {"target_user_id": user_id, "amount": 1})
-    except Exception:
-        logger.warning("atomic_probe_refund_failed", user_id=user_id)
+    # BUG-0040 fix: refund the 1 probe credit with retry loop (3 attempts,
+    # exponential backoff).  If all retries fail, log at ERROR with enough
+    # context for manual reconciliation instead of silently losing credits.
+    refund_ok = False
+    for _attempt in range(3):
+        try:
+            await _rpc("add_credits", {"target_user_id": user_id, "amount": 1})
+            refund_ok = True
+            break
+        except Exception:
+            if _attempt < 2:
+                await asyncio.sleep(0.5 * (2 ** _attempt))  # 0.5s, 1s
+    if not refund_ok:
+        logger.error(
+            "atomic_probe_refund_failed_all_retries",
+            user_id=user_id,
+            amount=1,
+            attempts=3,
+        )
     return "ok"
 
 

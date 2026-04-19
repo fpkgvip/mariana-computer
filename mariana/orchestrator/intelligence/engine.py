@@ -362,10 +362,10 @@ async def before_report(
     else:
         log.info("perspectives_skipped", tier=tier, reason="not_deep_tier")
 
-    # 2. Reasoning chain audit (deep tier only — 1× Opus call)
+    # 2. Reasoning chain audit
+    from mariana.orchestrator.intelligence.auditor import audit_reasoning_chain  # noqa: PLC0415
     if tier == "deep":
         try:
-            from mariana.orchestrator.intelligence.auditor import audit_reasoning_chain
             audit = await audit_reasoning_chain(
                 task_id=task_id,
                 research_topic=topic,
@@ -380,10 +380,27 @@ async def before_report(
         except Exception as exc:
             log.warning("reasoning_audit_failed", error=str(exc))
     else:
-        log.info("reasoning_audit_skipped", tier=tier, reason="not_deep_tier")
-        # For non-deep tiers, assume audit passed (no quality gate)
-        results["audit_passed"] = True
-        results["audit_score"] = 1.0
+        # BUG-0021 fix: run a lite audit for non-deep tiers instead of auto-passing.
+        # Auto-passing with score=1.0 let unreviewed content through.
+        log.info("reasoning_audit_lite", tier=tier)
+        try:
+            audit = await audit_reasoning_chain(
+                task_id=task_id,
+                research_topic=topic,
+                db=db,
+                cost_tracker=cost_tracker,
+                config=config,
+                quality_tier=quality_tier,
+                audit_type="lite",
+            )
+            results["audit_passed"] = audit.get("passed", False)
+            results["audit_score"] = audit.get("overall_score", 0.0)
+            results["audit_issues"] = audit.get("total_issues", 0)
+        except Exception as exc:
+            log.warning("reasoning_audit_lite_failed", error=str(exc))
+            # On failure, default to not-passed to be safe
+            results["audit_passed"] = False
+            results["audit_score"] = 0.0
 
     # 3. Executive summaries (always run — cheap and high-value)
     try:

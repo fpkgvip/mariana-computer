@@ -18,6 +18,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from mariana.ai.session import spawn_model
+from mariana.ai.prompt_builder import _sanitize_untrusted_text
 from mariana.data.models import AISession, TaskType
 
 logger = structlog.get_logger(__name__)
@@ -110,11 +111,13 @@ async def extract_claims_from_finding(
     """
     log = logger.bind(component="extract_claims")
 
+    # BUG-0018 fix: sanitize finding_content and hypothesis_statement before
+    # passing to the LLM to prevent prompt injection via malicious findings.
     context: dict[str, Any] = {
         "task_id": task_id,
         "finding_id": finding_id,
-        "finding_content": finding_content[:4000],  # Cap to avoid context overflow
-        "hypothesis_statement": hypothesis_statement,
+        "finding_content": _sanitize_untrusted_text(finding_content[:4000], max_chars=4000),
+        "hypothesis_statement": _sanitize_untrusted_text(hypothesis_statement, max_chars=1000),
     }
 
     try:

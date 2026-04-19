@@ -46,6 +46,7 @@ from typing import Any
 
 import structlog
 
+from mariana.ai.prompt_builder import _sanitize_untrusted_text
 from mariana.data.models import (
     Finding,
     Source,
@@ -241,10 +242,12 @@ async def run_tribunal(
     log.info("tribunal_session", role="DEFENDANT")
     t0 = time.monotonic()
 
-    plaintiff_arg_text = (
+    # BUG-0056 fix: sanitize LLM output before injecting into next session context
+    plaintiff_arg_text = _sanitize_untrusted_text(
         f"{plaintiff_arg.argument_summary}\n\n"
         "Key points:\n"
-        + "\n".join(f"• {pt}" for pt in plaintiff_arg.key_points)
+        + "\n".join(f"• {pt}" for pt in plaintiff_arg.key_points),
+        max_chars=6000,
     )
 
     defendant_parsed, defendant_session = await spawn_model(
@@ -271,10 +274,12 @@ async def run_tribunal(
     log.info("tribunal_session", role="PLAINTIFF_REBUTTAL")
     t0 = time.monotonic()
 
-    defendant_arg_text = (
+    # BUG-0056 fix: sanitize LLM output before injecting into next session context
+    defendant_arg_text = _sanitize_untrusted_text(
         f"{defendant_arg.argument_summary}\n\n"
         "Key attacks:\n"
-        + "\n".join(f"• {pt}" for pt in defendant_arg.key_points)
+        + "\n".join(f"• {pt}" for pt in defendant_arg.key_points),
+        max_chars=6000,
     )
 
     rebuttal_parsed, rebuttal_session = await spawn_model(
@@ -302,10 +307,12 @@ async def run_tribunal(
     log.info("tribunal_session", role="DEFENDANT_COUNTER")
     t0 = time.monotonic()
 
-    rebuttal_arg_text = (
+    # BUG-0056 fix: sanitize LLM output before injecting into next session context
+    rebuttal_arg_text = _sanitize_untrusted_text(
         f"{rebuttal_arg.argument_summary}\n\n"
         "Rebuttal key points:\n"
-        + "\n".join(f"• {pt}" for pt in rebuttal_arg.key_points)
+        + "\n".join(f"• {pt}" for pt in rebuttal_arg.key_points),
+        max_chars=6000,
     )
 
     counter_parsed, counter_session = await spawn_model(
@@ -334,10 +341,19 @@ async def run_tribunal(
     t0 = time.monotonic()
 
     # The judge sees ONLY bullet-point summaries to prevent anchoring.
-    plaintiff_summary = _summarise_argument(plaintiff_arg, "PLAINTIFF OPENING")
-    defendant_summary = _summarise_argument(defendant_arg, "DEFENDANT OPENING")
-    rebuttal_summary = _summarise_argument(rebuttal_arg, "PLAINTIFF REBUTTAL")
-    counter_summary = _summarise_argument(counter_arg, "DEFENDANT COUNTER")
+    # BUG-0056 fix: sanitize all summaries derived from prior LLM outputs.
+    plaintiff_summary = _sanitize_untrusted_text(
+        _summarise_argument(plaintiff_arg, "PLAINTIFF OPENING"), max_chars=4000,
+    )
+    defendant_summary = _sanitize_untrusted_text(
+        _summarise_argument(defendant_arg, "DEFENDANT OPENING"), max_chars=4000,
+    )
+    rebuttal_summary = _sanitize_untrusted_text(
+        _summarise_argument(rebuttal_arg, "PLAINTIFF REBUTTAL"), max_chars=4000,
+    )
+    counter_summary = _sanitize_untrusted_text(
+        _summarise_argument(counter_arg, "DEFENDANT COUNTER"), max_chars=4000,
+    )
 
     verdict_parsed, judge_session = await spawn_model(
         task_type=TaskType.TRIBUNAL_JUDGE,

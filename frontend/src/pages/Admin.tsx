@@ -94,21 +94,42 @@ export default function Admin() {
   const [showUsers, setShowUsers] = useState(true);
   const [showInvestigations, setShowInvestigations] = useState(true);
 
-  /* Auth guard — redirect non-admins (including unauthenticated users)
-     BUG-C3-02 fix: Add 500ms grace period matching other protected pages
-     to survive the brief user=null during Supabase token refresh. */
+  // FE-CRIT-02 fix: Server-side admin verification. The client-side role check
+  // is trivially bypassable — verify admin status via an API call on mount.
+  const [adminVerified, setAdminVerified] = useState(false);
+
   useEffect(() => {
-    if (user === null) {
-      const timer = setTimeout(() => {
-        navigate("/login", { replace: true });
-      }, 500);
-      return () => clearTimeout(timer);
-    }
-    // P1-FIX-71: Guard against null user — the check above sets a timer but
-    // doesn't return early from the effect, so user.role would crash.
-    if (user && user.role !== "admin") {
+    if (!user) return;
+    if (user.role !== "admin") {
       navigate("/chat", { replace: true });
+      return;
     }
+    // Verify admin status server-side
+    let cancelled = false;
+    (async () => {
+      try {
+        const token = await getAccessToken();
+        if (!token || cancelled) return;
+        const res = await fetch(`${API_URL}/api/admin/stats`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (cancelled) return;
+        if (res.status === 403 || res.status === 401) {
+          toast.error("Admin access denied by server");
+          navigate("/chat", { replace: true });
+          return;
+        }
+        if (res.ok) {
+          setAdminVerified(true);
+        }
+      } catch {
+        if (!cancelled) {
+          toast.error("Could not verify admin status");
+          navigate("/chat", { replace: true });
+        }
+      }
+    })();
+    return () => { cancelled = true; };
   }, [user, navigate]);
 
   const fetchStats = useCallback(async () => {
@@ -174,17 +195,24 @@ export default function Admin() {
   }, []);
 
   useEffect(() => {
-    if (!user || user.role !== "admin") return;
+    if (!user || user.role !== "admin" || !adminVerified) return;
     fetchStats();
     fetchUsers();
     fetchInvestigations();
-  }, [user, fetchStats, fetchUsers, fetchInvestigations]);
+  }, [user, adminVerified, fetchStats, fetchUsers, fetchInvestigations]);
 
   const handleAddCredits = async (e: React.FormEvent) => {
     e.preventDefault();
     const amount = parseInt(addCreditAmount, 10);
     if (!addCreditUserId || isNaN(amount) || amount <= 0) {
       toast.error("Enter a valid user ID and credit amount.");
+      return;
+    }
+    // FE-CRIT-03 fix: Validate user ID is a proper UUID before interpolating
+    // into the URL to prevent path traversal attacks.
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!UUID_RE.test(addCreditUserId)) {
+      toast.error("Invalid user ID format. Must be a UUID.");
       return;
     }
 
@@ -220,8 +248,8 @@ export default function Admin() {
     }
   };
 
-  // Show loading spinner while redirect is in flight
-  if (!user || user.role !== "admin") {
+  // Show loading spinner while admin verification is in flight
+  if (!user || user.role !== "admin" || !adminVerified) {
     return (
       <div className="flex h-screen items-center justify-center bg-background">
         <Loader2 size={18} className="animate-spin text-muted-foreground" />

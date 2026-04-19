@@ -24,6 +24,7 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal
@@ -307,8 +308,13 @@ def _budget_is_available(cost_tracker: CostTracker, minimum: float) -> bool:
 # Public transition function
 # ===========================================================================
 
+# BUG-0038 fix: module-scope asyncio.Lock prevents concurrent transitions
+# from reading the same state, both passing guards, and producing conflicting
+# state writes.
+_transition_lock = asyncio.Lock()
 
-def transition(
+
+async def transition(
     current_state: State,
     trigger: TransitionTrigger,
     session_data: ResearchSessionData,
@@ -344,64 +350,67 @@ def transition(
         If no row in :data:`TRANSITION_TABLE` matches (current_state,
         trigger) and no budget-cap override applies.
     """
-    actions: list[Action] = []
+    # BUG-0038 fix: serialise all state reads + guard evaluations + state writes
+    # under a single asyncio.Lock to prevent race conditions from concurrent triggers.
+    async with _transition_lock:
+        actions: list[Action] = []
 
-    # ------------------------------------------------------------------
-    # 1. Budget hard cap always overrides everything
-    # ------------------------------------------------------------------
-    if (
-        trigger == TransitionTrigger.BUDGET_HARD_CAP
-        or cost_tracker.is_exhausted
-    ):
-        logger.warning(
-            "budget_hard_cap_override",
-            state=current_state.value,
-            trigger=trigger.value,
-            total_spent=cost_tracker.total_spent,
-            budget=cost_tracker.task_budget,
+        # ------------------------------------------------------------------
+        # 1. Budget hard cap always overrides everything
+        # ------------------------------------------------------------------
+        if (
+            trigger == TransitionTrigger.BUDGET_HARD_CAP
+            or cost_tracker.is_exhausted
+        ):
+            logger.warning(
+                "budget_hard_cap_override",
+                state=current_state.value,
+                trigger=trigger.value,
+                total_spent=cost_tracker.total_spent,
+                budget=cost_tracker.task_budget,
+            )
+            actions.append(Action("SAVE_CHECKPOINT", {"reason": "budget_cap"}))
+            actions.append(Action("HALT", {"reason": "budget_exhausted"}))
+            return State.HALT, actions
+
+        # ------------------------------------------------------------------
+        # 2. Manual halt override
+        # ------------------------------------------------------------------
+        if trigger == TransitionTrigger.MANUAL_HALT:
+            actions.append(Action("SAVE_CHECKPOINT", {"reason": "manual_halt"}))
+            actions.append(Action("HALT", {"reason": "manual_halt"}))
+            return State.HALT, actions
+
+        # ------------------------------------------------------------------
+        # 3. Table lookup
+        # ------------------------------------------------------------------
+        raw_next = TRANSITION_TABLE.get((current_state, trigger))
+        if raw_next is None:
+            raise InvalidTransitionError(current_state, trigger)
+
+        next_state = raw_next
+
+        # ------------------------------------------------------------------
+        # 4. Apply guard conditions and produce actions
+        # ------------------------------------------------------------------
+        next_state, actions = _apply_guards(
+            current_state=current_state,
+            trigger=trigger,
+            raw_next=next_state,
+            session_data=session_data,
+            cost_tracker=cost_tracker,
+            actions=actions,
         )
-        actions.append(Action("SAVE_CHECKPOINT", {"reason": "budget_cap"}))
-        actions.append(Action("HALT", {"reason": "budget_exhausted"}))
-        return State.HALT, actions
 
-    # ------------------------------------------------------------------
-    # 2. Manual halt override
-    # ------------------------------------------------------------------
-    if trigger == TransitionTrigger.MANUAL_HALT:
-        actions.append(Action("SAVE_CHECKPOINT", {"reason": "manual_halt"}))
-        actions.append(Action("HALT", {"reason": "manual_halt"}))
-        return State.HALT, actions
+        logger.info(
+            "state_transition",
+            from_state=current_state.value,
+            trigger=trigger.value,
+            to_state=next_state.value,
+            actions=[a.action_type for a in actions],
+        )
 
-    # ------------------------------------------------------------------
-    # 3. Table lookup
-    # ------------------------------------------------------------------
-    raw_next = TRANSITION_TABLE.get((current_state, trigger))
-    if raw_next is None:
-        raise InvalidTransitionError(current_state, trigger)
-
-    next_state = raw_next
-
-    # ------------------------------------------------------------------
-    # 4. Apply guard conditions and produce actions
-    # ------------------------------------------------------------------
-    next_state, actions = _apply_guards(
-        current_state=current_state,
-        trigger=trigger,
-        raw_next=next_state,
-        session_data=session_data,
-        cost_tracker=cost_tracker,
-        actions=actions,
-    )
-
-    logger.info(
-        "state_transition",
-        from_state=current_state.value,
-        trigger=trigger.value,
-        to_state=next_state.value,
-        actions=[a.action_type for a in actions],
-    )
-
-    return next_state, actions
+        return next_state, actions
 
 
 # ===========================================================================

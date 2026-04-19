@@ -24,6 +24,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from mariana.ai.session import spawn_model
+from mariana.ai.prompt_builder import _sanitize_untrusted_text
 from mariana.data.models import TaskType
 
 logger = structlog.get_logger(__name__)
@@ -198,17 +199,19 @@ async def audit_reasoning_chain(
     ) if diversity_row else "No source data"
 
     # 6. LLM audit
+    # BUG-0056 fix: sanitize all text fields derived from prior LLM outputs
+    # (claims, hypotheses, contradictions, perspectives all originate from LLM calls)
     try:
         output, _session = await spawn_model(
             task_type=TaskType.REASONING_AUDIT,
             context={
                 "task_id": task_id,
-                "research_topic": research_topic,
-                "claims": claims_text,
+                "research_topic": _sanitize_untrusted_text(research_topic, max_chars=2000),
+                "claims": _sanitize_untrusted_text(claims_text, max_chars=10000),
                 "claims_count": len(claims_rows),
-                "hypotheses": hypotheses_text,
-                "contradictions": contradictions_text,
-                "perspectives": perspectives_text,
+                "hypotheses": _sanitize_untrusted_text(hypotheses_text, max_chars=6000),
+                "contradictions": _sanitize_untrusted_text(contradictions_text, max_chars=6000),
+                "perspectives": _sanitize_untrusted_text(perspectives_text, max_chars=8000),
                 "source_info": source_info,
                 "audit_type": audit_type,
             },
@@ -235,6 +238,23 @@ async def audit_reasoning_chain(
     major_count = sum(1 for i in parsed.issues if i.severity == "major")
     minor_count = sum(1 for i in parsed.issues if i.severity == "minor")
 
+    # BUG-0021 fix: do NOT trust the LLM's self-reported `passed` field.
+    # Instead, apply deterministic server-side criteria:
+    #   passed IFF: LLM said passed AND zero critical issues AND score >= 0.6
+    server_passed = (
+        parsed.passed
+        and critical_count == 0
+        and parsed.overall_score >= 0.6
+    )
+    if server_passed != parsed.passed:
+        log.warning(
+            "audit_pass_overridden",
+            llm_passed=parsed.passed,
+            server_passed=server_passed,
+            critical_count=critical_count,
+            overall_score=parsed.overall_score,
+        )
+
     # 7. Persist audit results
     try:
         await db.execute(
@@ -247,7 +267,7 @@ async def audit_reasoning_chain(
             task_id,
             audit_type,
             json.dumps(issues_json),
-            parsed.passed,
+            server_passed,
             parsed.overall_score,
             parsed.auditor_notes,
         )
@@ -255,7 +275,7 @@ async def audit_reasoning_chain(
         log.warning("audit_persist_failed", error=str(exc))
 
     result = {
-        "passed": parsed.passed,
+        "passed": server_passed,
         "overall_score": parsed.overall_score,
         "issues": issues_json,
         "auditor_notes": parsed.auditor_notes,
@@ -268,7 +288,7 @@ async def audit_reasoning_chain(
     log.info(
         "audit_complete",
         task_id=task_id,
-        passed=parsed.passed,
+        passed=server_passed,
         score=f"{parsed.overall_score:.2f}",
         critical=critical_count,
         major=major_count,

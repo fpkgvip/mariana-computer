@@ -406,7 +406,28 @@ export default function InvestigationGraph() {
       const data: GraphData = await res.json();
       if (!isMountedRef.current) return;
       const normalized = normalizeGraphData(data);
-      setNodes(normalized.nodes);
+
+      // FE-HIGH-04 fix: Merge incoming backend data with existing local node
+      // positions instead of replacing. This prevents the 10s poll from wiping
+      // user's drag-and-drop position edits. Only overwrite data fields (label,
+      // type, notes); preserve x/y/fx/fy from existing nodes.
+      const existingPositions = new Map(
+        nodesRef.current.map((n) => [n.id, { x: n.x, y: n.y, fx: n.fx, fy: n.fy }])
+      );
+      const mergedNodes = normalized.nodes.map((incoming) => {
+        const existing = existingPositions.get(incoming.id);
+        if (existing) {
+          return {
+            ...incoming,
+            x: existing.x,
+            y: existing.y,
+            fx: existing.fx,
+            fy: existing.fy,
+          };
+        }
+        return incoming;
+      });
+      setNodes(mergedNodes);
       setEdges(normalized.edges);
     } catch {
       // Network hiccup — surface error but don't crash

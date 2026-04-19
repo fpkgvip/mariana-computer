@@ -32,6 +32,7 @@ from typing import Any
 
 import structlog
 
+from mariana.ai.prompt_builder import _sanitize_untrusted_text
 from mariana.data.models import (
     Finding,
     QuestionClassification,
@@ -286,18 +287,21 @@ async def run_skeptic(
         )
 
     # ── Layer 0: AI question generation ──────────────────────────────────────
+    # BUG-0056 fix: sanitize finding_summary and unanswered_block — both
+    # contain content derived from prior LLM outputs (tribunal) and could
+    # carry injected control sequences.
     skeptic_parsed, skeptic_session = await spawn_model(
         task_type=TaskType.SKEPTIC_QUESTIONS,
         context={
             "task_id": task_id,
-            "finding_summary": finding_summary,
+            "finding_summary": _sanitize_untrusted_text(finding_summary, max_chars=6000),
             "confidence_score": f"{finding.confidence:.2f}",
             "tribunal_verdict": (
                 tribunal_session.verdict.value
                 if tribunal_session.verdict
                 else "N/A"
             ),
-            "unanswered_questions": unanswered_block,
+            "unanswered_questions": _sanitize_untrusted_text(unanswered_block, max_chars=2000),
         },
         output_schema=SkepticQuestionsOutput,
         db=db,

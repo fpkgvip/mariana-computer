@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import defaultdict, deque
 import hashlib
 import hmac
 import json
@@ -97,7 +98,8 @@ except ImportError:  # pragma: no cover - slowapi is an optional hardening dep
     Limiter = _NoopLimiter  # type: ignore[misc,assignment]
 
 from mariana.config import AppConfig, load_config
-from mariana.data.db import create_pool, init_schema
+from mariana.data.db import create_pool, init_schema, insert_research_task as _db_insert_research_task
+from mariana.data.models import ResearchTask as _ResearchTask, TaskStatus as _TaskStatus, State as _State
 
 logger = structlog.get_logger(__name__)
 
@@ -133,13 +135,18 @@ _VERSION = "0.1.0"
 # Admin constants
 # ---------------------------------------------------------------------------
 
-#: Hardcoded admin user UUID — matches the Supabase profile with role='admin'.
-# L-04 fix: load admin user ID from env so it can be rotated without a
-# deploy.  Falls back to the previously hard-coded default to preserve
-# behaviour when ADMIN_USER_ID is not set.
-ADMIN_USER_ID = os.environ.get(
-    "ADMIN_USER_ID", "a34a319e-a046-4df2-8c98-9b83f6d512a0"
-)
+# BUG-0006 fix: Remove hardcoded default UUID.  When ADMIN_USER_ID is not set,
+# admin features are disabled (empty string never matches any user_id).
+ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID", "")
+
+
+def _is_admin_user(user_id: str) -> bool:
+    """Return True if the given user_id matches the configured admin user.
+
+    BUG-0006 fix: When ADMIN_USER_ID is empty (not configured), no user
+    is treated as admin, preventing accidental privilege grants.
+    """
+    return bool(ADMIN_USER_ID) and user_id == ADMIN_USER_ID
 
 # BUG-API-024: Allow-list of valid task status values. Clients that pass
 # anything outside this set receive a 400 instead of an empty result.
@@ -314,6 +321,7 @@ if _SLOWAPI_AVAILABLE:
 # updated via environment variable without a code change.
 _DEFAULT_PROD_CORS_ORIGINS = [
     "https://frontend-tau-navy-80.vercel.app",
+    "https://app.mariana.computer",
 ]
 _DEFAULT_DEV_CORS_ORIGINS = [
     "http://localhost:5173",
@@ -355,12 +363,15 @@ def _get_cors_origins() -> list[str]:
         return list(_DEFAULT_PROD_CORS_ORIGINS) + list(_DEFAULT_DEV_CORS_ORIGINS)
     return list(_DEFAULT_PROD_CORS_ORIGINS)
 
+# BUG-0022 fix: Use explicit allow_origins list with allow_credentials=True.
+# The CORS spec forbids allow_credentials=True with wildcard origin/methods/headers.
+# Restrict methods and headers to what the frontend actually needs.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_get_cors_origins(),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "X-Requested-With"],
 )
 
 
@@ -395,6 +406,69 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(SecurityHeadersMiddleware)
+
+
+# ---------------------------------------------------------------------------
+# BUG-0047 fix: Simple in-memory rate limiter
+# ---------------------------------------------------------------------------
+
+_rate_limit_store: dict[str, deque] = defaultdict(deque)
+
+# Auth endpoints get stricter limits to slow credential stuffing
+_AUTH_PATH_PREFIXES = ("/api/auth/", "/auth/")
+_AUTH_RATE_LIMIT = 20       # requests per window
+_DEFAULT_RATE_LIMIT = 60    # requests per window
+_RATE_LIMIT_WINDOW = 60     # seconds
+
+
+def _check_rate_limit(key: str, max_requests: int = _DEFAULT_RATE_LIMIT, window_seconds: int = _RATE_LIMIT_WINDOW) -> bool:
+    """Return True if the request is within rate limits, False if exceeded."""
+    now = time.monotonic()
+    dq = _rate_limit_store[key]
+    while dq and dq[0] < now - window_seconds:
+        dq.popleft()
+    if len(dq) >= max_requests:
+        return False
+    dq.append(now)
+    return True
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """In-memory per-user rate limiting middleware."""
+
+    async def dispatch(self, request: Request, call_next):
+        # Skip rate limiting for health/docs endpoints
+        path = request.url.path
+        if path in ("/health", "/docs", "/openapi.json", "/redoc"):
+            return await call_next(request)
+
+        # Extract user identity: prefer user_id from auth, fall back to IP
+        # We can't run the full auth dependency here, so use a lightweight
+        # token extraction for rate-limit keying.
+        key = ""
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+            if token:
+                # Hash the token to avoid storing raw tokens in memory
+                key = f"user:{hashlib.sha256(token.encode()).hexdigest()[:16]}"
+        if not key:
+            key = f"ip:{request.client.host if request.client else 'unknown'}"
+
+        # Choose rate limit based on path
+        is_auth_path = any(path.startswith(p) for p in _AUTH_PATH_PREFIXES)
+        max_req = _AUTH_RATE_LIMIT if is_auth_path else _DEFAULT_RATE_LIMIT
+
+        if not _check_rate_limit(key, max_requests=max_req):
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded. Please retry after a short wait."},
+            )
+
+        return await call_next(request)
+
+
+app.add_middleware(RateLimitMiddleware)
 
 
 # ---------------------------------------------------------------------------
@@ -987,7 +1061,7 @@ async def _require_investigation_owner(
     row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
-    if current_user["user_id"] == ADMIN_USER_ID:
+    if _is_admin_user(current_user["user_id"]):
         return current_user
 
     metadata = row.get("metadata") or {}
@@ -1102,7 +1176,7 @@ async def _require_investigation_owner_header_or_query(
     row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
-    if current_user["user_id"] == ADMIN_USER_ID:
+    if _is_admin_user(current_user["user_id"]):
         return current_user
 
     metadata = row.get("metadata") or {}
@@ -1151,7 +1225,7 @@ async def _authenticate_stream_token_or_header(
         row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
         if row is None:
             raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
-        if user["user_id"] != ADMIN_USER_ID:
+        if not _is_admin_user(user["user_id"]):
             metadata = row.get("metadata") or {}
             # BUG-API-016: wrap json.loads in try/except so that a malformed
             # metadata string (rare, but seen when ingesting legacy rows)
@@ -1172,7 +1246,7 @@ async def _require_admin(
     current_user: dict[str, str] = Depends(_get_current_user),
 ) -> dict[str, str]:
     """Dependency that raises 403 unless the caller is the admin user."""
-    if current_user["user_id"] != ADMIN_USER_ID:
+    if not _is_admin_user(current_user["user_id"]):
         raise HTTPException(status_code=403, detail="Admin access required")
     return current_user
 
@@ -1536,7 +1610,12 @@ async def _supabase_rest(
     user_token: str | None = None,
     allow_retry: bool | None = None,
 ) -> httpx.Response:
-    """Low-level Supabase REST helper. Uses service key for admin ops, or user token for RLS-respecting ops.
+    """Low-level Supabase REST helper for user-scoped operations.
+
+    BUG-0004 fix: ``user_token`` is now required (must be a non-empty string).
+    Callers performing system-level operations (webhook handlers, internal
+    bookkeeping) must use ``_supabase_rest_system()`` instead to make the
+    service-key usage explicit.
 
     BUG-API-050: for idempotent requests (GET/HEAD, or PATCH/DELETE/PUT with a
     PK-shaped filter), transparently retry on connection errors, read timeouts,
@@ -1545,10 +1624,15 @@ async def _supabase_rest(
     writes.  Callers that know their PATCH/DELETE is non-idempotent (e.g. bulk
     updates without a PK filter) can opt out by passing ``allow_retry=False``.
     """
+    if not user_token:
+        raise ValueError(
+            "_supabase_rest() requires a non-empty user_token for RLS-scoped "
+            "requests. Use _supabase_rest_system() for service-key operations."
+        )
     api_key = _supabase_api_key(cfg)
     if not api_key:
         raise HTTPException(status_code=503, detail="Supabase not configured")
-    auth_key = user_token or api_key
+    auth_key = user_token
     headers = {
         "apikey": api_key,
         "Authorization": f"Bearer {auth_key}",
@@ -1619,6 +1703,75 @@ async def _supabase_rest(
             return resp
 
     # Unreachable — either returned or raised above.
+    assert last_exc is not None
+    raise last_exc
+
+
+async def _supabase_rest_system(
+    cfg: AppConfig,
+    method: str,
+    path: str,
+    *,
+    json: dict | list | None = None,
+    params: dict[str, str] | None = None,
+    headers_extra: dict[str, str] | None = None,
+    allow_retry: bool | None = None,
+) -> httpx.Response:
+    """Supabase REST helper for system/service-key operations.
+
+    BUG-0004 fix: Explicitly uses the service-role API key for internal
+    bookkeeping (webhook handlers, task linking) where no user JWT is
+    available. This separation makes service-key usage auditable and prevents
+    accidental privilege escalation in user-facing code paths.
+    """
+    api_key = _supabase_api_key(cfg)
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+    auth_key = api_key
+    headers = {
+        "apikey": api_key,
+        "Authorization": f"Bearer {auth_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+    if headers_extra:
+        headers.update(headers_extra)
+    url = f"{cfg.SUPABASE_URL}/rest/v1{path}"
+
+    method_upper = method.upper()
+    if allow_retry is None:
+        if method_upper in ("GET", "HEAD"):
+            allow_retry = True
+        elif method_upper in ("PATCH", "DELETE", "PUT") and params:
+            allow_retry = any(
+                isinstance(v, str) and v.startswith("eq.")
+                for v in params.values()
+            )
+        else:
+            allow_retry = False
+
+    max_attempts = _SUPABASE_RETRY_MAX_ATTEMPTS if allow_retry and method_upper in _SUPABASE_RETRY_IDEMPOTENT_METHODS else 1
+    last_exc: Exception | None = None
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = await client.request(
+                    method_upper, url, json=json, params=params, headers=headers
+                )
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
+                last_exc = exc
+                if attempt >= max_attempts:
+                    raise
+                delay = _SUPABASE_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                await asyncio.sleep(delay)
+                continue
+
+            if resp.status_code in _SUPABASE_RETRYABLE_STATUSES and attempt < max_attempts:
+                delay = _SUPABASE_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                await asyncio.sleep(delay)
+                continue
+            return resp
+
     assert last_exc is not None
     raise last_exc
 
@@ -1825,6 +1978,13 @@ async def update_conversation(
     )
     if resp.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail="Failed to update conversation")
+    # BUG-0053b fix: check if any rows were actually affected
+    try:
+        affected = resp.json()
+        if isinstance(affected, list) and len(affected) == 0:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+    except (json.JSONDecodeError, ValueError):
+        pass  # 204 has no body; that's fine
     return {"ok": True}
 
 
@@ -1853,6 +2013,13 @@ async def delete_conversation(
     )
     if resp.status_code not in (200, 204):
         raise HTTPException(status_code=500, detail="Failed to delete conversation")
+    # BUG-0053b fix: check if any rows were actually affected
+    try:
+        affected = resp.json()
+        if isinstance(affected, list) and len(affected) == 0:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+    except (json.JSONDecodeError, ValueError):
+        pass  # 204 has no body; that's fine
     return {"ok": True}
 
 
@@ -1979,16 +2146,94 @@ async def start_investigation(
         classification.tier = body.tier
         classification.estimated_credits = _TIER_CREDITS.get(body.tier, 100)
 
+    # ── BUG-0049 fix: Validate tier/plan constraints server-side ───────────
+    # Determine user plan (default to "free" if lookup fails)
+    user_plan = "free"
+    try:
+        _plan_resp = await _supabase_rest_system(
+            cfg, "GET", "/profiles",
+            params={
+                "id": f"eq.{current_user['user_id']}",
+                "select": "plan",
+                "limit": "1",
+            },
+        )
+        if _plan_resp.status_code == 200:
+            _plan_data = _plan_resp.json()
+            if _plan_data:
+                user_plan = (_plan_data[0].get("plan") or "free") if isinstance(_plan_data, list) else (_plan_data.get("plan") or "free")
+    except Exception:  # noqa: BLE001
+        pass  # Default to "free" on lookup failure
+
+    # Plan-based tier restrictions
+    _PLAN_ALLOWED_TIERS: dict[str, set[str]] = {
+        "free": {"instant", "quick"},
+        "starter": {"instant", "quick", "standard"},
+        "pro": {"instant", "quick", "standard", "deep"},
+        "flagship": {"instant", "quick", "standard", "deep"},
+    }
+    allowed_tiers = _PLAN_ALLOWED_TIERS.get(user_plan, {"instant", "quick"})
+    if classification.tier not in allowed_tiers:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Your {user_plan!r} plan does not support tier {classification.tier!r}. "
+                f"Allowed tiers: {sorted(allowed_tiers)}"
+            ),
+        )
+
+    # Cap duration_hours at 24 (or plan maximum)
+    _PLAN_MAX_DURATION: dict[str, float] = {
+        "free": 1.0,
+        "starter": 6.0,
+        "pro": 24.0,
+        "flagship": 24.0,
+    }
+    max_duration = _PLAN_MAX_DURATION.get(user_plan, 1.0)
+
+    # Continuous mode only for flagship plan
+    if body.continuous_mode and user_plan != "flagship":
+        raise HTTPException(
+            status_code=403,
+            detail=f"Continuous mode requires the flagship plan (your plan: {user_plan!r})",
+        )
+
     effective_duration_hours: float = (
         body.duration_hours
         if body.duration_hours is not None
         else classification.estimated_duration_hours
     )
+    if effective_duration_hours > max_duration:
+        raise HTTPException(
+            status_code=400,
+            detail=f"duration_hours {effective_duration_hours} exceeds your plan maximum of {max_duration}h",
+        )
+
     effective_budget_usd: float = (
         body.budget_usd
         if body.budget_usd is not None
         else float(classification.estimated_credits) * _CREDIT_USD_RATE
     )
+
+    # ── BUG-0052 fix: Enforce budget bounds explicitly instead of silent clamping ──
+    _BUDGET_MIN_USD = 0.10
+    _PLAN_MAX_BUDGET: dict[str, float] = {
+        "free": 5.0,
+        "starter": 50.0,
+        "pro": 500.0,
+        "flagship": 10000.0,
+    }
+    _budget_max = _PLAN_MAX_BUDGET.get(user_plan, 5.0)
+    if effective_budget_usd < _BUDGET_MIN_USD:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Budget ${effective_budget_usd:.2f} is below minimum ${_BUDGET_MIN_USD:.2f}",
+        )
+    if effective_budget_usd > _budget_max:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Budget ${effective_budget_usd:.2f} exceeds your plan maximum of ${_budget_max:.2f}",
+        )
 
     # ── Reserve estimated credits up-front to prevent concurrent overspend ──
     # VULN-C2-01 fix: Enforce a minimum reservation equal to the tier's base
@@ -2046,6 +2291,8 @@ async def start_investigation(
                 task_upload_dir.mkdir(parents=True, exist_ok=True)
                 import shutil
                 for f in pending_dir.iterdir():
+                    if f.is_symlink():  # BUG-0008 fix: skip symlinks
+                        continue
                     if f.is_file() and f.name != ".owner":
                         dest = task_upload_dir / f.name
                         shutil.move(str(f), str(dest))
@@ -2069,9 +2316,12 @@ async def start_investigation(
         # off the authenticated user context (populated by Supabase auth
         # middleware) and also match against the configured ADMIN_USER_ID
         # for environments where the role claim is not yet provisioned.
+        # BUG-0007 fix: admin-only QA-bypass flags are stripped for non-admin
+        # users.  BUG-0006 fix: uses _is_admin_user() which handles empty
+        # ADMIN_USER_ID safely.
         _is_admin: bool = (
             current_user.get("role") == "admin"
-            or str(current_user.get("user_id", "")) == ADMIN_USER_ID
+            or _is_admin_user(str(current_user.get("user_id", "")))
         )
 
         task_payload: dict[str, Any] = {
@@ -2104,6 +2354,25 @@ async def start_investigation(
             "user_directives": body.user_directives or {},
         }
 
+        # BUG-0051 fix: Write the task to DB synchronously BEFORE writing
+        # the daemon file.  This ensures that a GET /api/investigations
+        # immediately after POST sees the task (read-your-writes).
+        db = _get_db()
+        _parsed_created_at = datetime.fromisoformat(created_at)
+        _task_model = _ResearchTask(
+            id=task_id,
+            topic=body.topic,
+            budget_usd=effective_budget_usd,
+            status=_TaskStatus.PENDING,
+            current_state=_State.INIT,
+            total_spent_usd=0.0,
+            diminishing_flags=0,
+            ai_call_counter=0,
+            created_at=_parsed_created_at,
+            metadata=task_payload,
+        )
+        await _db_insert_research_task(db, _task_model)
+
         inbox = Path(cfg.inbox_dir)
         inbox.mkdir(parents=True, exist_ok=True)
         task_file = inbox / f"{task_id}.task.json"
@@ -2131,7 +2400,7 @@ async def start_investigation(
             try:
                 # Validate UUID shape before hitting PostgREST (avoids confusing 400s).
                 uuid.UUID(body.conversation_id)
-                ownership_resp = await _supabase_rest(
+                ownership_resp = await _supabase_rest_system(
                     cfg, "GET", "/conversations",
                     params={
                         "id": f"eq.{body.conversation_id}",
@@ -2161,7 +2430,7 @@ async def start_investigation(
 
             if conversation_owned:
                 try:
-                    await _supabase_rest(
+                    await _supabase_rest_system(
                         cfg, "PATCH", "/investigations",
                         json={"conversation_id": body.conversation_id},
                         params={"task_id": f"eq.{task_id}"},
@@ -2352,7 +2621,7 @@ async def get_investigation(
         except (json.JSONDecodeError, TypeError):
             metadata = {}
     task_user_id = metadata.get("user_id", "")
-    if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
+    if not _is_admin_user(current_user["user_id"]) and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
     return _row_to_task_summary(row)
 
@@ -2390,7 +2659,7 @@ async def kill_investigation(
         except (json.JSONDecodeError, TypeError):
             metadata = {}
     task_user_id = metadata.get("user_id", "")
-    if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
+    if not _is_admin_user(current_user["user_id"]) and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
 
     # BUG-021: Atomic conditional UPDATE to avoid race condition
@@ -2453,7 +2722,7 @@ async def stop_investigation(
         except (json.JSONDecodeError, TypeError):
             metadata = {}
     task_user_id = metadata.get("user_id", "")
-    if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
+    if not _is_admin_user(current_user["user_id"]) and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
 
     # BUG-API-011: Return 409 when task is already in a terminal state (matches kill_investigation behavior)
@@ -2525,7 +2794,7 @@ async def delete_investigation(
     row_user_id = str(metadata.get("user_id", "")).strip()
     # BUG-API-017 fix: Treat missing owner as admin-only. Previously, empty
     # user_id let anyone delete legacy tasks.
-    if user_id != ADMIN_USER_ID and row_user_id != user_id:
+    if not _is_admin_user(user_id) and row_user_id != user_id:
         raise HTTPException(status_code=403, detail="Not authorized to delete this investigation")
 
     # If still running, kill it first
@@ -2543,51 +2812,59 @@ async def delete_investigation(
             task_id,
         )
 
-    # Delete all related intelligence data (cascade from task_id foreign keys)
+    # BUG-0025 fix: Only delete from tables that actually exist in the schema.
+    # Removed non-existent tables: replan_modifications, retrieval_coverage,
+    # diversity_assessments, confidence_calibrations, temporal_tags,
+    # source_credibility_scores, research_findings, research_branches, task_logs.
+    # Fixed: research_findings → findings, research_branches → branches.
     # Order matters — delete children before parent.
-    intelligence_tables = [
+    cascade_tables = [
+        # Intelligence / analysis tables
         "executive_summaries",
         "audit_results",
         "perspective_syntheses",
-        "replan_modifications",
         "gap_analyses",
-        "retrieval_coverage",
-        "diversity_assessments",
-        "confidence_calibrations",
         "hypothesis_priors",
         "contradiction_pairs",
         "claims",
-        "temporal_tags",
-        "source_credibility_scores",
-    ]
-    # BUG-API-023: table names are interpolated into the SQL string with an
-    # f-string, but come exclusively from the hardcoded allow-list above, so
-    # this is not SQL-injectable. The ``noqa: S608`` annotation documents
-    # that the Bandit finding is intentional.
-    for table in intelligence_tables:
-        try:
-            await pool.execute(f"DELETE FROM {table} WHERE task_id = $1", task_id)  # noqa: S608
-        except Exception:  # noqa: BLE001
-            # Table may not exist yet or have different FK structure
-            pass
-
-    # Delete findings, branches, hypotheses, graph data
-    auxiliary_tables = [
-        "research_findings",
+        "source_scores",
+        # Learning / outcome tables
+        "learning_events",
+        "investigation_outcomes",
+        "learning_insights",
+        # Session / report tables
+        "ai_sessions",
+        "evaluation_results",
+        "report_generations",
+        "tribunal_sessions",
+        "skeptic_results",
+        "orchestrator_handoffs",
+        "research_plans",
+        "checkpoints",
+        # Graph data
         "graph_edges",
         "graph_nodes",
-        "research_branches",
+        # Core entities (children of research_tasks)
+        "sources",
+        "findings",
+        "branches",
         "hypotheses",
-        "task_logs",
     ]
-    for table in auxiliary_tables:
+    for table in cascade_tables:
         try:
             await pool.execute(f"DELETE FROM {table} WHERE task_id = $1", task_id)  # noqa: S608
         except Exception:  # noqa: BLE001
             pass
 
-    # Finally delete the investigation itself
-    await pool.execute("DELETE FROM research_tasks WHERE id = $1", task_id)
+    # BUG-0033 fix: Use DELETE ... RETURNING to atomically claim the row.
+    # If a concurrent DELETE already removed it, deleted_row is None and we
+    # return 404 instead of a misleading 200.
+    deleted_row = await pool.fetchrow(
+        "DELETE FROM research_tasks WHERE id = $1 RETURNING id",
+        task_id,
+    )
+    if not deleted_row:
+        raise HTTPException(status_code=404, detail="Investigation already deleted")
 
     _log.info("investigation_deleted")
     return {"status": "deleted", "task_id": task_id}
@@ -3130,7 +3407,7 @@ async def stream_logs(
                                     meta = json.loads(meta)
                                 except (json.JSONDecodeError, TypeError):
                                     meta = {}
-                            if _sse_user_id != ADMIN_USER_ID and meta.get("user_id") != _sse_user_id:
+                            if not _is_admin_user(_sse_user_id) and meta.get("user_id") != _sse_user_id:
                                 yield {"data": json.dumps({"error": "authentication_revoked"}), "event": "error"}
                                 break
                         except HTTPException as exc:
@@ -3234,7 +3511,7 @@ async def stream_logs(
                                 meta = json.loads(meta)
                             except (json.JSONDecodeError, TypeError):
                                 meta = {}
-                        if _sse_user_id != ADMIN_USER_ID and meta.get("user_id") != _sse_user_id:
+                        if not _is_admin_user(_sse_user_id) and meta.get("user_id") != _sse_user_id:
                             yield {"data": json.dumps({"error": "authentication_revoked"}), "event": "error"}
                             break
                     except Exception as exc:  # noqa: BLE001
@@ -3354,6 +3631,9 @@ async def download_report_pdf(
             status_code=404,
             detail="Report PDF file is not available. It may still be generating or was removed.",
         )
+    # BUG-0008 fix: reject symlinks in report download
+    if resolved.is_symlink():
+        raise HTTPException(status_code=403, detail="Access denied: symlinks are not allowed")
 
     # BUG-API-047: `FileResponse` already emits a correctly-encoded
     # Content-Disposition header when ``filename`` is passed (it uses
@@ -3495,7 +3775,7 @@ async def list_investigation_files(
         except (json.JSONDecodeError, TypeError):
             metadata = {}
     task_user_id = metadata.get("user_id", "")
-    if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
+    if not _is_admin_user(current_user["user_id"]) and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
 
     files_dir = Path(cfg.DATA_ROOT) / "files" / task_id
@@ -3505,6 +3785,8 @@ async def list_investigation_files(
     result: list[FileAttachmentInfo] = []
     for f in sorted(files_dir.iterdir()):
         try:  # BUG-API-037: guard against OSError if file vanishes between iterdir() and stat()
+            if f.is_symlink():  # BUG-0008 fix: skip symlinks
+                continue
             if f.is_file():
                 stat = f.stat()
                 suffix = f.suffix.lower()
@@ -3549,7 +3831,7 @@ async def download_investigation_file(
         except (json.JSONDecodeError, TypeError):
             metadata = {}
     task_user_id = metadata.get("user_id", "")
-    if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
+    if not _is_admin_user(current_user["user_id"]) and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
 
     files_dir = Path(cfg.DATA_ROOT) / "files" / task_id
@@ -3563,6 +3845,9 @@ async def download_investigation_file(
 
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail=f"File {filename!r} not found")
+    # BUG-0008 fix: reject symlinks in file download
+    if file_path.is_symlink():
+        raise HTTPException(status_code=403, detail="Access denied: symlinks are not allowed")
 
     suffix = file_path.suffix.lower()
     mime = _MIME_MAP.get(suffix, "application/octet-stream")
@@ -3693,7 +3978,7 @@ async def upload_investigation_files(
         except (json.JSONDecodeError, TypeError):
             metadata = {}
     task_user_id = metadata.get("user_id", "")
-    if current_user["user_id"] != ADMIN_USER_ID and task_user_id != current_user["user_id"]:
+    if not _is_admin_user(current_user["user_id"]) and task_user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="You do not own this investigation")
 
     if len(files) > _UPLOAD_MAX_FILES_PER_INVESTIGATION:
@@ -3753,7 +4038,20 @@ async def upload_investigation_files(
             # Ensure resolved path is within the upload directory
             if not str(dest.resolve()).startswith(str(upload_dir.resolve())):
                 raise HTTPException(status_code=400, detail=f"Invalid filename: {filename!r}")
+            # BUG-0034 fix: append counter suffix on duplicate filenames
+            if dest.exists():
+                stem = Path(safe_name).stem
+                ext = Path(safe_name).suffix
+                counter = 1
+                while dest.exists():
+                    safe_name = f"{stem}_{counter}{ext}"
+                    dest = upload_dir / safe_name
+                    counter += 1
             dest.write_bytes(content)
+            # BUG-0008 fix: reject symlinks after write (race-safe check)
+            if dest.is_symlink():
+                dest.unlink()
+                raise HTTPException(status_code=400, detail=f"Symlinks are not allowed: {safe_name!r}")
 
             uploaded.append(UploadedFileInfo(
                 filename=safe_name,
@@ -3884,7 +4182,20 @@ async def upload_pending_files(
             dest = pending_dir / safe_name
             if not str(dest.resolve()).startswith(str(pending_dir.resolve())):
                 raise HTTPException(status_code=400, detail=f"Invalid filename: {filename!r}")
+            # BUG-0034 fix: append counter suffix on duplicate filenames
+            if dest.exists():
+                stem = Path(safe_name).stem
+                ext = Path(safe_name).suffix
+                counter = 1
+                while dest.exists():
+                    safe_name = f"{stem}_{counter}{ext}"
+                    dest = pending_dir / safe_name
+                    counter += 1
             dest.write_bytes(content)
+            # BUG-0008 fix: reject symlinks after write (race-safe check)
+            if dest.is_symlink():
+                dest.unlink()
+                raise HTTPException(status_code=400, detail=f"Symlinks are not allowed: {safe_name!r}")
 
             uploaded.append(UploadedFileInfo(
                 filename=safe_name,
@@ -5438,7 +5749,7 @@ async def delete_skill(
         raise HTTPException(status_code=403, detail="Cannot delete built-in skills")
     # P0-FIX-6: Require explicit ownership match; don't allow deletion of
     # orphaned skills (owner_id=None) by any user — only admin can clean those up.
-    if current_user["user_id"] != ADMIN_USER_ID:
+    if not _is_admin_user(current_user["user_id"]):
         if not skill.owner_id or skill.owner_id != current_user["user_id"]:
             raise HTTPException(status_code=403, detail="Not authorized to delete this skill")
 
@@ -5594,7 +5905,7 @@ async def submit_feedback(
         row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", validated_task_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Investigation not found")
-        if current_user["user_id"] != ADMIN_USER_ID:
+        if not _is_admin_user(current_user["user_id"]):
             meta = row.get("metadata") or {}
             if isinstance(meta, str):
                 try:
@@ -6036,6 +6347,17 @@ async def get_intelligence_overview(
 
 # BUG-037: Register on RequestValidationError (not integer 422) and return
 # structured field-level errors via exc.errors() instead of str(exc).
+@app.exception_handler(json.JSONDecodeError)
+async def json_decode_error_handler(
+    request: Request, exc: json.JSONDecodeError
+) -> JSONResponse:
+    """Handle malformed JSON (e.g. Infinity, NaN, trailing commas)."""
+    return JSONResponse(
+        status_code=400,
+        content={"detail": "Invalid JSON in request body", "type": "json_parse_error"},
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError

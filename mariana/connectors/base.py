@@ -83,6 +83,59 @@ def _is_internal_host(host: str | None) -> bool:
     return False
 
 
+def _validate_initial_url(url: str) -> None:
+    """BUG-0011 fix: validate the initial request URL against SSRF before connecting.
+
+    BUG-0012 fix: resolve hostname ONCE to pin the IP and prevent DNS rebinding.
+    The resolved IP is checked against internal ranges. If the hostname resolves
+    to a private/internal IP, the request is blocked.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception as exc:
+        raise SSRFBlockedError(f"Invalid URL: {url!r}") from exc
+
+    host = parsed.hostname
+    if not host:
+        raise SSRFBlockedError(f"No hostname in URL: {url!r}")
+
+    # Check the hostname itself (handles localhost, etc.)
+    h = host.strip().lower()
+    if h in ("localhost", "ip6-localhost", "ip6-loopback", ""):
+        raise SSRFBlockedError(f"Request to local address blocked: host={host!r}")
+
+    # Try to parse as IP directly
+    try:
+        ip = ipaddress.ip_address(h.strip("[]"))
+        if (
+            ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+        ):
+            raise SSRFBlockedError(f"Request to internal IP blocked: {ip}")
+        return  # IP is safe
+    except ValueError:
+        pass
+
+    # Hostname — resolve once and check all IPs
+    try:
+        infos = socket.getaddrinfo(h, parsed.port or 443)
+    except socket.gaierror:
+        return  # Let the actual request fail naturally
+
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except (ValueError, IndexError):
+            continue
+        if (
+            ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+        ):
+            raise SSRFBlockedError(
+                f"DNS resolved to internal address blocked: host={host!r} ip={ip}"
+            )
+
+
 def _redact_url(url: str) -> str:
     """Redact query parameters from a URL for safe logging. (M-06)"""
     try:
@@ -200,6 +253,8 @@ class BaseConnector(ABC):
             httpx.HTTPStatusError: For other non-2xx responses after retries.
             ConnectorError: For non-HTTP failures (network, timeout, etc.).
         """
+        # BUG-0011 fix: validate the INITIAL request URL, not just redirects.
+        _validate_initial_url(url)
         self._log.debug("http_request", method=method, url=_redact_url(url))
         try:
             resp = await self.client.request(method, url, **kwargs)
@@ -239,6 +294,8 @@ class BaseConnector(ABC):
 
         Useful for fetching filing documents, HTML pages, etc.
         """
+        # BUG-0011 fix: validate the INITIAL request URL, not just redirects.
+        _validate_initial_url(url)
         self._log.debug("http_request_text", method=method, url=_redact_url(url))
         try:
             resp = await self.client.request(method, url, **kwargs)

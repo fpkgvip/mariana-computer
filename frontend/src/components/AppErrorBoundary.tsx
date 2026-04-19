@@ -22,13 +22,22 @@ export default class AppErrorBoundary extends Component<
 
   private readonly handleUnhandledRejection = (event: PromiseRejectionEvent): void => {
     console.error("[AppErrorBoundary] Unhandled promise rejection:", event.reason);
-    // BUG-R15-01: Only crash the UI for genuine logic errors (TypeError, ReferenceError,
-    // SyntaxError). Network failures, AbortErrors, and other transient rejections from
-    // fire-and-forget Supabase calls should NOT nuke the entire UI.
+    // FE-HIGH-06 fix: Catch ALL unhandled rejections in the error boundary.
+    // Previously only TypeError/ReferenceError/SyntaxError triggered the fallback,
+    // which meant other fatal errors (e.g., RangeError, custom errors) would crash
+    // silently. Network-related errors (AbortError, fetch failures) are still
+    // excluded since they are transient and fire-and-forget by design.
     const reason = event.reason;
-    if (reason instanceof TypeError || reason instanceof ReferenceError || reason instanceof SyntaxError) {
-      this.setState({ hasError: true });
+    if (reason instanceof DOMException && reason.name === "AbortError") {
+      return; // Intentional fetch cancellations — not a crash
     }
+    if (reason instanceof Error && reason.message.includes("NetworkError")) {
+      return; // Transient network failures — not a crash
+    }
+    if (reason instanceof Error && reason.message.includes("Failed to fetch")) {
+      return; // Transient fetch failures (offline, DNS, etc.)
+    }
+    this.setState({ hasError: true });
   };
 
   static getDerivedStateFromError(): AppErrorBoundaryState {

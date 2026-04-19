@@ -284,11 +284,14 @@ async def score_source(
             log.warning("source_classification_llm_failed", error=str(exc), source_id=source_id)
 
     # 4. Cross-reference density (count how many claims cite this source)
+    # BUG-0009 fix: replace LIKE wildcard injection with array containment.
+    # The old query used LIKE '%' || $2 || '%' which allowed LIKE wildcards
+    # (% and _) in source_id to match unintended rows.
     cross_ref_row = await db.fetchrow(
         """
         SELECT COUNT(*) as ref_count
         FROM claims
-        WHERE task_id = $1 AND source_ids::text LIKE '%' || $2 || '%'
+        WHERE task_id = $1 AND source_ids @> ARRAY[$2]::text[]
         """,
         task_id,
         source_id,

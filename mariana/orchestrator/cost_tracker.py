@@ -79,6 +79,10 @@ class CostTracker:
     # still bounding the blast radius.
     _FINALIZATION_BUDGET_FRACTION: float = 0.15
 
+    # BUG-0005 fix: absolute ceiling on finalization budget so large
+    # task_budget values (e.g. $10,000) don't yield an unbounded $1,500.
+    _FINALIZATION_BUDGET_ABSOLUTE_CAP: float = 5.00
+
     # M-07 fix: cap the dedup set size so long investigations don't grow
     # memory without bound.  We keep the N most-recent session_ids and
     # evict oldest when the cap is hit.
@@ -118,7 +122,10 @@ class CostTracker:
         # H-11 fix: track spend entered while in finalization_mode so the
         # finalization cap can be enforced separately from the main budget.
         self.finalization_spent: float = 0.0
-        self.finalization_budget: float = task_budget * self._FINALIZATION_BUDGET_FRACTION
+        self.finalization_budget: float = min(
+            task_budget * self._FINALIZATION_BUDGET_FRACTION,
+            self._FINALIZATION_BUDGET_ABSOLUTE_CAP,
+        )
 
         # H-05 fix: serialise the accumulate-and-check sequence so two
         # concurrent record_call() invocations can't each individually pass
@@ -148,6 +155,10 @@ class CostTracker:
         Bounded LRU eviction keeps the dedup ledger from unbounded growth.
         """
         if session_id is None:
+            # BUG-0035 fix: log warning when session_id is None so callers
+            # notice the missing dedup key.  Return False so existing callers
+            # still proceed, but record_call() now rejects None explicitly.
+            logger.warning("cost_dedup_session_id_none")
             return False
         if session_id in self._seen_session_ids:
             self._seen_session_ids.move_to_end(session_id)
@@ -192,6 +203,19 @@ class CostTracker:
             the cost (i.e., the call itself was the straw that broke the
             camel's back).
         """
+        # BUG-0035 fix: reject None session_id to prevent dedup bypass.
+        if session_id is None:
+            raise ValueError(
+                "record_call requires a non-None session_id for dedup tracking"
+            )
+
+        # BUG-0036 fix: reject negative costs before recording.
+        cost = session.cost_usd
+        if cost < 0:
+            raise ValueError(
+                f"Negative cost {cost} from session {session_id}"
+            )
+
         # H-05 fix: dedup, accumulate, and cap-check under a single lock so
         # concurrent callers can't both race past the cap.
         with self._lock:
@@ -204,8 +228,6 @@ class CostTracker:
                     branch_id=branch_id,
                 )
                 return
-
-            cost = session.cost_usd
 
             # Accumulate totals
             self.total_spent += cost
@@ -405,6 +427,49 @@ class CostTracker:
         """Remaining budget for a specific branch (never negative)."""
         spent = self.per_branch.get(branch_id, 0.0)
         return max(0.0, self.branch_hard_cap - spent)
+
+    # ------------------------------------------------------------------
+    # Finalization mode management (BUG-0005)
+    # ------------------------------------------------------------------
+
+    def reset_finalization_mode(self) -> None:
+        """Reset finalization_mode flag and finalization_spent counter.
+
+        BUG-0005 fix: ensures finalization_mode doesn't permanently disable
+        budget enforcement.  Called when leaving REPORT/HALT state or on
+        continuous-mode restart.
+        """
+        with self._lock:
+            self.finalization_mode = False
+            self.finalization_spent = 0.0
+
+    def exit_finalization_mode(self) -> None:
+        """Alias for :meth:`reset_finalization_mode`.
+
+        Semantically indicates the REPORT/HALT phase is complete and normal
+        budget enforcement should resume.
+        """
+        self.reset_finalization_mode()
+
+    # ------------------------------------------------------------------
+    # Full reset (BUG-0046)
+    # ------------------------------------------------------------------
+
+    def reset(self) -> None:
+        """Reset all mutable state for a fresh cycle (e.g. continuous mode restart).
+
+        BUG-0046 fix: continuous mode must start each cycle with a clean
+        budget slate.  Clears total_spent, per_branch, per_model, call_count,
+        finalization_mode, and finalization_spent.
+        """
+        with self._lock:
+            self.total_spent = 0.0
+            self.per_branch.clear()
+            self.per_model.clear()
+            self.call_count = 0
+            self.finalization_mode = False
+            self.finalization_spent = 0.0
+            self._seen_session_ids.clear()
 
     # ------------------------------------------------------------------
     # Serialisation

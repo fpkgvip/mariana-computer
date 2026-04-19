@@ -333,6 +333,18 @@ function renderMarkdown(text: string): string {
 const extractCitationsCache = new Map<string, Array<{ text: string; url: string }>>();
 const EXTRACT_CITATIONS_CACHE_MAX = 500;
 
+// FE-HIGH-02 fix: Clear module-scoped caches on user logout so the next user
+// on the same tab cannot observe stale data from the previous session.
+// Also clears the module-level logout callback list for per-instance stores.
+const _logoutCallbacks: Array<() => void> = [];
+if (typeof window !== "undefined") {
+  window.addEventListener("mariana:logout", () => {
+    renderMarkdownCache.clear();
+    extractCitationsCache.clear();
+    for (const cb of _logoutCallbacks) cb();
+  });
+}
+
 function extractCitations(text: string): Array<{ text: string; url: string }> {
   const cached = extractCitationsCache.get(text);
   if (cached !== undefined) return cached;
@@ -481,7 +493,13 @@ export default function Chat() {
   const messagesContainerRef = useRef<HTMLDivElement>(null);
 
   // Per-investigation message store
+  // FE-HIGH-03 fix: Cap the number of conversations cached in-memory. When
+  // the limit is exceeded, the oldest entries are evicted. Also cap messages
+  // per conversation at 1000 and timeline steps at 500.
   const messageStoreRef = useRef<Record<string, Message[]>>({});
+  const MESSAGE_STORE_MAX_CONVERSATIONS = 50;
+  const MESSAGE_STORE_MAX_MESSAGES = 1000;
+  const TIMELINE_STORE_MAX_STEPS = 500;
 
   // Timeline steps for structured progress events
   const [timelineSteps, setTimelineSteps] = useState<TimelineStep[]>([]);
@@ -490,6 +508,34 @@ export default function Chat() {
   // timelineSteps to dep arrays of callbacks that consume it.
   // BUG-FE-124 fix: Sync in useEffect for concurrent-mode safety.
   const timelineStepsRef = useRef<TimelineStep[]>([]);
+
+  // FE-HIGH-02 / FE-HIGH-03 fix: Register ref stores for logout cleanup
+  useEffect(() => {
+    const clearStores = () => {
+      messageStoreRef.current = {};
+      timelineStoreRef.current = {};
+    };
+    _logoutCallbacks.push(clearStores);
+    return () => {
+      const idx = _logoutCallbacks.indexOf(clearStores);
+      if (idx >= 0) _logoutCallbacks.splice(idx, 1);
+    };
+  }, []);
+
+  // FE-HIGH-03 fix: Helper to write into the stores with size caps.
+  const storeMessages = useCallback((taskId: string, msgs: Message[]) => {
+    const store = messageStoreRef.current;
+    store[taskId] = msgs.slice(-MESSAGE_STORE_MAX_MESSAGES);
+    const keys = Object.keys(store);
+    while (keys.length > MESSAGE_STORE_MAX_CONVERSATIONS) {
+      const oldest = keys.shift()!;
+      delete store[oldest];
+      delete timelineStoreRef.current[oldest];
+    }
+  }, []);
+  const storeTimeline = useCallback((taskId: string, steps: TimelineStep[]) => {
+    timelineStoreRef.current[taskId] = steps.slice(-TIMELINE_STORE_MAX_STEPS);
+  }, []);
   useEffect(() => {
     timelineStepsRef.current = timelineSteps;
   }, [timelineSteps]);
@@ -762,18 +808,35 @@ export default function Chat() {
   /*  Load conversations from backend                                 */
   /* ---------------------------------------------------------------- */
 
-  const loadConversations = useCallback(async () => {
+  // FE-MED-01 fix: Add pagination to conversation list loading.
+  const CONVERSATIONS_PAGE_SIZE = 50;
+  const [hasMoreConversations, setHasMoreConversations] = useState(false);
+  const [loadingMoreConversations, setLoadingMoreConversations] = useState(false);
+
+  const loadConversations = useCallback(async (offset = 0, append = false) => {
     try {
+      if (append) setLoadingMoreConversations(true);
       const token = await getAccessToken();
       if (!token) return;
-      const res = await fetch(`${API_URL}/api/conversations`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await fetch(
+        `${API_URL}/api/conversations?limit=${CONVERSATIONS_PAGE_SIZE}&offset=${offset}`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
       if (!res.ok) return;
       const data = await res.json();
-      setConversations(data.items ?? []);
+      const items = data.items ?? [];
+      if (append) {
+        setConversations((prev) => [...prev, ...items]);
+      } else {
+        setConversations(items);
+      }
+      // If the server returns a total, use it; otherwise check if we got a full page
+      const total = data.total ?? Infinity;
+      setHasMoreConversations(offset + items.length < total && items.length === CONVERSATIONS_PAGE_SIZE);
     } catch (err) {
       console.warn("[Chat] Failed to load conversations:", err);
+    } finally {
+      setLoadingMoreConversations(false);
     }
   }, []);
 
@@ -1576,6 +1639,14 @@ export default function Chat() {
         return;
       }
 
+      // FE-HIGH-01: EventSource API does not support custom headers, so the
+      // stream token must be passed via query string. Mitigations in place:
+      //   1. Stream token is HMAC-signed, scoped to this task, expires in 2 min
+      //   2. Full JWT is only used as fallback if stream-token mint fails
+      //   3. Server should avoid logging query strings containing tokens
+      // A future improvement would be to use fetch() + ReadableStream for SSE
+      // to support Authorization headers, but that requires a polyfill for
+      // EventSource reconnection semantics.
       const url = `${API_URL}/api/investigations/${taskId}/logs?token=${encodeURIComponent(streamToken)}`;
 
       try {
@@ -2040,7 +2111,7 @@ export default function Chat() {
 
     // Save current investigation messages before starting new
     if (activeTaskId && messagesRef.current.length > 0) {
-      messageStoreRef.current[activeTaskId] = [...messagesRef.current];
+      storeMessages(activeTaskId, [...messagesRef.current]);
     }
 
     // BUG-003: Use stopConnectionsOnly to avoid race condition where
@@ -2506,6 +2577,21 @@ export default function Chat() {
         toast.error("Session expired", { description: "Please sign in again." });
         return;
       }
+
+      // FE-HIGH-05 fix: Before deleting a conversation, send a kill/stop request
+      // for any running investigation linked to it. This prevents orphaned backend
+      // investigations that continue consuming budget after the user deletes the chat.
+      if (activeConversationIdRef.current === conversationId && activeTaskIdRef.current) {
+        try {
+          await fetch(`${API_URL}/api/investigations/${activeTaskIdRef.current}/stop`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}` },
+          });
+        } catch {
+          // Best-effort — proceed with deletion even if stop fails
+        }
+      }
+
       const res = await fetch(`${API_URL}/api/conversations/${conversationId}`, {
         method: "DELETE",
         headers: { Authorization: `Bearer ${token}` },
@@ -2688,10 +2774,10 @@ export default function Chat() {
           <button
             onClick={() => {
               if (activeTaskId && messagesRef.current.length > 0) {
-                messageStoreRef.current[activeTaskId] = [...messagesRef.current];
+                storeMessages(activeTaskId, [...messagesRef.current]);
               }
               if (activeTaskId) {
-                timelineStoreRef.current[activeTaskId] = [...timelineStepsRef.current];
+                storeTimeline(activeTaskId, [...timelineStepsRef.current]);
               }
               stopAllConnections();
               // P1-FIX-22: Bump generation to invalidate any in-flight startSSE.
@@ -2744,10 +2830,10 @@ export default function Chat() {
                       if (isActive) return;
                       // Save current state
                       if (activeTaskId && messagesRef.current.length > 0) {
-                        messageStoreRef.current[activeTaskId] = [...messagesRef.current];
+                        storeMessages(activeTaskId, [...messagesRef.current]);
                       }
                       if (activeTaskId) {
-                        timelineStoreRef.current[activeTaskId] = [...timelineStepsRef.current];
+                        storeTimeline(activeTaskId, [...timelineStepsRef.current]);
                       }
                       stopAllConnections();
                       // P1-FIX-22: Bump generation to invalidate any in-flight startSSE
@@ -2805,6 +2891,16 @@ export default function Chat() {
               );
             })}
           </div>
+          {/* FE-MED-01: Load more button for paginated conversation list */}
+          {hasMoreConversations && (
+            <button
+              onClick={() => loadConversations(conversations.length, true)}
+              disabled={loadingMoreConversations}
+              className="mt-2 w-full rounded-md px-3 py-1.5 text-[11px] text-muted-foreground hover:bg-secondary/50 transition-colors disabled:opacity-40"
+            >
+              {loadingMoreConversations ? "Loading..." : "Load more"}
+            </button>
+          )}
         </div>
 
         {/* User info */}

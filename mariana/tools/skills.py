@@ -146,14 +146,27 @@ class SkillManager:
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         self._builtin: dict[str, Skill] = {s.id: s for s in BUILTIN_SKILLS}
 
-    def detect_skill(self, topic: str) -> Skill | None:
+    def detect_skill(self, topic: str, owner_id: str | None = None) -> Skill | None:
         """Auto-detect which skill to activate based on the research topic.
 
-        Checks custom skills first (so users can override built-ins), then
-        built-in skills.  Returns ``None`` if no keyword matches.
+        BUG-0017 fix: only consider built-in skills and the current user's
+        custom skills. Previously loaded ALL users' skills globally, allowing
+        cross-user skill injection.
+
+        Args:
+            topic: Research topic text to match keywords against.
+            owner_id: Current user's ID. Only this user's custom skills are
+                      considered. If None, only built-in skills are checked.
         """
         topic_lower = topic.lower()
-        for skill in self._load_custom_skills() + list(self._builtin.values()):
+        # Only load skills owned by the current user (not all users' skills)
+        custom = []
+        if owner_id:
+            custom = [
+                s for s in self._load_custom_skills()
+                if s.owner_id == owner_id or s.category == "built-in"
+            ]
+        for skill in custom + list(self._builtin.values()):
             for keyword in skill.trigger_keywords:
                 if keyword.lower() in topic_lower:
                     return skill

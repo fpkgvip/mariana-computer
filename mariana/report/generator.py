@@ -182,7 +182,16 @@ async def generate_report(
         failed_hypotheses=len(failed_hypotheses),
     )
 
-    out_dir = Path(report_dir)
+    out_dir = Path(report_dir).resolve()
+    # BUG-0014 fix: anchor report_dir to DATA_ROOT to prevent path traversal.
+    # Without this check, a crafted report_dir like "/etc/cron.d" could write
+    # files to arbitrary filesystem locations.
+    _data_root = Path(os.environ.get("DATA_ROOT", "/tmp/mariana_data")).resolve()
+    if not out_dir.is_relative_to(_data_root):
+        raise ValueError(
+            f"report_dir must be within DATA_ROOT ({_data_root}), "
+            f"got: {out_dir}"
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
 
     findings_block = _build_findings_block(confirmed_findings)

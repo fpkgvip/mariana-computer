@@ -446,12 +446,23 @@ async def _call_gateway(
     # M-03 fix: refuse plain-HTTP LLM Gateway URLs in production.  Sending
     # API keys and prompt contents over cleartext HTTP is a MITM hazard.
     # localhost / 127.x / *.local are permitted for dev environments only.
+    # BUG-0015 fix: parse the URL properly instead of substring matching,
+    # which allowed "http://127.evil.com" to bypass the check.
     _lower = base_url.lower()
     if not _lower.startswith("https://"):
-        if not any(
-            tok in _lower
-            for tok in ("://localhost", "://127.", "://[::1]", ".local:", ".local/")
-        ):
+        from urllib.parse import urlparse as _urlparse  # noqa: PLC0415
+        import ipaddress as _ipaddress  # noqa: PLC0415
+        _parsed = _urlparse(base_url)
+        _host = (_parsed.hostname or "").lower()
+        _is_local = _host in ("localhost", "::1")
+        if not _is_local and _host:
+            try:
+                _ip = _ipaddress.ip_address(_host.strip("[]"))
+                _is_local = _ip.is_loopback
+            except ValueError:
+                # Not an IP — check for .local suffix
+                _is_local = _host.endswith(".local")
+        if not _is_local:
             raise ModelCallError(
                 f"LLM_GATEWAY_BASE_URL must use https:// in non-local environments "
                 f"(got {base_url!r})"
@@ -872,7 +883,11 @@ async def spawn_model(
                     )
                 break
 
-        reframe_prompt = _REFRAME_PROMPT_TEMPLATE.format(original_query=original_query)
+        # BUG-0016 fix: sanitize user-derived content in the reframe path to
+        # prevent jailbreak via refusal-then-reframe with a stripped system prompt.
+        from mariana.ai.prompt_builder import _sanitize_untrusted_text  # noqa: PLC0415
+        safe_original_query = _sanitize_untrusted_text(original_query, max_chars=6000)
+        reframe_prompt = _REFRAME_PROMPT_TEMPLATE.format(original_query=safe_original_query)
         fallback_chain = _get_reframe_model_chain(model_cfg.model_id)
         best_response = raw_content
         best_response_len = len(raw_content)
@@ -886,8 +901,13 @@ async def spawn_model(
                 retry_idx + 1,
                 fallback_model_id.value,
             )
+            # BUG-0016 fix: use the FULL system prompt (not just the research
+            # context prefix) so the reframe path retains all safety guardrails.
+            # Also include the output schema so the response is parseable.
+            from mariana.ai.prompt_builder import STATIC_SYSTEM_PROMPT  # noqa: PLC0415
+            _reframe_system = _RESEARCH_CONTEXT_PREFIX + STATIC_SYSTEM_PROMPT.strip()
             reframe_messages: list[dict[str, Any]] = [
-                {"role": "system", "content": _RESEARCH_CONTEXT_PREFIX},
+                {"role": "system", "content": _reframe_system},
                 {"role": "user", "content": reframe_prompt},
             ]
             fallback_cfg = ModelConfig(

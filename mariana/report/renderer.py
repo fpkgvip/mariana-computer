@@ -225,10 +225,23 @@ def render_pdf(
             cause=exc,
         ) from exc
 
+    # BUG-0013 fix: use a custom url_fetcher that blocks external URL fetches.
+    # WeasyPrint will fetch URLs from LLM-generated HTML (images, stylesheets),
+    # which could be used for SSRF. Only allow file:// URLs within the template
+    # directory for local resources.
+    def _safe_url_fetcher(url, timeout=10, ssl_context=None):
+        if url.startswith("file://"):
+            from weasyprint import default_url_fetcher  # noqa: PLC0415
+            return default_url_fetcher(url, timeout=timeout)
+        if url.startswith("data:"):
+            from weasyprint import default_url_fetcher  # noqa: PLC0415
+            return default_url_fetcher(url, timeout=timeout)
+        raise ValueError(f"External URL fetch blocked by SSRF protection: {url}")
+
     try:
-        WeasyHTML(string=html_content, base_url=str(template_dir_path)).write_pdf(
-            output_path
-        )
+        WeasyHTML(
+            string=html_content, base_url=str(template_dir_path)
+        ).write_pdf(output_path, url_fetcher=_safe_url_fetcher)
     except Exception as exc:
         logger.error("weasyprint_pdf_conversion_failed", error=str(exc))
         raise ReportRenderError(
