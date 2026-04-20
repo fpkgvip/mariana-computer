@@ -2294,39 +2294,48 @@ export default function Chat() {
       };
       const meta = tierMeta[tier] || tierMeta.standard;
 
-      // Fetch architecture preview from classify endpoint (non-blocking)
+      // Always fetch architecture preview from classify endpoint.
+      // The deterministic classifier is more reliable than the LLM's tier
+      // choice, and we want the flowchart + model list for every research plan.
       let archPlan: ResearchArchitecturePlan | null = null;
       let orchModels: OrchestratorModel[] | undefined;
-      if (tier === "standard" || tier === "deep") {
-        try {
-          const classifyRes = await fetch(`${API_URL}/api/investigations/classify`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-            body: JSON.stringify({ topic: researchTopic }),
-          });
-          if (classifyRes.ok) {
-            const classifyData: ClassifyResponse = await classifyRes.json();
-            archPlan = classifyData.research_architecture || null;
-            orchModels = classifyData.orchestrator_models;
-            // Use classify endpoint's richer plan_summary if available
-            if (classifyData.plan_summary) {
-              meta.label = classifyData.plan_summary;
-            }
-            if (classifyData.estimated_duration_hours) {
-              meta.hours = classifyData.estimated_duration_hours;
-            }
-            if (classifyData.estimated_credits) {
-              meta.credits = classifyData.estimated_credits;
-            }
+      let effectiveTier = tier;
+      try {
+        const classifyRes = await fetch(`${API_URL}/api/investigations/classify`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ topic: researchTopic }),
+        });
+        if (classifyRes.ok) {
+          const classifyData: ClassifyResponse = await classifyRes.json();
+          archPlan = classifyData.research_architecture || null;
+          orchModels = classifyData.orchestrator_models;
+          // Use classify endpoint's richer plan data when available
+          if (classifyData.plan_summary) {
+            meta.label = classifyData.plan_summary;
           }
-        } catch (classifyErr) {
-          console.warn("[Chat] classify call failed (non-fatal):", classifyErr);
+          if (classifyData.estimated_duration_hours) {
+            meta.hours = classifyData.estimated_duration_hours;
+          }
+          if (classifyData.estimated_credits) {
+            meta.credits = classifyData.estimated_credits;
+          }
+          // Override chat AI's tier with deterministic classifier's tier
+          // if the classifier chose a higher tier (it's more accurate)
+          const tierRank: Record<string, number> = { instant: 0, quick: 1, standard: 2, deep: 3 };
+          const chatRank = tierRank[tier] ?? 1;
+          const classifyRank = tierRank[classifyData.tier] ?? 2;
+          if (classifyRank > chatRank) {
+            effectiveTier = classifyData.tier;
+          }
         }
+      } catch (classifyErr) {
+        console.warn("[Chat] classify call failed (non-fatal):", classifyErr);
       }
 
       setPendingPlan({
         topic: researchTopic,
-        tier,
+        tier: effectiveTier,
         plan_summary: meta.label,
         estimated_duration_hours: meta.hours,
         estimated_credits: meta.credits,
