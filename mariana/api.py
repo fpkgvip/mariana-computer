@@ -2148,15 +2148,26 @@ async def start_investigation(
 
     # ── BUG-0049 fix: Validate tier/plan constraints server-side ───────────
     # Determine user plan (default to "free" if lookup fails)
+    # BUG-S6-01 fix: Use the user's own JWT (via _supabase_rest) instead of
+    # _supabase_rest_system.  The system call uses the anon key (service key
+    # is not configured), which cannot read profiles through RLS — so every
+    # user was silently downgraded to "free".
     user_plan = "free"
+    _auth_header = request.headers.get("authorization", "")
+    _user_jwt = (
+        _auth_header.split(" ", 1)[1].strip()
+        if _auth_header.lower().startswith("bearer ")
+        else None
+    )
     try:
-        _plan_resp = await _supabase_rest_system(
+        _plan_resp = await _supabase_rest(
             cfg, "GET", "/profiles",
             params={
                 "id": f"eq.{current_user['user_id']}",
                 "select": "plan",
                 "limit": "1",
             },
+            user_token=_user_jwt,
         )
         if _plan_resp.status_code == 200:
             _plan_data = _plan_resp.json()
