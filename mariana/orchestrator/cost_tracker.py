@@ -203,12 +203,6 @@ class CostTracker:
             the cost (i.e., the call itself was the straw that broke the
             camel's back).
         """
-        # BUG-0035 fix: reject None session_id to prevent dedup bypass.
-        if session_id is None:
-            raise ValueError(
-                "record_call requires a non-None session_id for dedup tracking"
-            )
-
         # BUG-0036 fix: reject negative costs before recording.
         cost = session.cost_usd
         if cost < 0:
