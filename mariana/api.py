@@ -4647,9 +4647,13 @@ def _classify_topic(topic: str) -> ClassifyResponse:
             plan_summary="Quick investigation: focused lookup with web search and a concise answer with sources.",
             requires_approval=False,
         )
-    # Also catch "hello, let me test if you are live" style messages
-    if any(g in topic_lower for g in ("hello", "hi ", "hey ", "test")) and word_count < 15:
-        if not any(kw in topic_lower for kw in ("research", "analyze", "investigate", "report", "find")):
+    # Also catch "hello, let me test if you are live" style messages.
+    # Use word-boundary-aware matching to avoid false positives like
+    # "backtest" matching "test" or "highway" matching "hi ".
+    _greeting_patterns_re = [r'\bhello\b', r'\bhi\b', r'\bhey\b', r'\btest\b']
+    _has_greeting_word = any(re.search(p, topic_lower) for p in _greeting_patterns_re)
+    if _has_greeting_word and word_count < 15:
+        if not any(kw in topic_lower for kw in ("research", "analyze", "investigate", "report", "find", "backtest", "backtesting", "strategy", "performance", "competitive", "analysis", "compare", "evaluate")):
             return ClassifyResponse(
                 tier="instant",
                 estimated_duration_hours=0.01,
@@ -4668,6 +4672,10 @@ def _classify_topic(topic: str) -> ClassifyResponse:
         "compare", "evaluate", "comprehensive", "in-depth", "detailed",
         "thesis", "paper", "study", "survey", "assessment",
         "market analysis", "due diligence", "competitive analysis",
+        "competitive", "performance", "backtest", "backtesting",
+        "strategy", "position", "deep dive", "landscape",
+        "trend", "forecast", "prediction", "valuation",
+        "portfolio", "sector", "industry",
     }
     has_research_keyword = any(kw in topic_lower for kw in research_keywords)
 
