@@ -115,6 +115,7 @@ class TaskType(str, Enum):
 class ModelID(str, Enum):
     """Canonical identifiers for supported LLM back-ends."""
 
+    OPUS_47 = "claude-opus-4-7"
     OPUS_46 = "claude-opus-4-6"
     SONNET_46 = "claude-sonnet-4-6"
     HAIKU_45 = "claude-haiku-4-5"

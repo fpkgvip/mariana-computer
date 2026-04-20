@@ -33,6 +33,7 @@ import ProgressTimeline, {
 } from "@/components/ProgressTimeline";
 import FileViewer, { FileCard, type FileAttachment } from "@/components/FileViewer";
 import FileUpload, { type UploadedFile } from "@/components/FileUpload";
+import ResearchFlowchart from "@/components/ResearchFlowchart";
 // BUG-FE-137 fix: Use a styled AlertDialog instead of native window.confirm()
 // for delete confirmations. Native confirm() blocks the JS main thread, cannot
 // be styled, and is inconsistent across browsers.
@@ -91,6 +92,34 @@ interface InvestigationPollResponse {
   error?: string;
 }
 
+/** Orchestrator model choice (from /api/orchestrator-models) */
+interface OrchestratorModel {
+  id: string;
+  label: string;
+  description: string;
+  tier: string;
+}
+
+/** Lightweight architecture preview */
+interface ArchitectureHypothesis {
+  statement: string;
+  priority: number;
+  test_strategy: string;
+}
+interface ArchitecturePhase {
+  name: string;
+  description: string;
+  depends_on: string[];
+}
+interface ResearchArchitecturePlan {
+  hypotheses: ArchitectureHypothesis[];
+  data_sources: string[];
+  research_phases: ArchitecturePhase[];
+  estimated_branches: number;
+  risk_factors: string[];
+  flow_description: string;
+}
+
 /** POST /api/investigations/classify response */
 interface ClassifyResponse {
   tier: "instant" | "quick" | "standard" | "deep";
@@ -99,6 +128,8 @@ interface ClassifyResponse {
   estimated_credits: number;
   requires_approval: boolean;
   is_conversational?: boolean;
+  research_architecture?: ResearchArchitecturePlan | null;
+  orchestrator_models?: OrchestratorModel[];
 }
 
 /** POST /api/chat/respond response */
@@ -135,6 +166,8 @@ interface ResearchPlan {
   plan_summary: string;
   estimated_duration_hours: number;
   estimated_credits: number;
+  research_architecture?: ResearchArchitecturePlan | null;
+  orchestrator_models?: OrchestratorModel[];
   /** Carried from chat/respond so handleApprovePlan can forward them */
   _userInstructions?: string;
   _convId?: string;
@@ -440,6 +473,7 @@ export default function Chat() {
   // Pending research plan awaiting user approval
   const [pendingPlan, setPendingPlan] = useState<ResearchPlan | null>(null);
   const [selectedTier, setSelectedTier] = useState<string>(INITIAL_QUALITY_TIER);
+  const [selectedModel, setSelectedModel] = useState<string>("claude-sonnet-4-6");
   const [continuousMode, setContinuousMode] = useState(false);
   const [dontKillBranches, setDontKillBranches] = useState(false);
   const [userFlowInstructions, setUserFlowInstructions] = useState("");
@@ -2259,12 +2293,45 @@ export default function Chat() {
         deep:    { label: "Deep investigation", credits: 500, duration: "15–45 minutes", hours: 0.5 },
       };
       const meta = tierMeta[tier] || tierMeta.standard;
+
+      // Fetch architecture preview from classify endpoint (non-blocking)
+      let archPlan: ResearchArchitecturePlan | null = null;
+      let orchModels: OrchestratorModel[] | undefined;
+      if (tier === "standard" || tier === "deep") {
+        try {
+          const classifyRes = await fetch(`${API_URL}/api/investigations/classify`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ topic: researchTopic }),
+          });
+          if (classifyRes.ok) {
+            const classifyData: ClassifyResponse = await classifyRes.json();
+            archPlan = classifyData.research_architecture || null;
+            orchModels = classifyData.orchestrator_models;
+            // Use classify endpoint's richer plan_summary if available
+            if (classifyData.plan_summary) {
+              meta.label = classifyData.plan_summary;
+            }
+            if (classifyData.estimated_duration_hours) {
+              meta.hours = classifyData.estimated_duration_hours;
+            }
+            if (classifyData.estimated_credits) {
+              meta.credits = classifyData.estimated_credits;
+            }
+          }
+        } catch (classifyErr) {
+          console.warn("[Chat] classify call failed (non-fatal):", classifyErr);
+        }
+      }
+
       setPendingPlan({
         topic: researchTopic,
         tier,
-        plan_summary: `${meta.label}: ${researchTopic}`,
+        plan_summary: meta.label,
         estimated_duration_hours: meta.hours,
         estimated_credits: meta.credits,
+        research_architecture: archPlan,
+        orchestrator_models: orchModels,
         _userInstructions: chatData.user_instructions || undefined,
         _convId: convId || undefined,
       });
@@ -2347,6 +2414,7 @@ export default function Chat() {
         topic,
         plan_approved: planApproved,
         quality_tier: selectedTier,
+        selected_model: selectedModel,
         continuous_mode: continuousMode,
         dont_kill_branches: dontKillBranches,
         user_flow_instructions: mergedInstructions,
@@ -2516,7 +2584,7 @@ export default function Chat() {
       });
       setIsSending(false);
     }
-  }, [user, selectedTier, continuousMode, dontKillBranches, userFlowInstructions, uploadSessionUuid, appendMessage, refreshUser, startTimer, startSSE, navigate]);
+  }, [user, selectedTier, selectedModel, continuousMode, dontKillBranches, userFlowInstructions, uploadSessionUuid, appendMessage, refreshUser, startTimer, startSSE, navigate]);
 
   // BUG-C3-06 fix: Ref to hold the latest startInvestigation so handleSend
   // (defined before startInvestigation) always calls the current version,
@@ -2649,6 +2717,7 @@ export default function Chat() {
     setIsClassifying(false);
     setIsStopping(false); // BUG-F3-02: also clear stop guard on cancel
     setSelectedTier(INITIAL_QUALITY_TIER);
+    setSelectedModel("claude-sonnet-4-6");
     setContinuousMode(false);
     setDontKillBranches(false);
     setUserFlowInstructions("");
@@ -2788,6 +2857,7 @@ export default function Chat() {
               setTimelineSteps([]);
               setPendingPlan(null);
               setSelectedTier(INITIAL_QUALITY_TIER);
+              setSelectedModel("claude-sonnet-4-6");
               setContinuousMode(false);
               setDontKillBranches(false);
               setUserFlowInstructions("");
@@ -2848,6 +2918,7 @@ export default function Chat() {
                       setMessages([]);
                       setTimelineSteps([]);
                       setPendingPlan(null);
+                      setSelectedModel("claude-sonnet-4-6");
                       setUploadedFiles([]);
                       setUploadSessionUuid(null); // P1-FIX-39: reset upload session on conv switch
                       setElapsedSeconds(0);
@@ -3280,22 +3351,47 @@ export default function Chat() {
                   <span>·</span>
                   <span>{pendingPlan.estimated_credits.toLocaleString()} credits</span>
                 </div>
-                {/* Quality Tier & Loop Controls */}
+
+                {/* ── Architecture Flowchart ────────────────────────── */}
+                {pendingPlan.research_architecture && (
+                  <div className="mt-4 rounded-md border border-border bg-secondary/30 p-4">
+                    <ResearchFlowchart architecture={pendingPlan.research_architecture} />
+                  </div>
+                )}
+
+                {/* ── Model Selection & Controls ────────────────────── */}
                 <div className="mt-4 flex flex-wrap items-center gap-4">
                   <div className="flex items-center gap-2">
                     <label className="text-[10px] font-medium uppercase tracking-[0.15em] text-muted-foreground">
-                      Quality
+                      Model
                     </label>
                     <select
-                      value={selectedTier}
-                      onChange={(e) => setSelectedTier(e.target.value)}
+                      value={selectedModel}
+                      onChange={(e) => {
+                        setSelectedModel(e.target.value);
+                        // Sync quality tier from model selection
+                        const model = (pendingPlan.orchestrator_models || []).find(m => m.id === e.target.value);
+                        if (model) setSelectedTier(model.tier);
+                      }}
                       className="rounded-md border border-border bg-background px-2.5 py-1.5 text-xs text-foreground outline-none focus:ring-1 focus:ring-accent/50"
                     >
-                      <option value="economy">Economy</option>
-                      <option value="balanced">Balanced</option>
-                      <option value="high">High</option>
-                      <option value="maximum">Maximum</option>
+                      {(pendingPlan.orchestrator_models || [
+                        { id: "claude-opus-4-7", label: "Claude Opus 4.7", description: "Most capable", tier: "maximum" },
+                        { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro", description: "Fast, strong reasoning", tier: "high" },
+                        { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", description: "Balanced (default)", tier: "balanced" },
+                        { id: "deepseek-v3.2", label: "DeepSeek V3.2", description: "Budget-friendly", tier: "economy" },
+                      ]).map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.label}
+                        </option>
+                      ))}
                     </select>
+                    {(() => {
+                      const model = (pendingPlan.orchestrator_models || []).find(m => m.id === selectedModel);
+                      return model ? (
+                        <span className="text-[10px] text-muted-foreground">{model.description}</span>
+                      ) : null;
+                    })()}
                   </div>
                   <label className="flex items-center gap-1.5 cursor-pointer">
                     <input

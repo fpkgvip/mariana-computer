@@ -228,9 +228,9 @@ ROUTING_TABLE: dict[TaskType, ModelConfig] = {
 # Categories: orchestrator, research, analysis, writing, cheap
 _TIER_ROUTING: dict[QualityTier, dict[str, ModelID]] = {
     QualityTier.MAXIMUM: {
-        "orchestrator": ModelID.OPUS_46,
-        "research": ModelID.OPUS_46,
-        "analysis": ModelID.OPUS_46,
+        "orchestrator": ModelID.OPUS_47,
+        "research": ModelID.OPUS_47,
+        "analysis": ModelID.OPUS_47,
         "writing": ModelID.OPUS_46,
         "cheap": ModelID.SONNET_46,
     },
