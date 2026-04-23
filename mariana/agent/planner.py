@@ -21,6 +21,7 @@ import structlog
 
 from mariana.agent.dispatcher import VALID_TOOLS
 from mariana.agent.models import AgentStep, AgentTask, StepStatus
+from mariana.agent.skills import render_skill_block, select_skills
 
 logger = structlog.get_logger(__name__)
 
@@ -305,9 +306,17 @@ def _estimate_cost(model: str, usage: dict[str, Any]) -> float:
 async def build_initial_plan(task: AgentTask) -> tuple[list[AgentStep], float]:
     """Produce the first plan for a task."""
     user = _format_goal(task)
+    skills = select_skills(task.goal, task.user_instructions)
+    system = _PLAN_SYSTEM_PROMPT + render_skill_block(skills)
+    if skills:
+        logger.info(
+            "planner_skills_selected",
+            task_id=task.id,
+            skills=[s.name for s in skills],
+        )
     parsed, cost = await _llm_json(
         model=_normalise_model(task.selected_model),
-        system=_PLAN_SYSTEM_PROMPT,
+        system=system,
         user=user,
         max_tokens=6000,
         temperature=0.3,
@@ -341,9 +350,11 @@ async def replan(task: AgentTask, *, reason: str) -> tuple[list[AgentStep], floa
         "Previous attempt failed.  Review the history and produce a revised plan.\n\n"
         "HISTORY (JSON):\n" + json.dumps(summary, indent=2, default=str)
     )
+    skills = select_skills(task.goal, task.user_instructions)
+    system = _REPLAN_SYSTEM_PROMPT + render_skill_block(skills)
     parsed, cost = await _llm_json(
         model=_normalise_model(task.selected_model),
-        system=_REPLAN_SYSTEM_PROMPT,
+        system=system,
         user=user,
         max_tokens=6000,
         temperature=0.3,

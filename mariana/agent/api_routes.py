@@ -116,6 +116,12 @@ async def _insert_agent_task(db: Any, task: AgentTask) -> None:
 
 
 async def _load_agent_task(db: Any, task_id: str) -> AgentTask | None:
+    # Validate UUID format before hitting Postgres — otherwise asyncpg
+    # raises InvalidTextRepresentation which bubbles up as a 500.
+    try:
+        uuid.UUID(task_id)
+    except (ValueError, AttributeError, TypeError):
+        return None
     async with db.acquire() as conn:
         row = await conn.fetchrow(
             """
