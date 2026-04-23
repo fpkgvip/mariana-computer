@@ -1,0 +1,39 @@
+# Mariana browser pool — real Playwright/Chromium contexts for web tasks
+# the agent needs done: page fetch, screenshot, click, wait-for-selector, etc.
+#
+# Uses the official Microsoft Playwright image which comes with Chromium,
+# Firefox and WebKit, plus all system libs already installed and tested.
+
+FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN pip install --no-cache-dir \
+        fastapi==0.115.0 \
+        "uvicorn[standard]==0.30.6" \
+        pydantic==2.9.2 \
+        playwright==1.47.0 \
+        structlog==24.4.0 \
+        pillow==10.4.0
+
+# Browser runs as an unprivileged user.  Playwright base image provides `pwuser`
+# but we'll just create our own so UIDs match the workspace volume.
+RUN useradd --system --create-home --home-dir /home/browser \
+            --uid 1001 --gid users --shell /sbin/nologin browser \
+    && mkdir -p /app /home/browser/.cache \
+    && chown -R browser:users /home/browser
+
+COPY browser_server/ /app/
+RUN chown -R browser:users /app
+
+EXPOSE 8000
+
+# Run as non-root.
+USER browser
+WORKDIR /app
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "1", "--log-level", "info", "--app-dir", "/app"]

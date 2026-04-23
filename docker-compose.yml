@@ -13,6 +13,8 @@ services:
         condition: service_healthy
     networks:
       - mariana-net
+      # Orchestrator talks to the sandbox over the internal-only network.
+      - mariana-sandbox-net
     security_opt:
       - "no-new-privileges:true"
     cap_drop:
@@ -44,6 +46,8 @@ services:
       - mariana-data:/data/mariana
     networks:
       - mariana-net
+      # API needs sandbox access too — e.g. to serve /api/workspace file reads.
+      - mariana-sandbox-net
     restart: unless-stopped
     security_opt:
       - "no-new-privileges:true"
@@ -131,11 +135,96 @@ services:
       - SETUID
     mem_limit: 512m
 
+  # ------------------------------------------------------------------
+  # Sandbox — executes untrusted user code (Python / TS / Bash / Rust).
+  #
+  # Security posture:
+  #   * Attached to `mariana-sandbox-net` (internal: true), so the container
+  #     has NO route to the public internet, the host, or any other service
+  #     except the orchestrator / api.
+  #   * cap_drop ALL, no-new-privileges, read_only root fs, tmpfs for /tmp.
+  #   * User code runs as uid 1000 inside its own setsid()-isolated process
+  #     group with strict rlimits (memory, CPU, fds, nproc, fsize).
+  #   * Path traversal in /workspace is blocked by the FastAPI server.
+  #   * Auth: shared secret (SANDBOX_SHARED_SECRET) required on every call.
+  # ------------------------------------------------------------------
+  mariana-sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox
+    image: mariana-sandbox:latest
+    container_name: mariana-sandbox
+    restart: unless-stopped
+    environment:
+      SANDBOX_SHARED_SECRET: ${SANDBOX_SHARED_SECRET:?SANDBOX_SHARED_SECRET must be set in .env}
+      WORKSPACE_ROOT: /workspace
+    volumes:
+      - mariana-workspace:/workspace:rw
+    tmpfs:
+      - /tmp/sandbox:size=2g,mode=1777,exec
+      - /tmp:size=128m,mode=1777
+    read_only: true
+    networks:
+      - mariana-sandbox-net
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    # Sandbox server must run as root to setuid into the sandbox user after
+    # fork().  SETGID/SETUID are required for that drop.  DAC_OVERRIDE lets
+    # the server chown newly-created files to uid 1000.  Everything else
+    # remains dropped.
+    cap_add:
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+      - CHOWN
+      - FOWNER
+      - KILL
+    pids_limit: 1024
+    mem_limit: 6g
+    cpus: 4.0
+
+  # ------------------------------------------------------------------
+  # Browser pool — real Playwright/Chromium contexts.  Kept on the main
+  # mariana-net so Playwright can actually browse the real internet.
+  # ------------------------------------------------------------------
+  mariana-browser:
+    build:
+      context: .
+      dockerfile: Dockerfile.browser
+    image: mariana-browser:latest
+    container_name: mariana-browser
+    restart: unless-stopped
+    environment:
+      BROWSER_SHARED_SECRET: ${SANDBOX_SHARED_SECRET:?SANDBOX_SHARED_SECRET must be set in .env}
+      BROWSER_POOL_SIZE: "4"
+    networks:
+      - mariana-net
+    shm_size: "1gb"
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETGID
+      - SETUID
+    pids_limit: 1024
+    mem_limit: 4g
+    cpus: 2.0
+
 volumes:
   postgres-data:
   redis-data:
   mariana-data:
+  mariana-workspace:
 
 networks:
   mariana-net:
     driver: bridge
+  # Internal-only network for the sandbox.  `internal: true` means Docker
+  # does NOT attach a gateway — containers on this network have no route to
+  # the host, the public internet, or any service on other networks.
+  mariana-sandbox-net:
+    driver: bridge
+    internal: true

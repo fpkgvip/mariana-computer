@@ -728,6 +728,77 @@ async def _run_single_guarded(
             logger.warning("daemon_task_failed", file=task_file.name)
 
 
+# ---------------------------------------------------------------------------
+# Agent-mode queue consumer (computer tasks)
+# ---------------------------------------------------------------------------
+
+_AGENT_MAX_CONCURRENT = int(os.getenv("AGENT_MAX_CONCURRENT", "4"))
+
+
+async def _run_agent_queue_daemon(db: Any, redis_client: Any) -> None:
+    """Block on ``agent:queue`` and run the agent loop for each popped task id.
+
+    Up to ``AGENT_MAX_CONCURRENT`` tasks run in parallel.  Exits when the
+    shutdown flag is set.
+    """
+    # Local import keeps the research path independent if agent pkg missing.
+    from mariana.agent.api_routes import _load_agent_task  # noqa: PLC0415
+    from mariana.agent.loop import run_agent_task  # noqa: PLC0415
+
+    logger.info("agent_queue_start", max_concurrent=_AGENT_MAX_CONCURRENT)
+    sem = asyncio.Semaphore(_AGENT_MAX_CONCURRENT)
+    active: set[asyncio.Task[None]] = set()
+
+    async def _run_one(task_id: str) -> None:
+        async with sem:
+            try:
+                task = await _load_agent_task(db, task_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("agent_queue_load_failed", task_id=task_id, error=str(exc))
+                return
+            if task is None:
+                logger.warning("agent_queue_task_missing", task_id=task_id)
+                return
+            try:
+                await run_agent_task(task, db=db, redis=redis_client)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("agent_queue_task_crashed", task_id=task_id)
+
+    while not _SHUTDOWN.is_set():
+        # Clean up completed futures.
+        for t in {t for t in active if t.done()}:
+            active.discard(t)
+            try:
+                t.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("agent_queue_task_exception", error=str(exc))
+
+        try:
+            # BLPOP blocks for up to 5s; shutdown flag is checked between pops.
+            popped = await redis_client.blpop("agent:queue", timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agent_queue_blpop_error", error=str(exc))
+            await asyncio.sleep(2)
+            continue
+        if popped is None:
+            continue
+        _key, task_id = popped
+        if isinstance(task_id, bytes):
+            task_id = task_id.decode("utf-8")
+        logger.info("agent_queue_pop", task_id=task_id)
+        active.add(asyncio.create_task(_run_one(task_id), name=f"agent-{task_id[:8]}"))
+
+    # Shutdown: wait up to 60s for in-flight tasks.
+    if active:
+        logger.info("agent_queue_waiting", count=len(active))
+        done, pending = await asyncio.wait(active, timeout=60.0)
+        for p in pending:
+            p.cancel()
+    logger.info("agent_queue_stopped")
+
+
 async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
     """
     Poll an inbox directory for ``.task.json`` files and run investigations.
@@ -1106,7 +1177,28 @@ async def _async_main() -> int:  # noqa: PLR0912  (many branches by design)
 
         # ── Daemon mode ───────────────────────────────────────────────────────
         elif args.mode == "daemon":
-            await _run_daemon(config=config, db=db, redis_client=redis_client)
+            # Research daemon + agent-mode queue consumer run concurrently.
+            research_task = asyncio.create_task(
+                _run_daemon(config=config, db=db, redis_client=redis_client),
+                name="research-daemon",
+            )
+            agent_task = asyncio.create_task(
+                _run_agent_queue_daemon(db=db, redis_client=redis_client),
+                name="agent-queue",
+            )
+            done, pending = await asyncio.wait(
+                {research_task, agent_task},
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
+            for p in pending:
+                p.cancel()
+            for d in done:
+                try:
+                    d.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:  # noqa: BLE001
+                    log.error("daemon_task_failed", name=d.get_name(), error=str(exc))
 
         # ── Single mode ───────────────────────────────────────────────────────
         elif args.topic:

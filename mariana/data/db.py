@@ -534,6 +534,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_executive_summaries_task ON executive_summ
 """
 
 
+def _load_agent_schema_sql() -> str:
+    """Load the agent-mode schema SQL from disk, if present.
+
+    Packaging note: ``mariana/agent/schema.sql`` ships alongside the Python
+    package.  We resolve the path relative to this module so the file works
+    inside the Docker image and in local dev.
+    """
+    import pathlib  # noqa: PLC0415
+    candidate = pathlib.Path(__file__).resolve().parent.parent / "agent" / "schema.sql"
+    if candidate.is_file():
+        return candidate.read_text(encoding="utf-8")
+    return ""
+
+
 async def init_schema(pool: asyncpg.Pool) -> None:
     """
     Idempotently create all database tables and indices.
@@ -546,6 +560,9 @@ async def init_schema(pool: asyncpg.Pool) -> None:
     """
     async with pool.acquire() as conn:
         await conn.execute(_SCHEMA_SQL)
+        agent_sql = _load_agent_schema_sql()
+        if agent_sql:
+            await conn.execute(agent_sql)
     logger.info("Database schema initialised (or already present)")
 
 

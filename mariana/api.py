@@ -758,12 +758,14 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    """Smart reply: either a conversational response or a research launch signal."""
+    """Smart reply: either a conversational response, a research launch, or an agent task."""
     reply: str
-    action: str = "chat"  # "chat" = just reply, "research" = launch investigation
+    action: str = "chat"  # "chat" = just reply, "research" = launch investigation, "computer" = agent task
+    mode: str = "chat"    # "chat" | "research" | "computer" — same signal as action, kept for legacy clients
     research_topic: str | None = None  # refined topic for investigation (when action=research)
     tier: str | None = None  # suggested tier (when action=research)
     user_instructions: str | None = None  # extracted user methodology / custom instructions (when action=research)
+    agent_goal: str | None = None  # refined goal when action=computer
 
 
 class StartInvestigationResponse(BaseModel):
@@ -1322,6 +1324,30 @@ async def _require_admin(
 
 
 # ---------------------------------------------------------------------------
+# Agent (computer mode) routes — mounted from mariana.agent.api_routes
+# ---------------------------------------------------------------------------
+
+try:  # noqa: WPS229 — agent routes are optional at import time
+    from mariana.agent.api_routes import make_routes as _make_agent_routes  # noqa: PLC0415
+
+    def _agent_get_redis() -> Any:
+        if _redis is None:
+            raise HTTPException(status_code=503, detail="Redis unavailable")
+        return _redis
+
+    _agent_router = _make_agent_routes(
+        get_current_user=_get_current_user,
+        get_db=_get_db,
+        get_redis=_agent_get_redis,
+        get_stream_user=_get_current_user_from_header_or_query,
+    )
+    app.include_router(_agent_router)
+    logger.info("agent_routes_registered", route_count=len(_agent_router.routes))
+except Exception as _agent_exc:  # pragma: no cover — best effort
+    logger.warning("agent_routes_registration_failed", error=str(_agent_exc))
+
+
+# ---------------------------------------------------------------------------
 # Billing — hardcoded plan catalogue (matches Supabase plans table)
 # ---------------------------------------------------------------------------
 
@@ -1490,6 +1516,13 @@ require looking up real-world facts or research — REPLY CONVERSATIONALLY.
 RULE 2: If the message is a question that requires researching real-world facts, data,
 news, analysis, or investigation — signal that you want to launch a research investigation.
 
+RULE 2a: If the message is a REQUEST TO BUILD, CODE, EXECUTE, AUTOMATE, or OPERATE on files
+— e.g. "write a Python script to X", "build an app that Y", "refactor this code", "run this
+backtest", "fetch this URL and extract Z", "generate a PDF of Q", "compile a Rust binary",
+"scrape a page", "download and process", or anything where the right answer is to DO WORK
+in a sandbox/terminal/browser rather than write a prose research report — signal that you
+want to launch a COMPUTER (agent) task.
+
 RULE 2b: If the user's question refers to something said EARLIER in this conversation
 (e.g. "what did I say?", "what was my X?", "summarize what we discussed", "what's my
 favorite X?", or any recall/follow-up about prior messages) — REPLY CONVERSATIONALLY
@@ -1522,6 +1555,8 @@ RESPOND IN THIS EXACT JSON FORMAT (nothing else):
 {"action": "chat", "reply": "your conversational reply here"}
 OR
 {"action": "research", "reply": "brief message to the user", "research_topic": "clean research topic", "tier": "standard", "user_instructions": "extracted user instructions on HOW to research (methodology, focus, constraints, tone, etc.) — include EVERYTHING the user said about how to do it. If no special instructions, use null."}
+OR
+{"action": "computer", "reply": "brief message explaining what you will do", "agent_goal": "concise goal string describing the concrete build/code/execute task", "user_instructions": "extracted instructions on HOW (libraries, style, constraints). Null if none."}
 
 For the tier field when action is "research":
 - "quick" = simple factual lookup, takes ~30 seconds (e.g. "what is X?", "who is Y?")
@@ -1634,12 +1669,21 @@ If they ask what you can do, explain you're an AI that can have normal conversat
                 return ChatResponse(
                     reply=reply,
                     action="research",
+                    mode="research",
                     research_topic=parsed.get("research_topic", body.message),
                     tier=parsed.get("tier", "standard"),
                     user_instructions=parsed.get("user_instructions") or None,
                 )
+            elif action == "computer":
+                return ChatResponse(
+                    reply=reply,
+                    action="computer",
+                    mode="computer",
+                    agent_goal=parsed.get("agent_goal") or body.message,
+                    user_instructions=parsed.get("user_instructions") or None,
+                )
             else:
-                return ChatResponse(reply=reply, action="chat")
+                return ChatResponse(reply=reply, action="chat", mode="chat")
 
     except Exception as exc:
         logger.warning("chat_respond_error", error=str(exc))
