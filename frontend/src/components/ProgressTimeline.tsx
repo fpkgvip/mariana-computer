@@ -537,7 +537,7 @@ function pushCurrentGroup(groups: StepGroup[], currentGroup: Omit<StepGroup, "id
 }
 
 function ensureCurrentGroup(currentGroup: Omit<StepGroup, "id"> | null): Omit<StepGroup, "id"> {
-  return currentGroup ?? createEmptyGroup("Investigation");
+  return currentGroup ?? createEmptyGroup("Task");
 }
 
 function addStepToGroup(

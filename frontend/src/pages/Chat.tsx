@@ -23,6 +23,8 @@ import {
   LogOut,
   MessageSquare,
   Plus,
+  Inbox,
+  User as UserIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
@@ -833,7 +835,7 @@ export default function Chat() {
       if (ac.signal.aborted) return;
       if (error) {
         console.error("[Chat] Failed to load investigations:", error.message);
-        toast.error("Failed to load investigations", { description: error.message });
+        toast.error("Failed to load tasks", { description: error.message });
         return;
       }
       setInvestigations((data as Investigation[]) ?? []);
@@ -1515,7 +1517,7 @@ export default function Chat() {
               SEARCHING: "Searching the web...",
               EVALUATING: "Evaluating findings...",
               REPORTING: "Generating report...",
-              DEEP_DIVE: "Conducting deep dive...",
+              DEEP_DIVE: "Running deep work...",
               CHECKPOINT: "Checkpoint — reviewing progress...",
               PIVOT: "Adjusting research direction...",
               TRIBUNAL: "Running adversarial review...",
@@ -1548,7 +1550,7 @@ export default function Chat() {
             // Show a completion message and let the download buttons handle retrieval.
             appendMessage({
               role: "system",
-              content: "Investigation complete. Reports are ready for download.",
+              content: "Task complete. Deliverables are ready to download.",
               type: "status",
               id: `completed-${taskId}`,
               _id: makeMessageId(),
@@ -1593,14 +1595,14 @@ export default function Chat() {
             })();
           } else if (data.status === "FAILED" || data.status === "HALTED") {
             updateInvestigationStatus(taskId, data.status as InvestigationStatus);
-            const errMsg = data.error ?? `The investigation ${data.status.toLowerCase()}. Please try again.`;
+            const errMsg = data.error ?? `The task ${data.status.toLowerCase()}. Please try again.`;
             appendMessage({
               role: "assistant",
               content: errMsg,
               type: "text",
               _id: makeMessageId(),
             });
-            toast.error(`Investigation ${data.status.toLowerCase()}`, { description: errMsg });
+            toast.error(`Task ${data.status.toLowerCase()}`, { description: errMsg });
             stopAllConnections();
             // BUG-018: Refresh credit balance after investigation completes
             refreshUser().catch((e) => console.warn("[Chat] refreshUser failed:", e));
@@ -1743,7 +1745,7 @@ export default function Chat() {
                   });
                   appendMessage({
                     role: "system",
-                    content: "Investigation complete. Reports are ready for download.",
+                    content: "Task complete. Deliverables are ready to download.",
                     type: "status",
                     id: `completed-${taskId}`,
                     _id: makeMessageId(),
@@ -1789,7 +1791,7 @@ export default function Chat() {
                   updateInvestigationStatus(taskId, "HALTED");
                   appendMessage({
                     role: "system",
-                    content: "Investigation was halted. Some results may be incomplete.",
+                    content: "Task was halted. Some results may be incomplete.",
                     type: "error",
                     id: `halted-${taskId}`,
                     _id: makeMessageId(),
@@ -1833,7 +1835,7 @@ export default function Chat() {
               }
               appendMessage({
                 role: "system",
-                content: "Investigation complete. Reports are ready for download.",
+                content: "Task complete. Deliverables are ready to download.",
                 type: "status",
                 id: `completed-${taskId}`,
                 _id: makeMessageId(),
@@ -1844,7 +1846,7 @@ export default function Chat() {
               updateInvestigationStatus(taskId, status as InvestigationStatus);
               appendMessage({
                 role: "assistant",
-                content: parsed.error || `The investigation ${status.toLowerCase()}.`,
+                content: parsed.error || `The task ${status.toLowerCase()}.`,
                 type: "text",
                 _id: makeMessageId(),
               });
@@ -1885,7 +1887,7 @@ export default function Chat() {
               });
               appendMessage({
                 role: "system",
-                content: "Investigation complete. Reports are ready for download.",
+                content: "Task complete. Deliverables are ready to download.",
                 type: "status",
                 id: `completed-${taskId}`,
                 _id: makeMessageId(),
@@ -1908,7 +1910,7 @@ export default function Chat() {
             updateInvestigationStatus(taskId, "COMPLETED");
             appendMessage({
               role: "system",
-              content: "Investigation complete. Reports are ready for download.",
+              content: "Task complete. Deliverables are ready to download.",
               type: "status",
               id: `completed-${taskId}`,
               _id: makeMessageId(),
@@ -2467,7 +2469,7 @@ export default function Chat() {
     // Show initializing status
     const initMsg: Message = {
       role: "system",
-      content: "Initializing research environment...",
+      content: "Initializing workspace...",
       type: "status",
       id: "init",
       _id: makeMessageId(),
@@ -2573,7 +2575,7 @@ export default function Chat() {
         refreshUser().catch(() => {});
         appendMessage({
           role: "system",
-          content: "Server returned an unreadable response. Credits may have been reserved \u2014 please refresh your balance and retry if the investigation did not start.",
+          content: "Server returned an unreadable response. Credits may have been reserved \u2014 please refresh your balance and retry if the task did not start.",
           type: "error",
           id: `start-parse-error-${Date.now()}`,
           _id: makeMessageId(),
@@ -2625,7 +2627,7 @@ export default function Chat() {
 
       appendMessage({
         role: "system",
-        content: `Investigation started (ID: ${taskId}). Monitoring progress...`,
+        content: `Task started (ID: ${taskId}). Monitoring progress...`,
         type: "status",
         id: `started-${taskId}`,
         _id: makeMessageId(),
@@ -2652,7 +2654,7 @@ export default function Chat() {
       setRetryPayload({ topic });
       appendMessage({
         role: "system",
-        content: `Could not start the investigation: ${message}`,
+        content: `Could not start the task: ${message}`,
         type: "error",
         id: `error-${Date.now()}`,
         _id: makeMessageId(),
@@ -3059,6 +3061,22 @@ export default function Chat() {
               credits
             </div>
             <div className="flex items-center gap-1">
+              <Link
+                to="/tasks"
+                className="rounded-md p-1.5 text-muted-foreground/50 hover:text-primary hover:bg-secondary/50 transition-colors"
+                title="Tasks inbox"
+                aria-label="Open tasks inbox"
+              >
+                <Inbox size={14} />
+              </Link>
+              <Link
+                to="/account"
+                className="rounded-md p-1.5 text-muted-foreground/50 hover:text-primary hover:bg-secondary/50 transition-colors"
+                title="Account"
+                aria-label="Open account page"
+              >
+                <UserIcon size={14} />
+              </Link>
               <button
                 onClick={() => {
                   setMemoryOpen(true);
@@ -3073,7 +3091,19 @@ export default function Chat() {
                 <Brain size={14} />
               </button>
               <button
-                onClick={async () => { await logout(); navigate("/"); }}
+                onClick={() => {
+                  toast("Sign out of Mariana Computer?", {
+                    duration: 6000,
+                    action: {
+                      label: "Sign out",
+                      onClick: async () => {
+                        await logout();
+                        navigate("/");
+                      },
+                    },
+                    cancel: { label: "Cancel", onClick: () => { /* dismiss */ } },
+                  });
+                }}
                 className="rounded-md p-1.5 text-muted-foreground/50 hover:text-red-500 hover:bg-secondary/50 transition-colors"
                 title="Sign out"
                 aria-label="Sign out"
@@ -3199,11 +3229,11 @@ export default function Chat() {
             {messages.length === 0 && !isSending && !pendingPlan && !conversationLoading && (
               <div className="flex flex-col items-center justify-center py-24 text-center">
                 <h2 className="font-serif text-xl font-semibold text-foreground mb-2">
-                  What would you like to know?
+                  What should Mariana do for you?
                 </h2>
                 <p className="text-sm text-muted-foreground max-w-md">
-                  Ask anything. Mariana adapts — from quick answers to multi-day investigations.
-                  Your conversations are saved so you can pick up where you left off.
+                  Ask a question, build a tool, run an analysis, draft a document, or automate a workflow.
+                  Mariana picks the right approach and works until it's done.
                 </p>
               </div>
             )}
@@ -3512,7 +3542,7 @@ export default function Chat() {
                   <textarea
                     value={userFlowInstructions}
                     onChange={(e) => setUserFlowInstructions(e.target.value)}
-                    placeholder="Add any custom instructions for how Mariana should conduct this investigation..."
+                    placeholder="Add any custom instructions for how Mariana should approach this task..."
                     rows={2}
                     className="w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-xs text-foreground placeholder:text-muted-foreground/40 outline-none focus:ring-1 focus:ring-accent/50 resize-none"
                   />

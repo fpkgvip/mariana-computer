@@ -293,7 +293,13 @@ async def _run_subprocess(
     # Build base environment.
     base_env = {
         "PATH": "/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "HOME": "/home/sandbox",
+        # HOME must point at a writable dir: the container rootfs is
+        # read-only so /home/sandbox can't be used by tools that try to
+        # create cache dirs on first use (e.g. rustup, matplotlib).
+        "HOME": "/tmp/sandbox",
+        "RUSTUP_HOME": "/usr/local/rustup",
+        "CARGO_HOME": "/usr/local/cargo",
+        "RUSTUP_TOOLCHAIN": "stable",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -339,12 +345,24 @@ async def _run_subprocess(
 
 
 async def _compile_rust(src_path: pathlib.Path, *, wall_timeout_sec: int) -> tuple[pathlib.Path | None, str]:
-    """Compile Rust source with rustc.  Returns (binary_path or None, stderr)."""
+    """Compile Rust source with rustc.  Returns (binary_path or None, stderr).
+
+    v3.6: the sandbox rootfs is read-only, so rustup's default behaviour of
+    creating ``~/.rustup`` on first use fails.  We set RUSTUP_HOME /
+    CARGO_HOME explicitly to the image-baked paths and point HOME at the
+    writable tmpfs so any stray tool cache has somewhere to go.
+    """
     binary_path = src_path.with_suffix("")
     proc = await asyncio.create_subprocess_exec(
         "rustc", "-O", "--edition=2021", "-o", str(binary_path), str(src_path),
         cwd=str(src_path.parent),
-        env={"PATH": "/usr/local/cargo/bin:/usr/bin:/bin", "HOME": "/home/sandbox"},
+        env={
+            "PATH": "/usr/local/cargo/bin:/usr/bin:/bin",
+            "HOME": "/tmp/sandbox",
+            "RUSTUP_HOME": "/usr/local/rustup",
+            "CARGO_HOME": "/usr/local/cargo",
+            "RUSTUP_TOOLCHAIN": "stable",
+        },
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         preexec_fn=_preexec(2048, min(wall_timeout_sec, 120)),
@@ -368,45 +386,134 @@ def _truncate(raw: bytes, limit: int) -> tuple[str, bool]:
     return head.decode("utf-8", "replace") + f"\n\n…[truncated at {limit} bytes]", True
 
 
-def _collect_artifacts(run_dir: pathlib.Path, user_workspace: pathlib.Path) -> list[dict[str, Any]]:
-    """Collect non-source files the user's code produced in run_dir.
+def _snapshot_workspace(user_workspace: pathlib.Path) -> dict[str, float]:
+    """Record every file under user_workspace and its mtime.
 
-    Artifacts are copied into the user workspace under `_runs/{timestamp}/` so
-    they persist.  Returns metadata (name, size, relative workspace path,
-    sha256).  For binary files (e.g. PNGs) the orchestrator can later fetch
-    them with /fs/read.
+    Used to detect files the user's code created or modified during a run
+    when the code wrote directly into the workspace (outside run_dir).
+    """
+    snap: dict[str, float] = {}
+    if not user_workspace.exists():
+        return snap
+    try:
+        for p in user_workspace.rglob("*"):
+            if not p.is_file():
+                continue
+            try:
+                rel = str(p.relative_to(user_workspace))
+            except ValueError:
+                continue
+            # Skip anything under _runs/ since those are our own artifact copies.
+            if rel.startswith("_runs/") or rel.startswith("_runs\\"):
+                continue
+            try:
+                snap[rel] = p.stat().st_mtime
+            except OSError:
+                pass
+    except Exception as exc:  # noqa: BLE001
+        log.warning("workspace snapshot failed err=%s", exc)
+    return snap
+
+
+MAX_ARTIFACT_BYTES = 50 * 1024 * 1024  # 50 MB cap per artifact
+MAX_ARTIFACT_COUNT = 200
+
+
+def _collect_artifacts(
+    run_dir: pathlib.Path,
+    user_workspace: pathlib.Path,
+    pre_snapshot: dict[str, float] | None = None,
+    user_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Collect non-source files the user's code produced in run_dir OR in
+    user_workspace during the run.
+
+    Two sources are considered:
+      (a) files left in the ephemeral run_dir (code wrote relative paths)
+      (b) files in user_workspace newer than pre_snapshot (code wrote
+          absolute paths like /workspace/<uid>/foo.xlsx)
+
+    For (a) we copy into ``_runs/<ts>_<rand>/`` so they persist.  For (b) the
+    file already lives in the workspace, so we surface its workspace_path
+    directly without copying.
+    Returns a list of {name, workspace_path, size, sha256} dicts, deduped.
     """
     artifacts: list[dict[str, Any]] = []
-    if not run_dir.exists():
-        return artifacts
-    ts = int(time.time())
-    rand = secrets.token_hex(3)
-    dest_dir = user_workspace / "_runs" / f"{ts}_{rand}"
-    # Enumerate first so we don't chase files we just created.
-    files = [p for p in run_dir.rglob("*") if p.is_file()]
-    # Exclude source/compile artifacts.
+    seen_paths: set[str] = set()
     skip_names = {"main.py", "main.sh", "main.ts", "main.js", "main.rs", "main"}
-    interesting = [p for p in files if p.name not in skip_names and not p.name.endswith(".pyc")]
-    if not interesting:
-        return artifacts
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    for src in interesting:
+
+    # --- (a) files in run_dir -------------------------------------------------
+    if run_dir.exists():
+        ts = int(time.time())
+        rand = secrets.token_hex(3)
+        dest_dir = user_workspace / "_runs" / f"{ts}_{rand}"
+        files = [p for p in run_dir.rglob("*") if p.is_file()]
+        interesting = [p for p in files if p.name not in skip_names and not p.name.endswith(".pyc")]
+        if interesting:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            for src in interesting:
+                if len(artifacts) >= MAX_ARTIFACT_COUNT:
+                    break
+                try:
+                    size = src.stat().st_size
+                    if size > MAX_ARTIFACT_BYTES:
+                        continue
+                    rel = src.relative_to(run_dir)
+                    dst = dest_dir / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                    with suppress(PermissionError):
+                        os.chown(dst, SANDBOX_UID, SANDBOX_GID)
+                    digest = hashlib.sha256(dst.read_bytes()).hexdigest()
+                    wp = str(dst.relative_to(WORKSPACE_ROOT)).split("/", 1)[1]
+                    if wp in seen_paths:
+                        continue
+                    seen_paths.add(wp)
+                    artifacts.append({
+                        "name": str(rel),
+                        "workspace_path": wp,
+                        "size": size,
+                        "sha256": digest,
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("artifact copy failed name=%s err=%s", src.name, exc)
+
+    # --- (b) files newly written in user_workspace ---------------------------
+    if pre_snapshot is not None and user_workspace.exists():
         try:
-            rel = src.relative_to(run_dir)
-            dst = dest_dir / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-            with suppress(PermissionError):
-                os.chown(dst, SANDBOX_UID, SANDBOX_GID)
-            digest = hashlib.sha256(dst.read_bytes()).hexdigest()
+            post = _snapshot_workspace(user_workspace)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("post snapshot failed err=%s", exc)
+            post = {}
+        for rel, mtime in post.items():
+            if len(artifacts) >= MAX_ARTIFACT_COUNT:
+                break
+            old = pre_snapshot.get(rel)
+            if old is not None and mtime <= old + 1e-6:
+                continue  # unchanged
+            full = user_workspace / rel
+            if not full.is_file():
+                continue
+            if full.name in skip_names or full.name.endswith(".pyc"):
+                continue
+            try:
+                size = full.stat().st_size
+                if size > MAX_ARTIFACT_BYTES:
+                    continue
+                data = full.read_bytes()
+                digest = hashlib.sha256(data).hexdigest()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("artifact read failed path=%s err=%s", rel, exc)
+                continue
+            if rel in seen_paths:
+                continue
+            seen_paths.add(rel)
             artifacts.append({
-                "name": str(rel),
-                "workspace_path": str(dst.relative_to(WORKSPACE_ROOT)).split("/", 1)[1],
-                "size": dst.stat().st_size,
+                "name": pathlib.PurePosixPath(rel).name,
+                "workspace_path": rel,
+                "size": size,
                 "sha256": digest,
             })
-        except Exception as exc:  # noqa: BLE001
-            log.warning("artifact copy failed name=%s err=%s", src.name, exc)
     return artifacts
 
 
@@ -430,6 +537,12 @@ async def exec_code(req: ExecRequest) -> dict[str, Any]:
 
     # Ephemeral run dir so compile artifacts / matplotlib caches don't pollute.
     run_dir = pathlib.Path(tempfile.mkdtemp(prefix="run_", dir="/tmp/sandbox"))
+    # Snapshot workspace BEFORE the run so we can detect files the user's code
+    # writes directly into it (e.g. open('/workspace/<uid>/report.pdf','wb')).
+    try:
+        _pre_ws_snapshot = _snapshot_workspace(user_workspace)
+    except Exception:
+        _pre_ws_snapshot = {}
     try:
         os.chmod(run_dir, 0o770)
         with suppress(PermissionError):
@@ -478,9 +591,15 @@ async def exec_code(req: ExecRequest) -> dict[str, Any]:
             cpu_sec=cpu,
         )
 
-        # Collect artifacts the user's code produced in run_dir, persist them
-        # into the workspace under _runs/, and surface metadata.
-        artifacts = _collect_artifacts(run_dir, user_workspace)
+        # Collect artifacts from BOTH the ephemeral run_dir AND any new files
+        # the user's code wrote directly into its workspace.  Persist run_dir
+        # files under _runs/, surface workspace writes by their real path.
+        artifacts = _collect_artifacts(
+            run_dir,
+            user_workspace,
+            pre_snapshot=_pre_ws_snapshot,
+            user_id=req.user_id,
+        )
 
         stdout_str, stdout_trunc = _truncate(stdout, MAX_STDOUT_BYTES)
         stderr_str, stderr_trunc = _truncate(stderr, MAX_STDERR_BYTES)

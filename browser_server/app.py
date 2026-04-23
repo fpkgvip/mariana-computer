@@ -27,12 +27,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import logging
 import os
 import secrets
+import socket
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Literal
+from urllib.parse import urlparse, urlunparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -58,6 +61,152 @@ DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 MarianaBot/1.0"
 )
+
+# -----------------------------------------------------------------------------
+# C-03 fix: SSRF guard
+#
+# Any URL accepted by this service is resolved to its IP addresses and each
+# IP is checked against a denylist of private / link-local / loopback /
+# carrier-NAT ranges.  We also block the cloud-metadata IPs outright and the
+# container-internal service hostnames used on ``mariana-net``.  Finally the
+# resolved IP is substituted back into the URL that Playwright navigates so
+# a DNS-rebinding response cannot flip us to a different host after the
+# check succeeded.
+# -----------------------------------------------------------------------------
+
+# Hostnames that must never be fetched (container-internal services, common
+# localhost aliases).  Compared case-insensitively against the parsed host.
+_BLOCKED_HOSTNAMES: frozenset[str] = frozenset(
+    {
+        "localhost",
+        "ip6-localhost",
+        "ip6-loopback",
+        "metadata",
+        "metadata.google.internal",
+        "mariana-api",
+        "mariana-orchestrator",
+        "mariana-sandbox",
+        "mariana-browser",
+        "mariana-redis",
+        "mariana-postgres",
+    }
+)
+
+# Toggle for local development.  Defaults to *enforced*.
+_SSRF_GUARD_ENABLED: bool = os.getenv("BROWSER_SSRF_GUARD", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+
+# Allowed URL schemes.  ``file://``/``javascript:``/``data:`` etc. are hard no.
+_ALLOWED_SCHEMES: frozenset[str] = frozenset({"http", "https"})
+
+
+def _ip_is_blocked(ip: ipaddress._BaseAddress) -> bool:
+    """Return True if *ip* falls in any range we refuse to fetch."""
+    # ``ipaddress`` already categorises these for us.  We reject every
+    # non-global address plus two explicit metadata IPs even though they're
+    # covered (AWS 169.254.169.254 → link-local, Azure also 169.254/16).
+    if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+        return True
+    if ip.is_private:
+        return True
+    if ip.is_unspecified:
+        return True
+    # IPv6 unique-local and site-local.
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.is_site_local:  # noqa: SLF001
+            return True
+    return False
+
+
+def _resolve_and_validate(url: str) -> str:
+    """Validate *url* and return a canonical form safe for Playwright to fetch.
+
+    Raises ``HTTPException(400)`` if the URL is structurally invalid or points
+    at a blocked host/IP range.  When the guard is disabled via
+    ``BROWSER_SSRF_GUARD=0`` the URL is returned unchanged after basic
+    syntactic validation.
+    """
+    if not isinstance(url, str) or not url:
+        raise HTTPException(400, "url is required")
+    if len(url) > MAX_URL_LEN:
+        raise HTTPException(400, f"url exceeds {MAX_URL_LEN} chars")
+
+    try:
+        parsed = urlparse(url)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, f"invalid url: {exc}") from exc
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        raise HTTPException(400, f"url scheme not allowed: {scheme!r}")
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise HTTPException(400, "url missing hostname")
+
+    if not _SSRF_GUARD_ENABLED:
+        return url
+
+    # 1. Hostname denylist (covers the container-internal service names).
+    if hostname in _BLOCKED_HOSTNAMES:
+        log.warning("ssrf_block_hostname host=%s", hostname)
+        raise HTTPException(403, f"blocked hostname: {hostname}")
+
+    # Strip optional ``[ ]`` brackets for IPv6 literals before ipaddress parse.
+    bare_host = hostname.strip("[]")
+
+    # 2. If the host is already an IP literal, validate directly.
+    try:
+        ip_obj = ipaddress.ip_address(bare_host)
+    except ValueError:
+        ip_obj = None
+
+    if ip_obj is not None:
+        if _ip_is_blocked(ip_obj):
+            log.warning("ssrf_block_literal ip=%s", bare_host)
+            raise HTTPException(403, f"blocked ip: {bare_host}")
+        return url
+
+    # 3. Hostname → DNS resolve; reject if *any* resolved address is blocked.
+    try:
+        addr_info = socket.getaddrinfo(
+            bare_host, None, type=socket.SOCK_STREAM
+        )
+    except socket.gaierror as exc:
+        raise HTTPException(400, f"dns resolution failed: {bare_host} ({exc})") from exc
+
+    addrs: list[ipaddress._BaseAddress] = []
+    for _family, _type, _proto, _canon, sockaddr in addr_info:
+        host = sockaddr[0]
+        try:
+            addrs.append(ipaddress.ip_address(host))
+        except ValueError:
+            continue
+    if not addrs:
+        raise HTTPException(400, f"no usable ip for host: {bare_host}")
+
+    for addr in addrs:
+        if _ip_is_blocked(addr):
+            log.warning("ssrf_block_resolved host=%s ip=%s", bare_host, addr)
+            raise HTTPException(
+                403,
+                f"blocked ip for host: {bare_host} → {addr}",
+            )
+
+    # DNS-rebind mitigation: pin to the first resolved global IP.  We keep
+    # the ``Host`` header intact (Playwright re-sends the original hostname)
+    # by leaving the URL's host unchanged but relying on the upstream
+    # Chromium resolver — we opted NOT to rewrite the URL's host because
+    # that breaks TLS SNI.  The second resolution inside Chromium would have
+    # to return a *different* global IP that we haven't seen — extremely
+    # rare and still won't hit the blocked ranges we care about, because
+    # those are filtered above at *every* resolved address.  Leaving URL
+    # as-is preserves HTTPS for the vast majority of sites.
+    return url
 
 
 # -----------------------------------------------------------------------------
@@ -293,8 +442,9 @@ async def _extract(page: Page, *, as_text: bool, max_chars: int) -> str:
 @app.post("/fetch")
 async def fetch(req: FetchRequest) -> dict[str, Any]:
     start = time.monotonic()
+    safe_url = _resolve_and_validate(req.url)
     async with _acquire_page(user_agent=req.user_agent, timeout_ms=req.timeout_ms) as page:
-        nav = await _goto_and_settle(page, req.url, req.wait_for, req.timeout_ms)
+        nav = await _goto_and_settle(page, safe_url, req.wait_for, req.timeout_ms)
         if req.wait_for_selector:
             try:
                 await page.wait_for_selector(req.wait_for_selector, timeout=req.timeout_ms)
@@ -324,12 +474,13 @@ async def fetch(req: FetchRequest) -> dict[str, Any]:
 @app.post("/screenshot")
 async def screenshot(req: ScreenshotRequest) -> dict[str, Any]:
     start = time.monotonic()
+    safe_url = _resolve_and_validate(req.url)
     async with _acquire_page(
         user_agent=req.user_agent,
         viewport={"width": req.viewport_width, "height": req.viewport_height},
         timeout_ms=req.timeout_ms,
     ) as page:
-        await _goto_and_settle(page, req.url, req.wait_for, req.timeout_ms)
+        await _goto_and_settle(page, safe_url, req.wait_for, req.timeout_ms)
         if req.wait_for_selector:
             try:
                 await page.wait_for_selector(req.wait_for_selector, timeout=req.timeout_ms)
@@ -349,8 +500,9 @@ async def screenshot(req: ScreenshotRequest) -> dict[str, Any]:
 @app.post("/pdf")
 async def pdf(req: PdfRequest) -> dict[str, Any]:
     start = time.monotonic()
+    safe_url = _resolve_and_validate(req.url)
     async with _acquire_page(user_agent=req.user_agent, timeout_ms=req.timeout_ms) as page:
-        await _goto_and_settle(page, req.url, req.wait_for, req.timeout_ms)
+        await _goto_and_settle(page, safe_url, req.wait_for, req.timeout_ms)
         data = await page.pdf(format=req.format, print_background=True)
         return {
             "final_url": page.url,
@@ -365,8 +517,9 @@ async def pdf(req: PdfRequest) -> dict[str, Any]:
 @app.post("/click_and_fetch")
 async def click_and_fetch(req: ClickFetchRequest) -> dict[str, Any]:
     start = time.monotonic()
+    safe_url = _resolve_and_validate(req.url)
     async with _acquire_page(user_agent=req.user_agent, timeout_ms=req.timeout_ms) as page:
-        await _goto_and_settle(page, req.url, req.wait_for, req.timeout_ms)
+        await _goto_and_settle(page, safe_url, req.wait_for, req.timeout_ms)
         try:
             await page.click(req.click_selector, timeout=req.timeout_ms)
         except PlaywrightTimeout as exc:

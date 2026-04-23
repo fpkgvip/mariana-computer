@@ -23,6 +23,8 @@ import Signup from "./pages/Signup";
 import ResetPassword from "./pages/ResetPassword";
 import Skills from "./pages/Skills";
 import InvestigationGraph from "./pages/InvestigationGraph";
+import Tasks from "./pages/Tasks";
+import TaskDetail from "./pages/TaskDetail";
 import NotFound from "./pages/NotFound";
 
 // BUG-FE-134 fix: Configure sensible defaults so react-query doesn't refetch
@@ -102,6 +104,8 @@ const App = () => {
               <Route path="/skills" element={<ProtectedRoute><Skills /></ProtectedRoute>} />
               <Route path="/graph" element={<ProtectedRoute><InvestigationGraph /></ProtectedRoute>} />
               <Route path="/graph/:taskId" element={<ProtectedRoute><InvestigationGraph /></ProtectedRoute>} />
+              <Route path="/tasks" element={<ProtectedRoute><Tasks /></ProtectedRoute>} />
+              <Route path="/tasks/:taskId" element={<ProtectedRoute><TaskDetail /></ProtectedRoute>} />
               <Route path="/admin" element={<ProtectedRoute><Admin /></ProtectedRoute>} />
               <Route path="/login" element={<Login />} />
               <Route path="/signup" element={<Signup />} />

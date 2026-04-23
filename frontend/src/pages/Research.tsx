@@ -1,43 +1,180 @@
 import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
 import { ScrollReveal } from "@/components/ScrollReveal";
-import { Lock, ArrowRight } from "lucide-react";
+import { ArrowRight } from "lucide-react";
 import { useState } from "react";
-import { useAuth } from "@/contexts/AuthContext";
 import { Link } from "react-router-dom";
 
-type AccessLevel = "all" | "free" | "premium";
+type Category =
+  | "All"
+  | "Operations"
+  | "Research"
+  | "Engineering"
+  | "Marketing"
+  | "Sales"
+  | "Finance";
 
-const sectors = ["All", "Macro", "Equities", "Fixed Income", "Commodities", "Crypto"];
-
-// BUG-R1-13: Removed hardcoded placeholder report data that had future dates
-// and no real content behind any report link. Reports will be fetched from
-// /api/research once that endpoint is implemented. Until then the page shows
-// a Coming Soon empty state.
-const reports: {
+type Example = {
   title: string;
-  abstract: string;
-  date: string;
-  readTime: string;
-  sector: string;
-  access: "free" | "premium";
-}[] = [];
+  prompt: string;
+  outcome: string;
+  deliverables: string[];
+  runtime: string;
+  category: Exclude<Category, "All">;
+};
+
+const categories: Category[] = [
+  "All",
+  "Operations",
+  "Research",
+  "Engineering",
+  "Marketing",
+  "Sales",
+  "Finance",
+];
+
+// A curated catalog of tasks teams routinely hand to Mariana. These are
+// illustrative example prompts — click any of them to start a real task.
+const examples: Example[] = [
+  {
+    title: "Weekly revenue and cohort report",
+    prompt:
+      "Pull last week's orders from our Postgres read-replica, compute WoW revenue, new vs returning split, and a 12-week cohort retention chart. Deliver a one-page PDF and post a Slack summary.",
+    outcome:
+      "Automated every Monday at 8am. Finance replaced a 3-hour manual roll-up.",
+    deliverables: ["PDF report", "Charts", "Slack post", "Cron job"],
+    runtime: "~12 min build, 45s each run",
+    category: "Finance",
+  },
+  {
+    title: "Internal admin dashboard",
+    prompt:
+      "Build an internal admin dashboard (React + Tailwind, Supabase auth) with tabs for Users, Billing, Feature Flags, and Audit Log. Deploy to a private URL.",
+    outcome:
+      "Operator tool shipped in a day. Replaced a Google Sheet and 5 Retool screens.",
+    deliverables: [
+      "Full React app",
+      "Deployed URL",
+      "Admin API routes",
+      "README",
+    ],
+    runtime: "~2–4 hours",
+    category: "Engineering",
+  },
+  {
+    title: "Competitor teardown",
+    prompt:
+      "Give me a competitive teardown of the top 5 alternatives to our product. Pricing tiers, positioning, onboarding UX, recent releases, review sentiment. Output as a slide deck.",
+    outcome:
+      "20-slide deck with citations. PM team used it for Q2 planning.",
+    deliverables: ["PPTX deck", "Cited sources", "Comparison table"],
+    runtime: "~25 min",
+    category: "Marketing",
+  },
+  {
+    title: "Inbox triage & draft replies",
+    prompt:
+      "Every hour, read my support inbox, triage by severity, draft replies for tickets tagged 'billing' using our tone guide, and queue them for approval.",
+    outcome:
+      "CX team saves ~10 hrs/week. Drafts are approved in bulk.",
+    deliverables: [
+      "Scheduled job",
+      "Triage rules",
+      "Draft queue in Gmail",
+    ],
+    runtime: "Runs hourly",
+    category: "Operations",
+  },
+  {
+    title: "Lead enrichment for outbound",
+    prompt:
+      "Take this CSV of 500 leads, enrich with LinkedIn role, company size, funding, tech stack, and a personalized first line. Score and sort by fit. Drop back into the CSV.",
+    outcome:
+      "Enriched CSV back in 40 minutes. Outbound open rate jumped.",
+    deliverables: ["Enriched CSV", "Personalized openers", "Fit score"],
+    runtime: "~40 min for 500 rows",
+    category: "Sales",
+  },
+  {
+    title: "Landing page + analytics",
+    prompt:
+      "Build a landing page for our new SKU with a waitlist form, Stripe checkout, and PostHog events. Copy tone = confident but plain. Deploy to Vercel.",
+    outcome:
+      "Page live in under an hour. Collected 1.2k signups in week one.",
+    deliverables: ["Live URL", "Stripe integration", "Analytics wired"],
+    runtime: "~45 min",
+    category: "Marketing",
+  },
+  {
+    title: "API migration & regression suite",
+    prompt:
+      "Migrate our REST payments endpoints to v2 (idempotency keys, webhook signatures). Write a regression test suite, run it, fix whatever breaks.",
+    outcome:
+      "68 tests, 100% pass. Migration merged without a prod incident.",
+    deliverables: ["Migrated code", "Test suite", "PR with review notes"],
+    runtime: "~3 hours autonomous",
+    category: "Engineering",
+  },
+  {
+    title: "Board deck from the numbers",
+    prompt:
+      "Build next month's board deck. Pull ARR, NRR, burn, runway, hiring from our systems. Add narrative, highlight risks, cite assumptions. Output as PPTX.",
+    outcome:
+      "CFO edits a starting point instead of building from scratch.",
+    deliverables: ["PPTX deck", "Backing model", "Commentary"],
+    runtime: "~35 min",
+    category: "Finance",
+  },
+  {
+    title: "Market & pricing research",
+    prompt:
+      "Analyze the US small-business accounting software market. Size it, segment it, map competitors, identify unserved niches. Deliver a written report with sources.",
+    outcome:
+      "35-page report with 80+ citations. Informed the Q3 roadmap.",
+    deliverables: ["PDF report", "Source bibliography", "Charts"],
+    runtime: "~90 min",
+    category: "Research",
+  },
+  {
+    title: "Onboarding playbook generator",
+    prompt:
+      "For every new signup, generate a personalized 14-day onboarding email sequence based on their role and use case. Write copy, schedule in our ESP.",
+    outcome:
+      "Activation rate improved across every segment.",
+    deliverables: [
+      "Email sequences",
+      "Scheduled sends",
+      "Segmentation logic",
+    ],
+    runtime: "Runs on signup",
+    category: "Marketing",
+  },
+  {
+    title: "SOC 2 evidence collector",
+    prompt:
+      "Collect last quarter's access reviews, change logs, vendor reviews, and security training completion. Organize into the Vanta evidence format.",
+    outcome:
+      "Two weeks of audit prep collapsed into one evening.",
+    deliverables: ["Evidence bundle", "Checklist status", "Gaps list"],
+    runtime: "~2 hours",
+    category: "Operations",
+  },
+  {
+    title: "Scrape, normalize, and chart public data",
+    prompt:
+      "Pull FDA medical device recalls for the last 5 years, normalize the classification field, chart recall counts by manufacturer, flag outliers.",
+    outcome:
+      "Clean dataset + chart-ready CSV. Used for a longer-form investigation.",
+    deliverables: ["Clean CSV", "Charts", "Jupyter notebook"],
+    runtime: "~50 min",
+    category: "Research",
+  },
+];
 
 export default function Research() {
-  const { user } = useAuth();
-  const [accessFilter, setAccessFilter] = useState<AccessLevel>("all");
-  const [sectorFilter, setSectorFilter] = useState("All");
-
-  const filtered = reports.filter((r) => {
-    if (accessFilter !== "all" && r.access !== accessFilter) return false;
-    if (sectorFilter !== "All" && r.sector !== sectorFilter) return false;
-    return true;
-  });
-
-  // BUG-R2-19: canAccessPremium is intentionally preserved even though `reports` is currently
-  // an empty array (making this dead code). Once the /api/research endpoint is implemented
-  // and reports are populated, this gate will be used by the paywall overlay below.
-  const canAccessPremium = user && user.tokens > 0;
+  const [activeCat, setActiveCat] = useState<Category>("All");
+  const filtered =
+    activeCat === "All" ? examples : examples.filter((e) => e.category === activeCat);
 
   return (
     <div className="min-h-screen bg-background">
@@ -45,127 +182,108 @@ export default function Research() {
       <div className="mx-auto max-w-7xl px-6 pb-24 pt-32 md:pt-40">
         <ScrollReveal>
           <h1 className="font-serif text-3xl font-semibold leading-[1.08] tracking-[-0.02em] text-foreground sm:text-4xl md:text-5xl">
-            Published Research
+            Examples of things Mariana has built
           </h1>
-          <p className="mt-5 max-w-lg text-lg leading-[1.7] text-muted-foreground">
-            Institutional-quality analysis across asset classes. Select reports
-            are free — premium research requires tokens.
+          <p className="mt-5 max-w-2xl text-lg leading-[1.7] text-muted-foreground">
+            Real prompts, real deliverables. Click any example to run it against
+            your own data and environment.
           </p>
         </ScrollReveal>
 
-        {/* Filters */}
-        <div className="mt-10 flex flex-col gap-4 border-b border-border pb-4 sm:mt-12 sm:flex-row sm:flex-wrap sm:items-center sm:gap-6">
-          <div className="flex gap-1">
-            {(["all", "free", "premium"] as AccessLevel[]).map((level) => (
+        {/* Category filter */}
+        <div className="mt-10 flex flex-col gap-4 border-b border-border pb-4 sm:mt-12 sm:flex-row sm:flex-wrap sm:items-center sm:gap-3">
+          <div className="flex gap-1 overflow-x-auto pb-1 -mx-1 px-1">
+            {categories.map((c) => (
               <button
-                key={level}
-                onClick={() => setAccessFilter(level)}
-                className={`rounded-md px-3 py-1.5 text-xs font-medium capitalize transition-colors ${
-                  accessFilter === level
+                key={c}
+                onClick={() => setActiveCat(c)}
+                className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                  activeCat === c
                     ? "bg-primary text-primary-foreground"
                     : "text-muted-foreground hover:text-foreground hover:bg-secondary"
                 }`}
               >
-                {level}
-              </button>
-            ))}
-          </div>
-          <div className="hidden h-4 w-px bg-border sm:block" />
-          <div className="flex gap-1 overflow-x-auto pb-1 -mx-1 px-1">
-            {sectors.map((s) => (
-              <button
-                key={s}
-                onClick={() => setSectorFilter(s)}
-                className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-                  sectorFilter === s
-                    ? "bg-secondary text-foreground"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                {s}
+                {c}
               </button>
             ))}
           </div>
         </div>
 
-        {/* Reports */}
-        <div className="mt-8 divide-y divide-border">
-          {filtered.map((report, i) => (
-            // BUG-R1-18: Use stable key (report.title) instead of array index.
-            // Index keys cause React to associate ScrollReveal animation state
-            // with the wrong report when filters change and array order shifts.
-            <ScrollReveal key={report.title} delay={i * 60}>
-              {/* BUG-021 / BUG-R1-12: Articles are not clickable — removed
-                  group/hover affordance to avoid implying navigation that
-                  doesn't exist yet.
-                  TODO: wrap in <Link> once report detail pages are added. */}
-              <article className="relative py-8 transition-colors">
+        {/* Examples grid */}
+        <div className="mt-10 grid gap-5 md:grid-cols-2">
+          {filtered.map((ex, i) => (
+            <ScrollReveal key={ex.title} delay={(i % 4) * 60}>
+              <Link
+                to={`/chat?prompt=${encodeURIComponent(ex.prompt)}`}
+                className="group block h-full rounded-lg border border-border bg-card p-6 transition-all hover:border-accent/40 hover:shadow-lg"
+              >
                 <div className="flex items-start justify-between gap-4">
                   <div className="flex-1">
-                    <div className="mb-2.5 flex flex-wrap items-center gap-3">
-                      <span className="font-mono text-[11px] text-muted-foreground">
-                        {report.date}
+                    <div className="mb-2 flex flex-wrap items-center gap-2">
+                      <span className="rounded-sm bg-secondary px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                        {ex.category}
                       </span>
-                      <span className="text-[11px] text-muted-foreground">
-                        {report.readTime} read
+                      <span className="font-mono text-[10px] text-muted-foreground">
+                        {ex.runtime}
                       </span>
-                      <span className="text-[11px] text-muted-foreground/60">
-                        {report.sector}
-                      </span>
-                      {report.access === "premium" ? (
-                        <span className="inline-flex items-center gap-1 text-[11px] font-medium text-accent">
-                          <Lock size={10} /> Premium
-                        </span>
-                      ) : (
-                        <span className="text-[11px] text-muted-foreground">Free</span>
-                      )}
                     </div>
-                    <h2 className="font-serif text-xl font-semibold text-foreground transition-colors">
-                      {report.title}
-                    </h2>
-                    <p className="mt-2 max-w-2xl text-sm leading-[1.7] text-muted-foreground">
-                      {report.abstract}
-                    </p>
+                    <h3 className="font-serif text-lg font-semibold text-foreground transition-colors group-hover:text-accent">
+                      {ex.title}
+                    </h3>
                   </div>
-                  {/* ArrowRight removed — articles not yet clickable */}
+                  <ArrowRight
+                    size={16}
+                    className="mt-1 text-muted-foreground opacity-0 transition-all group-hover:translate-x-1 group-hover:opacity-100"
+                  />
                 </div>
 
-                {/* Paywall overlay */}
-                {report.access === "premium" && !canAccessPremium && (
-                  <div className="absolute inset-0 flex items-center justify-center rounded-lg bg-background/80 backdrop-blur-sm">
-                    <div className="text-center">
-                      <Lock size={18} className="mx-auto mb-2 text-accent" />
-                      <p className="text-sm font-medium text-foreground">Premium Research</p>
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        {user ? "Purchase tokens to access" : "Sign in to access"}
-                      </p>
-                      <Link
-                        to={user ? "/pricing" : "/login"}
-                        className="mt-3 inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
-                      >
-                        {user ? "Get Tokens" : "Sign In"} <ArrowRight size={12} />
-                      </Link>
-                    </div>
-                  </div>
-                )}
-              </article>
+                <p className="mt-4 text-[13px] italic leading-[1.7] text-muted-foreground">
+                  "{ex.prompt}"
+                </p>
+
+                <p className="mt-4 text-[13px] leading-[1.7] text-foreground/80">
+                  {ex.outcome}
+                </p>
+
+                <div className="mt-4 flex flex-wrap gap-1.5">
+                  {ex.deliverables.map((d) => (
+                    <span
+                      key={d}
+                      className="rounded-sm border border-border px-2 py-0.5 text-[10px] text-muted-foreground"
+                    >
+                      {d}
+                    </span>
+                  ))}
+                </div>
+              </Link>
             </ScrollReveal>
           ))}
         </div>
 
-        {reports.length === 0 ? (
-          // BUG-R1-13: No published reports yet — show honest empty state
-          <div className="py-20 text-center">
-            <p className="text-lg font-medium text-foreground">Coming soon</p>
-            <p className="mt-2 text-sm text-muted-foreground max-w-sm mx-auto">
-              Published research reports are in preparation. Check back soon.
-            </p>
-          </div>
-        ) : filtered.length === 0 ? (
+        {filtered.length === 0 && (
           <p className="py-12 text-center text-muted-foreground">
-            No reports match the current filters.
+            No examples in this category yet.
           </p>
-        ) : null}
+        )}
+
+        {/* CTA */}
+        <div className="mt-20 rounded-lg border border-border bg-secondary/30 p-8 md:p-12">
+          <div className="max-w-2xl">
+            <h2 className="font-serif text-2xl font-semibold text-foreground md:text-3xl">
+              Have something specific in mind?
+            </h2>
+            <p className="mt-3 text-[15px] leading-[1.7] text-muted-foreground">
+              Describe what you want built, researched, or automated. Mariana
+              will plan the work, ask only what's necessary, and start shipping.
+            </p>
+            <Link
+              to="/chat"
+              className="mt-6 inline-flex items-center gap-2 rounded-md bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground transition-all hover:bg-primary/90"
+            >
+              Start a task <ArrowRight size={14} />
+            </Link>
+          </div>
+        </div>
       </div>
       <Footer />
     </div>

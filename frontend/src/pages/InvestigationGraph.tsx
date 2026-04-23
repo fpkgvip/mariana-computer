@@ -385,11 +385,11 @@ export default function InvestigationGraph() {
       if (!res.ok) {
         // BUG-FIX-04: Distinguish definitive errors from transient ones
         if (res.status === 404) {
-          setGraphError("Investigation not found. It may have been deleted.");
-          graphErrorRef.current = "Investigation not found. It may have been deleted.";
+          setGraphError("Task not found. It may have been deleted.");
+          graphErrorRef.current = "Task not found. It may have been deleted.";
         } else if (res.status === 403) {
-          setGraphError("You do not have access to this investigation.");
-          graphErrorRef.current = "You do not have access to this investigation.";
+          setGraphError("You do not have access to this task.");
+          graphErrorRef.current = "You do not have access to this task.";
         } else if (res.status === 401) {
           // Session expired — redirect to login
           navigate("/login");
@@ -440,7 +440,7 @@ export default function InvestigationGraph() {
 
   const saveGraphToBackend = useCallback(async () => {
     if (!taskId) {
-      toast.info("No investigation linked — graph is local only");
+      toast.info("No task linked — graph is local only");
       return;
     }
     const token = await getAccessToken();
@@ -479,7 +479,7 @@ export default function InvestigationGraph() {
         body: JSON.stringify(body),
       });
       if (res.ok) {
-        toast.success("Graph saved to investigation");
+        toast.success("Graph saved to task");
       } else {
         toast.error("Failed to save graph");
       }
@@ -490,7 +490,7 @@ export default function InvestigationGraph() {
 
   const aiPopulate = useCallback(async () => {
     if (!taskId) {
-      toast.info("AI Populate requires an active investigation");
+      toast.info("AI Populate requires an active task");
       return;
     }
     const token = await getAccessToken();
@@ -563,7 +563,7 @@ export default function InvestigationGraph() {
     setContextMenu({ visible: false, x: 0, y: 0, nodeId: null });
     setGraphError(null);
     graphErrorRef.current = null;
-    setGraphStatusMessage(taskId ? `Loading graph for investigation ${taskId.slice(0, 8)}.` : "");
+    setGraphStatusMessage(taskId ? `Loading graph for task ${taskId.slice(0, 8)}.` : "");
     setInvestigationRunning(false);
     if (!taskId) return;
     // Initial fetch
@@ -1752,7 +1752,7 @@ export default function InvestigationGraph() {
                 to="/chat"
                 className="pointer-events-auto text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground transition-colors"
               >
-                Return to investigations
+                Return to tasks
               </Link>
             </div>
           )}

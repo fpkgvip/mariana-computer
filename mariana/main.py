@@ -749,6 +749,27 @@ async def _run_agent_queue_daemon(db: Any, redis_client: Any) -> None:
     sem = asyncio.Semaphore(_AGENT_MAX_CONCURRENT)
     active: set[asyncio.Task[None]] = set()
 
+    # v3.6 recovery: re-queue any task stuck in a non-terminal state with no
+    # heartbeat for >= 60 seconds.  This fixes the failure mode where the
+    # orchestrator crashes / is redeployed mid-task and the task is abandoned.
+    try:
+        async with db.acquire() as conn:
+            stuck = await conn.fetch(
+                "SELECT id, state FROM agent_tasks "
+                "WHERE state NOT IN ('done', 'failed', 'halted', 'cancelled', 'stopped') "
+                "AND updated_at < NOW() - INTERVAL '60 seconds' "
+                "ORDER BY created_at ASC LIMIT 500"
+            )
+        for row in stuck:
+            tid = str(row["id"])
+            logger.warning("agent_queue_requeue_stuck", task_id=tid, state=row["state"])
+            try:
+                await redis_client.rpush("agent:queue", tid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("agent_queue_requeue_failed", task_id=tid, error=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("agent_queue_recovery_failed", error=str(exc))
+
     async def _run_one(task_id: str) -> None:
         async with sem:
             try:

@@ -58,6 +58,10 @@ TOOL_NAMES = Literal[
     "web_search",
     "think",
     "deliver",
+    # v3 additions.
+    "generate_image",
+    "generate_video",
+    "describe_self",
 ]
 
 

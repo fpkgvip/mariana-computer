@@ -289,9 +289,280 @@ When the goal touches on auth, data handling, or exposed endpoints:
 )
 
 
+# ---------------------------------------------------------------------------
+# v3 skills
+# ---------------------------------------------------------------------------
+
+
+SOCIAL_OPS = Skill(
+    name="social_ops",
+    keywords=(
+        "social media", "twitter", "tweet", "x.com", "instagram", "tiktok",
+        "linkedin", "facebook", "threads", "post", "caption", "hashtag",
+        "schedule", "calendar", "content plan", "campaign", "influencer",
+        "engagement", "follower", "reach", "impressions",
+    ),
+    guidance="""SKILL: Social-media Operations
+
+When the goal involves drafting, scheduling, or analysing social-media
+content:
+- For multi-platform output, produce ONE content brief first (angle,
+  audience, CTA, hook) and then derive per-platform variants (character
+  limits, tone shift, aspect ratio).
+- Character limits: X = 280, LinkedIn = 3000, Instagram caption = 2200,
+  TikTok caption = 2200, YouTube short description = 5000.  Hard-validate
+  length before delivery.
+- Hashtags: 2-3 on LinkedIn, 3-5 on X, 8-15 on Instagram/TikTok.  No
+  banned or shadow-banned tags.  Never fabricate trending tags — pull from
+  a current source when relevance matters.
+- Image/video posts: prefer generate_image / generate_video with an
+  explicit aspect ratio per platform (1:1, 4:5, 9:16).  Save to
+  assets/social/<platform>/.
+- Output a single schedule.csv with columns: platform, post_time (ISO),
+  asset_path, body, hashtags, cta — makes copy-paste into buffer/later
+  trivial.
+- Never post on a user's behalf without explicit per-platform consent.
+""",
+)
+
+
+SALES_OPS = Skill(
+    name="sales_ops",
+    keywords=(
+        "sales", "prospect", "lead", "outreach", "cold email", "sequence",
+        "crm", "pipeline", "deal", "quota", "enrichment", "icp", "persona",
+        "account", "abm", "forecast", "win rate", "conversion",
+    ),
+    guidance="""SKILL: Sales Operations
+
+When the goal involves prospect research, outreach drafting, or pipeline
+analysis:
+- Start by confirming the ICP (industry, company size, role, geography)
+  from the goal.  If any dimension is unspecified and assumed, flag it.
+- Enrichment: for each prospect produce a structured row with name, title,
+  company, source URL, 1-line rationale, suggested hook.  Never invent an
+  email — leave blank if not verifiable.
+- Outreach copy: open with a specific observation (not 'I noticed your
+  company'), one value claim with evidence, one soft CTA.  Max 90 words.
+- Respect CAN-SPAM / GDPR: include unsubscribe language if producing actual
+  send-ready copy, and note jurisdiction constraints in the deliverable.
+- Never submit sends or edit a live CRM without an explicit approval step.
+""",
+)
+
+
+RECONCILIATION = Skill(
+    name="reconciliation",
+    keywords=(
+        "reconcile", "reconciliation", "invoice", "billing", "payment",
+        "ap", "ar", "accounts payable", "accounts receivable", "ledger",
+        "journal", "bank statement", "expense", "receipt", "match",
+        "discrepancy", "variance", "audit trail", "chart of accounts",
+    ),
+    guidance="""SKILL: Reconciliation / Back-office finance
+
+When the goal involves matching transactions across systems (bank <-> ledger,
+invoice <-> payment, expense <-> receipt):
+- Load every input independently, print row counts + date ranges, and
+  confirm they overlap BEFORE any matching.
+- Match on (amount, date within tolerance, counterparty).  Tolerance
+  defaults: amount = exact, date = +/- 3 business days.  Document the
+  tolerances.
+- Output three tables: matched, unmatched-in-A, unmatched-in-B.  Include
+  a reason code on every unmatched row (duplicate, out-of-period,
+  amount-off, counterparty-missing).
+- Never silently drop rows.  Every input row must be accounted for in
+  exactly one output table.
+- Deliverable format: XLSX with three sheets (Matched, Unmatched-Left,
+  Unmatched-Right) and a Summary sheet with totals by reason code.
+- Record the raw inputs' SHA256 on the Summary sheet so the audit trail
+  is cryptographically linked to the reconciliation.
+""",
+)
+
+
+FINANCE_MODELING = Skill(
+    name="finance_modeling",
+    keywords=(
+        "financial model", "three-statement", "3-statement", "dcf",
+        "valuation", "wacc", "terminal value", "lbo", "merger model",
+        "accretion", "dilution", "pro forma", "cap table", "waterfall",
+        "scenarios", "sensitivity", "monte carlo", "operating model",
+    ),
+    guidance="""SKILL: Financial Modelling
+
+When the goal involves building a financial model:
+- Structure: separate Inputs, Assumptions, Calcs, and Outputs sheets.
+  Colour code: blue = hard input, black = formula, green = link to other
+  sheet.
+- Use real Excel formulas (SUM, INDEX/MATCH, XLOOKUP, IFERROR) so the
+  user can tweak assumptions.  Never paste calculated values.  Define
+  named ranges for key drivers.
+- Three-statement models: balance sheet MUST balance at every period;
+  add a diagnostic row `Assets - (Liab + Equity)` that should be zero,
+  and highlight if non-zero.
+- Scenario manager: build Base/Bull/Bear with a single cell switch.  Use
+  CHOOSE() or INDEX() driven by a dropdown data-validation cell.
+- Sensitivity tables: use Excel data tables (row/col) not hard-coded
+  grids.  State the two driving variables in the header.
+- End deliverable should include a README cell on the first sheet
+  describing file structure, assumption sources, and model date.
+""",
+)
+
+
+DOCUMENT_REVIEW = Skill(
+    name="document_review",
+    keywords=(
+        "review", "proofread", "redline", "fact-check", "verify", "audit",
+        "check", "qa", "quality assurance", "edit", "critique", "feedback",
+        "contract review", "nda", "compliance check", "consistency",
+    ),
+    guidance="""SKILL: Document Review
+
+When the goal is to review or fact-check an existing document:
+- Read the document end-to-end ONCE before offering any edits.  Capture
+  the document's claim structure first.
+- Produce findings in four buckets: factual errors, internal
+  inconsistencies (numbers that don't add up, names that change), style
+  issues, unclear passages.  Bucket every finding; never mix.
+- For every factual claim: attempt verification via web_search /
+  browser_fetch.  Cite the primary source and label the claim as
+  verified, contradicted, or unverifiable.
+- Numerical checks: re-compute every sum / percentage / ratio in the
+  document.  Report the computed value alongside the stated value.
+- Deliverable: a markdown findings report with one row per finding
+  (location, severity, issue, suggested fix, evidence).  Never silently
+  rewrite the document — suggestions go next to the original, not over
+  it.
+""",
+)
+
+
+DELIVERABLE_QUALITY = Skill(
+    name="deliverable_quality",
+    keywords=(
+        "report", "deliverable", "document", "pdf", "docx", "pptx",
+        "presentation", "slides", "deck", "spreadsheet", "excel", "xlsx",
+        "workbook", "dashboard", "memo", "brief", "whitepaper", "write-up",
+        "summary", "summarize", "write up", "write a", "build a",
+    ),
+    guidance="""SKILL: Deliverable quality (Mariana house style)
+
+Deliverables are what the user sees.  Polish here determines perception
+of the entire system.  House style: Steve Jobs / FT / Stripe \u2014 precise,
+low-chrome, high-signal.
+
+## Format selection
+- Default = Markdown (.md).  The UI renders MD inline and offers a PDF
+  download button, so MD covers 80% of cases at zero risk.
+- Use XLSX when the user says \"spreadsheet\", \"excel\", \"model\",
+  \"reconcile\", or the output is rows\u00d7columns of numbers.
+- Use PPTX when the user says \"slides\", \"deck\", \"presentation\", or
+  needs a live-pitch artefact.
+- Use DOCX when the user says \"word\", \"redline\", or the output will be
+  co-edited in Word.
+- Use PDF only when the user explicitly asks, or for locked-artefact
+  distribution (contracts, final memos).  Otherwise ship MD and let the
+  UI produce the PDF.
+
+## Every deliverable MUST include
+1. A title and one-line summary at the top.
+2. A clearly labelled \"As of\" date.
+3. A \"Sources\" section listing every URL consulted (with access date).
+  Also write `sources.json` alongside the deliverable with the same
+  list in structured form \u2014 one object per source with keys
+  {url, title, accessed_at}.
+4. A \"Methodology\" block of 2-5 bullets explaining how the answer was
+  produced.  Name the tools used (web_search, browser_fetch, etc.).
+5. No placeholders, no TBDs, no Lorem Ipsum.  Ship only finished work.
+
+## Markdown deliverables
+- Use `#` for title, `##` for sections, `###` sparingly.
+- Tables are GitHub-flavoured.  Right-align numeric columns with `---:`.
+- Inline citations as `[label](url)` \u2014 never bare URLs.
+- Final file at `/workspace/<name>.md`.
+
+## XLSX deliverables (openpyxl)
+- Always write real formulas, never pasted numbers.  Wrong:
+  `ws['C2'] = 12000`.  Right: `ws['C2'] = '=A2*B2'`.
+- Sheets: Inputs (blue fill), Assumptions, Calcs, Outputs.  Use
+  `PatternFill(start_color='DCE6F1', fill_type='solid')` for inputs.
+- Number format: `'#,##0'` for currency, `'0.0%'` for percentages,
+  `'0.00'` for ratios.
+- Every sheet: freeze row 1 (`ws.freeze_panes = 'A2'`), set column
+  widths to accommodate headers.
+- Recipe:
+  ```python
+  from openpyxl import Workbook
+  from openpyxl.styles import Font, PatternFill, Alignment
+  wb = Workbook(); ws = wb.active; ws.title = 'Inputs'
+  ws['A1'] = 'Driver'; ws['B1'] = 'Value'
+  for c in ('A1','B1'): ws[c].font = Font(bold=True)
+  ws.freeze_panes = 'A2'
+  ws.column_dimensions['A'].width = 24
+  wb.save('/workspace/out.xlsx')
+  ```
+
+## PPTX deliverables (python-pptx)
+- Use 16:9 aspect ratio (`prs.slide_width = Inches(13.333)`).
+- One idea per slide.  Titles 32pt, body 18pt, source footer 10pt.
+- House palette: ink `#0A0A0A`, accent `#0F62FE`, muted `#6B7280`,
+  surface `#F5F5F5`.  No clipart.  No gradients unless requested.
+- Every slide has a source footer (small, bottom-right).
+- Recipe:
+  ```python
+  from pptx import Presentation
+  from pptx.util import Inches, Pt
+  prs = Presentation()
+  prs.slide_width = Inches(13.333); prs.slide_height = Inches(7.5)
+  s = prs.slides.add_slide(prs.slide_layouts[5])
+  s.shapes.title.text = 'Title'
+  tx = s.shapes.add_textbox(Inches(0.5), Inches(1.5), Inches(12.3), Inches(5))
+  tf = tx.text_frame; tf.text = 'Body text'
+  tf.paragraphs[0].runs[0].font.size = Pt(18)
+  prs.save('/workspace/out.pptx')
+  ```
+
+## PDF from Markdown
+- Preferred path: write the MD and let the UI convert.  The delivered
+  MD file is already a first-class artefact.
+- If the user insists on a server-side PDF, use `reportlab` (available
+  in the sandbox).  Do NOT depend on pandoc, weasyprint, or
+  wkhtmltopdf \u2014 not installed.
+- Recipe (reportlab, simple):
+  ```python
+  from reportlab.lib.pagesizes import LETTER
+  from reportlab.pdfgen import canvas
+  c = canvas.Canvas('/workspace/out.pdf', pagesize=LETTER)
+  c.setFont('Helvetica-Bold', 18); c.drawString(72, 720, 'Title')
+  c.setFont('Helvetica', 11)
+  y = 690
+  for line in open('/workspace/out.md'):
+      c.drawString(72, y, line.rstrip()[:95]); y -= 14
+      if y < 72: c.showPage(); y = 720
+  c.save()
+  ```
+
+## DOCX deliverables (python-docx)
+- Not in the sandbox by default.  Attempt `pip install python-docx` in
+  code_exec; if that fails, fall back to MD and tell the user.
+
+## Final check before `deliver`
+- Open the file you wrote; verify size > 0 and first 200 bytes look
+  sane.  For XLSX/PPTX, re-open with openpyxl/python-pptx and count
+  sheets/slides.  For PDF, verify header is `%PDF-`.
+- If any check fails, fix before calling deliver.
+""",
+)
+
+
 ALL_SKILLS: tuple[Skill, ...] = (
     CODING, WEB_DEV, DATA_ANALYSIS, BROWSER_AUTOMATION, DEVOPS, ML,
     CONTENT, RESEARCH, FINANCE, SECURITY,
+    # v3 additions.
+    SOCIAL_OPS, SALES_OPS, RECONCILIATION, FINANCE_MODELING, DOCUMENT_REVIEW,
+    DELIVERABLE_QUALITY,
 )
 
 

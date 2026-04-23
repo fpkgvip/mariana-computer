@@ -2,8 +2,8 @@ import { Link } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
 
 const links = [
-  { label: "Research", href: "/research" },
-  { label: "Mariana", href: "/mariana" },
+  { label: "Product", href: "/mariana" },
+  { label: "Examples", href: "/research" },
   { label: "Pricing", href: "/pricing" },
   { label: "Contact", href: "/contact" },
 ];
@@ -21,7 +21,7 @@ export function Footer() {
               Mariana
             </Link>
             <p className="mt-1 text-xs text-muted-foreground">
-              Autonomous financial research.
+              The AI that actually does the work.
             </p>
             <a href="mailto:support@mariana.co" className="mt-2 block text-xs text-muted-foreground transition-colors hover:text-foreground">
               support@mariana.co
@@ -49,7 +49,7 @@ export function Footer() {
 
         <div className="mt-8 border-t border-border pt-6">
           <p className="text-xs text-muted-foreground/50">
-            © {new Date().getFullYear()} Mariana Financial Research. All rights reserved.
+© {new Date().getFullYear()} Mariana. All rights reserved.
           </p>
         </div>
       </div>

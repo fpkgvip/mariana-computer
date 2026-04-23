@@ -42,48 +42,64 @@ const BUILTIN_SKILLS: Skill[] = [
     id: "research-report",
     name: "Research Report",
     description:
-      "Generate comprehensive research reports with citations, data analysis, and actionable conclusions.",
-    trigger_keywords: ["report", "research report", "analysis", "deep dive"],
+      "Produce long-form research with citations, data analysis, and clear conclusions — market studies, teardowns, landscape analyses.",
+    trigger_keywords: ["report", "research", "analysis", "deep dive", "market study"],
     category: "built-in",
   },
   {
     id: "financial-analysis",
-    name: "Financial Analysis",
+    name: "Business & Financial Analysis",
     description:
-      "Analyze financial statements, SEC filings, and market data to produce investment-grade analysis.",
-    trigger_keywords: ["financial", "earnings", "valuation", "SEC filing"],
+      "Analyze revenue, margins, cohorts, unit economics, and financial statements to produce decision-ready analysis.",
+    trigger_keywords: ["financial", "revenue", "metrics", "unit economics", "cohort"],
     category: "built-in",
   },
   {
     id: "competitive-analysis",
     name: "Competitive Analysis",
     description:
-      "Map competitive landscapes, identify market positioning, and analyze competitive dynamics.",
-    trigger_keywords: ["competitive", "competition", "market share", "landscape"],
+      "Map competitive landscapes, compare pricing and positioning, and identify underserved niches or gaps.",
+    trigger_keywords: ["competitive", "competitors", "positioning", "landscape", "pricing"],
     category: "built-in",
   },
   {
     id: "data-analysis",
     name: "Data Analysis",
     description:
-      "Quantitative analysis with statistical methods, data visualization descriptions, and pattern identification.",
-    trigger_keywords: ["data", "statistics", "quantitative", "correlation"],
+      "Clean, join, model, and visualize data from warehouses, sheets, and APIs. Statistical tests, forecasts, and dashboards.",
+    trigger_keywords: ["data", "sql", "statistics", "chart", "dashboard"],
     category: "built-in",
   },
   {
     id: "presentation-builder",
     name: "Presentation Builder",
     description:
-      "Create structured slide presentations from research findings.",
-    trigger_keywords: ["presentation", "slides", "pptx", "powerpoint", "deck"],
+      "Produce polished slide decks — board updates, customer proposals, launch announcements, internal reviews.",
+    trigger_keywords: ["presentation", "slides", "pptx", "deck", "board"],
     category: "built-in",
   },
   {
     id: "excel-model",
-    name: "Excel Model Builder",
+    name: "Spreadsheet & Modeling",
     description:
-      "Build financial models, DCF valuations, and data tables in Excel format.",
-    trigger_keywords: ["excel", "model", "spreadsheet", "dcf", "valuation model"],
+      "Build spreadsheets and models — forecasts, budgets, pricing calculators, scenario analyses — in Excel format.",
+    trigger_keywords: ["excel", "spreadsheet", "model", "forecast", "budget"],
+    category: "built-in",
+  },
+  {
+    id: "app-builder",
+    name: "App & Tool Builder",
+    description:
+      "Build full web apps, internal tools, dashboards, and landing pages — React/TypeScript, deployed to a live URL.",
+    trigger_keywords: ["app", "dashboard", "internal tool", "landing page", "build"],
+    category: "built-in",
+  },
+  {
+    id: "automation",
+    name: "Automation & Scheduling",
+    description:
+      "Create recurring jobs — weekly reports, inbox triage, monitoring, data syncs — scheduled and running on their own.",
+    trigger_keywords: ["automate", "schedule", "recurring", "cron", "weekly"],
     category: "built-in",
   },
 ];
@@ -95,6 +111,8 @@ const CATEGORY_ICONS: Record<string, React.FC<{ size?: number; className?: strin
   "data-analysis": LineChart,
   "presentation-builder": Presentation,
   "excel-model": Table,
+  "app-builder": Zap,
+  "automation": Zap,
 };
 
 /* ------------------------------------------------------------------ */
@@ -191,7 +209,7 @@ function CreateSkillModal({
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-primary focus:outline-none"
-                placeholder="e.g. M&A Analysis"
+                placeholder="e.g. Weekly Growth Review"
               />
             </div>
             <div>
@@ -212,7 +230,7 @@ function CreateSkillModal({
                 onChange={(e) => setSystemPrompt(e.target.value)}
                 rows={3}
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-primary focus:outline-none resize-none"
-                placeholder="Instructions for the AI when this skill is active..."
+                placeholder="Instructions for Mariana when this skill is active..."
               />
             </div>
             <div>
@@ -223,7 +241,7 @@ function CreateSkillModal({
                 value={keywords}
                 onChange={(e) => setKeywords(e.target.value)}
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-primary focus:outline-none"
-                placeholder="merger, acquisition, m&a, deal"
+                placeholder="growth, weekly, cohort, activation"
               />
             </div>
           </div>
@@ -315,9 +333,9 @@ export default function Skills() {
               </button>
             </div>
             <p className="mt-2 text-sm text-muted-foreground">
-              Skills are reusable instruction sets that guide how Mariana approaches different types
-              of research. Skills are auto-detected based on your query, or you can select one
-              manually.
+              Skills are reusable playbooks that guide how Mariana approaches different kinds
+              of work — research, building, analysis, automation. Skills are auto-detected from
+              your request, or you can pick one manually.
             </p>
           </ScrollReveal>
 

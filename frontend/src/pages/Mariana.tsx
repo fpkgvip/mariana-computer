@@ -18,9 +18,10 @@ export default function Mariana() {
         </ScrollReveal>
         <ScrollReveal delay={150}>
           <p className="mt-8 max-w-xl text-lg leading-[1.7] text-muted-foreground">
-            Mariana operates inside a full compute environment. It writes and
-            runs code, builds applications, queries live data sources, and works
-            autonomously until the investigation is complete.
+            Mariana runs inside a full compute environment. It writes and
+            executes code, builds applications, browses the web, queries your
+            data, and works autonomously until the task is done — not just
+            drafted.
           </p>
         </ScrollReveal>
         <ScrollReveal delay={300}>
@@ -54,22 +55,22 @@ export default function Mariana() {
               <ScrollReveal delay={100}>
                 <div className="mt-8 space-y-6 text-[16px] leading-[1.8] text-muted-foreground">
                   <p>
-                    When Mariana needs data that doesn't exist in a database, it
-                    writes a program to get it — a web scraper, an API client, a
-                    parser for obscure file formats. When it needs to test a
-                    hypothesis, it builds a statistical model and runs it.
+                    When Mariana needs information that isn't in a database, it
+                    writes a program to get it — a browser script, an API
+                    client, a parser for whatever file format it runs into. When
+                    it needs to verify a claim, it builds a check and runs it.
                   </p>
                   <p>
                     It doesn't just produce text. It creates{" "}
-                    <span className="text-foreground font-medium">whatever the research requires</span>:
-                    Python scripts, Monte Carlo simulations, regression models,
-                    custom scrapers, data pipelines, interactive dashboards,
-                    finished PDF reports, slide decks, even full web applications.
+                    <span className="text-foreground font-medium">whatever the work requires</span>:
+                    Python and TypeScript programs, data pipelines, charts and
+                    dashboards, PDFs, slide decks, spreadsheets, emails, and
+                    complete web applications — deployed and linkable.
                   </p>
                   <p>
-                    And it works autonomously. Close your browser. Mariana keeps
-                    running — following evidence chains, hitting dead ends,
-                    pivoting, trying new approaches. You get notified when it's done.
+                    And it works autonomously. Close the tab. Mariana keeps
+                    running — executing steps, handling errors, pivoting, and
+                    finishing the job. You get notified when it's done.
                   </p>
                 </div>
               </ScrollReveal>
@@ -78,28 +79,29 @@ export default function Mariana() {
             <ScrollReveal delay={250} className="self-start lg:mt-14">
               <div className="rounded-lg bg-card p-6 shadow-sm ring-1 ring-border">
                 <p className="mb-5 text-[11px] font-medium uppercase tracking-[0.15em] text-muted-foreground">
-                  What Mariana can build during a single investigation
+                  What Mariana can build during a single task
                 </p>
                 <div className="space-y-4 text-[15px] leading-relaxed text-muted-foreground">
                   <p>
                     <span className="text-foreground font-medium">Programs.</span>{" "}
-                    Custom scrapers, API clients, data parsers, ETL pipelines —
-                    written in Python, executed in a sandboxed environment.
+                    Custom scripts, API clients, data connectors, ETL pipelines
+                    — written in Python or TypeScript, executed in a sandboxed
+                    environment.
                   </p>
                   <p>
-                    <span className="text-foreground font-medium">Models.</span>{" "}
-                    Monte Carlo simulations, regression analyses, NLP classifiers,
-                    factor models — built from scratch for each query.
+                    <span className="text-foreground font-medium">Analysis.</span>{" "}
+                    Spreadsheets, statistical models, A/B test read-outs, cohort
+                    breakdowns, forecasts — built from your actual data.
                   </p>
                   <p>
                     <span className="text-foreground font-medium">Applications.</span>{" "}
-                    Interactive dashboards, monitoring systems, custom web apps,
-                    data visualization tools — deployed and ready to use.
+                    Dashboards, internal tools, marketing sites, small web apps
+                    — deployed to a live URL you can share.
                   </p>
                   <p>
                     <span className="text-foreground font-medium">Documents.</span>{" "}
-                    PDF reports, slide decks, Excel workbooks, data exports —
-                    formatted and presentation-ready.
+                    PDF reports, slide decks, Word docs, Excel workbooks,
+                    emails, and SOPs — formatted and ready to send.
                   </p>
                 </div>
               </div>
@@ -108,15 +110,15 @@ export default function Mariana() {
         </div>
       </section>
 
-      {/* Adaptive intelligence — replaces "Choose your research depth" */}
+      {/* Adaptive intelligence */}
       <section className="mx-auto max-w-7xl px-6 py-24 md:py-32">
         <ScrollReveal>
           <h2 className="font-serif text-3xl font-semibold text-foreground md:text-4xl">
             Mariana decides.
           </h2>
           <p className="mt-5 max-w-xl text-[16px] leading-[1.7] text-muted-foreground">
-            You describe what you need. Mariana determines the right approach —
-            whether that's a quick lookup or a week-long investigation.
+            You describe what you need. Mariana picks the right approach —
+            whether that's a ten-second lookup or a multi-hour build.
           </p>
         </ScrollReveal>
         <div className="mt-14 grid gap-6 sm:grid-cols-3">
@@ -124,17 +126,17 @@ export default function Mariana() {
             {
               label: "Instant",
               time: "Seconds to minutes",
-              desc: "Factual questions, quick data lookups, and targeted single-source retrievals. No approval needed — Mariana answers immediately.",
+              desc: "Quick answers, fast lookups, single-file edits, one-shot scripts. No approval needed — Mariana answers immediately.",
             },
             {
               label: "Standard",
               time: "Minutes to hours",
-              desc: "Multi-source research with cross-referencing, model building, and comprehensive analysis. Mariana proposes a plan for your approval before starting.",
+              desc: "Multi-step work: reports, dashboards, small apps, data pipelines, document generation. Mariana proposes a plan before it starts.",
             },
             {
               label: "Deep",
               time: "Hours to days",
-              desc: "Exhaustive autonomous investigations across jurisdictions — writing custom tooling, testing hypotheses, and producing institutional-grade deliverables.",
+              desc: "Long-running autonomous work: full applications, large research projects, complex migrations, end-to-end automations.",
             },
           ].map((tier, i) => (
             <ScrollReveal key={tier.label} delay={i * 80}>
@@ -148,36 +150,36 @@ export default function Mariana() {
         </div>
       </section>
 
-      {/* What it finds */}
+      {/* What it actually ships */}
       <section className="bg-secondary/30">
         <div className="mx-auto max-w-7xl px-6 py-24 md:py-32">
           <ScrollReveal>
             <h2 className="max-w-2xl font-serif text-3xl font-semibold text-foreground md:text-4xl">
-              What it finds that nobody else catches
+              What it actually ships
             </h2>
             <p className="mt-5 max-w-2xl text-[16px] leading-[1.7] text-muted-foreground">
-              Mariana doesn't summarize public information. It investigates —
-              reading raw filings, cross-referencing datasets across jurisdictions,
-              and building custom tools to test hypotheses no one has thought to test.
+              Mariana doesn't stop at a draft. It runs the code, verifies the
+              output, fixes its own mistakes, and hands you something you can
+              use today — not a to-do list.
             </p>
           </ScrollReveal>
           <div className="mt-14 grid gap-10 md:grid-cols-2">
             {[
               {
-                title: "Accounting irregularities",
-                desc: "Revenue recognition timing shifts, off-balance-sheet structures, related-party transactions buried in footnotes across years of filings. Mariana reads every page — not summaries.",
+                title: "Working software",
+                desc: "Internal tools, admin dashboards, scheduled jobs, Slack bots, Chrome extensions, landing pages — built, tested, and deployed to a live URL.",
               },
               {
-                title: "Hidden corporate relationships",
-                desc: "Shared directors between a company and its suppliers. Subsidiary structures designed to obscure ownership. Undisclosed arrangements that materially affect margins.",
+                title: "Real analysis on real data",
+                desc: "Pull from your warehouse, spreadsheet, or an API. Clean it, model it, chart it, write it up. Numbers that match your source, not made-up estimates.",
               },
               {
-                title: "Unusual trading patterns",
-                desc: "Statistically anomalous insider transactions timed around unreported events. Options activity clustering. Share accumulation patterns that precede material disclosures.",
+                title: "Polished documents",
+                desc: "Board decks, customer proposals, research reports, product specs, policies, onboarding docs — in PDF, DOCX, PPTX, or XLSX, with citations where it matters.",
               },
               {
-                title: "Supply chain exposure",
-                desc: "Single-source dependencies, geographic concentration risk, undisclosed supplier relationships — mapped by cross-referencing trade data, corporate registries, and procurement filings.",
+                title: "Automations that run",
+                desc: "Recurring reports, inbox triage, CRM hygiene, monitoring jobs — scheduled, running, and sending you the results. Not a workflow diagram.",
               },
             ].map((item, i) => (
               <ScrollReveal key={item.title} delay={i * 100}>
@@ -199,44 +201,39 @@ export default function Mariana() {
       <section className="mx-auto max-w-7xl px-6 py-24 md:py-32">
         <ScrollReveal>
           <h2 className="font-serif text-3xl font-semibold text-foreground md:text-4xl">
-            Frontier reasoning, not surface analysis
+            Frontier reasoning, end-to-end execution
           </h2>
         </ScrollReveal>
         <div className="mt-12 grid gap-20 lg:grid-cols-2">
           <ScrollReveal delay={100}>
             <div className="space-y-6 text-[16px] leading-[1.8] text-muted-foreground">
               <p>
-                Powered by Claude Opus and other frontier models capable of
-                sustained, multi-step reasoning. Mariana doesn't run a prompt
-                and return a response. It reasons through problems the way a
-                research team would: formulating hypotheses, gathering evidence,
-                testing assumptions, revising conclusions, and going deeper when
-                something doesn't add up.
+                Mariana is powered by frontier models — Claude, GPT, Gemini, and
+                specialized coding and vision models — routed automatically for
+                each step. It doesn't just run one prompt and return one
+                response. It plans, acts, checks, and revises like a good
+                contractor would.
               </p>
               <p>
-                When it hits a gap in available data, it doesn't approximate.
-                It writes a program to go get the data — scraping trade
-                registries, parsing PDF exhibits, calling financial data APIs,
-                querying SEC EDGAR directly. Then it validates what it found
-                against multiple independent sources before drawing conclusions.
+                When it hits a gap — missing data, a failing test, an API that
+                moved — it doesn't bluff. It writes a program to close the gap,
+                runs it, verifies the result, and only then moves on. Every
+                step is logged and inspectable.
               </p>
             </div>
           </ScrollReveal>
           <ScrollReveal delay={250}>
             <div className="space-y-6 text-[16px] leading-[1.8] text-muted-foreground">
               <p>
-                The depth is the point. A surface-level scan of a company
-                might take minutes. Tracing an undisclosed related-party
-                transaction through three jurisdictions, building a custom
-                pricing model to quantify its impact, and stress-testing that
-                model against macro scenarios — that takes real compute time.
+                The depth is the point. A one-paragraph summary is fast.
+                Shipping a working tool, cleaning a real dataset, producing a
+                numbers-accurate report — that takes real compute time, and
+                Mariana will use it.
               </p>
               <p>
-                Mariana will work for as long as the investigation demands.
-                Some queries resolve in minutes. Others require hours or days of
-                autonomous operation — writing thousands of lines of code,
-                making thousands of API calls, building and discarding models
-                until the evidence is clear.
+                Some jobs finish in seconds. Others run for hours or days —
+                writing thousands of lines of code, making thousands of API
+                calls, building and testing until the work is actually done.
               </p>
             </div>
           </ScrollReveal>
@@ -248,33 +245,57 @@ export default function Mariana() {
         <div className="mx-auto max-w-7xl px-6 py-24 md:py-32">
           <ScrollReveal>
             <h2 className="font-serif text-3xl font-semibold text-foreground md:text-4xl">
-              Built for teams that need depth
+              Built for teams that need to actually ship
             </h2>
           </ScrollReveal>
           <div className="mt-14 grid gap-12 sm:grid-cols-2 md:grid-cols-3">
             {[
               {
-                title: "Quantitative Funds",
+                title: "Operators & Founders",
                 items: [
-                  "Factor exposure decomposition across portfolios",
-                  "Alternative data signal validation and backtesting",
-                  "Custom model construction and stress testing",
+                  "Spin up internal tools and admin panels in a day",
+                  "Automate weekly reporting, inbox triage, CRM hygiene",
+                  "Turn a Loom-level idea into a working prototype",
                 ],
               },
               {
-                title: "Hedge Funds",
+                title: "Product & Engineering",
                 items: [
-                  "Short thesis development with primary source verification",
-                  "Event-driven research (M&A, activism, restructuring)",
-                  "Supply chain mapping and concentration risk analysis",
+                  "Feature spikes, migrations, and throwaway scripts",
+                  "Generate SDKs, docs, and test harnesses from an API",
+                  "Run full build/test/deploy loops autonomously",
                 ],
               },
               {
-                title: "Institutional Research",
+                title: "Analysts & Researchers",
                 items: [
-                  "Sector-wide competitive landscape analysis",
-                  "Regulatory impact modeling across jurisdictions",
-                  "Cross-border corporate structure investigation",
+                  "Clean and model data from warehouses, sheets, and APIs",
+                  "Produce board decks, reports, and dashboards on demand",
+                  "Reproduce the exact pipeline every week, every month",
+                ],
+              },
+              {
+                title: "Marketing & Growth",
+                items: [
+                  "Build landing pages, campaigns, and tracking plans",
+                  "Competitor sweeps, SEO audits, pricing teardowns",
+                  "Generate launch assets in every format you need",
+                ],
+              },
+              {
+                title: "Sales & Success",
+                items: [
+                  "Account research packs and custom outreach at scale",
+                  "Auto-generated proposals, SOWs, and renewal briefs",
+                  "QBR decks pulled straight from CRM data",
+                ],
+              },
+              {
+                title: "Finance & Ops",
+                items: [
+                  "Close-cycle automation and reconciliation checks",
+                  "Variance analysis, cohort reporting, forecast updates",
+                  "One-off deep dives that would normally take a week",
                 ],
               },
             ].map((uc, i) => (
@@ -302,18 +323,18 @@ export default function Mariana() {
         <ScrollReveal>
           <div className="max-w-xl">
             <h2 className="font-serif text-3xl font-semibold text-foreground md:text-4xl">
-              Give it a real problem.
+              Give it a real job.
             </h2>
             <p className="mt-4 text-[16px] leading-[1.7] text-muted-foreground">
-              Start your first investigation today. If the depth is what your team needs,
-              we'll structure a plan that fits.
+              Describe something you've been meaning to ship. Mariana will plan
+              it, build it, and hand it back to you — working.
             </p>
             <div className="mt-8 flex flex-wrap items-center gap-5">
               <Link
                 to="/chat"
                 className="inline-flex items-center gap-2.5 rounded-md bg-primary px-6 py-3 text-sm font-medium text-primary-foreground transition-all hover:bg-primary/90 hover:shadow-xl hover:shadow-primary/10"
               >
-                Start with your first investigation <ArrowRight size={15} />
+                Start your first task <ArrowRight size={15} />
               </Link>
               <Link
                 to="/pricing"

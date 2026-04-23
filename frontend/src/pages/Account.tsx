@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
 import { ScrollReveal } from "@/components/ScrollReveal";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/contexts/AuthContext";
-import { LogOut, CreditCard, ShieldCheck, ExternalLink, Loader2 } from "lucide-react";
+import { LogOut, CreditCard, ShieldCheck, ExternalLink, Loader2, Inbox } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { toast } from "sonner";
 
@@ -37,6 +37,13 @@ export default function Account() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const [isOpeningPortal, setIsOpeningPortal] = useState(false);
+  const [usage, setUsage] = useState<{
+    plan: { id: string; name: string; price_usd_monthly: number; credits_per_month: number };
+    subscription_status: string;
+    credits_remaining: number | null;
+    credits_used_this_period: number;
+    credits_used_pct: number;
+  } | null>(null);
   // BUG-FE-120 fix: Track the in-flight portal fetch so we can abort on unmount
   // and avoid state updates after the component is gone.
   const portalAbortRef = useRef<AbortController | null>(null);
@@ -55,6 +62,30 @@ export default function Account() {
   useEffect(() => {
     return () => {
       portalAbortRef.current?.abort();
+    };
+  }, []);
+
+  // v3.5: fetch usage for the meter
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        const token = session?.access_token;
+        if (!token) return;
+        const res = await fetch(`${API_URL}/api/billing/usage`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled) setUsage(data);
+      } catch {
+        // silent — the existing card still renders from user context
+      }
+    };
+    run();
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -200,8 +231,57 @@ export default function Account() {
             </div>
           </ScrollReveal>
 
+          {/* v3.5: credit usage meter */}
+          {usage && usage.plan.credits_per_month > 0 && (
+            <ScrollReveal>
+              <div className="mt-6 rounded-lg border border-border bg-card p-6">
+                <div className="flex items-baseline justify-between">
+                  <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                    Usage this period
+                  </p>
+                  <p className="text-[11px] font-semibold text-foreground">
+                    {usage.credits_used_pct.toFixed(1)}%
+                  </p>
+                </div>
+                <div className="mt-3 h-3 overflow-hidden rounded-full border border-border bg-muted">
+                  <div
+                    className={`h-full rounded-full transition-all ${
+                      usage.credits_used_pct > 90
+                        ? "bg-red-500"
+                        : usage.credits_used_pct > 70
+                          ? "bg-amber-500"
+                          : "bg-emerald-500"
+                    }`}
+                    // Always show at least a tiny sliver so the bar is visible
+                    style={{ width: `${Math.max(2, Math.min(100, usage.credits_used_pct))}%` }}
+                  />
+                </div>
+                <div className="mt-3 flex items-baseline justify-between">
+                  <p className="text-xs text-muted-foreground">
+                    <span className="font-semibold text-foreground">
+                      {usage.credits_used_this_period.toLocaleString()}
+                    </span>{" "}
+                    of {usage.plan.credits_per_month.toLocaleString()} credits used
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    <span className="font-semibold text-foreground">
+                      {(usage.credits_remaining ?? 0).toLocaleString()}
+                    </span>{" "}
+                    remaining · {usage.plan.name} plan
+                  </p>
+                </div>
+              </div>
+            </ScrollReveal>
+          )}
+
           <ScrollReveal>
             <div className="mt-6 grid gap-3 sm:grid-cols-2">
+              <Link
+                to="/tasks"
+                className="inline-flex w-full items-center gap-2 rounded-md border border-border bg-background px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-secondary"
+              >
+                <Inbox size={16} /> Your tasks
+              </Link>
               <Button
                 variant="outline"
                 onClick={handleManageSubscription}

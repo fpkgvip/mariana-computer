@@ -981,6 +981,57 @@ class AdminStatsResponse(BaseModel):
     active_users_30d: int
 
 
+# --- v3.7 admin models -----------------------------------------------------
+
+
+class AdminSetRoleRequest(BaseModel):
+    role: Literal["user", "admin", "banned"]
+
+
+class AdminSuspendRequest(BaseModel):
+    suspend: bool
+    reason: str | None = Field(None, max_length=500)
+
+
+class AdminCreditsV2Request(BaseModel):
+    mode: Literal["set", "delta"]
+    amount: int
+    reason: str | None = Field(None, max_length=500)
+
+
+class AdminSystemFreezeRequest(BaseModel):
+    frozen: bool
+    reason: str | None = Field(None, max_length=500)
+    message: str | None = Field(None, max_length=500)
+
+
+class AdminFeatureFlagUpsert(BaseModel):
+    key: str = Field(..., min_length=1, max_length=128)
+    enabled: bool = True
+    value: dict[str, Any] | None = None
+    description: str | None = Field(None, max_length=500)
+
+
+class AdminAdminTaskUpsert(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    description: str | None = Field(None, max_length=2000)
+    category: str | None = Field(None, max_length=64)
+    priority: str | None = Field("P2", max_length=8)
+    status: str | None = Field("todo", max_length=32)
+    assignee: str | None = Field(None, max_length=128)
+    due_date: str | None = None
+
+
+class AdminAdminTaskPatch(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    category: str | None = None
+    priority: str | None = None
+    status: str | None = None
+    assignee: str | None = None
+    due_date: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
@@ -1360,32 +1411,33 @@ _PLANS: list[dict[str, Any]] = [
         "price_usd_monthly": 299.0,
         "credits_per_month": 30_000,
         "stripe_price_id": os.environ.get("STRIPE_PRICE_INDIVIDUAL", "price_individual"),
-        "description": "For individual analysts and researchers",
+        "description": "For individuals and power users",
         "features": [
-            "30,000 research credits/month",
-            "Standard + Deep investigations",
-            "PDF, DOCX, PPTX, XLSX report export",
-            "Perplexity-powered web search",
+            "30,000 credits/month",
+            "Instant, standard, and deep tasks",
+            "All built-in skills (research, coding, analysis, docs)",
+            "Deploy apps and tools to live URLs",
+            "PDF, DOCX, PPTX, XLSX export",
             "Persistent memory across sessions",
             "Priority support",
         ],
     },
     {
         "id": "enterprise",
-        "name": "Enterprise",
+        "name": "Team",
         "price_usd_monthly": 3999.0,
         "credits_per_month": 500_000,
         "stripe_price_id": os.environ.get("STRIPE_PRICE_ENTERPRISE", "price_enterprise"),
-        "description": "For large organisations with heavy research workloads",
+        "description": "For teams with heavy workloads",
         "features": [
-            "500,000 research credits/month",
-            "All investigation tiers incl. Flagship",
-            "Concurrent investigations (up to 4)",
+            "500,000 shared credits/month",
+            "All task tiers incl. flagship models",
+            "Concurrent tasks (up to 4)",
             "Sub-agent delegation",
-            "Custom skills",
+            "Custom skills and shared libraries",
             "Image & video generation",
-            "Dedicated queue",
-            "Custom integrations",
+            "SSO and role-based access",
+            "Dedicated queue and custom integrations",
             "Dedicated account manager",
             "SLA-backed support",
         ],
@@ -4760,6 +4812,67 @@ async def list_plans() -> list[PlanInfo]:
     return [PlanInfo(**plan) for plan in _PLANS]
 
 
+@app.get("/api/billing/usage", tags=["Billing"])
+async def billing_usage(
+    current_user: dict[str, str] = Depends(_get_current_user),
+) -> dict[str, Any]:
+    """Return the caller's subscription plan + credit usage.
+
+    v3.5: single endpoint the frontend polls to show a usage meter and
+    gate agent-task creation when the user is out of credits. Credits
+    returned as the raw integer balance from Supabase; plan details come
+    from the static ``_PLANS`` list so we don't need a round trip to Stripe.
+    """
+    cfg = _get_config()
+    user_id = current_user["user_id"]
+
+    balance: int | None = None
+    if cfg.SUPABASE_URL and _supabase_api_key(cfg):
+        try:
+            balance = await _supabase_get_user_tokens(user_id, cfg)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("billing_usage_balance_lookup_failed", user_id=user_id, error=str(exc))
+            balance = None
+
+    # Fetch plan details. Resolve from JWT claims when available, else
+    # default to "free". We intentionally return plan details instead of
+    # just the slug so the frontend can render the usage meter without a
+    # second API call.
+    plan_slug = (current_user.get("subscription_plan") or "free").lower()
+    plan_status = current_user.get("subscription_status") or "none"
+    matched = next((p for p in _PLANS if p["id"] == plan_slug), None)
+    # If user has no active plan, synthesize a "free" tier so the UI has
+    # something to render. Free tier has limited credits to encourage upgrade.
+    if matched is None:
+        credits_per_month = 500 if plan_slug == "free" else 0
+        plan_info = {
+            "id": plan_slug,
+            "name": "Free" if plan_slug == "free" else plan_slug.title(),
+            "price_usd_monthly": 0.0,
+            "credits_per_month": credits_per_month,
+        }
+    else:
+        plan_info = {
+            "id": matched["id"],
+            "name": matched["name"],
+            "price_usd_monthly": matched["price_usd_monthly"],
+            "credits_per_month": matched["credits_per_month"],
+        }
+
+    # Usage percentage for the meter — monthly bucket.
+    total = int(plan_info.get("credits_per_month") or 0)
+    used = max(0, total - (balance or 0)) if total > 0 else 0
+    pct = round(100.0 * used / total, 1) if total > 0 else 0.0
+
+    return {
+        "plan": plan_info,
+        "subscription_status": plan_status,
+        "credits_remaining": balance,
+        "credits_used_this_period": used,
+        "credits_used_pct": pct,
+    }
+
+
 @app.post(
     "/api/billing/create-checkout",
     response_model=CreateCheckoutResponse,
@@ -5746,6 +5859,643 @@ async def admin_stats(
         total_spent_usd=total_spent,
         active_users_30d=active_users_30d,
     )
+
+
+# ---------------------------------------------------------------------------
+# Routes — Admin v3.7 (RPC-backed via SECURITY DEFINER functions)
+# ---------------------------------------------------------------------------
+
+
+def _admin_supabase_headers(request: Request, cfg: AppConfig) -> dict[str, str]:
+    """Build headers for forwarding to Supabase PostgREST with caller JWT."""
+    auth_header = _normalize_bearer_auth_header(
+        request.headers.get("authorization") or request.headers.get("Authorization")
+    )
+    return {
+        "apikey": cfg.SUPABASE_ANON_KEY or "",
+        "Authorization": auth_header,
+        "Content-Type": "application/json",
+    }
+
+
+async def _admin_rpc_call(
+    request: Request,
+    fn: str,
+    payload: dict[str, Any],
+    *,
+    timeout: float = 15.0,
+) -> Any:
+    """POST to a Supabase RPC function, returning parsed JSON.
+
+    Raises HTTPException on non-200. Caller's JWT is forwarded so the
+    SECURITY DEFINER fn can verify admin role.
+    """
+    cfg = _get_config()
+    if not cfg.SUPABASE_URL:
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+    url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/{fn}"
+    headers = _admin_supabase_headers(request, cfg)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+    if resp.status_code != 200:
+        body = resp.text[:400] if resp.text else ""
+        logger.error("admin_rpc_failed", fn=fn, status=resp.status_code, body=body)
+        # Map Postgres permission / validation errors to 4xx where possible
+        code = 403 if resp.status_code in (401, 403) else 502
+        raise HTTPException(status_code=code, detail=f"RPC {fn} failed: {body}")
+    try:
+        return resp.json()
+    except ValueError:
+        return None
+
+
+async def _admin_rest_request(
+    request: Request,
+    method: str,
+    path: str,
+    *,
+    params: dict[str, str] | None = None,
+    json_body: Any = None,
+    prefer: str | None = None,
+    timeout: float = 15.0,
+) -> httpx.Response:
+    """Proxy a PostgREST request with caller JWT.
+
+    RLS ensures admin-only tables refuse non-admin callers.
+    """
+    cfg = _get_config()
+    if not cfg.SUPABASE_URL:
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+    url = f"{cfg.SUPABASE_URL}/rest/v1{path}"
+    headers = _admin_supabase_headers(request, cfg)
+    if prefer:
+        headers["Prefer"] = prefer
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.request(
+            method.upper(), url, headers=headers, params=params, json=json_body
+        )
+    return resp
+
+
+@app.get("/api/admin/overview", tags=["Admin"], summary="Admin dashboard overview (v2)")
+async def admin_overview_v2(
+    request: Request,
+    caller: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    data = await _admin_rpc_call(
+        request, "admin_overview_stats", {"caller": caller["user_id"]}
+    )
+    return JSONResponse(content=data or {})
+
+
+@app.get("/api/admin/audit-log", tags=["Admin"], summary="List audit log entries")
+async def admin_audit_log_list(
+    request: Request,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    action: str | None = Query(None, max_length=64),
+    caller: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    data = await _admin_rpc_call(
+        request,
+        "admin_audit_list",
+        {
+            "caller": caller["user_id"],
+            "limit_n": limit,
+            "offset_n": offset,
+            "action_filter": action,
+        },
+    )
+    return JSONResponse(content=data or [])
+
+
+@app.post("/api/admin/users/{user_id}/role", tags=["Admin"], summary="Set user role")
+async def admin_user_set_role(
+    user_id: str,
+    body: AdminSetRoleRequest,
+    request: Request,
+    caller: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    await _admin_rpc_call(
+        request,
+        "admin_set_role",
+        {
+            "caller": caller["user_id"],
+            "target": user_id,
+            "new_role": body.role,
+        },
+    )
+    logger.info("admin_role_set", actor=caller["user_id"], target=user_id, role=body.role)
+    return JSONResponse(content={"user_id": user_id, "role": body.role})
+
+
+@app.post("/api/admin/users/{user_id}/suspend", tags=["Admin"], summary="Suspend/unsuspend user")
+async def admin_user_suspend(
+    user_id: str,
+    body: AdminSuspendRequest,
+    request: Request,
+    caller: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    await _admin_rpc_call(
+        request,
+        "admin_suspend",
+        {
+            "caller": caller["user_id"],
+            "target": user_id,
+            "suspend_bool": body.suspend,
+            "reason": body.reason,
+        },
+    )
+    logger.info(
+        "admin_suspend_toggled",
+        actor=caller["user_id"],
+        target=user_id,
+        suspend=body.suspend,
+    )
+    return JSONResponse(content={"user_id": user_id, "suspended": body.suspend})
+
+
+@app.post("/api/admin/users/{user_id}/credits-v2", tags=["Admin"], summary="Adjust credits (v2, audited)")
+async def admin_user_credits_v2(
+    user_id: str,
+    body: AdminCreditsV2Request,
+    request: Request,
+    caller: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    if body.mode == "set" and body.amount < 0:
+        raise HTTPException(status_code=422, detail="amount must be >= 0 when mode='set'")
+    new_balance = await _admin_rpc_call(
+        request,
+        "admin_adjust_credits",
+        {
+            "caller": caller["user_id"],
+            "target": user_id,
+            "mode": body.mode,
+            "amount": body.amount,
+            "reason": body.reason,
+        },
+    )
+    logger.info(
+        "admin_credits_adjusted",
+        actor=caller["user_id"],
+        target=user_id,
+        mode=body.mode,
+        amount=body.amount,
+        new_balance=new_balance,
+    )
+    return JSONResponse(content={"user_id": user_id, "new_balance": new_balance})
+
+
+@app.post("/api/admin/system/freeze", tags=["Admin"], summary="Toggle global system freeze (kill-switch)")
+async def admin_system_freeze(
+    body: AdminSystemFreezeRequest,
+    request: Request,
+    caller: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    await _admin_rpc_call(
+        request,
+        "admin_system_freeze",
+        {
+            "caller": caller["user_id"],
+            "frozen_bool": body.frozen,
+            "reason": body.reason,
+            "message": body.message,
+        },
+    )
+    logger.warning(
+        "admin_system_freeze_toggled",
+        actor=caller["user_id"],
+        frozen=body.frozen,
+        reason=body.reason,
+    )
+    return JSONResponse(content={"frozen": body.frozen, "message": body.message})
+
+
+@app.get("/api/admin/tasks", tags=["Admin"], summary="List all user tasks (investigations)")
+async def admin_list_all_tasks(
+    request: Request,
+    status: str | None = Query(None, max_length=32),
+    user_id: str | None = Query(None, max_length=64),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    caller: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    data = await _admin_rpc_call(
+        request,
+        "admin_list_tasks",
+        {
+            "caller": caller["user_id"],
+            "status_filter": status,
+            "user_id_filter": user_id,
+            "limit_n": limit,
+            "offset_n": offset,
+        },
+    )
+    return JSONResponse(content=data or [])
+
+
+# --- Admin todo-list (admin_tasks table) ----------------------------------
+
+
+@app.get("/api/admin/admin-tasks", tags=["Admin"], summary="List internal admin todo tasks")
+async def admin_admintasks_list(
+    request: Request,
+    status: str | None = Query(None, max_length=32),
+    category: str | None = Query(None, max_length=64),
+    priority: str | None = Query(None, max_length=8),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    _: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    params: dict[str, str] = {
+        "select": "*",
+        "order": "priority.asc,created_at.desc",
+        "limit": str(limit),
+        "offset": str(offset),
+    }
+    if status:
+        params["status"] = f"eq.{status}"
+    if category:
+        params["category"] = f"eq.{category}"
+    if priority:
+        params["priority"] = f"eq.{priority}"
+    resp = await _admin_rest_request(request, "GET", "/admin_tasks", params=params)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"List admin_tasks failed: {resp.text[:200]}")
+    return JSONResponse(content=resp.json())
+
+
+@app.post("/api/admin/admin-tasks", tags=["Admin"], summary="Create an internal admin todo task")
+async def admin_admintasks_create(
+    body: AdminAdminTaskUpsert,
+    request: Request,
+    caller: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    payload = body.model_dump(exclude_none=True)
+    payload["created_by"] = caller["user_id"]
+    resp = await _admin_rest_request(
+        request,
+        "POST",
+        "/admin_tasks",
+        json_body=payload,
+        prefer="return=representation",
+    )
+    if resp.status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail=f"Create admin_task failed: {resp.text[:200]}")
+    data = resp.json()
+    return JSONResponse(content=data[0] if isinstance(data, list) and data else data)
+
+
+@app.patch("/api/admin/admin-tasks/{task_id}", tags=["Admin"], summary="Update an internal admin todo task")
+async def admin_admintasks_patch(
+    task_id: str,
+    body: AdminAdminTaskPatch,
+    request: Request,
+    _: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    try:
+        uuid.UUID(task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid task_id (must be UUID)") from exc
+    payload = body.model_dump(exclude_none=True)
+    if not payload:
+        raise HTTPException(status_code=422, detail="No fields provided")
+    resp = await _admin_rest_request(
+        request,
+        "PATCH",
+        "/admin_tasks",
+        params={"id": f"eq.{task_id}"},
+        json_body=payload,
+        prefer="return=representation",
+    )
+    if resp.status_code not in (200, 204):
+        raise HTTPException(status_code=502, detail=f"Patch admin_task failed: {resp.text[:200]}")
+    data = resp.json() if resp.status_code == 200 else []
+    return JSONResponse(content=data[0] if isinstance(data, list) and data else {})
+
+
+@app.delete("/api/admin/admin-tasks/{task_id}", tags=["Admin"], summary="Delete an internal admin todo task")
+async def admin_admintasks_delete(
+    task_id: str,
+    request: Request,
+    _: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    try:
+        uuid.UUID(task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid task_id (must be UUID)") from exc
+    resp = await _admin_rest_request(
+        request,
+        "DELETE",
+        "/admin_tasks",
+        params={"id": f"eq.{task_id}"},
+    )
+    if resp.status_code not in (200, 204):
+        raise HTTPException(status_code=502, detail=f"Delete admin_task failed: {resp.text[:200]}")
+    return JSONResponse(content={"id": task_id, "deleted": True})
+
+
+# --- Feature flags ---------------------------------------------------------
+
+
+@app.get("/api/admin/feature-flags", tags=["Admin"], summary="List feature flags")
+async def admin_feature_flags_list(
+    request: Request,
+    _: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    resp = await _admin_rest_request(
+        request,
+        "GET",
+        "/feature_flags",
+        params={"select": "*", "order": "key.asc"},
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"List feature_flags failed: {resp.text[:200]}")
+    return JSONResponse(content=resp.json())
+
+
+@app.post("/api/admin/feature-flags", tags=["Admin"], summary="Upsert a feature flag")
+async def admin_feature_flags_upsert(
+    body: AdminFeatureFlagUpsert,
+    request: Request,
+    caller: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    payload = body.model_dump(exclude_none=True)
+    payload["updated_by"] = caller["user_id"]
+    resp = await _admin_rest_request(
+        request,
+        "POST",
+        "/feature_flags",
+        json_body=payload,
+        prefer="resolution=merge-duplicates,return=representation",
+    )
+    if resp.status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail=f"Upsert feature_flag failed: {resp.text[:200]}")
+    # Audit the change
+    try:
+        await _admin_rpc_call(
+            request,
+            "admin_audit_insert",
+            {
+                "actor": caller["user_id"],
+                "action": "feature_flag.upsert",
+                "target_type": "feature_flag",
+                "target_id": body.key,
+                "before": None,
+                "after": payload,
+                "meta": None,
+                "ip": request.client.host if request.client else None,
+                "ua": request.headers.get("user-agent"),
+            },
+        )
+    except HTTPException:
+        pass
+    data = resp.json()
+    return JSONResponse(content=data[0] if isinstance(data, list) and data else data)
+
+
+@app.delete("/api/admin/feature-flags/{key}", tags=["Admin"], summary="Delete a feature flag")
+async def admin_feature_flags_delete(
+    key: str,
+    request: Request,
+    caller: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    resp = await _admin_rest_request(
+        request,
+        "DELETE",
+        "/feature_flags",
+        params={"key": f"eq.{key}"},
+    )
+    if resp.status_code not in (200, 204):
+        raise HTTPException(status_code=502, detail=f"Delete feature_flag failed: {resp.text[:200]}")
+    try:
+        await _admin_rpc_call(
+            request,
+            "admin_audit_insert",
+            {
+                "actor": caller["user_id"],
+                "action": "feature_flag.delete",
+                "target_type": "feature_flag",
+                "target_id": key,
+                "before": None,
+                "after": None,
+                "meta": None,
+                "ip": request.client.host if request.client else None,
+                "ua": request.headers.get("user-agent"),
+            },
+        )
+    except HTTPException:
+        pass
+    return JSONResponse(content={"key": key, "deleted": True})
+
+
+# --- Usage rollup ----------------------------------------------------------
+
+
+@app.get("/api/admin/usage", tags=["Admin"], summary="Daily usage rollup")
+async def admin_usage_rollup(
+    request: Request,
+    days: int = Query(30, ge=1, le=365),
+    limit: int = Query(500, ge=1, le=5000),
+    _: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    from datetime import timedelta
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+    params = {
+        "select": "*",
+        "day": f"gte.{since}",
+        "order": "day.desc",
+        "limit": str(limit),
+    }
+    resp = await _admin_rest_request(request, "GET", "/usage_rollup_daily", params=params)
+    if resp.status_code != 200:
+        # Table may be empty or missing — return empty list rather than 502
+        logger.warning("admin_usage_rollup_non_200", status=resp.status_code)
+        return JSONResponse(content=[])
+    return JSONResponse(content=resp.json())
+
+
+# --- System health probe ---------------------------------------------------
+
+
+@app.get("/api/admin/health-probe", tags=["Admin"], summary="Deep health probe of all dependencies")
+async def admin_health_probe(
+    request: Request,
+    _: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    """Probe DB, Redis, Supabase, browser service, sandbox, LLM gateway.
+
+    Returns a dict of {component: {ok: bool, detail: str, latency_ms: float}}.
+    Each probe runs with a short timeout and is isolated so one failure does
+    not mask others. Never raises — always returns 200 with per-component status.
+    """
+    cfg = _get_config()
+    results: dict[str, dict[str, Any]] = {}
+
+    async def _probe(name: str, coro) -> None:
+        t0 = time.perf_counter()
+        try:
+            detail = await asyncio.wait_for(coro, timeout=5.0)
+            results[name] = {
+                "ok": True,
+                "detail": str(detail)[:200] if detail else "ok",
+                "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+            }
+        except Exception as exc:  # noqa: BLE001
+            results[name] = {
+                "ok": False,
+                "detail": f"{type(exc).__name__}: {str(exc)[:200]}",
+                "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+            }
+
+    async def _db_probe() -> str:
+        db = _get_db()
+        v = await db.fetchval("SELECT 1")
+        return f"select=1 result={v}"
+
+    async def _redis_probe() -> str:
+        if _redis is None:
+            raise RuntimeError("redis not initialized")
+        pong = await _redis.ping()
+        return f"ping={pong}"
+
+    async def _supabase_probe() -> str:
+        if not cfg.SUPABASE_URL:
+            raise RuntimeError("SUPABASE_URL not configured")
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(
+                f"{cfg.SUPABASE_URL}/auth/v1/health",
+                headers={"apikey": cfg.SUPABASE_ANON_KEY or ""},
+            )
+        return f"status={r.status_code}"
+
+    async def _browser_probe() -> str:
+        url = os.environ.get("BROWSER_SERVICE_URL", "").rstrip("/")
+        if not url:
+            raise RuntimeError("BROWSER_SERVICE_URL not configured")
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"{url}/health")
+        return f"status={r.status_code}"
+
+    async def _sandbox_probe() -> str:
+        url = os.environ.get("SANDBOX_URL", "").rstrip("/")
+        if not url:
+            raise RuntimeError("SANDBOX_URL not configured")
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"{url}/health")
+        return f"status={r.status_code}"
+
+    async def _gateway_probe() -> str:
+        base = os.environ.get("LLM_GATEWAY_BASE_URL", "").rstrip("/")
+        if not base:
+            raise RuntimeError("LLM_GATEWAY_BASE_URL not configured")
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"{base}/models", headers={
+                "Authorization": f"Bearer {os.environ.get('LLM_GATEWAY_API_KEY','')}"
+            })
+        return f"status={r.status_code}"
+
+    await asyncio.gather(
+        _probe("database", _db_probe()),
+        _probe("redis", _redis_probe()),
+        _probe("supabase", _supabase_probe()),
+        _probe("browser", _browser_probe()),
+        _probe("sandbox", _sandbox_probe()),
+        _probe("llm_gateway", _gateway_probe()),
+        return_exceptions=True,
+    )
+
+    overall_ok = all(r["ok"] for r in results.values())
+    return JSONResponse(
+        content={
+            "ok": overall_ok,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "components": results,
+        }
+    )
+
+
+# --- Danger zone ops -------------------------------------------------------
+
+
+class AdminDangerConfirm(BaseModel):
+    confirm: str = Field(..., description="Must equal 'I UNDERSTAND' to proceed")
+
+
+@app.post("/api/admin/danger/flush-redis", tags=["Admin"], summary="DANGER: flush Redis (cache + queues)")
+async def admin_danger_flush_redis(
+    body: AdminDangerConfirm,
+    request: Request,
+    caller: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    if body.confirm != "I UNDERSTAND":
+        raise HTTPException(status_code=422, detail="Confirmation phrase required")
+    if _redis is None:
+        raise HTTPException(status_code=503, detail="Redis not initialized")
+    try:
+        await _redis.flushdb()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Flush failed: {exc}") from exc
+    logger.warning("admin_danger_flush_redis", actor=caller["user_id"])
+    try:
+        await _admin_rpc_call(
+            request,
+            "admin_audit_insert",
+            {
+                "actor": caller["user_id"],
+                "action": "danger.flush_redis",
+                "target_type": "system",
+                "target_id": "redis",
+                "before": None,
+                "after": None,
+                "meta": None,
+                "ip": request.client.host if request.client else None,
+                "ua": request.headers.get("user-agent"),
+            },
+        )
+    except HTTPException:
+        pass
+    return JSONResponse(content={"flushed": True})
+
+
+@app.post("/api/admin/danger/halt-running", tags=["Admin"], summary="DANGER: halt all RUNNING tasks")
+async def admin_danger_halt_running(
+    body: AdminDangerConfirm,
+    request: Request,
+    caller: dict[str, str] = Depends(_require_admin),
+) -> JSONResponse:
+    if body.confirm != "I UNDERSTAND":
+        raise HTTPException(status_code=422, detail="Confirmation phrase required")
+    db = _get_db()
+    result = await db.execute(
+        "UPDATE research_tasks SET status='HALTED' WHERE status='RUNNING'"
+    )
+    # asyncpg returns 'UPDATE N' string
+    halted = 0
+    try:
+        halted = int(result.split()[-1])
+    except Exception:
+        pass
+    logger.warning("admin_danger_halt_running", actor=caller["user_id"], halted=halted)
+    try:
+        await _admin_rpc_call(
+            request,
+            "admin_audit_insert",
+            {
+                "actor": caller["user_id"],
+                "action": "danger.halt_running",
+                "target_type": "system",
+                "target_id": "research_tasks",
+                "before": None,
+                "after": {"halted": halted},
+                "meta": None,
+                "ip": request.client.host if request.client else None,
+                "ua": request.headers.get("user-agent"),
+            },
+        )
+    except HTTPException:
+        pass
+    return JSONResponse(content={"halted": halted})
 
 
 # ---------------------------------------------------------------------------

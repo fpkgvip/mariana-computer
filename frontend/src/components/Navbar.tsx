@@ -1,11 +1,11 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useState, useEffect, useRef } from "react";
-import { Menu, X, User, LogOut, CreditCard, Settings, ShieldCheck } from "lucide-react";
+import { Menu, X, User, LogOut, CreditCard, Settings, ShieldCheck, Inbox } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 
 const navLinks = [
-  { label: "Research", href: "/research" },
-  { label: "Mariana", href: "/mariana" },
+  { label: "Product", href: "/mariana" },
+  { label: "Examples", href: "/research" },
   { label: "Pricing", href: "/pricing" },
   { label: "Contact", href: "/contact" },
 ];
@@ -94,7 +94,10 @@ export function Navbar() {
               {userMenuOpen && (
                 <div role="menu" className="absolute right-0 top-full mt-2 w-56 rounded-lg border border-border bg-card py-1 shadow-lg">
                   <Link role="menuitem" to="/chat" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
-                    Research
+                    Workspace
+                  </Link>
+                  <Link role="menuitem" to="/tasks" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
+                    <Inbox size={13} /> Tasks
                   </Link>
                   <Link role="menuitem" to="/account" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
                     <Settings size={13} /> Account
@@ -179,7 +182,8 @@ export function Navbar() {
               <>
                 <Link to="/account" className="py-1 text-sm text-muted-foreground">Account</Link>
                 <Link to="/checkout" className="py-1 text-sm text-muted-foreground">Upgrade plan</Link>
-                <Link to="/chat" className="py-1 text-sm text-muted-foreground">Research</Link>
+                <Link to="/chat" className="py-1 text-sm text-muted-foreground">Workspace</Link>
+                <Link to="/tasks" className="py-1 text-sm text-muted-foreground">Tasks</Link>
                 {user.role === "admin" && (
                   <Link to="/admin" className="py-1 text-sm text-muted-foreground">Admin</Link>
                 )}

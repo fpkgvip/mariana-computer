@@ -194,6 +194,172 @@ def make_routes(*, get_current_user, get_db, get_redis, get_stream_user) -> APIR
     """
     r = APIRouter(prefix="/api", tags=["Agent"])
 
+    # -- GET /api/agent/about -------------------------------------------
+    # Public (auth still required for consistency) capability description.
+    # Backed by mariana.agent.self_knowledge so the prompt / dispatcher /
+    # frontend stay in sync.
+    @r.get("/agent/about")
+    async def agent_about(
+        current_user: dict = Depends(get_current_user),
+    ) -> dict:
+        from mariana.agent.self_knowledge import describe_self_payload
+        return describe_self_payload()
+
+    # -- GET /api/agent  (task inbox) -----------------------------------
+    # v3: paginated list of the caller's own agent tasks, newest first.
+    # Supports filtering by state so the frontend can show "Running",
+    # "Needs approval", and "History" tabs without spawning one query per
+    # task row.
+    @r.get("/agent")
+    async def list_agent_tasks(
+        state: str | None = Query(None, max_length=32),
+        limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0, le=10_000),
+        current_user: dict = Depends(get_current_user),
+    ) -> dict:
+        db = get_db()
+        # Build parameterised query.  State filter is optional.
+        where = "user_id = $1"
+        params: list[Any] = [current_user["user_id"]]
+        if state:
+            where += " AND state = $2"
+            params.append(state)
+        params.extend([limit, offset])
+        lim_placeholder = f"${len(params) - 1}"
+        off_placeholder = f"${len(params)}"
+        sql = (
+            "SELECT id, goal, state, selected_model, budget_usd, spent_usd, "
+            "replan_count, total_failures, error, final_answer, "
+            "created_at, updated_at FROM agent_tasks WHERE " + where
+            + f" ORDER BY created_at DESC LIMIT {lim_placeholder} OFFSET {off_placeholder}"
+        )
+        count_sql = "SELECT COUNT(*) AS n FROM agent_tasks WHERE " + where
+        async with db.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+            total_row = await conn.fetchrow(count_sql, *params[: 2 if state else 1])
+        return {
+            "total": int(total_row["n"]) if total_row else 0,
+            "limit": limit,
+            "offset": offset,
+            "tasks": [
+                {
+                    "id": str(row["id"]),
+                    "goal": row["goal"],
+                    "state": row["state"],
+                    "selected_model": row["selected_model"],
+                    "budget_usd": float(row["budget_usd"]),
+                    "spent_usd": float(row["spent_usd"]),
+                    "replan_count": int(row["replan_count"]),
+                    "total_failures": int(row["total_failures"]),
+                    "error": row["error"],
+                    "has_final_answer": bool(row["final_answer"]),
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in rows
+            ],
+        }
+
+    # -- GET /api/agent/{task_id}/approvals -----------------------------
+    # v3: scan the event log for `approval_requested` events that have no
+    # matching `approval_resolved` event.  Returns one entry per pending
+    # approval so the frontend can render the approval queue.
+    @r.get("/agent/{task_id}/approvals")
+    async def list_pending_approvals(
+        task_id: str,
+        current_user: dict = Depends(get_current_user),
+    ) -> dict:
+        db = get_db()
+        task = await _load_agent_task(db, task_id)
+        if task is None:
+            raise HTTPException(404, f"agent task {task_id} not found")
+        if task.user_id != current_user["user_id"]:
+            raise HTTPException(403, "not your task")
+        async with db.acquire() as conn:
+            req_rows = await conn.fetch(
+                "SELECT id, payload, created_at FROM agent_events "
+                "WHERE task_id = $1 AND event_type = 'approval_requested' "
+                "ORDER BY id ASC LIMIT 500",
+                task_id,
+            )
+            res_rows = await conn.fetch(
+                "SELECT payload FROM agent_events "
+                "WHERE task_id = $1 AND event_type = 'approval_resolved' "
+                "ORDER BY id ASC LIMIT 1000",
+                task_id,
+            )
+        resolved: set[str] = set()
+        for row in res_rows:
+            p = row["payload"]
+            if isinstance(p, str):
+                try:
+                    p = json.loads(p)
+                except Exception:
+                    p = {}
+            aid = (p or {}).get("approval_id")
+            if aid:
+                resolved.add(str(aid))
+        pending: list[dict[str, Any]] = []
+        for row in req_rows:
+            p = row["payload"]
+            if isinstance(p, str):
+                try:
+                    p = json.loads(p)
+                except Exception:
+                    p = {}
+            aid = (p or {}).get("approval_id") or f"evt-{row['id']}"
+            if str(aid) in resolved:
+                continue
+            pending.append({
+                "approval_id": str(aid),
+                "event_id": int(row["id"]),
+                "requested_at": row["created_at"],
+                "summary": (p or {}).get("summary", ""),
+                "tool": (p or {}).get("tool", ""),
+                "params": (p or {}).get("params", {}),
+                "tier": (p or {}).get("tier", "B"),
+            })
+        return {"task_id": task_id, "count": len(pending), "approvals": pending}
+
+    # -- POST /api/agent/{task_id}/approvals/{approval_id}/decide -------
+    @r.post("/agent/{task_id}/approvals/{approval_id}/decide")
+    async def decide_approval(
+        task_id: str,
+        approval_id: str,
+        body: dict[str, Any],
+        current_user: dict = Depends(get_current_user),
+    ) -> dict:
+        decision = str(body.get("decision", "")).lower()
+        if decision not in ("approve", "deny"):
+            raise HTTPException(422, "decision must be 'approve' or 'deny'")
+        db = get_db()
+        task = await _load_agent_task(db, task_id)
+        if task is None:
+            raise HTTPException(404, f"agent task {task_id} not found")
+        if task.user_id != current_user["user_id"]:
+            raise HTTPException(403, "not your task")
+        payload = {
+            "approval_id": approval_id,
+            "decision": decision,
+            "decided_by": current_user["user_id"],
+            "note": str(body.get("note", ""))[:2000],
+        }
+        async with db.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO agent_events (task_id, event_type, state, payload) "
+                "VALUES ($1, 'approval_resolved', $2, $3::jsonb)",
+                task_id, task.state.value, json.dumps(payload),
+            )
+        # Signal the orchestrator via Redis pub/sub so a blocked task can
+        # resume.  No-op if redis is unavailable.
+        try:
+            redis = get_redis()
+            if redis is not None:
+                await redis.publish(f"agent:approval:{task_id}", json.dumps(payload))
+        except Exception as exc:
+            logger.warning("approval_publish_failed", error=str(exc))
+        return {"task_id": task_id, "approval_id": approval_id, "decision": decision}
+
     # -- POST /api/agent ------------------------------------------------
     @r.post("/agent", response_model=AgentStartResponse, status_code=202)
     async def start_agent_task(
@@ -202,6 +368,42 @@ def make_routes(*, get_current_user, get_db, get_redis, get_stream_user) -> APIR
     ) -> AgentStartResponse:
         db = get_db()
         task_id = str(uuid.uuid4())
+
+        # v3.5: Reserve credits before enqueueing so free-tier users can't
+        # burn unlimited agent time. Formula: 500 credits per $1 of budget,
+        # capped at 10x the plan's per-task limit. Late import avoids the
+        # circular dependency between api.py and this module.
+        reserved_credits = 0
+        try:
+            from mariana.api import (  # noqa: PLC0415
+                _get_config as _get_cfg,
+                _supabase_deduct_credits as _deduct,
+                _supabase_add_credits as _refund,
+            )
+            cfg = _get_cfg()
+            # Conservative estimate: 500 credits per $ of budget. Quick tasks
+            # cost ~200 credits, deep ones up to ~5000. Refunded on error.
+            reserved_credits = max(200, int(body.budget_usd * 500))
+            if cfg.SUPABASE_URL and cfg.SUPABASE_ANON_KEY:
+                result = await _deduct(current_user["user_id"], reserved_credits, cfg)
+                if result == "insufficient":
+                    raise HTTPException(
+                        status_code=402,
+                        detail=(
+                            f"Insufficient credits. This task needs ~{reserved_credits} credits. "
+                            f"Subscribe or upgrade your plan on the Pricing page."
+                        ),
+                    )
+                if result == "error":
+                    # Don't block on transient Supabase errors. Log and continue.
+                    logger.warning("agent_credits_deduct_error", user_id=current_user["user_id"])
+                    reserved_credits = 0
+        except HTTPException:
+            raise
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning("agent_credits_reserve_skipped", error=str(exc))
+            reserved_credits = 0
+
         task = AgentTask(
             id=task_id,
             user_id=current_user["user_id"],
@@ -213,7 +415,32 @@ def make_routes(*, get_current_user, get_db, get_redis, get_stream_user) -> APIR
             max_duration_hours=body.max_duration_hours,
             state=AgentState.PLAN,
         )
-        await _insert_agent_task(db, task)
+
+        # Refund-on-DB-failure guard: if the INSERT blows up, credits are
+        # returned immediately so a crash never silently charges a user.
+        try:
+            await _insert_agent_task(db, task)
+        except Exception as insert_exc:
+            if reserved_credits > 0:
+                try:
+                    from mariana.api import (  # noqa: PLC0415
+                        _get_config as _get_cfg2,
+                        _supabase_add_credits as _refund2,
+                    )
+                    await _refund2(current_user["user_id"], reserved_credits, _get_cfg2())
+                    logger.info(
+                        "agent_credits_refunded_on_insert_failure",
+                        user_id=current_user["user_id"],
+                        amount=reserved_credits,
+                    )
+                except Exception as refund_exc:  # pragma: no cover
+                    logger.error(
+                        "agent_credits_refund_failed",
+                        user_id=current_user["user_id"],
+                        amount=reserved_credits,
+                        error=str(refund_exc),
+                    )
+            raise insert_exc
 
         # Enqueue.  If no redis, orchestrator isn't running — still return 202
         # so frontend can display the "pending" state and retry later.
@@ -417,6 +644,27 @@ def make_routes(*, get_current_user, get_db, get_redis, get_stream_user) -> APIR
             except Exception:
                 pass
         return StopResponse(task_id=task_id, stopped=True, message="stop requested")
+
+    # -- GET /api/agent/{task_id}/artifacts --------------------------------
+    # Convenience endpoint that returns the artefact manifest for a task
+    # without having to pull the whole task JSON.  Powers the v3 Artifact
+    # Gallery on the frontend.
+    @r.get("/agent/{task_id}/artifacts")
+    async def list_task_artifacts(
+        task_id: str,
+        current_user: dict = Depends(get_current_user),
+    ) -> dict:
+        db = get_db()
+        task = await _load_agent_task(db, task_id)
+        if task is None:
+            raise HTTPException(404, f"agent task {task_id} not found")
+        if task.user_id != current_user["user_id"]:
+            raise HTTPException(403, "not your task")
+        return {
+            "task_id": task_id,
+            "count": len(task.artifacts),
+            "artifacts": [a.model_dump(mode="json") for a in task.artifacts],
+        }
 
     # -- GET /api/workspace/{user_id}  (list) ----------------------------
     @r.get("/workspace/{user_id}")

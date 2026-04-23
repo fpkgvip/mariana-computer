@@ -82,7 +82,14 @@ RUN useradd --system --create-home --home-dir /home/sandbox \
 #   /tmp/sandbox     ephemeral per-execution tempdirs (tmpfs in prod)
 #   /app             sandbox server code (read-only)
 RUN mkdir -p /workspace /tmp/sandbox /app \
-    && chown -R sandbox:users /workspace /tmp/sandbox /home/sandbox \
+    && chown -R sandbox:users /tmp/sandbox /home/sandbox \
+    && chown root:root /workspace \
+    # v3.6 security: /workspace is mode 711 root-owned so the sandbox user
+    # cannot write stray files to the workspace root (only into their own
+    # user_id subdirectory, which is created per-user at 750 sandbox:users
+    # by the FastAPI server).  Prevents absolute-path writes from escaping
+    # the user's subtree.
+    && chmod 711 /workspace \
     && chmod 1777 /tmp/sandbox
 
 COPY sandbox_server/ /app/

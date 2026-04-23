@@ -29,43 +29,43 @@ const plans: Plan[] = [
     highlighted: true,
     features: [
       "30,000 credits/month",
-      "Full access to Mariana Computer",
-      "Instant, standard, and deep investigations",
-      "All built-in research skills",
-      "PDF report downloads",
+      "Full access to Mariana's compute environment",
+      "Instant, standard, and deep tasks",
+      "All built-in skills (research, coding, analysis, docs)",
+      "Deploy apps and tools to live URLs",
       "File uploads and attachments",
       "Priority support",
     ],
   },
   {
     id: "enterprise",
-    name: "Enterprise",
+    name: "Team",
     price: 3999,
     credits: 500000,
     comingSoon: true,
     features: [
-      "500,000 credits/month",
+      "500,000 shared credits/month",
       "Everything in Individual",
-      "Custom skills and workflows",
+      "Shared workspaces and skill libraries",
+      "SSO and role-based access",
       "Dedicated account manager",
       "SLA-backed support",
-      "Custom data source integration",
-      "White-glove onboarding",
+      "Custom connector integration",
     ],
   },
   {
     id: "custom",
-    name: "Custom",
+    name: "Enterprise",
     price: 0,
     credits: 0,
     comingSoon: true,
     features: [
       "Unlimited credits",
-      "Everything in Enterprise",
-      "On-premise deployment options",
-      "Custom model fine-tuning",
+      "Everything in Team",
+      "On-premise or VPC deployment",
+      "Custom model routing and fine-tuning",
       "Dedicated infrastructure",
-      "Bespoke data pipeline integration",
+      "Bespoke data and system integration",
       "24/7 priority engineering support",
     ],
   },
@@ -74,11 +74,11 @@ const plans: Plan[] = [
 const faqs = [
   {
     q: "What are credits?",
-    a: "Credits are the unit of research capacity. Each investigation consumes credits based on complexity, data sources accessed, and compute used.",
+    a: "Credits are the unit of work. Each task consumes credits based on complexity, model usage, tools invoked, and compute time. Quick lookups cost very little; long autonomous builds cost more.",
   },
   {
     q: "How does billing work?",
-    a: "Choose a plan that fits your research volume. Credits refresh monthly. Unused credits do not roll over.",
+    a: "Choose a plan that fits your volume. Credits refresh monthly. Unused credits do not roll over. You can also buy top-up credit packs at any time.",
   },
   {
     q: "Can I upgrade or downgrade?",
@@ -86,29 +86,33 @@ const faqs = [
   },
   {
     q: "What happens if I run out of credits?",
-    a: "Your investigations will pause until your credits refresh or you upgrade your plan.",
+    a: "In-flight tasks finish. New tasks pause until credits refresh or you add a top-up.",
   },
   {
-    q: "What data sources does Mariana access?",
-    a: "SEC EDGAR, earnings transcripts, corporate registries, academic databases, and select financial data providers. Enterprise clients can connect their own proprietary data feeds and terminal credentials.",
+    q: "What can Mariana do?",
+    a: "Pretty much anything you'd hand to a smart teammate with a laptop: build web apps and tools, run research and analysis, generate documents, automate workflows, clean and model data, draft emails and proposals, and connect to your systems.",
+  },
+  {
+    q: "Can it connect to our tools?",
+    a: "Yes — Slack, Gmail, Google Drive, Notion, Linear, GitHub, Supabase, Vercel, Stripe, HubSpot, Salesforce, and more through connectors. Team plans can add custom integrations.",
   },
 ];
 
 const howItWorks = [
   {
     step: "01",
-    title: "Describe your question",
-    desc: "Type anything — from a quick factual question to a complex multi-day investigation. Mariana classifies your request automatically.",
+    title: "Describe what you want",
+    desc: "Type anything — a quick question, a report to write, a tool to build, a workflow to automate. Mariana picks the right approach automatically.",
   },
   {
     step: "02",
     title: "Review the plan",
-    desc: "For substantial research, Mariana proposes an approach: data sources, methodology, estimated duration. Approve with one click.",
+    desc: "For substantial work, Mariana proposes a plan: steps, tools, data sources, estimated duration. Approve with one click.",
   },
   {
     step: "03",
-    title: "Receive results",
-    desc: "Mariana works autonomously — reading filings, writing code, building models. You get notified when deliverables are ready.",
+    title: "Get the finished result",
+    desc: "Mariana works autonomously — writing code, running tests, building docs, deploying. You get notified when the deliverable is ready.",
   },
 ];
 
@@ -184,10 +188,10 @@ export default function Pricing() {
       <div className="mx-auto max-w-7xl px-6 pb-24 pt-32 md:pt-40">
         <ScrollReveal>
           <h1 className="font-serif text-3xl font-semibold leading-[1.08] tracking-[-0.02em] text-foreground sm:text-4xl md:text-5xl lg:text-[3.5rem]">
-            Simple, transparent pricing.
+Simple, transparent pricing.
           </h1>
           <p className="mt-6 max-w-lg text-lg leading-[1.7] text-muted-foreground">
-            Choose the plan that fits your research volume. Credits refresh monthly.
+Choose the plan that fits your team's volume. Credits refresh monthly.
           </p>
         </ScrollReveal>
 
