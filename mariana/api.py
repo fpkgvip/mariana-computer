@@ -140,13 +140,58 @@ _VERSION = "0.1.0"
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID", "")
 
 
-def _is_admin_user(user_id: str) -> bool:
-    """Return True if the given user_id matches the configured admin user.
+_ADMIN_ROLE_CACHE: dict[str, tuple[float, bool]] = {}
+_ADMIN_ROLE_CACHE_TTL = 30.0  # seconds
 
-    BUG-0006 fix: When ADMIN_USER_ID is empty (not configured), no user
-    is treated as admin, preventing accidental privilege grants.
+
+def _is_admin_user(user_id: str) -> bool:
+    """Return True if the given user_id is an admin.
+
+    Two-path check:
+    1. Fast path — matches env-configured ADMIN_USER_ID (bootstrap admin).
+    2. DB path — profiles.role = 'admin' for this user_id. Cached 30s.
+
+    BUG-0006 fix: When ADMIN_USER_ID is empty and the DB lookup fails or
+    no admin row exists, no user is treated as admin.
     """
-    return bool(ADMIN_USER_ID) and user_id == ADMIN_USER_ID
+    if not user_id:
+        return False
+    if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
+        return True
+
+    # DB-backed admin check with short TTL cache
+    import time as _time
+    now = _time.time()
+    cached = _ADMIN_ROLE_CACHE.get(user_id)
+    if cached and now - cached[0] < _ADMIN_ROLE_CACHE_TTL:
+        return cached[1]
+
+    is_admin = False
+    try:
+        cfg = _get_config()
+        if cfg.SUPABASE_URL and cfg.SUPABASE_ANON_KEY:
+            import httpx as _httpx  # noqa: PLC0415
+            # Use SECURITY DEFINER RPC is_admin(user_id uuid) which reads
+            # profiles.role='admin' irrespective of RLS.
+            url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/is_admin"
+            r = _httpx.post(
+                url,
+                headers={
+                    "apikey": cfg.SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {cfg.SUPABASE_ANON_KEY}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json={"user_id": user_id},
+                timeout=3.0,
+            )
+            if r.status_code == 200:
+                is_admin = bool(r.json())
+    except Exception:  # noqa: BLE001 — never leak exceptions from auth gate
+        is_admin = False
+
+    _ADMIN_ROLE_CACHE[user_id] = (now, is_admin)
+    return is_admin
 
 # BUG-API-024: Allow-list of valid task status values. Clients that pass
 # anything outside this set receive a 400 instead of an empty result.
@@ -5943,7 +5988,7 @@ async def admin_overview_v2(
     caller: dict[str, str] = Depends(_require_admin),
 ) -> JSONResponse:
     data = await _admin_rpc_call(
-        request, "admin_overview_stats", {"caller": caller["user_id"]}
+        request, "admin_overview_stats", {"p_caller": caller["user_id"]}
     )
     return JSONResponse(content=data or {})
 
@@ -5960,10 +6005,10 @@ async def admin_audit_log_list(
         request,
         "admin_audit_list",
         {
-            "caller": caller["user_id"],
-            "limit_n": limit,
-            "offset_n": offset,
-            "action_filter": action,
+            "p_caller": caller["user_id"],
+            "p_limit": limit,
+            "p_offset": offset,
+            "p_action_filter": action,
         },
     )
     return JSONResponse(content=data or [])
@@ -5980,9 +6025,9 @@ async def admin_user_set_role(
         request,
         "admin_set_role",
         {
-            "caller": caller["user_id"],
-            "target": user_id,
-            "new_role": body.role,
+            "p_caller": caller["user_id"],
+            "p_target": user_id,
+            "p_new_role": body.role,
         },
     )
     logger.info("admin_role_set", actor=caller["user_id"], target=user_id, role=body.role)
@@ -6000,10 +6045,10 @@ async def admin_user_suspend(
         request,
         "admin_suspend",
         {
-            "caller": caller["user_id"],
-            "target": user_id,
-            "suspend_bool": body.suspend,
-            "reason": body.reason,
+            "p_caller": caller["user_id"],
+            "p_target": user_id,
+            "p_suspend": body.suspend,
+            "p_reason": body.reason,
         },
     )
     logger.info(
@@ -6028,11 +6073,11 @@ async def admin_user_credits_v2(
         request,
         "admin_adjust_credits",
         {
-            "caller": caller["user_id"],
-            "target": user_id,
-            "mode": body.mode,
-            "amount": body.amount,
-            "reason": body.reason,
+            "p_caller": caller["user_id"],
+            "p_target": user_id,
+            "p_mode": body.mode,
+            "p_amount": body.amount,
+            "p_reason": body.reason,
         },
     )
     logger.info(
@@ -6056,10 +6101,10 @@ async def admin_system_freeze(
         request,
         "admin_system_freeze",
         {
-            "caller": caller["user_id"],
-            "frozen_bool": body.frozen,
-            "reason": body.reason,
-            "message": body.message,
+            "p_caller": caller["user_id"],
+            "p_frozen": body.frozen,
+            "p_reason": body.reason,
+            "p_message": body.message,
         },
     )
     logger.warning(
@@ -6084,11 +6129,11 @@ async def admin_list_all_tasks(
         request,
         "admin_list_tasks",
         {
-            "caller": caller["user_id"],
-            "status_filter": status,
-            "user_id_filter": user_id,
-            "limit_n": limit,
-            "offset_n": offset,
+            "p_caller": caller["user_id"],
+            "p_status": status,
+            "p_user_id": user_id,
+            "p_limit": limit,
+            "p_offset": offset,
         },
     )
     return JSONResponse(content=data or [])
@@ -6237,15 +6282,15 @@ async def admin_feature_flags_upsert(
             request,
             "admin_audit_insert",
             {
-                "actor": caller["user_id"],
-                "action": "feature_flag.upsert",
-                "target_type": "feature_flag",
-                "target_id": body.key,
-                "before": None,
-                "after": payload,
-                "meta": None,
-                "ip": request.client.host if request.client else None,
-                "ua": request.headers.get("user-agent"),
+                "p_actor_id": caller["user_id"],
+                "p_action": "feature_flag.upsert",
+                "p_target_type": "feature_flag",
+                "p_target_id": body.key,
+                "p_before": None,
+                "p_after": payload,
+                "p_metadata": None,
+                "p_ip": request.client.host if request.client else None,
+                "p_user_agent": request.headers.get("user-agent"),
             },
         )
     except HTTPException:
@@ -6273,15 +6318,15 @@ async def admin_feature_flags_delete(
             request,
             "admin_audit_insert",
             {
-                "actor": caller["user_id"],
-                "action": "feature_flag.delete",
-                "target_type": "feature_flag",
-                "target_id": key,
-                "before": None,
-                "after": None,
-                "meta": None,
-                "ip": request.client.host if request.client else None,
-                "ua": request.headers.get("user-agent"),
+                "p_actor_id": caller["user_id"],
+                "p_action": "feature_flag.delete",
+                "p_target_type": "feature_flag",
+                "p_target_id": key,
+                "p_before": None,
+                "p_after": None,
+                "p_metadata": None,
+                "p_ip": request.client.host if request.client else None,
+                "p_user_agent": request.headers.get("user-agent"),
             },
         )
     except HTTPException:
@@ -6370,17 +6415,21 @@ async def admin_health_probe(
         return f"status={r.status_code}"
 
     async def _browser_probe() -> str:
-        url = os.environ.get("BROWSER_SERVICE_URL", "").rstrip("/")
-        if not url:
-            raise RuntimeError("BROWSER_SERVICE_URL not configured")
+        url = (
+            os.environ.get("BROWSER_BASE_URL")
+            or os.environ.get("BROWSER_SERVICE_URL")
+            or "http://mariana-browser:8000"
+        ).rstrip("/")
         async with httpx.AsyncClient(timeout=3.0) as client:
             r = await client.get(f"{url}/health")
         return f"status={r.status_code}"
 
     async def _sandbox_probe() -> str:
-        url = os.environ.get("SANDBOX_URL", "").rstrip("/")
-        if not url:
-            raise RuntimeError("SANDBOX_URL not configured")
+        url = (
+            os.environ.get("SANDBOX_BASE_URL")
+            or os.environ.get("SANDBOX_URL")
+            or "http://mariana-sandbox:8000"
+        ).rstrip("/")
         async with httpx.AsyncClient(timeout=3.0) as client:
             r = await client.get(f"{url}/health")
         return f"status={r.status_code}"
@@ -6442,15 +6491,15 @@ async def admin_danger_flush_redis(
             request,
             "admin_audit_insert",
             {
-                "actor": caller["user_id"],
-                "action": "danger.flush_redis",
-                "target_type": "system",
-                "target_id": "redis",
-                "before": None,
-                "after": None,
-                "meta": None,
-                "ip": request.client.host if request.client else None,
-                "ua": request.headers.get("user-agent"),
+                "p_actor_id": caller["user_id"],
+                "p_action": "danger.flush_redis",
+                "p_target_type": "system",
+                "p_target_id": "redis",
+                "p_before": None,
+                "p_after": None,
+                "p_metadata": None,
+                "p_ip": request.client.host if request.client else None,
+                "p_user_agent": request.headers.get("user-agent"),
             },
         )
     except HTTPException:
@@ -6482,15 +6531,15 @@ async def admin_danger_halt_running(
             request,
             "admin_audit_insert",
             {
-                "actor": caller["user_id"],
-                "action": "danger.halt_running",
-                "target_type": "system",
-                "target_id": "research_tasks",
-                "before": None,
-                "after": {"halted": halted},
-                "meta": None,
-                "ip": request.client.host if request.client else None,
-                "ua": request.headers.get("user-agent"),
+                "p_actor_id": caller["user_id"],
+                "p_action": "danger.halt_running",
+                "p_target_type": "system",
+                "p_target_id": "research_tasks",
+                "p_before": None,
+                "p_after": {"halted": halted},
+                "p_metadata": None,
+                "p_ip": request.client.host if request.client else None,
+                "p_user_agent": request.headers.get("user-agent"),
             },
         )
     except HTTPException:
