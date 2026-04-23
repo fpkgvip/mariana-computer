@@ -5,11 +5,12 @@ import { TerminalOutput, type TerminalLine } from "./TerminalOutput";
 import { WorkspaceSidebar } from "./WorkspaceSidebar";
 
 interface AgentEvent {
-  id?: string;
+  event_type: string;
   task_id?: string;
-  type: string;
-  data?: Record<string, unknown>;
-  ts?: number;
+  state?: string;
+  step_id?: string;
+  payload?: Record<string, unknown>;
+  event_id?: number;
   replay?: boolean;
 }
 
@@ -53,6 +54,7 @@ export function AgentTaskView({
 
   const esRef = useRef<EventSource | null>(null);
   const lineCounter = useRef(0);
+  const stepsRef = useRef<AgentPlanStep[]>([]);
 
   const pushLine = (kind: TerminalLine["kind"], text: string) => {
     lineCounter.current += 1;
@@ -85,99 +87,132 @@ export function AgentTaskView({
     esRef.current = es;
     setStartedAt(Date.now());
 
+    const findStepIdx = (stepId: unknown): number => {
+      if (typeof stepId !== "string") return -1;
+      // Use a ref-less approach: we read steps from state via closure.
+      // React batches updates — for indexing purposes this is acceptable
+      // because the plan rarely shifts beneath active indices.
+      return stepsRef.current.findIndex((s) => s.id === stepId);
+    };
+
     const handleEvent = (evt: AgentEvent) => {
-      const t = evt.type;
-      const d = (evt.data ?? {}) as Record<string, unknown>;
+      const t = evt.event_type;
+      const d = (evt.payload ?? {}) as Record<string, unknown>;
+      const stepId = evt.step_id ?? (d.step_id as string | undefined);
       switch (t) {
-        case "task_created":
-        case "task_queued":
-          setStatus("QUEUED");
-          pushLine("info", `Task ${taskId.slice(0, 8)} queued.`);
-          break;
-        case "state_change":
-          if (typeof d.to === "string") setState(d.to.toUpperCase());
-          pushLine("info", `State → ${String(d.to ?? "?").toUpperCase()}`);
-          break;
-        case "plan_built":
-        case "plan_updated": {
-          const rawSteps = Array.isArray(d.steps) ? (d.steps as Record<string, unknown>[]) : [];
-          const mapped: AgentPlanStep[] = rawSteps.map((s, i) => ({
-            id: (s.id as string) || `step-${i}`,
-            description: (s.description as string) || (s.goal as string) || `Step ${i + 1}`,
-            tool: (s.tool as string) || undefined,
-          }));
-          setSteps(mapped);
-          if (t === "plan_updated") setReplans((r) => r + 1);
-          pushLine("info", `Plan: ${mapped.length} steps.`);
+        case "state_change": {
+          const to = typeof d.to === "string" ? d.to.toUpperCase() : "";
+          if (to) {
+            setState(to);
+            if (["DONE", "FAILED", "HALTED"].includes(to)) {
+              setStatus(to);
+              setWorkspaceRefreshTick((n) => n + 1);
+              if (onTerminal) onTerminal(to);
+            } else if (to === "EXECUTE" || to === "TEST" || to === "DELIVER") {
+              setStatus("RUNNING");
+            }
+          }
+          pushLine("info", `state: ${String(d.from ?? "?")} → ${to || "?"}`);
           break;
         }
-        case "step_start": {
-          const idx =
-            typeof d.index === "number" ? (d.index as number) : typeof d.step_index === "number" ? (d.step_index as number) : -1;
-          if (idx >= 0) setCurrentStepIndex(idx);
-          pushLine("cmd", String(d.description ?? d.tool ?? "step started"));
-          break;
-        }
-        case "step_end":
-        case "step_complete": {
-          const idx =
-            typeof d.index === "number" ? (d.index as number) : typeof d.step_index === "number" ? (d.step_index as number) : -1;
-          if (idx >= 0) setCurrentStepIndex(idx + 1);
-          break;
-        }
-        case "tool_call":
-          pushLine("cmd", `${String(d.tool ?? "tool")}(${JSON.stringify(d.args ?? {}).slice(0, 240)})`);
-          break;
-        case "tool_stdout":
-        case "stdout":
-          if (typeof d.text === "string") pushLine("stdout", d.text);
-          else if (typeof d.line === "string") pushLine("stdout", d.line);
-          break;
-        case "tool_stderr":
-        case "stderr":
-          if (typeof d.text === "string") pushLine("stderr", d.text);
-          else if (typeof d.line === "string") pushLine("stderr", d.line);
-          break;
-        case "tool_result": {
-          const preview =
-            typeof d.preview === "string"
-              ? d.preview
-              : JSON.stringify(d.result ?? d.value ?? "").slice(0, 400);
-          if (preview) pushLine("stdout", preview);
-          if (d.file_written || d.path || d.artifact) {
-            setWorkspaceRefreshTick((n) => n + 1);
+        case "plan_created": {
+          const kind = String(d.kind ?? "initial");
+          const rawSteps = Array.isArray(d.steps) ? (d.steps as Record<string, unknown>[]) : null;
+          if (rawSteps) {
+            const mapped: AgentPlanStep[] = rawSteps.map((s, i) => ({
+              id: (s.id as string) || `step-${i}`,
+              description: (s.title as string) || (s.description as string) || `Step ${i + 1}`,
+              tool: (s.tool as string) || undefined,
+            }));
+            setSteps(mapped);
+            stepsRef.current = mapped;
+            pushLine("info", `Plan (${kind}): ${mapped.length} steps.`);
+            if (kind === "replan") setReplans((r) => r + 1);
+          } else if (d.step) {
+            // Single-step fix — replace in-place by id.
+            const s = d.step as Record<string, unknown>;
+            const replaced: AgentPlanStep = {
+              id: (s.id as string) || "",
+              description: (s.title as string) || (s.description as string) || "",
+              tool: (s.tool as string) || undefined,
+            };
+            setSteps((prev) => {
+              const next = prev.map((p) => (p.id === replaced.id ? replaced : p));
+              stepsRef.current = next;
+              return next;
+            });
+            setFixAttempts((n) => n + 1);
+            pushLine("info", `Fix applied to step ${replaced.id.slice(0, 8)}…`);
           }
           break;
         }
-        case "fix_attempt":
-          setFixAttempts((n) => n + 1);
-          pushLine("info", `Fix attempt (${String(d.reason ?? "")}).`);
-          break;
-        case "task_done":
-        case "task_failed":
-        case "task_halted":
-        case "eof": {
-          const final =
-            t === "task_done"
-              ? "DONE"
-              : t === "task_failed"
-              ? "FAILED"
-              : t === "task_halted"
-              ? "HALTED"
-              : (String(d.state ?? "DONE")).toUpperCase();
-          setStatus(final);
-          setState(final);
-          pushLine("info", `Task ${final}.`);
-          setWorkspaceRefreshTick((n) => n + 1);
-          if (onTerminal) onTerminal(final);
+        case "step_started": {
+          const idx = findStepIdx(stepId);
+          if (idx >= 0) setCurrentStepIndex(idx);
+          const tool = String(d.tool ?? "");
+          const title = String(d.title ?? tool ?? "step");
+          const params = d.params ? JSON.stringify(d.params).slice(0, 240) : "";
+          pushLine("cmd", `${tool ? tool + ": " : ""}${title}${params ? " " + params : ""}`);
           break;
         }
-        case "error":
-          pushLine("error", String(d.message ?? d.error ?? "unknown error"));
+        case "step_completed": {
+          const idx = findStepIdx(stepId);
+          if (idx >= 0) setCurrentStepIndex(idx + 1);
+          const dur = typeof d.duration_ms === "number" ? ` (${Math.round((d.duration_ms as number) / 10) / 100}s)` : "";
+          pushLine("info", `✓ step done${dur}`);
+          break;
+        }
+        case "step_failed": {
+          const err = String(d.error ?? "failed");
+          pushLine("stderr", `step failed: ${err}`);
+          break;
+        }
+        case "terminal_output": {
+          const stdout = typeof d.stdout === "string" ? (d.stdout as string) : "";
+          const stderr = typeof d.stderr === "string" ? (d.stderr as string) : "";
+          const exitCode = d.exit_code;
+          if (stdout) stdout.split(/\r?\n/).forEach((ln) => { if (ln) pushLine("stdout", ln); });
+          if (stderr) stderr.split(/\r?\n/).forEach((ln) => { if (ln) pushLine("stderr", ln); });
+          if (typeof exitCode === "number" && exitCode !== 0) {
+            pushLine("stderr", `exit code: ${exitCode}`);
+          }
+          break;
+        }
+        case "artifact_created": {
+          const name = String(d.name ?? d.workspace_path ?? "artifact");
+          const size = typeof d.size === "number" ? ` (${d.size} B)` : "";
+          pushLine("info", `artifact: ${name}${size}`);
+          setWorkspaceRefreshTick((n) => n + 1);
+          break;
+        }
+        case "delivered": {
+          const ans = String(d.final_answer ?? "");
+          if (ans) {
+            ans.split(/\r?\n/).forEach((ln) => pushLine("info", ln));
+          }
+          setWorkspaceRefreshTick((n) => n + 1);
+          break;
+        }
+        case "halted": {
+          const reason = String(d.reason ?? "halted");
+          pushLine("info", `halted: ${reason}`);
+          setStatus("HALTED");
+          setState("HALTED");
+          if (onTerminal) onTerminal("HALTED");
+          break;
+        }
+        case "error": {
+          const phase = String(d.phase ?? "");
+          const err = String(d.error ?? d.message ?? "unknown error");
+          pushLine("error", `${phase ? phase + ": " : ""}${err}`);
+          break;
+        }
+        case "eof":
+          // Stream closed; no-op (handled by terminal state_change).
           break;
         default:
           if (t && !evt.replay) {
-            const payload = JSON.stringify(d).slice(0, 240);
+            const payload = JSON.stringify(d).slice(0, 200);
             if (payload.length > 2) pushLine("info", `${t}: ${payload}`);
           }
       }

@@ -126,7 +126,7 @@ class AgentTask(BaseModel):
     artifacts: list[AgentArtifact] = Field(default_factory=list)
 
     # Selected orchestrator model (Opus / Sonnet / Gemini / DeepSeek).
-    selected_model: str = "claude-opus-4-7-20260208"
+    selected_model: str = "claude-opus-4-7"
 
     # Budget.
     max_duration_hours: float = 2.0

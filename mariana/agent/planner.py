@@ -32,15 +32,22 @@ logger = structlog.get_logger(__name__)
 # User-selected agent models.  The planner always uses the strongest
 # available model.  Executor/fix steps may downgrade for cost.
 AGENT_MODEL_ALIASES: dict[str, str] = {
-    "claude-opus-4-7-20260208": "claude-opus-4-7-20260208",
-    "claude-sonnet-4-6-20260117": "claude-sonnet-4-6-20260117",
+    # Canonical IDs exposed by the LLM gateway (no date suffix required).
+    "claude-opus-4-7": "claude-opus-4-7",
+    "claude-opus-4-6": "claude-opus-4-6",
+    "claude-sonnet-4-6": "claude-sonnet-4-6",
+    "claude-sonnet-4-5": "claude-sonnet-4-5",
+    "claude-haiku-4-5": "claude-haiku-4-5",
     "gemini-3-1-pro": "gemini-3-1-pro",
     "deepseek-v3.2": "deepseek-v3.2",
+    # Legacy dated IDs from earlier drafts — map back to canonical.
+    "claude-opus-4-7-20260208": "claude-opus-4-7",
+    "claude-sonnet-4-6-20260117": "claude-sonnet-4-6",
 }
 
 
 def _normalise_model(name: str) -> str:
-    return AGENT_MODEL_ALIASES.get(name, "claude-opus-4-7-20260208")
+    return AGENT_MODEL_ALIASES.get(name, "claude-opus-4-7")
 
 
 # ---------------------------------------------------------------------------
@@ -209,20 +216,39 @@ async def _llm_json(
     key = _llm_gateway_key()
     if not base or not key:
         raise RuntimeError("LLM_GATEWAY_BASE_URL / LLM_GATEWAY_API_KEY not configured")
+    # Anthropic models via the gateway don't support the OpenAI-style
+    # ``response_format: json_object`` flag.  Add JSON coercion via prompt
+    # instead, and rely on ``_extract_json`` to strip fences / extract the
+    # outermost object.  OpenAI / Gemini / DeepSeek still benefit from the
+    # native json_object mode.
+    supports_json_mode = not (
+        "claude" in model.lower() or "anthropic" in model.lower()
+    )
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "max_tokens": max_tokens,
+    }
+    # Opus 4.7 and newer Anthropic reasoning models reject the ``temperature``
+    # parameter outright.  Only include it for models known to accept it.
+    rejects_temperature = (
+        "opus-4-7" in model.lower()
+        or "opus-4-6" in model.lower()
+        or "sonnet-4-6" in model.lower()
+        or "sonnet-4-5" in model.lower()
+    )
+    if not rejects_temperature:
+        payload["temperature"] = temperature
+    if supports_json_mode:
+        payload["response_format"] = {"type": "json_object"}
     async with httpx.AsyncClient(timeout=timeout_sec) as client:
         resp = await client.post(
             f"{base}/chat/completions",
             headers={"Authorization": f"Bearer {key}"},
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "response_format": {"type": "json_object"},
-            },
+            json=payload,
         )
     if resp.status_code >= 400:
         raise RuntimeError(f"LLM gateway error: {resp.status_code} {resp.text[:500]}")
@@ -350,7 +376,7 @@ async def fix_step(task: AgentTask, failed_step: AgentStep) -> tuple[AgentStep, 
         "CONTEXT:\n" + json.dumps(ctx, indent=2, default=str)
     )
     # Sonnet is fine for single-step fixes; cheaper and faster than Opus.
-    model = os.getenv("AGENT_FIX_MODEL") or "claude-sonnet-4-6-20260117"
+    model = os.getenv("AGENT_FIX_MODEL") or "claude-sonnet-4-6"
     parsed, cost = await _llm_json(
         model=model,
         system=_FIX_SYSTEM_PROMPT,

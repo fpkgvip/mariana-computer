@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 
+interface WorkspaceEntry {
+  path: string;
+  type: string;
+  size: number;
+  mtime?: number;
+}
+
 interface WorkspaceFile {
   path: string;
   name: string;
@@ -9,7 +16,9 @@ interface WorkspaceFile {
 }
 
 interface WorkspaceResponse {
-  files: WorkspaceFile[];
+  root: string;
+  entries: WorkspaceEntry[];
+  truncated?: boolean;
 }
 
 export interface WorkspaceSidebarProps {
@@ -46,7 +55,16 @@ export function WorkspaceSidebar({ apiUrl, getToken, userId, refreshTick = 0 }: 
         throw new Error(`${res.status} ${res.statusText}`);
       }
       const data: WorkspaceResponse = await res.json();
-      const list = Array.isArray(data.files) ? data.files : [];
+      const rawEntries = Array.isArray(data.entries) ? data.entries : [];
+      const list: WorkspaceFile[] = rawEntries
+        .filter((e) => e.type === "file")
+        .map((e) => ({
+          path: e.path,
+          name: e.path.split("/").pop() || e.path,
+          size: e.size,
+          modified: e.mtime,
+          type: e.type,
+        }));
       list.sort((a, b) => (b.modified ?? 0) - (a.modified ?? 0));
       setFiles(list);
     } catch (e) {

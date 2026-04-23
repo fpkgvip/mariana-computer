@@ -48,7 +48,7 @@ class AgentStartRequest(BaseModel):
     goal: str = Field(..., min_length=1, max_length=16_000)
     user_instructions: str | None = Field(default=None, max_length=8_000)
     conversation_id: str | None = None
-    selected_model: str = "claude-opus-4-7-20260208"
+    selected_model: str = "claude-opus-4-7"
     budget_usd: float = Field(default=5.0, ge=0.1, le=100.0)
     max_duration_hours: float = Field(default=2.0, ge=0.1, le=24.0)
 
@@ -440,7 +440,7 @@ def make_routes(*, get_current_user, get_db, get_redis, get_stream_user) -> APIR
             raise HTTPException(403, "cannot read another user's workspace")
         try:
             result = await sandbox_tools.fs_read(
-                user_id=user_id, path=path, binary=binary, max_bytes=16 * 1024 * 1024,
+                user_id=user_id, path=path, binary=binary, max_bytes=10 * 1024 * 1024,
             )
         except sandbox_tools.SandboxError as exc:
             raise HTTPException(404, f"file error: {exc}") from exc
@@ -464,6 +464,16 @@ def make_routes(*, get_current_user, get_db, get_redis, get_stream_user) -> APIR
 
 
 def _sse_msg(event: str, data: dict) -> bytes:
-    """Format an SSE frame.  Stable encoding, ASCII-safe."""
-    body = json.dumps(data, ensure_ascii=True, default=str)
-    return f"event: {event}\ndata: {body}\n\n".encode("utf-8")
+    """Format an SSE frame.  Stable encoding, ASCII-safe.
+
+    We emit every frame under the default ``message`` event so the browser's
+    ``EventSource.onmessage`` handler fires for all of them.  The event kind
+    is embedded in ``data.event_type`` for dispatch on the client.  Without
+    this, a frame like ``event: step_started`` would only fire listeners
+    registered via ``addEventListener('step_started', …)`` — never
+    ``onmessage`` — which makes the SSE API fragile.
+    """
+    enriched = dict(data)
+    enriched.setdefault("event_type", event)
+    body = json.dumps(enriched, ensure_ascii=True, default=str)
+    return f"data: {body}\n\n".encode("utf-8")
