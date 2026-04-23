@@ -778,8 +778,15 @@ async def _run_agent_queue_daemon(db: Any, redis_client: Any) -> None:
         try:
             # BLPOP blocks for up to 5s; shutdown flag is checked between pops.
             popped = await redis_client.blpop("agent:queue", timeout=5)
+        except asyncio.TimeoutError:
+            # Socket-level timeout when queue is idle — expected, just retry.
+            continue
         except Exception as exc:  # noqa: BLE001
-            logger.warning("agent_queue_blpop_error", error=str(exc))
+            msg = str(exc)
+            if "Timeout" in msg or "timeout" in msg:
+                # Redis client raises TimeoutError on idle BLPOP — silent retry.
+                continue
+            logger.warning("agent_queue_blpop_error", error=msg)
             await asyncio.sleep(2)
             continue
         if popped is None:

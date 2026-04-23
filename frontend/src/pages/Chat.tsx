@@ -34,6 +34,7 @@ import ProgressTimeline, {
 import FileViewer, { FileCard, type FileAttachment } from "@/components/FileViewer";
 import FileUpload, { type UploadedFile } from "@/components/FileUpload";
 import ResearchFlowchart from "@/components/ResearchFlowchart";
+import { AgentTaskView } from "@/components/agent/AgentTaskView";
 // BUG-FE-137 fix: Use a styled AlertDialog instead of native window.confirm()
 // for delete confirmations. Native confirm() blocks the JS main thread, cannot
 // be styled, and is inconsistent across browsers.
@@ -55,9 +56,12 @@ import {
 interface Message {
   role: "user" | "assistant" | "system";
   content: string;
-  type?: "text" | "code" | "status" | "error" | "plan";
+  type?: "text" | "code" | "status" | "error" | "plan" | "agent";
   id?: string; // dedup key for status messages
   _id: string; // stable React key, always set
+  // For type === "agent": track a running agent task so we can mount AgentTaskView.
+  agentTaskId?: string;
+  agentGoal?: string;
 }
 
 type InvestigationStatus = "PENDING" | "RUNNING" | "COMPLETED" | "FAILED" | "HALTED";
@@ -135,10 +139,12 @@ interface ClassifyResponse {
 /** POST /api/chat/respond response */
 interface ChatRespondResponse {
   reply: string;
-  action: "chat" | "research";
+  action: "chat" | "research" | "computer";
+  mode?: string;
   research_topic?: string;
   tier?: string;
   user_instructions?: string | null;
+  agent_goal?: string | null;
 }
 
 /** Conversation from the backend */
@@ -2269,6 +2275,66 @@ export default function Chat() {
         return;
       }
 
+      // action === "computer" — AI wants to launch an autonomous agent task
+      if (chatData.action === "computer") {
+        const agentGoal = chatData.agent_goal || topic;
+
+        if (chatData.reply) {
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: chatData.reply, type: "text", _id: makeMessageId() },
+          ]);
+          if (convId) {
+            persistMessage(convId, "assistant", chatData.reply, "text").catch((e) =>
+              console.warn("[Chat] persistMessage failed:", e),
+            );
+          }
+        }
+
+        try {
+          const createRes = await fetch(`${API_URL}/api/agent`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              goal: agentGoal,
+              conversation_id: convId || undefined,
+            }),
+          });
+          if (!createRes.ok) {
+            const errTxt = await createRes.text().catch(() => "");
+            throw new Error(`${createRes.status}: ${errTxt.slice(0, 200)}`);
+          }
+          const createData: { task_id: string } = await createRes.json();
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: "",
+              type: "agent",
+              _id: makeMessageId(),
+              agentTaskId: createData.task_id,
+              agentGoal,
+            },
+          ]);
+        } catch (e) {
+          console.error("[Chat] agent launch failed:", e);
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: `Failed to launch agent task: ${String(e)}`,
+              type: "error",
+              _id: makeMessageId(),
+            },
+          ]);
+          toast.error("Agent launch failed", { description: String(e) });
+        }
+        return;
+      }
+
       // action === "research" — AI wants to launch an investigation
       const researchTopic = chatData.research_topic || topic;
       const tier = chatData.tier || "standard";
@@ -3283,6 +3349,18 @@ export default function Chat() {
                       </button>
                     )}
                   </div>
+                ) : msg.type === "agent" ? (
+                  msg.agentTaskId && userId ? (
+                    <AgentTaskView
+                      taskId={msg.agentTaskId}
+                      userId={userId}
+                      apiUrl={API_URL}
+                      getToken={getAccessToken}
+                      goal={msg.agentGoal || "Agent task"}
+                    />
+                  ) : (
+                    <div className="text-xs text-muted-foreground">Initialising agent task…</div>
+                  )
                 ) : msg.type === "code" ? (
                   <div className="max-w-[90%] sm:max-w-lg">
                     <pre className="my-1 rounded-md bg-zinc-900 px-4 py-3 text-xs leading-relaxed overflow-x-auto">
