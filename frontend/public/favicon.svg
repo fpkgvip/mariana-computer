@@ -1,4 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <rect width="32" height="32" rx="5" fill="#0F1A2E"/>
-  <text x="16" y="24.5" text-anchor="middle" font-family="'Playfair Display',Georgia,'Times New Roman',serif" font-weight="600" font-size="24" fill="#F5F0EB">M</text>
+  <rect width="32" height="32" rx="7" fill="#0A0A0F"/>
+  <path d="M9 9h7.5c4.142 0 7.5 3.134 7.5 7s-3.358 7-7.5 7H9V9zm3.4 3.1v7.8h4.1c2.402 0 4.35-1.746 4.35-3.9s-1.948-3.9-4.35-3.9H12.4z" fill="#6E56CF"/>
+  <circle cx="22.5" cy="9.5" r="2" fill="#00D68F"/>
 </svg>

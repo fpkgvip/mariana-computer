@@ -224,9 +224,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // FE-HIGH-02 fix: Dispatch a custom event so module-scoped caches (outside
     // React) can clear themselves when the user logs out. This prevents the next
     // user on the same tab from seeing cached data from the previous session.
-    // Note: legacy event name retained for one release as 'deft:logout' alias.
     window.dispatchEvent(new Event("deft:logout"));
-    window.dispatchEvent(new Event("mariana:logout"));
   };
 
   /**

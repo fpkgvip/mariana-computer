@@ -7,7 +7,6 @@ import { AuthProvider } from "@/contexts/AuthContext";
 import AppErrorBoundary from "@/components/AppErrorBoundary";
 import RouteErrorBoundary from "@/components/RouteErrorBoundary";
 import ProtectedRoute from "@/components/ProtectedRoute";
-import OnboardingWizard from "@/components/OnboardingWizard";
 import { initAnalytics } from "@/lib/analytics";
 import { useEffect } from "react";
 import { supabaseConfigError } from "@/lib/supabase";
@@ -97,11 +96,8 @@ const App = () => {
         <Sonner />
         <BrowserRouter>
           <AuthProvider>
-            <OnboardingWizard />
-            {/* FE-CRIT-01 fix: Protected routes wrapped with ProtectedRoute
-                to prevent rendering before auth is resolved. Public routes
-                (/, /research, /product, /pricing, /contact, /login, /signup,
-                /reset-password) remain unwrapped. */}
+            {/* No onboarding modal — Deft teaches by doing. The first prompt
+               IS the onboarding (see Index hero + Build empty state). */}
             <Routes>
               <Route path="/" element={<RouteErrorBoundary routeName="home"><Index /></RouteErrorBoundary>} />
               <Route path="/research" element={<RouteErrorBoundary routeName="research"><Research /></RouteErrorBoundary>} />

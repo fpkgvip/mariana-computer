@@ -208,6 +208,19 @@ async def fs_delete(*, user_id: str, path: str) -> dict[str, Any]:
     return await _sandbox_post("/fs/delete", {"user_id": user_id, "path": path})
 
 
+# ---------------------------------------------------------------------------
+# Deft v2 — deploy_preview helper.  Pulls every file under a directory in the
+# sandbox workspace down to the orchestrator and snapshots it into the local
+# preview cache, served by api.py at /preview/{task_id}/...
+# ---------------------------------------------------------------------------
+
+
+async def fs_walk(*, user_id: str, path: str = "", max_entries: int = 5000) -> list[dict[str, Any]]:
+    """Recursive listing of a workspace directory, files only."""
+    res = await fs_list(user_id=user_id, path=path, recursive=True, max_entries=max_entries)
+    return [e for e in res.get("entries", []) if e.get("type") == "file"]
+
+
 async def _sandbox_post(path: str, payload: dict, *, read_timeout: float | None = None) -> dict[str, Any]:
     url = f"{_sandbox_base()}{path}"
     client = _get_client()

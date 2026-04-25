@@ -62,6 +62,8 @@ TOOL_NAMES = Literal[
     "generate_image",
     "generate_video",
     "describe_self",
+    # Deft v2: ship a static preview of the workspace.
+    "deploy_preview",
 ]
 
 

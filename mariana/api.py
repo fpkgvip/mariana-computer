@@ -1478,6 +1478,102 @@ except Exception as _vault_exc:  # pragma: no cover — best effort
 
 
 # ---------------------------------------------------------------------------
+# Deft preview hosting — the deploy_preview tool snapshots a built static
+# site to ${DEFT_PREVIEW_ROOT}/<task_id>/ and we serve it from /preview/
+# directly via FastAPI (no nginx layer).  This is the magic moment:
+# the right-side iframe in /build points here.
+# ---------------------------------------------------------------------------
+try:
+    import mimetypes as _mt
+    import re as _re_preview
+    from pathlib import Path as _PathPv
+    from fastapi import Path as _FPath  # noqa: PLC0415
+    from fastapi.responses import FileResponse as _FileResponse  # noqa: PLC0415
+
+    _PREVIEW_ROOT_PATH = _PathPv(os.environ.get("DEFT_PREVIEW_ROOT", "/var/lib/deft/preview"))
+    _PREVIEW_ROOT_PATH.mkdir(parents=True, exist_ok=True)
+    _SAFE_PREVIEW_TASK = _re_preview.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+
+    @app.get("/preview/{task_id}", include_in_schema=False)
+    async def preview_root_redirect(task_id: str):  # noqa: ANN201
+        # Redirect /preview/<id> -> /preview/<id>/index.html so iframe paths
+        # resolve correctly relative to the entry document.
+        from fastapi.responses import RedirectResponse  # noqa: PLC0415
+        if not _SAFE_PREVIEW_TASK.match(task_id):
+            raise HTTPException(404, "preview not found")
+        return RedirectResponse(url=f"/preview/{task_id}/index.html", status_code=302)
+
+    @app.get("/preview/{task_id}/{file_path:path}", include_in_schema=False)
+    async def preview_static(task_id: str, file_path: str):  # noqa: ANN201
+        """Serve files from the per-task preview snapshot.
+
+        Security: task_id whitelist; resolved path must stay inside the
+        task root.  Cache-Control: no-cache to keep the iframe live during
+        rapid redeploys.  CORS: open (the frontend iframe lives on a
+        different origin than the backend).
+        """
+        if not _SAFE_PREVIEW_TASK.match(task_id):
+            raise HTTPException(404, "preview not found")
+        if "\x00" in file_path or ".." in file_path.split("/"):
+            raise HTTPException(400, "invalid path")
+        root = (_PREVIEW_ROOT_PATH / task_id).resolve()
+        if not root.is_dir():
+            raise HTTPException(404, "preview not found")
+        target = (root / file_path).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            raise HTTPException(400, "path escapes preview root") from None
+        if target.is_dir():
+            target = target / "index.html"
+        if not target.is_file():
+            raise HTTPException(404, f"not found: {file_path}")
+        ctype, _ = _mt.guess_type(str(target))
+        ctype = ctype or "application/octet-stream"
+        headers = {
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Access-Control-Allow-Origin": "*",
+            "X-Deft-Preview-Task": task_id,
+        }
+        return _FileResponse(str(target), media_type=ctype, headers=headers)
+
+    @app.get("/api/preview/{task_id}", tags=["Status"])
+    async def preview_manifest(
+        task_id: str,
+        current_user: dict = Depends(_get_current_user),  # noqa: B008
+    ) -> dict[str, Any]:
+        """Return the manifest for a task's deployed preview, if any."""
+        if not _SAFE_PREVIEW_TASK.match(task_id):
+            raise HTTPException(404, "preview not found")
+        manifest_file = _PREVIEW_ROOT_PATH / task_id / "_deft_manifest.json"
+        if not manifest_file.is_file():
+            return {"task_id": task_id, "deployed": False}
+        try:
+            data = json.loads(manifest_file.read_text("utf-8"))
+        except Exception:
+            return {"task_id": task_id, "deployed": False}
+        # Owners only — sanity check user_id; admins always allowed.
+        owner = data.get("user_id")
+        if owner and owner != current_user.get("user_id") and not _is_admin_user(current_user.get("user_id", "")):
+            raise HTTPException(403, "not your preview")
+        rel_url = f"/preview/{task_id}/{data.get('entry') or 'index.html'}"
+        return {
+            "task_id": task_id,
+            "deployed": True,
+            "url": rel_url,
+            "entry": data.get("entry"),
+            "label": data.get("label"),
+            "files": int(data.get("files") or 0),
+            "total_bytes": int(data.get("total_bytes") or 0),
+            "created_at": data.get("created_at"),
+        }
+
+    logger.info("preview_routes_registered", root=str(_PREVIEW_ROOT_PATH))
+except Exception as _preview_exc:  # pragma: no cover
+    logger.warning("preview_routes_registration_failed", error=str(_preview_exc))
+
+
+# ---------------------------------------------------------------------------
 # Billing — hardcoded plan catalogue (matches Supabase plans table)
 # ---------------------------------------------------------------------------
 

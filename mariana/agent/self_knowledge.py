@@ -19,29 +19,28 @@ from mariana.agent.skills import ALL_SKILLS
 
 # Version bumped whenever the capability surface changes.  Used by the
 # frontend to invalidate any cached About copy.
-VERSION = "3.0.0"
+VERSION = "4.0.0"
 
-PRODUCT_NAME = "Mariana Computer"
+PRODUCT_NAME = "Deft"
 TAGLINE = (
-    "Autonomous agent for financial firms, social media agencies, and power "
-    "users.  Plans, executes, self-corrects, and delivers."
+    "One prompt to a deployed app. Deft plans, writes, builds, verifies, "
+    "and ships your code to a live preview \u2014 no debug hell."
 )
 
 # Short capability bullets.  Keep punchy \u2014 these show up in About panels and
 # bot replies when a user asks 'what can you do?'.
 CAPABILITIES = [
-    "Run multi-step plans that include code (Python, Rust, Bash, TypeScript), "
-    "browsing the web, reading files, and generating deliverables.",
-    "Self-correct: if a step fails, the agent inspects the error, fixes the "
-    "code, and retries (up to 5 attempts per step, 3 replans per task).",
-    "Deliver files to your workspace: Markdown reports, PDFs, PowerPoint, "
-    "Excel with live formulas, generated images, generated videos.",
-    "Operate in a hardened sandbox: every code step runs in a containerised "
-    "environment with no internet and strict memory/CPU caps.",
-    "Stream live: every plan, step, and terminal output is pushed to the UI "
-    "over SSE as it happens \u2014 no polling, no blank spinners.",
-    "Respect budgets: the task halts automatically when the wall-clock or "
-    "dollar budget is reached.",
+    "Generate full web apps from a single prompt: React + Vite + Tailwind, "
+    "production-grade scaffolding, accessible UI by default.",
+    "Plan \u2192 Write \u2192 Build \u2192 Verify \u2192 Ship: every run ends in a deployed "
+    "preview URL the right pane opens automatically.",
+    "Self-correct: if a step fails, Deft inspects the stderr, patches the "
+    "offending file, and re-runs the build \u2014 up to 5 fixes per step, then escalates.",
+    "Hardened sandbox: code runs in a containerised environment with strict "
+    "memory and CPU caps; no client-side secrets ever leak.",
+    "Live reasoning stream: every plan, file write, build line, and screenshot "
+    "streams to the UI over SSE.",
+    "Generation is free; pay only when you deploy. Vault for env secrets.",
 ]
 
 # Tool categories mapped to the tool names that back them.  Used both to
@@ -57,6 +56,7 @@ TOOL_CATEGORIES: dict[str, list[str]] = {
         "browser_click_fetch", "web_search",
     ],
     "Media generation": ["generate_image", "generate_video"],
+    "Deployment": ["deploy_preview"],
     "Planning & delivery": ["think", "deliver", "describe_self"],
 }
 

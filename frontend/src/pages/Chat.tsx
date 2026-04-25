@@ -386,7 +386,6 @@ if (typeof window !== "undefined") {
     for (const cb of _logoutCallbacks) cb();
   };
   window.addEventListener("deft:logout", clearOnLogout);
-  window.addEventListener("mariana:logout", clearOnLogout);
 }
 
 function extractCitations(text: string): Array<{ text: string; url: string }> {

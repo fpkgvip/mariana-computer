@@ -494,6 +494,128 @@ async def _h_describe_self(p: dict[str, Any], *, user_id: str, task_id: str) -> 
 
 
 # ---------------------------------------------------------------------------
+# Deft v2 — deploy_preview
+# ---------------------------------------------------------------------------
+
+_PREVIEW_ROOT = os.environ.get("DEFT_PREVIEW_ROOT", "/var/lib/deft/preview")
+_PREVIEW_PUBLIC_BASE = os.environ.get("DEFT_PREVIEW_PUBLIC_BASE", "")  # e.g. https://api.deft.ai
+_PREVIEW_MAX_FILES = 2000
+_PREVIEW_MAX_TOTAL = 100 * 1024 * 1024  # 100 MB / preview
+
+
+def _preview_dir(task_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_\-]", "", task_id)[:64] or "task"
+    return os.path.join(_PREVIEW_ROOT, safe)
+
+
+async def _h_deploy_preview(p: dict[str, Any], *, user_id: str, task_id: str) -> dict[str, Any]:
+    """Snapshot a built directory in the sandbox workspace to a local public dir.
+
+    Files are read via the sandbox `/fs/read` endpoint (binary mode), then
+    written to ``$DEFT_PREVIEW_ROOT/<task_id>/`` which the FastAPI app mounts
+    at ``/preview/<task_id>/`` for the frontend iframe.  Returns the public
+    URL pointing at the entry file (default ``index.html``).
+    """
+    src_dir = _require(p, "source_dir", str).strip().lstrip("/")
+    if not src_dir or src_dir in (".", "./"):
+        raise ToolError("", "source_dir must be a non-empty workspace path")
+    entry = _opt(p, "entry", "index.html", str) or "index.html"
+    label = _opt(p, "label", "", str) or ""
+
+    # 1) walk the directory in the sandbox
+    walk = await tools.fs_walk(user_id=user_id, path=src_dir, max_entries=_PREVIEW_MAX_FILES + 1)
+    if not walk:
+        raise ToolError("", f"source_dir {src_dir!r} is empty or missing")
+    if len(walk) > _PREVIEW_MAX_FILES:
+        raise ToolError("", f"too many files ({len(walk)}); cap is {_PREVIEW_MAX_FILES}")
+
+    # 2) prepare the local public dir; nuke any prior preview for this task.
+    target_root = _preview_dir(task_id)
+    try:
+        if os.path.isdir(target_root):
+            import shutil
+            shutil.rmtree(target_root, ignore_errors=True)
+        os.makedirs(target_root, exist_ok=True)
+    except OSError as exc:
+        raise ToolError("", f"could not initialise preview dir: {exc}") from exc
+
+    # 3) verify the entry file exists in the walk.
+    rel_paths = [e["path"] for e in walk]
+    src_prefix = src_dir.rstrip("/") + "/"
+    src_relative = [p[len(src_prefix):] if p.startswith(src_prefix) else p for p in rel_paths]
+    if entry not in src_relative:
+        raise ToolError(
+            "",
+            f"entry {entry!r} not found in {src_dir!r}. Available: {src_relative[:10]}{'...' if len(src_relative) > 10 else ''}",
+        )
+
+    # 4) copy each file via fs_read in binary mode.  Cap total bytes.
+    total_bytes = 0
+    files_written = 0
+    for entry_meta in walk:
+        sb_path = entry_meta["path"]
+        rel = sb_path[len(src_prefix):] if sb_path.startswith(src_prefix) else sb_path
+        if rel.startswith(".."):
+            continue  # paranoia
+        local_path = os.path.join(target_root, rel)
+        os.makedirs(os.path.dirname(local_path) or target_root, exist_ok=True)
+        sz = int(entry_meta.get("size", 0))
+        if total_bytes + sz > _PREVIEW_MAX_TOTAL:
+            raise ToolError("", f"preview exceeds {_PREVIEW_MAX_TOTAL // (1024*1024)} MB cap")
+        try:
+            file_blob = await tools.fs_read(
+                user_id=user_id, path=sb_path, binary=True, max_bytes=max(sz + 16, 65536)
+            )
+        except tools.SandboxError as exc:
+            raise ToolError("", f"failed to read {sb_path}: {exc}") from exc
+        b64 = file_blob.get("content_b64")
+        if b64 is None:
+            txt = file_blob.get("content", "")
+            data = txt.encode("utf-8")
+        else:
+            data = base64.b64decode(b64)
+        with open(local_path, "wb") as fh:
+            fh.write(data)
+        total_bytes += len(data)
+        files_written += 1
+
+    # 5) write a tiny manifest for the API.
+    manifest = {
+        "task_id": task_id,
+        "user_id": user_id,
+        "entry": entry,
+        "label": label[:120],
+        "source_dir": src_dir,
+        "files": files_written,
+        "total_bytes": total_bytes,
+        "created_at": __import__("time").time(),
+    }
+    with open(os.path.join(target_root, "_deft_manifest.json"), "w", encoding="utf-8") as fh:
+        import json as _json
+        _json.dump(manifest, fh)
+
+    # 6) build the public URL.  If a base URL is configured, return absolute;
+    # otherwise return a path the frontend will resolve against the api host.
+    base = _PREVIEW_PUBLIC_BASE.rstrip("/")
+    rel_url = f"/preview/{os.path.basename(target_root)}/{entry}"
+    public_url = f"{base}{rel_url}" if base else rel_url
+    logger.info(
+        "deploy_preview",
+        task_id=task_id,
+        files=files_written,
+        total_bytes=total_bytes,
+        url=public_url,
+    )
+    return {
+        "url": public_url,
+        "entry": entry,
+        "files": files_written,
+        "total_bytes": total_bytes,
+        "label": manifest["label"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
 
@@ -517,6 +639,8 @@ _DISPATCH_TABLE: dict[str, Any] = {
     "generate_image": _h_generate_image,
     "generate_video": _h_generate_video,
     "describe_self": _h_describe_self,
+    # Deft v2.
+    "deploy_preview": _h_deploy_preview,
 }
 
 VALID_TOOLS: frozenset[str] = frozenset(_DISPATCH_TABLE.keys())
