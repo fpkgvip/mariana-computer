@@ -1,12 +1,11 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useState, useEffect, useRef } from "react";
-import { Menu, X, User, LogOut, CreditCard, Settings, ShieldCheck, Inbox, KeyRound } from "lucide-react";
+import { Menu, X, User, LogOut, CreditCard, Settings, ShieldCheck, Inbox, KeyRound, LayoutDashboard } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import { BRAND } from "@/lib/brand";
 
 const navLinks = [
   { label: "Product", href: "/product" },
-  { label: "Examples", href: "/research" },
   { label: "Pricing", href: "/pricing" },
   { label: "Contact", href: "/contact" },
 ];
@@ -58,8 +57,15 @@ export function Navbar() {
       }`}
     >
       <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-6">
-        <Link to="/" className="flex items-center gap-2">
-          <span className="text-lg font-semibold tracking-tight text-foreground">
+        <Link to="/" className="group flex items-center gap-2" aria-label={`${BRAND.name} home`}>
+          <span
+            aria-hidden
+            className="relative inline-flex h-7 w-7 items-center justify-center rounded-md border border-border/70 bg-surface-1 font-mono text-[14px] font-semibold text-foreground transition-all group-hover:border-accent/60"
+          >
+            D
+            <span className="absolute -right-0.5 -top-0.5 size-1.5 rounded-full bg-deploy shadow-[0_0_6px_hsl(var(--deploy)/0.7)]" />
+          </span>
+          <span className="text-[15px] font-semibold tracking-tight text-foreground">
             {BRAND.name}
           </span>
         </Link>
@@ -95,10 +101,7 @@ export function Navbar() {
               {userMenuOpen && (
                 <div role="menu" className="absolute right-0 top-full mt-2 w-56 rounded-lg border border-border bg-card py-1 shadow-lg">
                   <Link role="menuitem" to="/build" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
-                    Studio
-                  </Link>
-                  <Link role="menuitem" to="/chat" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
-                    Workspace
+                    <LayoutDashboard size={13} /> Studio
                   </Link>
                   <Link role="menuitem" to="/tasks" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
                     <Inbox size={13} /> Tasks
@@ -190,7 +193,6 @@ export function Navbar() {
                 <Link to="/account" className="py-1 text-sm text-muted-foreground">Account</Link>
                 <Link to="/checkout" className="py-1 text-sm text-muted-foreground">Upgrade plan</Link>
                 <Link to="/build" className="py-1 text-sm text-muted-foreground">Studio</Link>
-                <Link to="/chat" className="py-1 text-sm text-muted-foreground">Workspace</Link>
                 <Link to="/tasks" className="py-1 text-sm text-muted-foreground">Tasks</Link>
                 <Link to="/vault" className="py-1 text-sm text-muted-foreground">Vault</Link>
                 {user.role === "admin" && (

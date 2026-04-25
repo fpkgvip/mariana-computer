@@ -5,6 +5,9 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { track } from "@/lib/analytics";
+import { BrandMark } from "@/components/BrandMark";
+import { BRAND } from "@/lib/brand";
+import { ArrowRight, CheckCircle2, Sparkles } from "lucide-react";
 
 export default function Signup() {
   const [name, setName] = useState("");
@@ -15,118 +18,195 @@ export default function Signup() {
   const { signup, user } = useAuth();
   const navigate = useNavigate();
 
-  // BUG-R2C-12 fix: same race as Login — wait for the AuthContext user before
-  // navigating, otherwise ProtectedRoute on /chat will bounce us back.
+  // BUG-R2C-12: wait for AuthContext.user.  Land new users in /build, not /chat.
   useEffect(() => {
-    if (pendingNav && user) {
-      navigate("/chat");
-    }
+    if (pendingNav && user) navigate("/build");
   }, [pendingNav, user, navigate]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-
-    // BUG-FE-136: Validate email format client-side before round trip
     const trimmedEmail = email.trim();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
       toast.error("Invalid email", { description: "Please enter a valid email address." });
       return;
     }
-
-    // BUG-022: Client-side password length validation
     if (password.length < 8) {
-      toast.error("Password too short", {
-        description: "Password must be at least 8 characters.",
-      });
+      toast.error("Password too short", { description: "Password must be at least 8 characters." });
       return;
     }
 
     setIsLoading(true);
     try {
-      // BUG-FE-140: Use trimmed email
       const confirmed = await signup(trimmedEmail, name, password);
-      // BUG-R2C-03: Only navigate to /chat when signup returned a live session
-      // (email confirmation disabled). When email confirmation is required,
-      // signup() returns false and the toast is already shown by AuthContext.
       if (confirmed) {
         try {
           track("signup_completed", { method: "password" });
         } catch {
-          // ignore
+          /* ignore */
         }
         setPendingNav(true);
-        // Navigation runs from useEffect once AuthContext.user is populated.
       }
-      // else: stay on page — user must confirm email first
     } catch {
-      // Error toast already shown by AuthContext.signup()
+      /* error already toasted */
     } finally {
       setIsLoading(false);
     }
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background px-6">
-      <div className="w-full max-w-sm">
-        <Link to="/" className="mb-10 block text-lg font-semibold tracking-tight text-foreground">
-          Deft
-        </Link>
+    <div className="relative grid min-h-screen grid-cols-1 overflow-hidden bg-background text-foreground lg:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)]">
+      <div className="relative z-10 flex flex-col px-6 py-10 sm:px-10 lg:px-16">
+        <div className="mb-12">
+          <BrandMark />
+        </div>
 
-        <h1 className="text-2xl font-semibold tracking-tight text-foreground">Create an account</h1>
-        <p className="mt-2 text-sm text-muted-foreground">
-          Set a goal. Set a ceiling. Let Deft ship the work.
+        <div className="flex flex-1 items-center">
+          <div className="w-full max-w-sm">
+            <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-border/70 bg-surface-1/70 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">
+              <Sparkles size={11} className="text-deploy" />
+              Free credits to start
+            </div>
+            <h1 className="text-[32px] font-semibold leading-[1.1] tracking-[-0.02em] text-foreground">
+              From a prompt
+              <br />
+              to a deployed app.
+            </h1>
+            <p className="mt-2.5 text-[14.5px] leading-[1.55] text-muted-foreground">
+              Create your account. Your first project ships today.
+            </p>
+
+            <form onSubmit={handleSubmit} className="mt-9 space-y-4">
+              <div>
+                <label htmlFor="name" className="mb-1.5 block text-[11px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
+                  Name
+                </label>
+                <Input
+                  id="name"
+                  type="text"
+                  autoComplete="name"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  required
+                  placeholder="Your name"
+                  disabled={isLoading}
+                  className="h-11"
+                />
+              </div>
+              <div>
+                <label htmlFor="email" className="mb-1.5 block text-[11px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
+                  Email
+                </label>
+                <Input
+                  id="email"
+                  type="email"
+                  autoComplete="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  required
+                  placeholder="you@example.com"
+                  disabled={isLoading}
+                  className="h-11"
+                />
+              </div>
+              <div>
+                <label htmlFor="password" className="mb-1.5 block text-[11px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
+                  Password
+                </label>
+                <Input
+                  id="password"
+                  type="password"
+                  autoComplete="new-password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  required
+                  minLength={8}
+                  placeholder="At least 8 characters"
+                  disabled={isLoading}
+                  className="h-11"
+                />
+              </div>
+
+              <Button
+                type="submit"
+                className="group h-11 w-full gap-2 text-[14px] font-medium"
+                disabled={isLoading}
+              >
+                {isLoading ? "Creating account…" : (
+                  <>
+                    Create account <ArrowRight size={14} className="transition-transform group-hover:translate-x-0.5" />
+                  </>
+                )}
+              </Button>
+            </form>
+
+            <p className="mt-8 text-center text-[12.5px] text-muted-foreground">
+              Already on {BRAND.name}?{" "}
+              <Link to="/login" className="font-medium text-foreground underline-offset-4 hover:underline">
+                Sign in
+              </Link>
+            </p>
+          </div>
+        </div>
+
+        <p className="mt-12 text-[11px] text-muted-foreground/70">
+          By creating an account you agree to our{" "}
+          <Link to="/legal/terms" className="hover:text-foreground">Terms</Link> and{" "}
+          <Link to="/legal/privacy" className="hover:text-foreground">Privacy</Link>.
         </p>
+      </div>
 
-        <form onSubmit={handleSubmit} className="mt-8 space-y-4">
-          <div>
-            <label htmlFor="name" className="mb-1.5 block text-xs font-medium text-muted-foreground">Name</label>
-            <Input
-              id="name"
-              type="text"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              required
-              placeholder="Your name"
-              disabled={isLoading}
-            />
-          </div>
-          <div>
-            <label htmlFor="email" className="mb-1.5 block text-xs font-medium text-muted-foreground">Email</label>
-            <Input
-              id="email"
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              required
-              placeholder="you@firm.com"
-              disabled={isLoading}
-            />
-          </div>
-          <div>
-            <label htmlFor="password" className="mb-1.5 block text-xs font-medium text-muted-foreground">Password</label>
-            <Input
-              id="password"
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-              minLength={8}
-              placeholder="••••••••"
-              disabled={isLoading}
-            />
-            {/* BUG-R1-15: Show minimum length hint before submission */}
-            <p className="mt-1 text-xs text-muted-foreground">Minimum 8 characters</p>
-          </div>
+      {/* RIGHT: value-prop visual */}
+      <div className="relative hidden overflow-hidden border-l border-border/60 lg:block">
+        <div className="absolute inset-0 bg-grid opacity-50" aria-hidden />
+        <div className="absolute inset-0 bg-vignette" aria-hidden />
+        <div
+          className="absolute left-1/2 top-1/3 h-[600px] w-[800px] -translate-x-1/2 -translate-y-1/2 rounded-full opacity-30 blur-3xl"
+          style={{ background: "radial-gradient(closest-side, hsl(var(--accent)/0.6), transparent)" }}
+          aria-hidden
+        />
 
-          <Button type="submit" className="w-full" disabled={isLoading}>
-            {isLoading ? "Creating account…" : "Create account"}
-          </Button>
-        </form>
+        <div className="relative flex h-full items-center justify-center px-12">
+          <div className="w-full max-w-md space-y-6">
+            <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-accent">The Loop</p>
+            <h2 className="text-balance text-[28px] font-semibold leading-[1.15] tracking-[-0.02em]">
+              Five steps. Always the last is a live URL.
+            </h2>
 
-        <p className="mt-8 text-center text-xs text-muted-foreground">
-          Already have an account?{" "}
-          <Link to="/login" className="font-medium text-foreground hover:underline">Sign in</Link>
-        </p>
+            <ol className="space-y-2.5">
+              {[
+                { l: "Plan", c: "Break the goal into ordered steps." },
+                { l: "Write", c: "Generate every file in a sandbox." },
+                { l: "Build", c: "Compile, lint, type-check." },
+                { l: "Verify", c: "Run it. Open it. Catch errors." },
+                { l: "Ship", c: "Push to a live URL.", deploy: true },
+              ].map((s, i) => (
+                <li
+                  key={s.l}
+                  className={[
+                    "flex items-center gap-3 rounded-lg border bg-surface-1/70 px-3.5 py-2.5",
+                    s.deploy ? "border-deploy/40" : "border-border/60",
+                  ].join(" ")}
+                >
+                  <span
+                    className={[
+                      "inline-flex h-6 w-6 items-center justify-center rounded-md font-mono text-[11px]",
+                      s.deploy ? "bg-deploy/15 text-deploy" : "bg-accent/15 text-accent",
+                    ].join(" ")}
+                  >
+                    {i + 1}
+                  </span>
+                  <span className="flex-1 text-[13.5px] text-foreground">{s.l}</span>
+                  <span className="text-[12.5px] text-muted-foreground">{s.c}</span>
+                  {s.deploy && <CheckCircle2 size={14} className="text-deploy" />}
+                </li>
+              ))}
+            </ol>
+
+            <p className="text-[12.5px] text-muted-foreground">
+              Generation is free. Credits only spend when {BRAND.name} pushes your work to a live URL.
+            </p>
+          </div>
+        </div>
       </div>
     </div>
   );

@@ -112,6 +112,12 @@ export default {
           DEFAULT: "hsl(var(--success))",
           foreground: "hsl(0 0% 100%)",
         },
+        // Deft v2 — phosphor green deploy accent.
+        deploy: {
+          DEFAULT: "hsl(var(--deploy))",
+          foreground: "hsl(var(--deploy-foreground))",
+          muted: "hsl(var(--deploy-muted))",
+        },
         warning: {
           DEFAULT: "hsl(var(--warning))",
           foreground: "hsl(240 10% 8%)",

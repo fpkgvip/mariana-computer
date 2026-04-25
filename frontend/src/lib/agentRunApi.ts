@@ -103,6 +103,34 @@ export function stopAgentRun(taskId: string): Promise<{ task_id: string; stopped
 }
 
 /**
+ * Preview manifest — the result written by the `deploy_preview` tool.  When
+ * `deployed: true`, the URL is a backend-relative path like
+ * `/preview/<task_id>/index.html` that the iframe in /build can render.
+ */
+export interface AgentPreviewManifest {
+  task_id: string;
+  deployed: boolean;
+  /** Backend-relative URL like /preview/<task_id>/index.html */
+  url?: string;
+  entry?: string;
+  label?: string;
+  files?: number;
+  total_bytes?: number;
+  created_at?: string;
+}
+
+export function getAgentPreview(taskId: string, signal?: AbortSignal): Promise<AgentPreviewManifest> {
+  return api.get<AgentPreviewManifest>(`/api/preview/${encodeURIComponent(taskId)}`, { signal });
+}
+
+/** Resolve a relative preview URL into an absolute one against the API base. */
+export function previewAbsoluteUrl(relUrl: string): string {
+  const apiBase = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
+  if (/^https?:\/\//i.test(relUrl)) return relUrl;
+  return `${apiBase}${relUrl.startsWith("/") ? "" : "/"}${relUrl}`;
+}
+
+/**
  * Open an EventSource for the agent's SSE stream.
  *
  * EventSource doesn't support custom headers, so we attach the access token

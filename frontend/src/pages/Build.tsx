@@ -1,19 +1,23 @@
 /**
  * /build — Deft Studio
  *
- * The core loop in one page:
- *   1. Prompt Bar (F1)
- *   2. Pre-flight Card (F2) — appears as soon as the prompt is non-empty
- *   3. Live Canvas (F3) — appears when an agent task is running
- *   4. Projects sidebar (F5) — list of past tasks
+ * Two modes:
+ *   • IDLE — no active task. A centered prompt bar (the moment of intent),
+ *     plus a preflight card showing the quote and tier picker.
+ *   • LIVE — split pane. Left = LiveCanvas (plan, activity, artifacts).
+ *     Right = PreviewPane iframe pointed at the deployed preview URL.
+ *     Header offers "New run" + cancel; sidebar lists past projects.
+ *
+ * The split is the product. The receipt is the URL.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate, useSearchParams } from "react-router-dom";
-import { ChevronLeft, FolderOpen, Plus, Search } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { ArrowLeft, Plus } from "lucide-react";
 import { Navbar } from "@/components/Navbar";
 import { PromptBar } from "@/components/deft/PromptBar";
 import { PreflightCard } from "@/components/deft/PreflightCard";
 import { LiveCanvas } from "@/components/deft/LiveCanvas";
+import { PreviewPane } from "@/components/deft/PreviewPane";
 import { ProjectsSidebar } from "@/components/deft/ProjectsSidebar";
 import { useCredits, CREDITS_CHANGED_EVENT } from "@/hooks/useCredits";
 import { useAuth } from "@/contexts/AuthContext";
@@ -29,12 +33,12 @@ import {
 import { ApiError } from "@/lib/api";
 import type { ModelTier, QuoteResponse } from "@/lib/agentApi";
 import { toast } from "sonner";
-import { cn } from "@/lib/utils";
 import { useVault } from "@/hooks/useVault";
 import { VaultUnlockDialog } from "@/components/deft/VaultUnlockDialog";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { scanVaultRefs, resolveVaultRefs, VaultRefError } from "@/lib/vaultPromptScan";
 import { track } from "@/lib/analytics";
+import { BRAND } from "@/lib/brand";
 
 const FIRST_PROMPT_FLAG = "deft.firstPromptSubmitted.v1";
 
@@ -51,8 +55,7 @@ export default function Build() {
 
   const [draftPrompt, setDraftPrompt] = useState(promptParam ?? "");
 
-  // Strip ?prompt=... from URL after seeding so reloading the page doesn't
-  // re-prefill or leak the prompt back into shared links.
+  // Strip ?prompt=... from URL after seeding so reloading doesn't re-prefill.
   useEffect(() => {
     if (!promptParam) return;
     const next = new URLSearchParams(params);
@@ -60,6 +63,7 @@ export default function Build() {
     setParams(next, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
   const [activeTaskId, setActiveTaskId] = useState<string | null>(taskIdParam);
   const [task, setTask] = useState<AgentTaskState | null>(null);
   const [events, setEvents] = useState<AgentEvent[]>([]);
@@ -70,7 +74,7 @@ export default function Build() {
   const lastEventIdRef = useRef<number>(0);
   const pollTimerRef = useRef<number | null>(null);
 
-  // F4 Vault wiring — used to resolve $KEY refs at submit time.
+  // F4 Vault wiring
   const vault = useVault();
   const [vaultUnlockOpen, setVaultUnlockOpen] = useState(false);
   const pendingSubmitRef = useRef<
@@ -83,7 +87,7 @@ export default function Build() {
     if (!authLoading && !user) navigate("/login", { replace: true });
   }, [authLoading, user, navigate]);
 
-  // Sync activeTaskId with URL ?task=
+  // Sync activeTaskId with URL
   useEffect(() => {
     setActiveTaskId(taskIdParam);
   }, [taskIdParam]);
@@ -122,43 +126,27 @@ export default function Build() {
         return;
       }
 
-      // Open SSE
       try {
         const es = await openAgentStream(activeTaskId);
         eventSourceRef.current = es;
         setConnectionStatus("live");
-
         es.addEventListener("open", () => setConnectionStatus("live"));
-
-        es.addEventListener("message", (msg) => {
-          handleStreamMessage((msg as MessageEvent).data);
-        });
-
-        // Custom named events the backend may emit
+        es.addEventListener("message", (msg) => handleStreamMessage((msg as MessageEvent).data));
         ["event", "task_state", "approval_requested", "step_started", "step_finished", "artifact"].forEach(
-          (name) => {
-            es.addEventListener(name, (msg) => handleStreamMessage((msg as MessageEvent).data));
-          },
+          (name) => es.addEventListener(name, (msg) => handleStreamMessage((msg as MessageEvent).data)),
         );
-
         es.addEventListener("error", () => {
           setConnectionStatus("polling");
           es.close();
           eventSourceRef.current = null;
-          // Fallback poll every 4s
           if (!pollTimerRef.current) {
-            pollTimerRef.current = window.setInterval(() => {
-              void pollUpdates();
-            }, 4_000);
+            pollTimerRef.current = window.setInterval(() => void pollUpdates(), 4_000);
           }
         });
-      } catch (err) {
-        // SSE setup failed — fall back to polling
+      } catch {
         setConnectionStatus("polling");
         if (!pollTimerRef.current) {
-          pollTimerRef.current = window.setInterval(() => {
-            void pollUpdates();
-          }, 4_000);
+          pollTimerRef.current = window.setInterval(() => void pollUpdates(), 4_000);
         }
       }
     })();
@@ -189,7 +177,6 @@ export default function Build() {
     function handleStreamMessage(raw: string) {
       try {
         const data = JSON.parse(raw);
-        // Server emits two payload shapes: an event row, or a task snapshot.
         if (data && typeof data === "object" && "event_type" in data && "id" in data) {
           const ev = data as AgentEvent;
           setEvents((prev) => mergeEvents(prev, [ev]));
@@ -204,7 +191,7 @@ export default function Build() {
           }
         }
       } catch {
-        /* skip malformed events */
+        /* skip malformed */
       }
     }
 
@@ -246,7 +233,7 @@ export default function Build() {
             });
           }
         } catch {
-          // ignore
+          /* ignore */
         }
         refetchBalance();
         setParams((prev) => {
@@ -269,11 +256,6 @@ export default function Build() {
   const handleSubmit = useCallback(
     async ({ tier, ceiling, quote }: { tier: ModelTier; ceiling: number; quote: QuoteResponse }) => {
       if (!draftPrompt.trim()) return;
-
-      // F4 Vault: scan the prompt for $KEY references.  If any are found:
-      //  1. If no vault exists yet — redirect the user to /vault to set one up.
-      //  2. If the vault is locked — open the unlock dialog and resume here.
-      //  3. If unlocked — decrypt all referenced secrets locally and pass them.
       const { names } = scanVaultRefs(draftPrompt);
       let vaultEnv: Record<string, string> | undefined;
       if (names.length > 0) {
@@ -291,9 +273,7 @@ export default function Build() {
           vaultEnv = await resolveVaultRefs(names, vault.decryptByName);
         } catch (e) {
           if (e instanceof VaultRefError) {
-            toast.error(
-              `${e.message}. Add it on the Vault page or remove the $${e.missingName} reference.`,
-            );
+            toast.error(`${e.message}. Add it on the Vault page or remove the $${e.missingName} reference.`);
             return;
           }
           toast.error("Could not decrypt vault secrets");
@@ -305,7 +285,6 @@ export default function Build() {
     [draftPrompt, launchRun, navigate, vault],
   );
 
-  // After a successful unlock, retry the queued submission.
   const onVaultUnlocked = useCallback(async () => {
     setVaultUnlockOpen(false);
     const pending = pendingSubmitRef.current;
@@ -316,9 +295,7 @@ export default function Build() {
       await launchRun(pending.tier, pending.ceiling, pending.quote, env);
     } catch (e) {
       if (e instanceof VaultRefError) {
-        toast.error(
-          `${e.message}. Add it on the Vault page or remove the $${e.missingName} reference.`,
-        );
+        toast.error(`${e.message}. Add it on the Vault page or remove the $${e.missingName} reference.`);
       } else {
         toast.error("Could not decrypt vault secrets");
       }
@@ -363,57 +340,29 @@ export default function Build() {
           onNew={newRun}
           balance={balance}
         />
-        <main className="flex-1 overflow-auto">
-          <div className="mx-auto flex w-full max-w-[1280px] flex-col gap-4 px-6 py-6">
-            {activeTaskId && task ? (
-              <>
-                <div className="flex items-center justify-between">
-                  <button
-                    type="button"
-                    onClick={newRun}
-                    className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-                  >
-                    <ChevronLeft size={12} aria-hidden /> New run
-                  </button>
-                </div>
-                <LiveCanvas
-                  task={task}
-                  events={events}
-                  connectionStatus={connectionStatus}
-                  onCancel={onCancel}
-                />
-              </>
-            ) : (
-              <>
-                <div className="rounded-2xl border border-border bg-gradient-to-b from-card to-background p-6">
-                  <div className="mb-4">
-                    <h1 className="text-2xl font-semibold tracking-tight text-foreground">
-                      What should Deft build?
-                    </h1>
-                    <p className="mt-1 text-sm text-muted-foreground">
-                      Set a goal and a credit ceiling. Deft plans, executes, and hands you the receipt.
-                    </p>
-                  </div>
-                  <PromptBar
-                    initialValue={draftPrompt}
-                    onChange={setDraftPrompt}
-                    onSubmit={async (p) => setDraftPrompt(p)}
-                    busy={starting}
-                  />
-                </div>
-                {draftPrompt.trim() && (
-                  <PreflightCard
-                    prompt={draftPrompt}
-                    onStart={handleSubmit}
-                    balance={balance}
-                    starting={starting}
-                  />
-                )}
-              </>
-            )}
-          </div>
+
+        <main className="relative flex flex-1 overflow-hidden">
+          {activeTaskId && task ? (
+            <LiveStudio
+              task={task}
+              events={events}
+              connectionStatus={connectionStatus}
+              onCancel={onCancel}
+              onNew={newRun}
+              taskId={activeTaskId}
+            />
+          ) : (
+            <IdleStudio
+              prompt={draftPrompt}
+              onPromptChange={setDraftPrompt}
+              onStart={handleSubmit}
+              balance={balance}
+              starting={starting}
+            />
+          )}
         </main>
       </div>
+
       <Dialog
         open={vaultUnlockOpen}
         onOpenChange={(o) => {
@@ -441,6 +390,114 @@ export default function Build() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Idle: centered prompt + preflight (clean, focused, single column)
+// ---------------------------------------------------------------------------
+
+interface IdleStudioProps {
+  prompt: string;
+  onPromptChange: (v: string) => void;
+  onStart: (params: { tier: ModelTier; ceiling: number; quote: QuoteResponse }) => void | Promise<void>;
+  balance: number;
+  starting: boolean;
+}
+
+function IdleStudio({ prompt, onPromptChange, onStart, balance, starting }: IdleStudioProps) {
+  return (
+    <div className="relative flex-1 overflow-auto">
+      <div className="absolute inset-0 -z-0 bg-grid opacity-50" aria-hidden />
+      <div className="absolute inset-0 -z-0 bg-vignette" aria-hidden />
+      <div className="relative mx-auto flex w-full max-w-[860px] flex-col gap-5 px-6 py-12 md:py-16">
+        <div className="text-center">
+          <div className="mx-auto mb-4 inline-flex items-center gap-2 rounded-full border border-border/70 bg-surface-1/70 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground backdrop-blur">
+            <span className="size-1.5 rounded-full bg-deploy animate-pulse" />
+            New run
+          </div>
+          <h1 className="text-balance text-3xl font-semibold tracking-[-0.02em] text-foreground sm:text-4xl">
+            What should {BRAND.name} build?
+          </h1>
+          <p className="mx-auto mt-3 max-w-md text-[14.5px] leading-[1.6] text-muted-foreground">
+            Plan, write, build, verify, ship — a complete app in one autonomous loop.
+            Generation is free. Credits only spend when {BRAND.name} ships.
+          </p>
+        </div>
+
+        <div className="rounded-2xl border border-border/80 bg-surface-1/85 p-4 shadow-elev-2 backdrop-blur-md focus-within:border-accent/60 focus-within:shadow-[0_0_0_4px_hsl(var(--accent)/0.10),0_18px_48px_-22px_hsl(var(--accent)/0.55)]">
+          <PromptBar
+            initialValue={prompt}
+            onChange={onPromptChange}
+            onSubmit={async (p) => onPromptChange(p)}
+            busy={starting}
+            placeholder="Build a habit tracker with a streak heatmap and Supabase auth…"
+          />
+        </div>
+
+        {prompt.trim() && (
+          <PreflightCard prompt={prompt} onStart={onStart} balance={balance} starting={starting} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Live: split pane — LiveCanvas left, PreviewPane right
+// ---------------------------------------------------------------------------
+
+interface LiveStudioProps {
+  task: AgentTaskState;
+  events: AgentEvent[];
+  connectionStatus: "live" | "polling" | "closed";
+  onCancel: () => void;
+  onNew: () => void;
+  taskId: string;
+}
+
+function LiveStudio({ task, events, connectionStatus, onCancel, onNew, taskId }: LiveStudioProps) {
+  return (
+    <div className="flex h-full min-h-0 flex-1 flex-col">
+      {/* Sub-bar */}
+      <div className="flex items-center justify-between gap-3 border-b border-border/70 bg-surface-1/40 px-4 py-2.5 backdrop-blur">
+        <button
+          type="button"
+          onClick={onNew}
+          className="inline-flex items-center gap-1.5 rounded-md border border-border/60 bg-surface-1 px-2.5 py-1.5 text-[12px] font-medium text-muted-foreground transition-colors hover:border-accent/50 hover:text-foreground"
+        >
+          <ArrowLeft size={12} /> New run
+        </button>
+
+        <div className="hidden items-center gap-2 truncate text-[12px] text-muted-foreground sm:flex">
+          <span className="truncate">{task.goal}</span>
+        </div>
+
+        <button
+          type="button"
+          onClick={onNew}
+          className="inline-flex items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-[12px] font-medium text-accent-foreground shadow-[0_4px_14px_-6px_hsl(var(--accent)/0.55)] transition-all hover:brightness-110"
+        >
+          <Plus size={12} /> Start another
+        </button>
+      </div>
+
+      {/* Split */}
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 p-3 lg:grid-cols-[minmax(360px,1fr)_minmax(0,1.35fr)]">
+        <div className="min-h-0">
+          <LiveCanvas
+            task={task}
+            events={events}
+            connectionStatus={connectionStatus}
+            onCancel={onCancel}
+            className="h-full"
+          />
+        </div>
+        <div className="min-h-0">
+          <PreviewPane taskId={taskId} task={task} events={events} className="h-full" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function mergeEvents(prev: AgentEvent[], next: AgentEvent[]): AgentEvent[] {
   if (next.length === 0) return prev;
   const seen = new Set(prev.map((e) => e.id));
@@ -452,7 +509,6 @@ function mergeEvents(prev: AgentEvent[], next: AgentEvent[]): AgentEvent[] {
     }
   }
   merged.sort((a, b) => a.id - b.id);
-  // Cap at 1000 to avoid runaway memory in long sessions
   if (merged.length > 1000) return merged.slice(merged.length - 1000);
   return merged;
 }
