@@ -22,11 +22,23 @@ export interface ApiErrorBody {
 export class ApiError extends Error {
   status: number;
   body: ApiErrorBody | null;
-  constructor(status: number, message: string, body: ApiErrorBody | null) {
+  /**
+   * Backend request id, when the server returned X-Request-Id. Carried so that
+   * UI surfaces (toasts, ErrorState, report-issue) can echo a copyable
+   * identifier for support without forcing the user to dig through devtools.
+   */
+  requestId: string | null;
+  constructor(
+    status: number,
+    message: string,
+    body: ApiErrorBody | null,
+    requestId: string | null = null,
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.body = body;
+    this.requestId = requestId;
   }
 }
 
@@ -101,7 +113,8 @@ export async function apiRequest<T = unknown>(
         : Array.isArray(detail)
           ? detail.map((d) => (typeof d === "object" && d ? (d as { msg?: string }).msg ?? "validation error" : String(d))).join(", ")
           : body?.message ?? `Request failed (HTTP ${resp.status})`;
-    throw new ApiError(resp.status, String(detailMsg), body);
+    const requestId = resp.headers.get("x-request-id");
+    throw new ApiError(resp.status, String(detailMsg), body, requestId);
   }
   return payload as T;
 }

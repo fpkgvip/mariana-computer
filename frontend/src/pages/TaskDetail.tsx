@@ -24,6 +24,8 @@ import {
   ShieldAlert,
 } from "lucide-react";
 import { toast } from "sonner";
+import { ErrorState, describeError } from "@/components/deft/states";
+import { ApiError } from "@/lib/api";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "";
 
@@ -99,7 +101,8 @@ export default function TaskDetail() {
   const { user } = useAuth();
   const navigate = useNavigate();
   const [task, setTask] = useState<TaskDetail | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ message: string; requestId: string | null } | null>(null);
+  const [retrying, setRetrying] = useState(false);
   const [approvals, setApprovals] = useState<PendingApproval[]>([]);
   const [approvalLoading, setApprovalLoading] = useState<string | null>(null);
   const [downloading, setDownloading] = useState<string | null>(null);
@@ -134,12 +137,19 @@ export default function TaskDetail() {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) {
-        throw new Error(`HTTP ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+        const requestId = res.headers.get("x-request-id");
+        const text = await res.text().catch(() => res.statusText);
+        throw new ApiError(res.status, `HTTP ${res.status}: ${text}`, null, requestId);
       }
       const data: TaskDetail = await res.json();
-      if (mountedRef.current) setTask(data);
+      if (mountedRef.current) {
+        setTask(data);
+        setError(null);
+      }
     } catch (e) {
-      if (mountedRef.current) setError(e instanceof Error ? e.message : String(e));
+      if (mountedRef.current) setError(describeError(e));
+    } finally {
+      if (mountedRef.current) setRetrying(false);
     }
   }, [taskId, getToken]);
 
@@ -271,8 +281,17 @@ export default function TaskDetail() {
           </Link>
 
           {error && !task && (
-            <div className="mt-8 rounded-lg border border-red-500/30 bg-red-500/5 p-4 text-sm text-red-400">
-              Could not load task. {error}
+            <div className="mt-8">
+              <ErrorState
+                title="Could not load task"
+                message={error.message}
+                requestId={error.requestId}
+                onRetry={() => {
+                  setRetrying(true);
+                  void loadTask();
+                }}
+                retrying={retrying}
+              />
             </div>
           )}
 

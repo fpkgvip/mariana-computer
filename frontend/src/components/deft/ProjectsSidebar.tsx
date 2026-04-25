@@ -20,17 +20,15 @@
  * real wiring lands in a later phase.
  */
 import { useEffect, useMemo, useState } from "react";
-import {
-  AlertTriangle,
-  Archive,
-  Coins,
-  FolderOpen,
-  Loader2,
-  Plus,
-  Search,
-} from "lucide-react";
-import { api, ApiError } from "@/lib/api";
+import { Archive, Coins, FolderOpen, Plus, Search } from "lucide-react";
+import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import {
+  EmptyState,
+  ErrorState,
+  LoadingRows,
+  describeError,
+} from "@/components/deft/states";
 import { ProjectRow, type ProjectRowData } from "./projects/ProjectRow";
 import { ArchiveProjectDialog } from "./projects/ArchiveProjectDialog";
 import { ShareProjectDialog } from "./projects/ShareProjectDialog";
@@ -79,7 +77,9 @@ interface ActiveDialog {
 export function ProjectsSidebar({ activeTaskId, onSelect, onNew, balance }: ProjectsSidebarProps) {
   const [tasks, setTasks] = useState<AgentTaskRow[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ message: string; requestId: string | null } | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
   const [filter, setFilter] = useState("");
   const [showArchived, setShowArchived] = useState(false);
 
@@ -100,9 +100,12 @@ export function ProjectsSidebar({ activeTaskId, onSelect, onNew, balance }: Proj
         setError(null);
       } catch (err) {
         if (cancelled) return;
-        setError(err instanceof ApiError ? err.message : "Could not load projects");
+        setError(describeError(err));
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+          setRetrying(false);
+        }
       }
     };
     void load();
@@ -111,7 +114,12 @@ export function ProjectsSidebar({ activeTaskId, onSelect, onNew, balance }: Proj
       cancelled = true;
       window.clearInterval(id);
     };
-  }, []);
+  }, [reloadKey]);
+
+  const handleRetry = () => {
+    setRetrying(true);
+    setReloadKey((k) => k + 1);
+  };
 
   const merged = useMemo<ProjectRowData[]>(() => {
     return tasks
@@ -257,20 +265,26 @@ export function ProjectsSidebar({ activeTaskId, onSelect, onNew, balance }: Proj
 
       <div className="flex-1 overflow-auto px-2 py-2">
         {loading ? (
-          <div className="flex items-center justify-center gap-2 px-3 py-6 text-xs text-muted-foreground">
-            <Loader2 size={12} className="animate-spin" aria-hidden /> Loading…
-          </div>
+          <LoadingRows count={4} rowClassName="h-12" bare />
         ) : error ? (
-          <div className="flex items-start gap-2 px-2 py-3 text-xs text-destructive">
-            <AlertTriangle size={12} className="mt-0.5 shrink-0" aria-hidden />
-            <span>{error}</span>
-          </div>
+          <ErrorState
+            dense
+            title="Could not load projects"
+            message={error.message}
+            requestId={error.requestId}
+            onRetry={handleRetry}
+            retrying={retrying}
+          />
         ) : visible.length === 0 ? (
-          <div className="flex flex-col items-center justify-center gap-1 px-3 py-10 text-center text-xs text-muted-foreground">
-            <FolderOpen size={20} aria-hidden />
-            <div>{filter ? "No matches" : "No runs yet"}</div>
-            <div className="opacity-70">Start your first run from the prompt bar.</div>
-          </div>
+          <EmptyState
+            dense
+            icon={<FolderOpen size={20} aria-hidden />}
+            filtered={Boolean(filter)}
+            title={filter ? "No matches" : "No runs yet"}
+            description={
+              filter ? "Try a different keyword." : "Start your first run from the prompt bar."
+            }
+          />
         ) : (
           <ul className="space-y-0.5">
             {visible.map((t) => (

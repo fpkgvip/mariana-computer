@@ -37,6 +37,7 @@ import DevStudio from "./pages/DevStudio";
 import DevAccount from "./pages/DevAccount";
 import DevVault from "./pages/DevVault";
 import DevProjects from "./pages/DevProjects";
+import DevStates from "./pages/DevStates";
 
 // BUG-FE-134 fix: Configure sensible defaults so react-query doesn't refetch
 // aggressively on every window focus or mount. staleTime = 30s keeps data fresh
@@ -148,6 +149,9 @@ const App = () => {
               )}
               {import.meta.env.DEV && (
                 <Route path="/dev/projects" element={<RouteErrorBoundary routeName="dev projects"><DevProjects /></RouteErrorBoundary>} />
+              )}
+              {import.meta.env.DEV && (
+                <Route path="/dev/states" element={<RouteErrorBoundary routeName="dev states"><DevStates /></RouteErrorBoundary>} />
               )}
               <Route path="*" element={<NotFound />} />
             </Routes>

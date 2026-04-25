@@ -6,6 +6,13 @@ import { ScrollReveal } from "@/components/ScrollReveal";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/lib/supabase";
 import { Loader2, Inbox, CheckCircle2, AlertCircle, Clock, Play, ArrowRight, RefreshCw } from "lucide-react";
+import {
+  EmptyState,
+  ErrorState,
+  LoadingRows,
+  describeError,
+} from "@/components/deft/states";
+import { ApiError } from "@/lib/api";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "";
 
@@ -102,7 +109,8 @@ export default function Tasks() {
   const [tasks, setTasks] = useState<AgentTaskSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ message: string; requestId: string | null } | null>(null);
+  const [retrying, setRetrying] = useState(false);
   const [total, setTotal] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -133,17 +141,20 @@ export default function Tasks() {
         signal: ac.signal,
       });
       if (!res.ok) {
-        throw new Error(`HTTP ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+        const requestId = res.headers.get("x-request-id");
+        const text = await res.text().catch(() => res.statusText);
+        throw new ApiError(res.status, `HTTP ${res.status}: ${text}`, null, requestId);
       }
       const data: TasksListResponse = await res.json();
       setTasks(Array.isArray(data.tasks) ? data.tasks : []);
       setTotal(Number(data.total) || 0);
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") return;
-      setError(e instanceof Error ? e.message : String(e));
+      setError(describeError(e));
     } finally {
       setLoading(false);
       setRefreshing(false);
+      setRetrying(false);
     }
   };
 
@@ -246,38 +257,44 @@ export default function Tasks() {
           {/* Content */}
           <div className="mt-8">
             {loading ? (
-              <div className="space-y-3">
-                {[0, 1, 2].map((i) => (
-                  <div key={i} className="h-20 animate-pulse rounded-lg border border-border bg-card/50" />
-                ))}
-              </div>
+              <LoadingRows count={3} rowClassName="h-20" />
             ) : error ? (
-              <div className="rounded-lg border border-red-500/30 bg-red-500/5 p-4 text-sm text-red-400">
-                Could not load tasks. {error}
-              </div>
+              <ErrorState
+                title="Could not load tasks"
+                message={error.message}
+                requestId={error.requestId}
+                onRetry={() => {
+                  setRetrying(true);
+                  void fetchTasks(false);
+                }}
+                retrying={retrying}
+              />
             ) : filtered.length === 0 ? (
               <ScrollReveal>
-                <div className="rounded-lg border border-dashed border-border bg-card/30 p-10 text-center">
-                  <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-primary/10 text-primary">
-                    <Inbox size={20} />
-                  </div>
-                  <h3 className="mt-4 text-base font-semibold text-foreground">
-                    {filter === "all" ? "No tasks yet" : `No ${FILTER_LABELS[filter].toLowerCase()} tasks`}
-                  </h3>
-                  <p className="mt-2 text-sm text-muted-foreground">
-                    {filter === "all"
+                <EmptyState
+                  icon={<Inbox size={20} aria-hidden />}
+                  filtered={filter !== "all"}
+                  title={
+                    filter === "all"
+                      ? "No tasks yet"
+                      : `No ${FILTER_LABELS[filter].toLowerCase()} tasks`
+                  }
+                  description={
+                    filter === "all"
                       ? "Kick one off from Research to get started."
-                      : "Try a different filter."}
-                  </p>
-                  {filter === "all" && (
-                    <Link
-                      to="/chat"
-                      className="mt-4 inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-all hover:bg-primary/90"
-                    >
-                      Start a task <ArrowRight size={14} />
-                    </Link>
-                  )}
-                </div>
+                      : "Try a different filter."
+                  }
+                  action={
+                    filter === "all" ? (
+                      <Link
+                        to="/chat"
+                        className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-all hover:bg-primary/90"
+                      >
+                        Start a task <ArrowRight size={14} aria-hidden />
+                      </Link>
+                    ) : undefined
+                  }
+                />
               </ScrollReveal>
             ) : (
               <ul className="space-y-2">

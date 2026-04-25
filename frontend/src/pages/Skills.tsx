@@ -6,6 +6,7 @@ import { ScrollReveal } from "@/components/ScrollReveal";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/lib/supabase";
 import { toast } from "sonner";
+import { ErrorState, LoadingRows } from "@/components/deft/states";
 import {
   Zap,
   Plus,
@@ -278,6 +279,9 @@ export default function Skills() {
   const [customSkills, setCustomSkills] = useState<Skill[]>([]);
   const [showCreate, setShowCreate] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<{ message: string; requestId: string | null } | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     if (!user) {
@@ -288,6 +292,7 @@ export default function Skills() {
 
   useEffect(() => {
     if (!user) return;
+    let cancelled = false;
     const loadCustomSkills = async () => {
       try {
         const { data: { session } } = await supabase.auth.getSession();
@@ -297,18 +302,36 @@ export default function Skills() {
         const res = await fetch(`${API_URL}/api/skills`, {
           headers: { Authorization: `Bearer ${token}` },
         });
+        if (cancelled) return;
         if (res.ok) {
           const data: Skill[] = await res.json();
           setCustomSkills(data.filter((s) => s.category !== "built-in"));
+          setError(null);
+        } else if (res.status !== 404) {
+          // 404 means the endpoint isn't deployed yet — treat as empty,
+          // not as an error. Other failures bubble up so the user knows.
+          const requestId = res.headers.get("x-request-id");
+          const text = await res.text().catch(() => res.statusText);
+          setError({ message: `Could not load custom skills (HTTP ${res.status}): ${text}`, requestId });
         }
-      } catch {
-        // API may not have skills endpoint yet — silently ignore
+      } catch (e) {
+        if (cancelled) return;
+        setError({
+          message: e instanceof Error ? e.message : String(e),
+          requestId: null,
+        });
       } finally {
-        setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+          setRetrying(false);
+        }
       }
     };
-    loadCustomSkills();
-  }, [user]);
+    void loadCustomSkills();
+    return () => {
+      cancelled = true;
+    };
+  }, [user, reloadKey]);
 
   if (!user) return null;
 
@@ -341,8 +364,21 @@ export default function Skills() {
           </ScrollReveal>
 
           {loading ? (
-            <div className="flex justify-center py-12">
-              <Loader2 size={20} className="animate-spin text-muted-foreground" />
+            <div className="mt-8">
+              <LoadingRows count={4} rowClassName="h-24" />
+            </div>
+          ) : error ? (
+            <div className="mt-8">
+              <ErrorState
+                title="Could not load custom skills"
+                message={error.message}
+                requestId={error.requestId}
+                onRetry={() => {
+                  setRetrying(true);
+                  setReloadKey((k) => k + 1);
+                }}
+                retrying={retrying}
+              />
             </div>
           ) : (
             <div className="mt-8 grid gap-4 sm:grid-cols-2">

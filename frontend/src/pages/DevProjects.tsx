@@ -21,6 +21,7 @@ import { Archive, Coins, FolderOpen, Plus, Search } from "lucide-react";
 import { Navbar } from "@/components/Navbar";
 import { cn } from "@/lib/utils";
 import { ProjectRow, type ProjectRowData } from "@/components/deft/projects/ProjectRow";
+import { EmptyState } from "@/components/deft/states";
 import { ArchiveProjectDialog } from "@/components/deft/projects/ArchiveProjectDialog";
 import { ShareProjectDialog } from "@/components/deft/projects/ShareProjectDialog";
 import { ExportProjectDialog } from "@/components/deft/projects/ExportProjectDialog";
@@ -200,11 +201,12 @@ export default function DevProjects() {
 
           <div className="flex-1 overflow-auto px-2 py-2">
             {tasks.length === 0 ? (
-              <div className="flex flex-col items-center justify-center gap-1 px-3 py-10 text-center text-xs text-muted-foreground">
-                <FolderOpen size={20} aria-hidden />
-                <div>No runs yet</div>
-                <div className="opacity-70">Start your first run from the prompt bar.</div>
-              </div>
+              <EmptyState
+                dense
+                icon={<FolderOpen size={20} aria-hidden />}
+                title="No runs yet"
+                description="Start your first run from the prompt bar."
+              />
             ) : (
               <ul className="space-y-0.5">
                 {tasks.map((t, idx) => (
