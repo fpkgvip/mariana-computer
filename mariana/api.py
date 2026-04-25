@@ -1481,47 +1481,91 @@ except Exception as _vault_exc:  # pragma: no cover — best effort
 # Billing — hardcoded plan catalogue (matches Supabase plans table)
 # ---------------------------------------------------------------------------
 
-# Stripe price IDs must be created in the Stripe dashboard and set here.
-# These are placeholder IDs; replace with real ones from the Stripe dashboard.
+# Deft v1 pricing tiers (F6).
+# Money invariant: 1 credit = $0.01. Tiers chosen so gross margin >= 40% at p90
+# user utilization. Stripe price IDs are looked up from env at startup.
 _PLANS: list[dict[str, Any]] = [
     {
-        "id": "individual",
-        "name": "Individual",
-        "price_usd_monthly": 299.0,
-        "credits_per_month": 30_000,
-        "stripe_price_id": os.environ.get("STRIPE_PRICE_INDIVIDUAL", "price_individual"),
-        "description": "For individuals and power users",
+        "id": "starter",
+        "name": "Starter",
+        "price_usd_monthly": 20.0,
+        "credits_per_month": 2_000,
+        "stripe_price_id": os.environ.get("STRIPE_PRICE_STARTER", "price_starter"),
+        "description": "For curious builders kicking the tires",
         "features": [
-            "30,000 credits/month",
+            "2,000 credits / month",
+            "Instant + standard tasks",
+            "All built-in skills (research, coding, docs)",
+            "Vault for encrypted secrets",
+            "Deploy apps to live URLs",
+            "Community support",
+        ],
+    },
+    {
+        "id": "pro",
+        "name": "Pro",
+        "price_usd_monthly": 50.0,
+        "credits_per_month": 5_500,
+        "stripe_price_id": os.environ.get("STRIPE_PRICE_PRO", "price_pro"),
+        "description": "For prosumers shipping daily",
+        "features": [
+            "5,500 credits / month",
             "Instant, standard, and deep tasks",
-            "All built-in skills (research, coding, analysis, docs)",
-            "Deploy apps and tools to live URLs",
+            "All flagship models",
+            "Sub-agent delegation",
             "PDF, DOCX, PPTX, XLSX export",
-            "Persistent memory across sessions",
+            "Persistent memory + custom skills",
             "Priority support",
         ],
     },
     {
-        "id": "enterprise",
-        "name": "Team",
-        "price_usd_monthly": 3999.0,
-        "credits_per_month": 500_000,
-        "stripe_price_id": os.environ.get("STRIPE_PRICE_ENTERPRISE", "price_enterprise"),
-        "description": "For teams with heavy workloads",
+        "id": "max",
+        "name": "Max",
+        "price_usd_monthly": 200.0,
+        "credits_per_month": 25_000,
+        "stripe_price_id": os.environ.get("STRIPE_PRICE_MAX", "price_max"),
+        "description": "For heavy autonomous workloads",
         "features": [
-            "500,000 shared credits/month",
+            "25,000 credits / month",
             "All task tiers incl. flagship models",
-            "Concurrent tasks (up to 4)",
-            "Sub-agent delegation",
-            "Custom skills and shared libraries",
-            "Image & video generation",
-            "SSO and role-based access",
-            "Dedicated queue and custom integrations",
-            "Dedicated account manager",
-            "SLA-backed support",
+            "Up to 4 concurrent tasks",
+            "Image + video generation",
+            "Higher per-task budget caps",
+            "Dedicated queue",
+            "Priority support with SLA",
         ],
     },
 ]
+
+# One-time top-up packs. Each tier corresponds to a Stripe price (one-time).
+_TOPUPS: list[dict[str, Any]] = [
+    {
+        "id": "topup_starter",
+        "name": "Starter top-up",
+        "price_usd": 10.0,
+        "credits": 1_000,
+        "stripe_price_id": os.environ.get("STRIPE_PRICE_TOPUP_STARTER", "price_topup_starter"),
+    },
+    {
+        "id": "topup_pro",
+        "name": "Pro top-up",
+        "price_usd": 30.0,
+        "credits": 3_000,
+        "stripe_price_id": os.environ.get("STRIPE_PRICE_TOPUP_PRO", "price_topup_pro"),
+    },
+    {
+        "id": "topup_max",
+        "name": "Max top-up",
+        "price_usd": 150.0,
+        "credits": 15_000,
+        "stripe_price_id": os.environ.get("STRIPE_PRICE_TOPUP_MAX", "price_topup_max"),
+    },
+]
+
+_PLAN_BY_ID: dict[str, dict[str, Any]] = {p["id"]: p for p in _PLANS}
+_PLAN_BY_PRICE_ID: dict[str, dict[str, Any]] = {p["stripe_price_id"]: p for p in _PLANS}
+_TOPUP_BY_ID: dict[str, dict[str, Any]] = {t["id"]: t for t in _TOPUPS}
+_TOPUP_BY_PRICE_ID: dict[str, dict[str, Any]] = {t["stripe_price_id"]: t for t in _TOPUPS}
 
 #: Tier-to-credit cost mapping used by the classification heuristic.
 #: At $0.01/credit, these map to: instant=$0.10, standard=$5, deep=$20.
@@ -4992,27 +5036,31 @@ async def create_checkout(
         except Exception:
             raise HTTPException(status_code=400, detail=f"Invalid {url_field}: malformed URL")
 
-    # Resolve plan
-    plan = next((p for p in _PLANS if p["id"] == body.plan_id), None)
-    if plan is None:
+    # Resolve plan or top-up. Subscriptions use mode=subscription; top-ups use
+    # mode=payment so the Stripe Checkout session yields a one-shot
+    # payment_intent.succeeded webhook event.
+    plan = _PLAN_BY_ID.get(body.plan_id)
+    topup = _TOPUP_BY_ID.get(body.plan_id) if plan is None else None
+    if plan is None and topup is None:
         raise HTTPException(status_code=404, detail=f"Plan {body.plan_id!r} not found")
+
+    line_items = [{"price": (plan or topup)["stripe_price_id"], "quantity": 1}]
+    metadata: dict[str, str] = {
+        "user_id": current_user["user_id"],
+        "deft_kind": "subscription" if plan else "topup",
+        "deft_plan_id": body.plan_id,
+    }
 
     try:
         session = _stripe.checkout.Session.create(
-            mode="subscription",
-            line_items=[
-                {
-                    "price": plan["stripe_price_id"],
-                    "quantity": 1,
-                }
-            ],
+            mode="subscription" if plan else "payment",
+            line_items=line_items,
             success_url=body.success_url,
             cancel_url=body.cancel_url,
-            metadata={
-                "user_id": current_user["user_id"],
-                "plan_id": body.plan_id,
-            },
+            metadata=metadata,
             client_reference_id=current_user["user_id"],
+            payment_intent_data={"metadata": metadata} if topup else None,
+            subscription_data={"metadata": metadata} if plan else None,
         )
     except _stripe.StripeError as exc:
         # M-02 fix: log the raw Stripe error server-side but return a
@@ -5118,7 +5166,15 @@ async def stripe_webhook(request: Request) -> JSONResponse:
     try:
         if event_type == "checkout.session.completed":
             session_obj = event["data"]["object"]
-            await _handle_checkout_completed(session_obj, cfg)
+            await _handle_checkout_completed(session_obj, cfg, event_id=event_id)
+
+        elif event_type == "invoice.paid":
+            invoice_obj = event["data"]["object"]
+            await _handle_invoice_paid(invoice_obj, cfg, event_id=event_id)
+
+        elif event_type == "payment_intent.succeeded":
+            pi_obj = event["data"]["object"]
+            await _handle_payment_intent_succeeded(pi_obj, cfg, event_id=event_id)
 
         elif event_type == "customer.subscription.updated":
             sub_obj = event["data"]["object"]
@@ -5208,15 +5264,24 @@ async def billing_portal(
 async def _handle_checkout_completed(
     session_obj: dict[str, Any],
     cfg: AppConfig,
+    *,
+    event_id: str,
 ) -> None:
-    """Process checkout.session.completed: link Stripe customer, add credits."""
+    """Process checkout.session.completed.
+
+    For subscription mode: link Stripe customer / subscription / plan, then
+    immediately grant the first month's credits (idempotent on event_id).
+    For one-time payment (top-up) mode: skip — handled by
+    payment_intent.succeeded so refunds and metadata are consistent.
+    """
     # BUG-API-043: Stripe may return metadata: null; guard with `or {}`
     _meta = session_obj.get("metadata") or {}
     user_id: str | None = (
         _meta.get("user_id")
         or session_obj.get("client_reference_id")
     )
-    plan_id: str | None = _meta.get("plan_id")
+    plan_id: str | None = _meta.get("deft_plan_id") or _meta.get("plan_id")
+    kind: str = (_meta.get("deft_kind") or session_obj.get("mode") or "subscription").lower()
     stripe_customer_id: str | None = session_obj.get("customer")
     subscription_id: str | None = session_obj.get("subscription")
 
@@ -5224,16 +5289,20 @@ async def _handle_checkout_completed(
         logger.warning("checkout_completed_no_user_id", session_id=session_obj.get("id"))
         return
 
-    # Resolve credits for this plan
-    plan = next((p for p in _PLANS if p["id"] == plan_id), None)
-    credits_to_add = plan["credits_per_month"] if plan else 0
+    # Top-ups are handled by payment_intent.succeeded — exit early to avoid
+    # double-granting.
+    if kind == "topup" or session_obj.get("mode") == "payment":
+        logger.info("checkout_completed_topup_deferred", user_id=user_id, plan_id=plan_id)
+        return
+
+    plan = _PLAN_BY_ID.get(plan_id) if plan_id else None
+    credits_to_add = int(plan["credits_per_month"]) if plan else 0
 
     # Retrieve full subscription to get current_period_end
     period_end: str | None = None
     if subscription_id:
         try:
             sub = _stripe.Subscription.retrieve(subscription_id)
-            # BUG-API-021: Use .get() to avoid KeyError on missing field
             period_end_ts = sub.get("current_period_end")
             if period_end_ts:
                 period_end = datetime.fromtimestamp(
@@ -5256,9 +5325,15 @@ async def _handle_checkout_completed(
     if update_payload and cfg.SUPABASE_URL and _supabase_api_key(cfg):
         await _supabase_patch_profile(user_id, update_payload, cfg)
 
-    # Increment credits — use supabase RPC or a direct PATCH with increment
-    if credits_to_add > 0 and cfg.SUPABASE_URL and _supabase_api_key(cfg):
-        await _supabase_add_credits(user_id, credits_to_add, cfg)
+    if credits_to_add > 0:
+        await _grant_credits_for_event(
+            user_id=user_id,
+            credits=credits_to_add,
+            source="plan_renewal",
+            ref_id=event_id,
+            expires_at=period_end,
+            cfg=cfg,
+        )
 
     logger.info(
         "checkout_completed",
@@ -5266,6 +5341,209 @@ async def _handle_checkout_completed(
         plan_id=plan_id,
         credits_added=credits_to_add,
     )
+
+
+async def _handle_invoice_paid(
+    invoice_obj: dict[str, Any],
+    cfg: AppConfig,
+    *,
+    event_id: str,
+) -> None:
+    """Process invoice.paid: monthly renewal grant for an active subscription.
+
+    The invoice carries the customer + (line items -> price.id) which we map
+    back to the Deft plan. We skip the very first invoice on subscription
+    creation because checkout.session.completed already granted those credits;
+    Stripe identifies that with billing_reason=='subscription_create'.
+    """
+    billing_reason: str = invoice_obj.get("billing_reason") or ""
+    if billing_reason == "subscription_create":
+        logger.info("invoice_paid_skip_first", invoice_id=invoice_obj.get("id"))
+        return
+    if invoice_obj.get("status") != "paid":
+        logger.info("invoice_paid_not_paid", status=invoice_obj.get("status"))
+        return
+
+    customer_id: str | None = invoice_obj.get("customer")
+    if not customer_id:
+        logger.warning("invoice_paid_no_customer", invoice_id=invoice_obj.get("id"))
+        return
+
+    user_id = await _get_user_id_for_customer(customer_id, cfg)
+    if not user_id:
+        logger.warning("invoice_paid_unknown_customer", customer_id=customer_id)
+        return
+
+    # Resolve which plan was billed
+    plan: dict[str, Any] | None = None
+    for line in (invoice_obj.get("lines") or {}).get("data") or []:
+        price_id = (line.get("price") or {}).get("id") or line.get("plan", {}).get("id")
+        if price_id and price_id in _PLAN_BY_PRICE_ID:
+            plan = _PLAN_BY_PRICE_ID[price_id]
+            break
+
+    if plan is None:
+        logger.warning("invoice_paid_no_plan_match", invoice_id=invoice_obj.get("id"))
+        return
+
+    period_end_ts = invoice_obj.get("period_end") or invoice_obj.get("lines", {}).get(
+        "data", [{}]
+    )[0].get("period", {}).get("end")
+    period_end_iso: str | None = None
+    if period_end_ts:
+        try:
+            period_end_iso = datetime.fromtimestamp(
+                int(period_end_ts), tz=timezone.utc
+            ).isoformat()
+        except (TypeError, ValueError):
+            period_end_iso = None
+
+    await _grant_credits_for_event(
+        user_id=user_id,
+        credits=int(plan["credits_per_month"]),
+        source="plan_renewal",
+        ref_id=event_id,
+        expires_at=period_end_iso,
+        cfg=cfg,
+    )
+
+    if cfg.SUPABASE_URL and _supabase_api_key(cfg):
+        patch: dict[str, Any] = {
+            "subscription_plan": plan["id"],
+            "subscription_status": "active",
+        }
+        if period_end_iso:
+            patch["subscription_current_period_end"] = period_end_iso
+        await _supabase_patch_profile_by_customer(customer_id, patch, cfg)
+
+    logger.info(
+        "invoice_paid_granted",
+        user_id=user_id,
+        plan_id=plan["id"],
+        credits=int(plan["credits_per_month"]),
+    )
+
+
+async def _handle_payment_intent_succeeded(
+    pi_obj: dict[str, Any],
+    cfg: AppConfig,
+    *,
+    event_id: str,
+) -> None:
+    """Process payment_intent.succeeded for one-time top-up purchases.
+
+    We only grant credits when the payment_intent's metadata identifies it as
+    a Deft top-up (set in create_checkout via payment_intent_data.metadata).
+    Subscription invoices generate their own payment_intent.succeeded; those
+    are ignored here because invoice.paid is the canonical signal.
+    """
+    metadata = pi_obj.get("metadata") or {}
+    if metadata.get("deft_kind") != "topup":
+        logger.info("payment_intent_not_topup_skipped", pi_id=pi_obj.get("id"))
+        return
+
+    user_id = metadata.get("user_id")
+    plan_id = metadata.get("deft_plan_id")
+    topup = _TOPUP_BY_ID.get(plan_id) if plan_id else None
+    if not user_id or topup is None:
+        logger.warning(
+            "payment_intent_topup_unresolved",
+            user_id=user_id,
+            plan_id=plan_id,
+        )
+        return
+
+    await _grant_credits_for_event(
+        user_id=user_id,
+        credits=int(topup["credits"]),
+        source="topup",
+        ref_id=event_id,
+        expires_at=None,
+        cfg=cfg,
+    )
+    logger.info(
+        "topup_granted",
+        user_id=user_id,
+        plan_id=plan_id,
+        credits=int(topup["credits"]),
+    )
+
+
+async def _grant_credits_for_event(
+    *,
+    user_id: str,
+    credits: int,
+    source: str,
+    ref_id: str,
+    expires_at: str | None,
+    cfg: AppConfig,
+) -> None:
+    """Idempotent grant via the ledger RPC. ``ref_id`` should be the Stripe event id.
+
+    Replays of the same Stripe event collapse to a single bucket because the
+    grant_credits RPC is idempotent on (ref_type, ref_id).
+    """
+    from mariana.billing.ledger import grant_credits as _grant_rpc, LedgerError
+
+    api_key = _supabase_api_key(cfg)
+    if not cfg.SUPABASE_URL or not api_key:
+        logger.error(
+            "grant_credits_supabase_unconfigured",
+            user_id=user_id,
+            credits=credits,
+            ref_id=ref_id,
+        )
+        raise HTTPException(status_code=503, detail="Credit ledger unavailable")
+    try:
+        await _grant_rpc(
+            supabase_url=cfg.SUPABASE_URL,
+            service_key=api_key,
+            user_id=user_id,
+            credits=int(credits),
+            source=source,  # type: ignore[arg-type]
+            ref_type="stripe_event",
+            ref_id=ref_id,
+            expires_at=expires_at,
+        )
+    except LedgerError as exc:
+        logger.error(
+            "grant_credits_failed",
+            user_id=user_id,
+            credits=credits,
+            ref_id=ref_id,
+            error=str(exc),
+        )
+        # Surface as 500 so Stripe retries via the outer handler
+        raise HTTPException(status_code=503, detail="Credit grant failed") from exc
+
+
+async def _get_user_id_for_customer(
+    stripe_customer_id: str, cfg: AppConfig
+) -> str | None:
+    """Resolve a Stripe customer ID back to the Supabase user_id."""
+    api_key = _supabase_api_key(cfg)
+    if not cfg.SUPABASE_URL or not api_key:
+        return None
+    url = f"{cfg.SUPABASE_URL}/rest/v1/profiles"
+    params = {"stripe_customer_id": f"eq.{stripe_customer_id}", "select": "id", "limit": "1"}
+    headers = {"apikey": api_key, "Authorization": f"Bearer {api_key}"}
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            resp = await client.get(url, params=params, headers=headers)
+        except httpx.HTTPError as exc:
+            logger.error("customer_lookup_network_error", customer_id=stripe_customer_id, error=str(exc))
+            return None
+    if resp.status_code != 200:
+        logger.error(
+            "customer_lookup_failed",
+            customer_id=stripe_customer_id,
+            status=resp.status_code,
+        )
+        return None
+    rows = resp.json() or []
+    if not rows:
+        return None
+    return rows[0].get("id")
 
 
 async def _handle_subscription_updated(

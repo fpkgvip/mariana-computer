@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Awaitable, Callable, Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -65,6 +66,39 @@ def build_billing_router(
             logger.error("balance_read_failed", extra={"err": str(exc)})
             raise HTTPException(status_code=503, detail="balance unavailable")
         return BalanceResponse(balance=bal.balance, next_expiry=bal.next_expiry)
+
+    @router.get("/api/credits/transactions")
+    async def credits_transactions(
+        current_user: dict = Depends(get_current_user),
+        limit: int = 50,
+    ):
+        """Return the last ``limit`` (<=200) transactions for the current user."""
+        if limit <= 0 or limit > 200:
+            raise HTTPException(status_code=400, detail="limit must be 1..200")
+        url = f"{get_supabase_url().rstrip('/')}/rest/v1/credit_transactions"
+        params = {
+            "user_id": f"eq.{current_user['user_id']}",
+            "select": "id,type,credits,bucket_id,ref_type,ref_id,balance_after,metadata,created_at",
+            "order": "created_at.desc",
+            "limit": str(limit),
+        }
+        headers = {
+            "apikey": get_service_key(),
+            "Authorization": f"Bearer {get_service_key()}",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url, params=params, headers=headers)
+        except httpx.HTTPError as exc:
+            logger.error("transactions_network_error", extra={"err": str(exc)})
+            raise HTTPException(status_code=503, detail="transactions unavailable")
+        if resp.status_code != 200:
+            logger.error(
+                "transactions_read_failed",
+                extra={"status": resp.status_code, "body": resp.text[:200]},
+            )
+            raise HTTPException(status_code=503, detail="transactions unavailable")
+        return resp.json()
 
     @router.post("/api/agent/quote", response_model=QuoteResponse)
     async def agent_quote(

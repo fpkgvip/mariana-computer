@@ -22,51 +22,48 @@ interface Plan {
 
 const plans: Plan[] = [
   {
-    id: "individual",
-    name: "Individual",
-    price: 299,
-    credits: 30000,
+    id: "starter",
+    name: "Starter",
+    price: 20,
+    credits: 2000,
+    features: [
+      "2,000 credits / month",
+      "Instant + standard tasks",
+      "All built-in skills (research, coding, docs)",
+      "Vault for encrypted secrets",
+      "Deploy apps to live URLs",
+      "Community support",
+    ],
+  },
+  {
+    id: "pro",
+    name: "Pro",
+    price: 50,
+    credits: 5500,
     highlighted: true,
     features: [
-      "30,000 credits/month",
-      "Full access to Deft's compute environment",
+      "5,500 credits / month",
       "Instant, standard, and deep tasks",
-      "All built-in skills (research, coding, analysis, docs)",
-      "Deploy apps and tools to live URLs",
-      "File uploads and attachments",
+      "All flagship models",
+      "Sub-agent delegation",
+      "PDF, DOCX, PPTX, XLSX export",
+      "Persistent memory + custom skills",
       "Priority support",
     ],
   },
   {
-    id: "enterprise",
-    name: "Team",
-    price: 3999,
-    credits: 500000,
-    comingSoon: true,
+    id: "max",
+    name: "Max",
+    price: 200,
+    credits: 25000,
     features: [
-      "500,000 shared credits/month",
-      "Everything in Individual",
-      "Shared workspaces and skill libraries",
-      "SSO and role-based access",
-      "Dedicated account manager",
-      "SLA-backed support",
-      "Custom connector integration",
-    ],
-  },
-  {
-    id: "custom",
-    name: "Enterprise",
-    price: 0,
-    credits: 0,
-    comingSoon: true,
-    features: [
-      "Unlimited credits",
-      "Everything in Team",
-      "On-premise or VPC deployment",
-      "Custom model routing and fine-tuning",
-      "Dedicated infrastructure",
-      "Bespoke data and system integration",
-      "24/7 priority engineering support",
+      "25,000 credits / month",
+      "All task tiers incl. flagship models",
+      "Up to 4 concurrent tasks",
+      "Image + video generation",
+      "Higher per-task budget caps",
+      "Dedicated queue",
+      "Priority support with SLA",
     ],
   },
 ];
@@ -287,6 +284,51 @@ Choose the plan that fits your team's volume. Credits refresh monthly.
               Contact us
             </Link>{" "}
             and we'll help you choose.
+          </div>
+        </ScrollReveal>
+
+        {/* Top-ups (one-time credit packs) */}
+        <ScrollReveal>
+          <div className="mt-24 max-w-5xl mx-auto">
+            <h2 className="font-serif text-2xl font-semibold tracking-[-0.01em] text-foreground sm:text-3xl">
+              Need more credits this month?
+            </h2>
+            <p className="mt-3 text-base leading-[1.6] text-muted-foreground">
+              One-time top-ups apply instantly. They don't expire as long as your subscription is active.
+            </p>
+            <div className="mt-8 grid gap-4 md:grid-cols-3">
+              {[
+                { id: "topup_starter", name: "Starter pack", price: 10, credits: 1000 },
+                { id: "topup_pro", name: "Pro pack", price: 30, credits: 3000 },
+                { id: "topup_max", name: "Max pack", price: 150, credits: 15000 },
+              ].map((tu) => (
+                <div
+                  key={tu.id}
+                  className="flex flex-col rounded-lg bg-card p-6 ring-1 ring-border"
+                >
+                  <p className="text-xs font-medium uppercase tracking-[0.15em] text-muted-foreground">
+                    {tu.name}
+                  </p>
+                  <h3 className="mt-3 font-serif text-3xl font-semibold text-foreground">
+                    ${tu.price}
+                  </h3>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    +{tu.credits.toLocaleString()} credits
+                  </p>
+                  <button
+                    onClick={() => handleSubscribe(tu.id)}
+                    disabled={loadingPlanId !== null}
+                    className="mt-6 flex w-full items-center justify-center gap-2 rounded-md border border-border px-4 py-2.5 text-sm font-medium text-foreground transition-all hover:bg-secondary disabled:opacity-60"
+                  >
+                    {loadingPlanId === tu.id ? (
+                      <Loader2 size={14} className="animate-spin" />
+                    ) : (
+                      <>Buy now <ArrowRight size={15} /></>
+                    )}
+                  </button>
+                </div>
+              ))}
+            </div>
           </div>
         </ScrollReveal>
 
