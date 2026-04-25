@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -17,12 +17,29 @@ export default function Login() {
   const [submitted, setSubmitted] = useState(false);
   const { login, user } = useAuth();
   const navigate = useNavigate();
+  const [params] = useSearchParams();
 
-  // BUG-R2C-12: navigate AFTER AuthContext.user lands (avoids ProtectedRoute race).
-  // After login, send users to /build (the studio is the home for signed-in users).
+  // The `?next=` query param is set by ProtectedRoute (and by Index.tsx when
+  // an unauth user hits Enter on the landing prompt).  We honor it after
+  // login so the round-trip is lossless.  Defensive: only allow same-origin
+  // relative paths to avoid an open-redirect.
+  const nextParam = params.get("next");
+  const safeNext = useMemo(() => {
+    if (!nextParam) return "/build";
+    if (!nextParam.startsWith("/") || nextParam.startsWith("//")) return "/build";
+    return nextParam;
+  }, [nextParam]);
+
+  // Navigate AFTER AuthContext.user lands so ProtectedRoute doesn't race.
   useEffect(() => {
-    if (submitted && user) navigate("/build");
-  }, [submitted, user, navigate]);
+    if (submitted && user) navigate(safeNext, { replace: true });
+  }, [submitted, user, navigate, safeNext]);
+
+  // If a logged-in visitor lands on /login directly (e.g. by typing the URL),
+  // forward them rather than show the form they don't need.
+  useEffect(() => {
+    if (user) navigate(safeNext, { replace: true });
+  }, [user, navigate, safeNext]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -132,7 +149,10 @@ export default function Login() {
 
             <p className="mt-8 text-center text-[12.5px] text-muted-foreground">
               New to {BRAND.name}?{" "}
-              <Link to="/signup" className="font-medium text-foreground underline-offset-4 hover:underline">
+              <Link
+                to={`/signup${nextParam ? `?next=${encodeURIComponent(nextParam)}` : ""}`}
+                className="font-medium text-foreground underline-offset-4 hover:underline"
+              >
                 Create an account
               </Link>
             </p>
@@ -194,7 +214,7 @@ export default function Login() {
               </div>
               <div className="flex items-center gap-2.5">
                 <span className="size-1.5 rounded-full bg-accent" />
-                <span>Hard credit ceilings. No surprise bills.</span>
+                <span>You only pay for software that runs.</span>
               </div>
             </div>
           </div>

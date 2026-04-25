@@ -66,7 +66,7 @@ export default function Admin() {
   useEffect(() => {
     if (!user) return;
     if (user.role !== "admin") {
-      navigate("/chat", { replace: true });
+      navigate("/build", { replace: true });
       return;
     }
     let cancelled = false;
@@ -81,7 +81,7 @@ export default function Admin() {
         toast.error("Admin access denied by server", {
           description: err instanceof Error ? err.message : String(err),
         });
-        navigate("/chat", { replace: true });
+        navigate("/build", { replace: true });
       } finally {
         if (!cancelled) setVerifying(false);
       }

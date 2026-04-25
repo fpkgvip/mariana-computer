@@ -358,6 +358,7 @@ export default function Build() {
               onStart={handleSubmit}
               balance={balance}
               starting={starting}
+              unlimited={user?.role === "admin"}
             />
           )}
         </main>
@@ -400,9 +401,10 @@ interface IdleStudioProps {
   onStart: (params: { tier: ModelTier; ceiling: number; quote: QuoteResponse }) => void | Promise<void>;
   balance: number;
   starting: boolean;
+  unlimited?: boolean;
 }
 
-function IdleStudio({ prompt, onPromptChange, onStart, balance, starting }: IdleStudioProps) {
+function IdleStudio({ prompt, onPromptChange, onStart, balance, starting, unlimited }: IdleStudioProps) {
   return (
     <div className="relative flex-1 overflow-auto">
       <div className="absolute inset-0 -z-0 bg-grid opacity-50" aria-hidden />
@@ -414,11 +416,11 @@ function IdleStudio({ prompt, onPromptChange, onStart, balance, starting }: Idle
             New run
           </div>
           <h1 className="text-balance text-3xl font-semibold tracking-[-0.02em] text-foreground sm:text-4xl">
-            What should {BRAND.name} build?
+            Describe what you want.
           </h1>
           <p className="mx-auto mt-3 max-w-md text-[14.5px] leading-[1.6] text-muted-foreground">
-            Plan, write, build, verify, ship — a complete app in one autonomous loop.
-            Generation is free. Credits only spend when {BRAND.name} ships.
+            {BRAND.name} plans, writes the code, runs it in a real browser,
+            verifies it works, then deploys. You only pay for software that runs.
           </p>
         </div>
 
@@ -428,12 +430,18 @@ function IdleStudio({ prompt, onPromptChange, onStart, balance, starting }: Idle
             onChange={onPromptChange}
             onSubmit={async (p) => onPromptChange(p)}
             busy={starting}
-            placeholder="Build a habit tracker with a streak heatmap and Supabase auth…"
+            placeholder="A habit tracker with a streak heatmap and Supabase auth…"
           />
         </div>
 
         {prompt.trim() && (
-          <PreflightCard prompt={prompt} onStart={onStart} balance={balance} starting={starting} />
+          <PreflightCard
+            prompt={prompt}
+            onStart={onStart}
+            balance={balance}
+            starting={starting}
+            unlimited={unlimited}
+          />
         )}
       </div>
     </div>

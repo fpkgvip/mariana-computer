@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -17,11 +17,26 @@ export default function Signup() {
   const [pendingNav, setPendingNav] = useState(false);
   const { signup, user } = useAuth();
   const navigate = useNavigate();
+  const [params] = useSearchParams();
 
-  // BUG-R2C-12: wait for AuthContext.user.  Land new users in /build, not /chat.
+  // `?next=` set by Index.tsx when an unauth visitor submits the landing
+  // prompt, or by ProtectedRoute when they hit a gated page directly.  We
+  // forward them there post-signup so the prompt round-trip is lossless.
+  const nextParam = params.get("next");
+  const safeNext = useMemo(() => {
+    if (!nextParam) return "/build";
+    if (!nextParam.startsWith("/") || nextParam.startsWith("//")) return "/build";
+    return nextParam;
+  }, [nextParam]);
+
   useEffect(() => {
-    if (pendingNav && user) navigate("/build");
-  }, [pendingNav, user, navigate]);
+    if (pendingNav && user) navigate(safeNext, { replace: true });
+  }, [pendingNav, user, navigate, safeNext]);
+
+  // Already-authed visitor on /signup → forward immediately.
+  useEffect(() => {
+    if (user) navigate(safeNext, { replace: true });
+  }, [user, navigate, safeNext]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -141,7 +156,10 @@ export default function Signup() {
 
             <p className="mt-8 text-center text-[12.5px] text-muted-foreground">
               Already on {BRAND.name}?{" "}
-              <Link to="/login" className="font-medium text-foreground underline-offset-4 hover:underline">
+              <Link
+                to={`/login${nextParam ? `?next=${encodeURIComponent(nextParam)}` : ""}`}
+                className="font-medium text-foreground underline-offset-4 hover:underline"
+              >
                 Sign in
               </Link>
             </p>

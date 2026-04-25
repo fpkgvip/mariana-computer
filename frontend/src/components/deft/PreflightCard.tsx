@@ -50,6 +50,8 @@ interface PreflightCardProps {
   defaultTier?: ModelTier;
   /** Show inline busy spinner on Start (e.g. while POST /api/agent/run dispatches). */
   starting?: boolean;
+  /** Admins are billed internally; bypass balance/ceiling guards. */
+  unlimited?: boolean;
   className?: string;
 }
 
@@ -61,6 +63,7 @@ export function PreflightCard({
   balance,
   defaultTier = "standard",
   starting = false,
+  unlimited = false,
   className,
 }: PreflightCardProps) {
   const [tier, setTier] = useState<ModelTier>(defaultTier);
@@ -128,11 +131,16 @@ export function PreflightCard({
 
   if (!trimmed) return null;
 
-  const insufficient = quote ? balance < quote.credits_min : false;
+  const insufficient = unlimited ? false : quote ? balance < quote.credits_min : false;
   const ceilingBelowMin = quote ? ceiling < quote.credits_min : false;
   const ceilingDollars = (ceiling / 100).toFixed(2);
 
-  const ceilingMax = quote ? Math.max(quote.credits_max * 2, balance) : Math.max(100, balance);
+  const ceilingFloor = quote ? quote.credits_max * 2 : 100;
+  const ceilingMax = unlimited
+    ? ceilingFloor
+    : quote
+      ? Math.max(quote.credits_max * 2, balance)
+      : Math.max(100, balance);
   const ceilingMin = quote ? Math.max(1, Math.floor(quote.credits_min * 0.5)) : 1;
   const effectiveCeilingMax = Math.max(ceilingMin, ceilingMax);
 
@@ -153,8 +161,8 @@ export function PreflightCard({
           <ShieldCheck size={14} className="text-accent" aria-hidden />
           Pre-flight
         </div>
-        <span className="text-[11px] uppercase tracking-wide text-muted-foreground">
-          Promise a ceiling, deliver a receipt.
+        <span className="text-[11px] tracking-wide text-muted-foreground">
+          Set a ceiling. Pay only for what runs.
         </span>
       </div>
 
@@ -267,10 +275,16 @@ export function PreflightCard({
       {/* Footer: balance + Start */}
       <div className="mt-4 flex items-center justify-between gap-3">
         <div className="text-xs text-muted-foreground">
-          Balance:{" "}
-          <span className={cn("font-mono", insufficient && "text-destructive")}>
-            {balance.toLocaleString()} credits
-          </span>
+          {unlimited ? (
+            <span className="font-mono text-foreground">Internal account · usage not charged</span>
+          ) : (
+            <>
+              Balance:{" "}
+              <span className={cn("font-mono", insufficient && "text-destructive")}>
+                {balance.toLocaleString()} credits
+              </span>
+            </>
+          )}
         </div>
         <button
           type="button"
@@ -302,11 +316,13 @@ export function PreflightCard({
         >
           <AlertCircle size={12} className="mt-0.5 shrink-0" aria-hidden />
           {insufficient
-            ? `Estimated minimum ${quote.credits_min} credits exceeds your balance.`
-            : `Ceiling is below the estimated minimum of ${quote.credits_min} credits.`}{" "}
-          <a className="ml-1 font-medium underline" href="/checkout">
-            Top up
-          </a>
+            ? `This run needs at least ${quote.credits_min} credits to start.`
+            : `Raise the ceiling to at least ${quote.credits_min} credits to start this run.`}{" "}
+          {insufficient && (
+            <a className="ml-1 font-medium underline" href="/checkout">
+              Add credits
+            </a>
+          )}
         </div>
       )}
     </div>

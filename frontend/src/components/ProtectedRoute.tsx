@@ -1,14 +1,19 @@
-import { Navigate } from "react-router-dom";
+import { Navigate, useLocation } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 
 /**
- * FE-CRIT-01 fix: Route-level auth guard that prevents protected pages from
- * rendering before authentication is resolved. Shows a spinner while auth is
- * loading, redirects to /login if unauthenticated, and only renders children
- * once a valid user session is confirmed.
+ * Route-level auth guard.
+ *
+ * - While the initial session is resolving, render a quiet spinner so we
+ *   don't flash the public route at a logged-in user.
+ * - When unauthenticated, send the visitor to /login and preserve the
+ *   intended destination (path + query + hash) in `?next=`.  /login and
+ *   /signup respect `next` and route the visitor there post-auth.  This
+ *   makes the cross-page "prompt typed on the home page" flow lossless.
  */
 export default function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
+  const location = useLocation();
 
   if (loading) {
     return (
@@ -19,7 +24,9 @@ export default function ProtectedRoute({ children }: { children: React.ReactNode
   }
 
   if (!user) {
-    return <Navigate to="/login" replace />;
+    const next = `${location.pathname}${location.search}${location.hash}`;
+    const target = `/login?next=${encodeURIComponent(next)}`;
+    return <Navigate to={target} replace />;
   }
 
   return <>{children}</>;
