@@ -13,24 +13,23 @@ export default function Product() {
       <section className="mx-auto max-w-7xl px-6 pb-24 pt-32 md:pt-40">
         <ScrollReveal>
           <h1 className="max-w-4xl font-serif text-3xl font-semibold leading-[1.08] tracking-[-0.02em] text-foreground sm:text-4xl md:text-5xl lg:text-[4rem]">
-            An AI with its own computer.
+            An AI developer with a real computer.
           </h1>
         </ScrollReveal>
         <ScrollReveal delay={150}>
           <p className="mt-8 max-w-xl text-lg leading-[1.7] text-muted-foreground">
-            Deft runs inside a full compute environment. It writes and
-            executes code, builds applications, browses the web, queries your
-            data, and works autonomously until the task is done — not just
-            drafted.
+            Deft writes the code, then runs the app in a real browser. It reads
+            its own console, watches its own UI render, fixes its own errors,
+            and only then hands you a live URL — not a to-do list.
           </p>
         </ScrollReveal>
         <ScrollReveal delay={300}>
           <div className="mt-10 flex flex-wrap items-center gap-5">
             <Link
-              to="/chat"
+              to="/signup"
               className="inline-flex items-center gap-2.5 rounded-md bg-primary px-6 py-3 text-sm font-medium text-primary-foreground transition-all hover:bg-primary/90 hover:shadow-xl hover:shadow-primary/10"
             >
-              Try Deft <ArrowRight size={15} />
+              Try Deft free <ArrowRight size={15} />
             </Link>
             <Link
               to="/pricing"
@@ -245,7 +244,7 @@ export default function Product() {
         <div className="mx-auto max-w-7xl px-6 py-24 md:py-32">
           <ScrollReveal>
             <h2 className="font-serif text-3xl font-semibold text-foreground md:text-4xl">
-              Built for teams that need to actually ship
+              Built for teams that need code that actually runs
             </h2>
           </ScrollReveal>
           <div className="mt-14 grid gap-12 sm:grid-cols-2 md:grid-cols-3">
@@ -326,12 +325,13 @@ export default function Product() {
               Give it a real job.
             </h2>
             <p className="mt-4 text-[16px] leading-[1.7] text-muted-foreground">
-              Describe something you've been meaning to ship. Deft will plan
-              it, build it, and hand it back to you — working.
+              Describe something you{"\u2019"}ve been meaning to deliver. Deft
+              plans it, writes it, runs it, and hands it back to you — already
+              working.
             </p>
             <div className="mt-8 flex flex-wrap items-center gap-5">
               <Link
-                to="/chat"
+                to="/signup"
                 className="inline-flex items-center gap-2.5 rounded-md bg-primary px-6 py-3 text-sm font-medium text-primary-foreground transition-all hover:bg-primary/90 hover:shadow-xl hover:shadow-primary/10"
               >
                 Start your first task <ArrowRight size={15} />

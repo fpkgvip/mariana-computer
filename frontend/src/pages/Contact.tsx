@@ -60,10 +60,11 @@ export default function Contact() {
         <div className="mx-auto max-w-5xl">
           <ScrollReveal>
             <h1 className="font-serif text-3xl font-semibold text-foreground sm:text-4xl md:text-5xl">
-              Get in touch
+              Talk to a human.
             </h1>
             <p className="mt-4 max-w-xl text-base text-muted-foreground md:text-lg">
-              Whether you're exploring Deft for your team or need help with your account, we're here.
+              Sales, support, legal, partnerships. One business day, every email.
+              For account questions you can also reach us from inside the app.
             </p>
           </ScrollReveal>
 
