@@ -1,56 +1,80 @@
+/**
+ * Account — production route at /account.
+ *
+ * Renders AccountView with real user data from AuthContext + /api/billing/*.
+ * Bucket detail and ledger transactions degrade calmly when the backend
+ * hasn't yet exposed them: the balance card still renders with totals, and
+ * the activity card shows the empty state instead of fabricating rows.
+ */
 import { useEffect, useRef, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
-import { ScrollReveal } from "@/components/ScrollReveal";
-import { Button } from "@/components/ui/button";
 import { useAuth } from "@/contexts/AuthContext";
-import { LogOut, CreditCard, ShieldCheck, ExternalLink, Loader2, Inbox } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { toast } from "sonner";
+import {
+  AccountView,
+  type AccountData,
+  type CreditBucket,
+  type LedgerTx,
+  type SubscriptionStatus,
+} from "@/components/deft/account/AccountView";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "";
 
-/** Format a subscription plan slug into a display name */
-function formatPlanName(plan: string): string {
-  if (!plan || plan === "none") return "Free";
-  return plan.charAt(0).toUpperCase() + plan.slice(1);
+const PLAN_LIBRARY: Record<
+  string,
+  { name: string; price_usd_monthly: number; credits_per_month: number }
+> = {
+  none: { name: "Free", price_usd_monthly: 0, credits_per_month: 500 },
+  free: { name: "Free", price_usd_monthly: 0, credits_per_month: 500 },
+  starter: { name: "Starter", price_usd_monthly: 29, credits_per_month: 3_500 },
+  standard: { name: "Standard", price_usd_monthly: 99, credits_per_month: 13_000 },
+  pro: { name: "Pro", price_usd_monthly: 299, credits_per_month: 42_000 },
+  scale: { name: "Scale", price_usd_monthly: 699, credits_per_month: 100_000 },
+  // legacy slugs
+  researcher: { name: "Starter", price_usd_monthly: 29, credits_per_month: 3_500 },
+  professional: { name: "Standard", price_usd_monthly: 99, credits_per_month: 13_000 },
+  enterprise: { name: "Pro", price_usd_monthly: 299, credits_per_month: 42_000 },
+};
+
+function normalizePlan(slug: string | null | undefined) {
+  const key = (slug ?? "none").toLowerCase();
+  const meta = PLAN_LIBRARY[key] ?? PLAN_LIBRARY.none;
+  return { id: key, ...meta };
 }
 
-/** Format subscription status into a readable badge */
-function formatStatus(status: string): { label: string; className: string } {
-  switch (status) {
+function normalizeStatus(s: string | null | undefined): SubscriptionStatus {
+  switch ((s ?? "").toLowerCase()) {
     case "active":
-      return { label: "Active", className: "bg-green-500/20 text-green-400 ring-green-500/30" };
     case "canceled":
-      return { label: "Canceled", className: "bg-red-500/20 text-red-400 ring-red-500/30" };
     case "past_due":
-      return { label: "Past due", className: "bg-amber-500/20 text-amber-400 ring-amber-500/30" };
     case "trialing":
-      return { label: "Trialing", className: "bg-blue-500/20 text-blue-400 ring-blue-500/30" };
+      return s as SubscriptionStatus;
     default:
-      return { label: "None", className: "bg-zinc-500/20 text-zinc-400 ring-zinc-500/30" };
+      return "none";
   }
+}
+
+interface UsageResponse {
+  plan: { id: string; name: string; price_usd_monthly: number; credits_per_month: number };
+  subscription_status: string;
+  credits_remaining: number | null;
+  credits_used_this_period: number;
+  credits_used_pct: number;
+  next_renewal_at?: string | null;
+  buckets?: CreditBucket[];
+  transactions?: LedgerTx[];
 }
 
 export default function Account() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const [isOpeningPortal, setIsOpeningPortal] = useState(false);
-  const [usage, setUsage] = useState<{
-    plan: { id: string; name: string; price_usd_monthly: number; credits_per_month: number };
-    subscription_status: string;
-    credits_remaining: number | null;
-    credits_used_this_period: number;
-    credits_used_pct: number;
-  } | null>(null);
-  // BUG-FE-120 fix: Track the in-flight portal fetch so we can abort on unmount
-  // and avoid state updates after the component is gone.
+  const [usage, setUsage] = useState<UsageResponse | null>(null);
   const portalAbortRef = useRef<AbortController | null>(null);
 
-  // BUG-R1-10: Add a 500ms grace period before redirecting, matching Chat.tsx.
-  // Supabase token refresh briefly sets user=null; without the delay, users
-  // navigating to this page during a refresh cycle are incorrectly sent to /login.
   useEffect(() => {
     if (!user) {
       const timer = setTimeout(() => navigate("/login", { replace: true }), 500);
@@ -58,50 +82,49 @@ export default function Account() {
     }
   }, [user, navigate]);
 
-  // BUG-FE-120 fix: Abort any in-flight portal fetch on unmount.
   useEffect(() => {
     return () => {
       portalAbortRef.current?.abort();
     };
   }, []);
 
-  // v3.5: fetch usage for the meter
   useEffect(() => {
     let cancelled = false;
     const run = async () => {
       try {
-        const { data: { session } } = await supabase.auth.getSession();
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
         const token = session?.access_token;
         if (!token) return;
         const res = await fetch(`${API_URL}/api/billing/usage`, {
           headers: { Authorization: `Bearer ${token}` },
         });
         if (!res.ok) return;
-        const data = await res.json();
+        const data = (await res.json()) as UsageResponse;
         if (!cancelled) setUsage(data);
       } catch {
-        // silent — the existing card still renders from user context
+        // calm degrade — totals from auth context still render
       }
     };
-    run();
+    void run();
     return () => {
       cancelled = true;
     };
   }, []);
 
-  // BUG-FE-120 fix: Render a lightweight loading skeleton instead of `return null`
-  // during the brief grace-period window. This keeps the page visually stable while
-  // Supabase refreshes tokens, and prevents child components from unmounting and
-  // losing state (e.g. an in-flight billing-portal fetch).
   if (!user) {
     return (
       <div className="min-h-screen bg-background">
         <Navbar />
         <section className="px-6 pt-32 pb-16 md:pt-40 md:pb-24">
-          <div className="mx-auto max-w-lg">
+          <div className="mx-auto max-w-3xl">
             <div className="h-8 w-32 animate-pulse rounded bg-muted" />
-            <div className="mt-8 h-64 animate-pulse rounded-lg border border-border bg-card/50" />
-            <div className="mt-6 h-10 animate-pulse rounded-md bg-muted" />
+            <div className="mt-8 grid gap-5 md:grid-cols-2">
+              <div className="h-56 animate-pulse rounded-xl border border-border/60 bg-card/50" />
+              <div className="h-56 animate-pulse rounded-xl border border-border/60 bg-card/50" />
+            </div>
+            <div className="mt-5 h-72 animate-pulse rounded-xl border border-border/60 bg-card/50" />
           </div>
         </section>
         <Footer />
@@ -109,9 +132,6 @@ export default function Account() {
     );
   }
 
-  // BUG-R2-16: Make async and await logout() so navigation doesn't fire
-  // before supabase.auth.signOut() completes and setUser(null) runs.
-  // Without await, the user briefly sees the logged-in navbar state after redirect.
   const handleLogout = async () => {
     await logout();
     navigate("/");
@@ -119,206 +139,70 @@ export default function Account() {
 
   const handleManageSubscription = async () => {
     setIsOpeningPortal(true);
-
-    // BUG-FE-121 fix: Open the window synchronously on click so Safari treats
-    // it as a user-gesture navigation. Safari blocks window.open / location
-    // assignments issued after an `await` because the gesture context has
-    // expired by then.
     const popup = window.open("", "_self");
-
-    // BUG-FE-120 fix: Track the fetch with an AbortController so unmount can cancel it.
     const ac = new AbortController();
     portalAbortRef.current?.abort();
     portalAbortRef.current = ac;
 
     try {
-      const { data: { session } } = await supabase.auth.getSession();
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
       const token = session?.access_token;
       if (!token) {
-        toast.error("Not authenticated", { description: "Please sign in first." });
+        toast.error("Not authenticated", { description: "Sign in and try again." });
         navigate("/login");
         return;
       }
-
       const res = await fetch(`${API_URL}/api/billing/portal`, {
         headers: { Authorization: `Bearer ${token}` },
         signal: ac.signal,
       });
-
       if (!res.ok) {
         const errText = await res.text().catch(() => res.statusText);
         throw new Error(`HTTP ${res.status}: ${errText}`);
       }
-
       const data: { portal_url: string } = await res.json();
-      // P1-FIX-82b: Guard against missing portal_url
-      if (!data.portal_url) {
-        throw new Error("No portal URL received from server");
-      }
-      // BUG-FE-121: Navigate the pre-opened window (or current if popup is null).
-      if (popup) {
-        popup.location.href = data.portal_url;
-      } else {
-        window.location.href = data.portal_url;
-      }
+      if (!data.portal_url) throw new Error("No portal URL received from server");
+      if (popup) popup.location.href = data.portal_url;
+      else window.location.href = data.portal_url;
     } catch (err) {
-      // Don't toast on deliberate abort (e.g. unmount).
-      if (err instanceof DOMException && err.name === "AbortError") {
-        return;
-      }
+      if (err instanceof DOMException && err.name === "AbortError") return;
       const msg = err instanceof Error ? err.message : "Unknown error";
       toast.error("Could not open billing portal", { description: msg });
       setIsOpeningPortal(false);
     }
   };
 
-  const statusBadge = formatStatus(user.subscription_status);
+  const plan = normalizePlan(usage?.plan?.id ?? user.subscription_plan);
+  const status = normalizeStatus(usage?.subscription_status ?? user.subscription_status);
+
+  const data: AccountData = {
+    name: user.name,
+    email: user.email,
+    role: user.role === "admin" ? "admin" : "user",
+    plan,
+    subscriptionStatus: status,
+    nextRenewal: usage?.next_renewal_at ?? null,
+    balance: usage?.credits_remaining ?? user.tokens ?? 0,
+    buckets: usage?.buckets ?? [],
+    transactions: usage?.transactions ?? [],
+  };
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="flex min-h-screen flex-col bg-background">
       <Navbar />
-
-      <section className="px-6 pt-32 pb-16 md:pt-40 md:pb-24">
-        <div className="mx-auto max-w-lg">
-          <ScrollReveal>
-            <div className="flex items-center gap-3">
-              <h1 className="font-serif text-2xl font-semibold text-foreground sm:text-3xl">
-                Account
-              </h1>
-              {user.role === "admin" && (
-                <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2.5 py-0.5 text-xs font-medium text-primary ring-1 ring-primary/20">
-                  <ShieldCheck size={11} />
-                  Admin
-                </span>
-              )}
-            </div>
-          </ScrollReveal>
-
-          <ScrollReveal>
-            <div className="mt-8 rounded-lg border border-border bg-card p-6">
-              <div className="space-y-4">
-                <div>
-                  <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Name</p>
-                  <p className="mt-1 text-sm text-foreground">{user.name}</p>
-                </div>
-                <div>
-                  <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Email</p>
-                  <p className="mt-1 text-sm text-foreground">{user.email}</p>
-                </div>
-                <div>
-                  <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Plan</p>
-                  <div className="mt-1 flex items-center gap-2">
-                    <p className="text-sm font-semibold text-foreground">
-                      {formatPlanName(user.subscription_plan)}
-                    </p>
-                    {user.subscription_status !== "none" && (
-                      <span
-                        className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ring-1 ring-inset ${statusBadge.className}`}
-                      >
-                        {statusBadge.label}
-                      </span>
-                    )}
-                  </div>
-                </div>
-                <div>
-                  <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Credits</p>
-                  <p className="mt-1 text-lg font-semibold text-foreground">
-                    {user.tokens.toLocaleString()}
-                    <span className="ml-2 text-xs font-normal text-muted-foreground">credits remaining</span>
-                  </p>
-                </div>
-              </div>
-            </div>
-          </ScrollReveal>
-
-          {/* v3.5: credit usage meter */}
-          {usage && usage.plan.credits_per_month > 0 && (
-            <ScrollReveal>
-              <div className="mt-6 rounded-lg border border-border bg-card p-6">
-                <div className="flex items-baseline justify-between">
-                  <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                    Usage this period
-                  </p>
-                  <p className="text-[11px] font-semibold text-foreground">
-                    {usage.credits_used_pct.toFixed(1)}%
-                  </p>
-                </div>
-                <div className="mt-3 h-3 overflow-hidden rounded-full border border-border bg-muted">
-                  <div
-                    className={`h-full rounded-full transition-all ${
-                      usage.credits_used_pct > 90
-                        ? "bg-red-500"
-                        : usage.credits_used_pct > 70
-                          ? "bg-amber-500"
-                          : "bg-emerald-500"
-                    }`}
-                    // Always show at least a tiny sliver so the bar is visible
-                    style={{ width: `${Math.max(2, Math.min(100, usage.credits_used_pct))}%` }}
-                  />
-                </div>
-                <div className="mt-3 flex items-baseline justify-between">
-                  <p className="text-xs text-muted-foreground">
-                    <span className="font-semibold text-foreground">
-                      {usage.credits_used_this_period.toLocaleString()}
-                    </span>{" "}
-                    of {usage.plan.credits_per_month.toLocaleString()} credits used
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    <span className="font-semibold text-foreground">
-                      {(usage.credits_remaining ?? 0).toLocaleString()}
-                    </span>{" "}
-                    remaining · {usage.plan.name} plan
-                  </p>
-                </div>
-              </div>
-            </ScrollReveal>
-          )}
-
-          <ScrollReveal>
-            <div className="mt-6 grid gap-3 sm:grid-cols-2">
-              <Link
-                to="/tasks"
-                className="inline-flex w-full items-center gap-2 rounded-md border border-border bg-background px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-secondary"
-              >
-                <Inbox size={16} /> Your tasks
-              </Link>
-              <Button
-                variant="outline"
-                onClick={handleManageSubscription}
-                disabled={isOpeningPortal}
-                className="w-full justify-start gap-2"
-              >
-                {isOpeningPortal ? (
-                  <Loader2 size={16} className="animate-spin" />
-                ) : (
-                  <CreditCard size={16} />
-                )}
-                Manage subscription
-                {!isOpeningPortal && <ExternalLink size={12} className="ml-auto opacity-50" />}
-              </Button>
-
-              {user.role === "admin" && (
-                <Button
-                  variant="outline"
-                  onClick={() => navigate("/admin")}
-                  className="w-full justify-start gap-2"
-                >
-                  <ShieldCheck size={16} /> Admin panel
-                </Button>
-              )}
-            </div>
-
-            <Button
-              variant="ghost"
-              onClick={handleLogout}
-              className="mt-6 w-full justify-start gap-2 text-muted-foreground"
-            >
-              <LogOut size={16} /> Sign out
-            </Button>
-          </ScrollReveal>
-        </div>
-      </section>
-
+      <main className="flex-1 pt-20">
+        <AccountView
+          data={data}
+          isOpeningPortal={isOpeningPortal}
+          onManageBilling={handleManageSubscription}
+          onLogout={handleLogout}
+          onNavigateAdmin={
+            user.role === "admin" ? () => navigate("/admin") : undefined
+          }
+        />
+      </main>
       <Footer />
     </div>
   );

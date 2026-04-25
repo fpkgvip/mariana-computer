@@ -34,6 +34,7 @@ import TaskDetail from "./pages/TaskDetail";
 import Vault from "./pages/Vault";
 import NotFound from "./pages/NotFound";
 import DevStudio from "./pages/DevStudio";
+import DevAccount from "./pages/DevAccount";
 
 // BUG-FE-134 fix: Configure sensible defaults so react-query doesn't refetch
 // aggressively on every window focus or mount. staleTime = 30s keeps data fresh
@@ -136,6 +137,9 @@ const App = () => {
               <Route path="/reset-password" element={<RouteErrorBoundary routeName="password reset"><ResetPassword /></RouteErrorBoundary>} />
               {import.meta.env.DEV && (
                 <Route path="/dev/studio" element={<RouteErrorBoundary routeName="dev studio"><DevStudio /></RouteErrorBoundary>} />
+              )}
+              {import.meta.env.DEV && (
+                <Route path="/dev/account" element={<RouteErrorBoundary routeName="dev account"><DevAccount /></RouteErrorBoundary>} />
               )}
               <Route path="*" element={<NotFound />} />
             </Routes>
