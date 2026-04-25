@@ -82,12 +82,13 @@ export default function Signup() {
               Free credits to start
             </div>
             <h1 className="text-[32px] font-semibold leading-[1.1] tracking-[-0.02em] text-foreground">
-              From a prompt
+              Software that runs.
               <br />
-              to a deployed app.
+              From a single prompt.
             </h1>
             <p className="mt-2.5 text-[14.5px] leading-[1.55] text-muted-foreground">
-              Create your account. Your first project ships today.
+              Create your account and start your first run.
+              You only pay when {BRAND.name} delivers software that runs.
             </p>
 
             <form onSubmit={handleSubmit} className="mt-9 space-y-4">
@@ -187,16 +188,16 @@ export default function Signup() {
           <div className="w-full max-w-md space-y-6">
             <p className="text-[12px] font-medium tracking-[0.02em] text-accent">The loop</p>
             <h2 className="text-balance text-[28px] font-semibold leading-[1.15] tracking-[-0.02em]">
-              Five steps. Always the last is a live URL.
+              Five steps. The last one is a live URL.
             </h2>
 
             <ol className="space-y-2.5">
               {[
                 { l: "Plan", c: "Break the goal into ordered steps." },
                 { l: "Write", c: "Generate every file in a sandbox." },
-                { l: "Build", c: "Compile, lint, type-check." },
-                { l: "Verify", c: "Run it. Open it. Catch errors." },
-                { l: "Ship", c: "Push to a live URL.", deploy: true },
+                { l: "Compile", c: "Build, lint, type-check." },
+                { l: "Verify", c: "Open it in a real browser. Catch its own errors." },
+                { l: "Live", c: "Push to a public URL.", deploy: true },
               ].map((s, i) => (
                 <li
                   key={s.l}
@@ -221,7 +222,8 @@ export default function Signup() {
             </ol>
 
             <p className="text-[12.5px] text-muted-foreground">
-              Generation is free. Credits only spend when {BRAND.name} pushes your work to a live URL.
+              Planning, writing, and verifying are free. Credits charge
+              only against successful work.
             </p>
           </div>
         </div>
