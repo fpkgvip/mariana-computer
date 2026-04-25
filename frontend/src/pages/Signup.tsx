@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { Input } from "@/components/ui/input";
@@ -11,8 +11,17 @@ export default function Signup() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const { signup } = useAuth();
+  const [pendingNav, setPendingNav] = useState(false);
+  const { signup, user } = useAuth();
   const navigate = useNavigate();
+
+  // BUG-R2C-12 fix: same race as Login — wait for the AuthContext user before
+  // navigating, otherwise ProtectedRoute on /chat will bounce us back.
+  useEffect(() => {
+    if (pendingNav && user) {
+      navigate("/chat");
+    }
+  }, [pendingNav, user, navigate]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -45,7 +54,8 @@ export default function Signup() {
         } catch {
           // ignore
         }
-        navigate("/chat");
+        setPendingNav(true);
+        // Navigation runs from useEffect once AuthContext.user is populated.
       }
       // else: stay on page — user must confirm email first
     } catch {

@@ -1,0 +1,59 @@
+{
+  "results": [
+    {
+      "name": "home_page_renders",
+      "status": "PASS",
+      "detail": "hero=\"Set a ceiling.Get a receipt.\""
+    },
+    {
+      "name": "pricing_has_3_tiers",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "name": "pricing_has_3_topups",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "name": "api_health_proxy",
+      "status": "PASS",
+      "detail": "{\"status\":\"ok\",\"version\":\"0.1.0\"}"
+    },
+    {
+      "name": "api_plans_3_tiers",
+      "status": "PASS",
+      "detail": "ids=max,pro,starter"
+    },
+    {
+      "name": "signup_form_renders",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "name": "login_form_renders",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "name": "build_protected",
+      "status": "PASS",
+      "detail": "url=https://frontend-tau-navy-80.vercel.app/login"
+    },
+    {
+      "name": "vault_protected",
+      "status": "PASS",
+      "detail": "url=https://frontend-tau-navy-80.vercel.app/login"
+    },
+    {
+      "name": "quote_requires_auth",
+      "status": "PASS",
+      "detail": "status=401"
+    },
+    {
+      "name": "testrunner_login",
+      "status": "FAIL",
+      "detail": "url=https://frontend-tau-navy-80.vercel.app/login"
+    }
+  ]
+}

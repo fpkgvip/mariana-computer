@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { Input } from "@/components/ui/input";
@@ -11,8 +11,19 @@ export default function Login() {
   const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isResetting, setIsResetting] = useState(false); // BUG-FE-104
-  const { login } = useAuth();
+  const [submitted, setSubmitted] = useState(false);
+  const { login, user } = useAuth();
   const navigate = useNavigate();
+
+  // BUG-R2C-12 fix: navigate AFTER the AuthContext user becomes available.
+  // Doing navigate("/chat") synchronously after `await login()` races with the
+  // onAuthStateChange listener — ProtectedRoute then sees user==null and bounces
+  // us back to /login. Watch the user state instead.
+  useEffect(() => {
+    if (submitted && user) {
+      navigate("/chat");
+    }
+  }, [submitted, user, navigate]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -20,9 +31,11 @@ export default function Login() {
     try {
       // BUG-FE-140: Trim whitespace from email to prevent auth failures on paste
       await login(email.trim(), password);
-      navigate("/chat");
+      setSubmitted(true);
+      // Navigation happens via the useEffect once `user` is populated.
     } catch {
       // Error toast already shown by AuthContext.login()
+      setSubmitted(false);
     } finally {
       setIsLoading(false);
     }
