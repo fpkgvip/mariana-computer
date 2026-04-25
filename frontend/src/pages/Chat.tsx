@@ -2210,7 +2210,7 @@ export default function Chat() {
     // Get auth token
     const token = await getAccessToken();
     if (!token) {
-      toast.error("Not authenticated", {
+      toast.error("Sign in to continue", {
         description: "Please sign in.",
       });
       // P0-FIX-16: Reset isClassifying before navigating to prevent UI lock
@@ -2694,7 +2694,7 @@ export default function Chat() {
     try {
       const token = await getAccessToken();
       if (!token) {
-        toast.error("Not authenticated", { description: "Please sign in again." });
+        toast.error("Sign in to continue", { description: "Please sign in again." });
         navigate("/login");
         return;
       }
@@ -2825,7 +2825,7 @@ export default function Chat() {
     if (!activeTaskId) return;
     const token = await getAccessToken();
     if (!token) {
-      toast.error("Not authenticated", { description: "Please sign in again." });
+      toast.error("Sign in to continue", { description: "Please sign in again." });
       return;
     }
     const endpoint =

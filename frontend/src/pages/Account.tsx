@@ -157,7 +157,7 @@ export default function Account() {
       } = await supabase.auth.getSession();
       const token = session?.access_token;
       if (!token) {
-        toast.error("Not authenticated", { description: "Sign in and try again." });
+        toast.error("Sign in to continue", { description: "Your session has expired." });
         navigate("/login");
         return;
       }
@@ -211,7 +211,7 @@ export default function Account() {
       } = await supabase.auth.getSession();
       const token = session?.access_token;
       if (!token) {
-        toast.error("Not authenticated", { description: "Sign in and try again." });
+        toast.error("Sign in to continue", { description: "Your session has expired." });
         navigate("/login");
         return;
       }

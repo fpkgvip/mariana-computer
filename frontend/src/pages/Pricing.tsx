@@ -196,7 +196,7 @@ export default function Pricing() {
       const { data: { session } } = await supabase.auth.getSession();
       const token = session?.access_token;
       if (!token) {
-        toast.error("Not authenticated", { description: "Please sign in first." });
+        toast.error("Sign in to continue", { description: "You need an account to start a checkout." });
         setLoadingPlanId(null);
         navigate("/login");
         return;

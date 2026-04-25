@@ -445,7 +445,7 @@ export default function InvestigationGraph() {
     }
     const token = await getAccessToken();
     if (!token) {
-      toast.error("Not authenticated");
+      toast.error("Sign in to continue");
       return;
     }
     try {
@@ -495,7 +495,7 @@ export default function InvestigationGraph() {
     }
     const token = await getAccessToken();
     if (!token) {
-      toast.error("Not authenticated");
+      toast.error("Sign in to continue");
       return;
     }
     setAiLoading(true);

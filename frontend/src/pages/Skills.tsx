@@ -148,7 +148,7 @@ function CreateSkillModal({
       const { data: { session } } = await supabase.auth.getSession();
       const token = session?.access_token;
       if (!token) {
-        toast.error("Not authenticated");
+        toast.error("Sign in to continue");
         return;
       }
 
