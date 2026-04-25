@@ -274,7 +274,7 @@ export default function Research() {
             </h2>
             <p className="mt-3 text-[15px] leading-[1.7] text-muted-foreground">
               Describe what you want built, researched, or automated. Deft
-              will plan the work, ask only what's necessary, and start shipping.
+              plans the work, asks only what's necessary, then runs it end to end.
             </p>
             <Link
               to="/chat"

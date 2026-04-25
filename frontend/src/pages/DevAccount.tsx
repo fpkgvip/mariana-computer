@@ -16,6 +16,7 @@ import {
   type CreditBucket,
   type LedgerTx,
 } from "@/components/deft/account/AccountView";
+import { BuyCreditsDialog } from "@/components/deft/account/BuyCreditsDialog";
 
 type Mode = "plus" | "empty" | "admin" | "trial" | "pastdue";
 
@@ -98,6 +99,7 @@ export default function DevAccount() {
   const [params, setParams] = useSearchParams();
   const mode = (params.get("mode") as Mode | null) ?? "plus";
   const [opening, setOpening] = useState(false);
+  const [buyOpen, setBuyOpen] = useState(false);
 
   const goto = (m: Mode) => {
     const next = new URLSearchParams(params);
@@ -200,8 +202,20 @@ export default function DevAccount() {
           setOpening(true);
           window.setTimeout(() => setOpening(false), 1200);
         }}
+        onAddCredits={() => setBuyOpen(true)}
         onLogout={() => alert("(dev) sign out")}
         onNavigateAdmin={data.role === "admin" ? () => alert("(dev) admin") : undefined}
+      />
+      <BuyCreditsDialog
+        open={buyOpen}
+        onOpenChange={setBuyOpen}
+        currentBalance={data.balance}
+        onPurchase={async () => {
+          // dev: simulate latency, log only.
+          await new Promise((r) => window.setTimeout(r, 600));
+          // eslint-disable-next-line no-console
+          console.log("(dev) BuyCreditsDialog purchase");
+        }}
       />
     </div>
   );

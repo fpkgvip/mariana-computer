@@ -13,9 +13,9 @@ const API_URL = import.meta.env.VITE_API_URL ?? "";
 
 /**
  * Pricing — restated around the locked thesis: "You only pay for software
- * that runs." Plan IDs ("starter", "pro", "max") match the backend Stripe
- * price catalogue and remain stable; only the labels and copy have been
- * rewritten.
+ * that runs." Plan IDs ("starter", "standard", "pro", "scale") match the
+ * Stripe price catalogue locked in the Phase 1 positioning doc and the
+ * Account.tsx PLAN_LIBRARY. 1 credit = $0.01 across the product.
  */
 
 interface Plan {
@@ -25,8 +25,14 @@ interface Plan {
   price: number;
   credits: number;
   deploys: string;
+  /** Tight one-word stat for the deploys cell (e.g. "20", "Unlimited"). */
+  deploysShort: string;
   domain: string;
+  /** Tight one-word stat for the domain cell (e.g. "Subdomain", "Custom"). */
+  domainShort: string;
   collab: string;
+  /** Tight one-word stat for the seats cell (e.g. "1", "3", "10", "Unlimited"). */
+  seatsShort: string;
   features: string[];
   highlighted?: boolean;
   cta: string;
@@ -37,12 +43,15 @@ const plans: Plan[] = [
     id: "starter",
     name: "Starter",
     tagline: "For weekend projects and solo founders.",
-    price: 20,
-    credits: 2000,
+    price: 29,
+    credits: 3_500,
     deploys: "20 deploys / month",
     domain: "preview.deft.computer subdomain",
     collab: "Solo workspace",
-    cta: "Start a project",
+    cta: "Start with Starter",
+    deploysShort: "20",
+    domainShort: "Subdomain",
+    seatsShort: "1",
     features: [
       "Unlimited planning, writing, and verification",
       "20 deploys to live URLs each month",
@@ -53,16 +62,19 @@ const plans: Plan[] = [
     ],
   },
   {
-    id: "pro",
-    name: "Pro",
+    id: "standard",
+    name: "Standard",
     tagline: "For people deploying every week.",
-    price: 50,
-    credits: 5500,
+    price: 99,
+    credits: 13_000,
     deploys: "Unlimited deploys",
     domain: "Custom domain on any project",
     collab: "Up to 3 collaborators",
     highlighted: true,
-    cta: "Choose Pro",
+    cta: "Choose Standard",
+    deploysShort: "Unlimited",
+    domainShort: "Custom",
+    seatsShort: "3",
     features: [
       "Everything in Starter",
       "Unlimited deploys to live URLs",
@@ -73,22 +85,47 @@ const plans: Plan[] = [
     ],
   },
   {
-    id: "max",
-    name: "Max",
+    id: "pro",
+    name: "Pro",
+    tagline: "For teams that publish daily.",
+    price: 299,
+    credits: 42_000,
+    deploys: "Unlimited deploys",
+    domain: "Unlimited custom domains",
+    collab: "Up to 10 collaborators",
+    cta: "Choose Pro",
+    deploysShort: "Unlimited",
+    domainShort: "Custom",
+    seatsShort: "10",
+    features: [
+      "Everything in Standard",
+      "4 concurrent runs, dedicated queue",
+      "Unlimited custom domains",
+      "Up to 10 collaborators per workspace",
+      "Image and video generation",
+      "Priority support with one-business-day SLA",
+    ],
+  },
+  {
+    id: "scale",
+    name: "Scale",
     tagline: "For studios running runs all day.",
-    price: 200,
-    credits: 25000,
+    price: 699,
+    credits: 100_000,
     deploys: "Unlimited deploys",
     domain: "Unlimited custom domains",
     collab: "Unlimited collaborators",
-    cta: "Choose Max",
+    cta: "Choose Scale",
+    deploysShort: "Unlimited",
+    domainShort: "Custom",
+    seatsShort: "Unlimited",
     features: [
       "Everything in Pro",
-      "4 concurrent runs, dedicated queue",
-      "Unlimited custom domains",
+      "8 concurrent runs, dedicated queue",
       "Unlimited collaborators",
-      "Image and video generation",
-      "Priority support with SLA",
+      "SAML SSO and audit logs",
+      "Quarterly business review",
+      "Priority support with same-day SLA",
     ],
   },
 ];
@@ -121,9 +158,9 @@ const faqs = [
 ];
 
 const topups = [
-  { id: "topup_starter", name: "Starter pack", price: 10, credits: 1000 },
-  { id: "topup_pro", name: "Pro pack", price: 30, credits: 3000 },
-  { id: "topup_max", name: "Max pack", price: 150, credits: 15000 },
+  { id: "topup_small", name: "Small pack", price: 10, credits: 1_000 },
+  { id: "topup_medium", name: "Medium pack", price: 30, credits: 3_000 },
+  { id: "topup_large", name: "Large pack", price: 150, credits: 15_000 },
 ];
 
 export default function Pricing() {
@@ -219,7 +256,7 @@ export default function Pricing() {
       {/* Plans */}
       <section className="relative pb-24">
         <div className="container-deft">
-          <div className="mx-auto grid max-w-6xl gap-5 md:grid-cols-3">
+          <div className="mx-auto grid max-w-7xl gap-5 sm:grid-cols-2 lg:grid-cols-4">
             {plans.map((plan) => (
               <div
                 key={plan.id}
@@ -255,12 +292,15 @@ export default function Pricing() {
                   <span className="font-mono text-foreground">{plan.credits.toLocaleString()}</span>
                   <span>credits / month</span>
                 </div>
+                <p className="mt-1 text-[11px] text-muted-foreground/80">
+                  ≈ ${plan.credits / 100} of compute at 1c = $0.01
+                </p>
 
-                {/* Magic-three differentiators */}
+                {/* Three-up plan stats */}
                 <div className="mt-6 grid grid-cols-3 gap-2 rounded-lg border border-border/60 bg-background/50 p-3 text-center">
-                  <Stat icon={<Sparkles size={11} className="text-deploy" />} label={plan.deploys.split(" ")[0]} caption="deploys" />
-                  <Stat icon={<Globe size={11} className="text-accent" />} label={plan.id === "starter" ? "Subdomain" : "Custom"} caption="domains" />
-                  <Stat icon={<ShieldCheck size={11} className="text-foreground/80" />} label={plan.collab.split(" ")[0]} caption="seats" />
+                  <Stat icon={<Sparkles size={11} className="text-deploy" />} label={plan.deploysShort} caption="deploys" />
+                  <Stat icon={<Globe size={11} className="text-accent" />} label={plan.domainShort} caption="domains" />
+                  <Stat icon={<ShieldCheck size={11} className="text-foreground/80" />} label={plan.seatsShort} caption="seats" />
                 </div>
 
                 <ul className="mt-6 flex-1 space-y-2.5">
@@ -295,8 +335,10 @@ export default function Pricing() {
             ))}
           </div>
 
-          <p className="mt-8 text-center text-[13px] text-muted-foreground">
-            Working at company scale?{" "}
+          <p className="mt-10 text-center text-[12.5px] leading-[1.7] text-muted-foreground">
+            Every paid plan is annotated honestly: 1 credit = $0.01 of compute.
+            A run that needs $4 of compute deducts 400 credits, only after the
+            step succeeds. Working at company scale?{" "}
             <Link to="/contact" className="text-foreground underline-offset-4 hover:underline">
               Talk to us
             </Link>{" "}

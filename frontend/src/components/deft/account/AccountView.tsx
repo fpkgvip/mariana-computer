@@ -10,7 +10,7 @@
  * Voice: calm, technical, no hype.  No emojis, no exclamation points.
  * Numbers should always look like receipts.
  */
-import { Link } from "react-router-dom";
+
 import {
   CreditCard,
   ExternalLink,
@@ -21,6 +21,7 @@ import {
   Inbox,
   HelpCircle,
 } from "lucide-react";
+import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -78,6 +79,8 @@ export interface AccountViewProps {
   data: AccountData;
   isOpeningPortal: boolean;
   onManageBilling: () => void;
+  /** Opens the BuyCreditsDialog. Receives no args. */
+  onAddCredits?: () => void;
   onLogout: () => void;
   onNavigateAdmin?: () => void;
   /** When true the Add credits link is shown next to Manage billing. */
@@ -163,7 +166,15 @@ function HeaderRow({ name, email, role }: { name: string; email: string; role: "
   );
 }
 
-function BalanceCard({ balance, buckets }: { balance: number; buckets: CreditBucket[] }) {
+function BalanceCard({
+  balance,
+  buckets,
+  onAddCredits,
+}: {
+  balance: number;
+  buckets: CreditBucket[];
+  onAddCredits?: () => void;
+}) {
   return (
     <section
       aria-labelledby="acct-balance"
@@ -185,12 +196,14 @@ function BalanceCard({ balance, buckets }: { balance: number; buckets: CreditBuc
             ≈ {creditsToUsd(balance)} at 1c = $0.01
           </p>
         </div>
-        <Link
-          to="/checkout"
-          className="inline-flex items-center gap-1 rounded-md border border-border/70 bg-surface-2/40 px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-2"
+        <button
+          type="button"
+          onClick={onAddCredits}
+          className="inline-flex items-center gap-1 rounded-md border border-border/70 bg-surface-2/40 px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-2 disabled:opacity-60"
+          disabled={!onAddCredits}
         >
           <Plus size={12} aria-hidden /> Add credits
-        </Link>
+        </button>
       </div>
 
       {buckets.length > 0 && (
@@ -444,6 +457,7 @@ export function AccountView({
   data,
   isOpeningPortal,
   onManageBilling,
+  onAddCredits,
   onLogout,
   onNavigateAdmin,
 }: AccountViewProps) {
@@ -452,7 +466,11 @@ export function AccountView({
       <HeaderRow name={data.name} email={data.email} role={data.role} />
 
       <div className="mt-8 grid gap-5 md:grid-cols-2">
-        <BalanceCard balance={data.balance} buckets={data.buckets} />
+        <BalanceCard
+          balance={data.balance}
+          buckets={data.buckets}
+          onAddCredits={onAddCredits}
+        />
         <PlanCard
           plan={data.plan}
           status={data.subscriptionStatus}

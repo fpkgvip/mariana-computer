@@ -3,7 +3,7 @@
  *
  * The agent prompt language supports a `$KEY_NAME` sentinel that the
  * frontend resolves at submit time by decrypting the matching vault
- * secret locally and shipping the plaintext to the orchestrator under
+ * secret locally and forwarding the plaintext to the orchestrator under
  * `vault_env` (Redis-backed, per-task, auto-purged on terminal state).
  *
  * Grammar (mirrors the server-side store):

@@ -20,6 +20,7 @@ import {
   type LedgerTx,
   type SubscriptionStatus,
 } from "@/components/deft/account/AccountView";
+import { BuyCreditsDialog } from "@/components/deft/account/BuyCreditsDialog";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "";
 
@@ -72,6 +73,8 @@ export default function Account() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const [isOpeningPortal, setIsOpeningPortal] = useState(false);
+  const [isBuyOpen, setIsBuyOpen] = useState(false);
+  const [isPurchasing, setIsPurchasing] = useState(false);
   const [usage, setUsage] = useState<UsageResponse | null>(null);
   const portalAbortRef = useRef<AbortController | null>(null);
 
@@ -137,6 +140,54 @@ export default function Account() {
     navigate("/");
   };
 
+  const handleBuyCredits = async (packId: string) => {
+    setIsPurchasing(true);
+    // Open synchronously to keep Safari's user gesture alive (BUG-FE-121).
+    const popup = window.open("", "_self");
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const token = session?.access_token;
+      if (!token) {
+        toast.error("Not authenticated", { description: "Sign in and try again." });
+        navigate("/login");
+        return;
+      }
+      const res = await fetch(`${API_URL}/api/billing/create-checkout`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          plan_id: packId,
+          success_url: `${window.location.origin}/account?topup=success`,
+          cancel_url: `${window.location.origin}/account?topup=cancelled`,
+        }),
+      });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => res.statusText);
+        throw new Error(`HTTP ${res.status}: ${errText}`);
+      }
+      const data: { checkout_url?: string } = await res.json();
+      if (!data.checkout_url) throw new Error("No checkout URL received from server");
+      // Validate origin: same-origin or stripe.com only.
+      const parsed = new URL(data.checkout_url);
+      const isSameOrigin = parsed.origin === window.location.origin;
+      const isStripe = parsed.hostname.endsWith(".stripe.com");
+      if (!isSameOrigin && !isStripe) {
+        throw new Error("Untrusted checkout URL");
+      }
+      if (popup) popup.location.href = data.checkout_url;
+      else window.location.href = data.checkout_url;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      toast.error("Could not start checkout", { description: msg });
+      setIsPurchasing(false);
+    }
+  };
+
   const handleManageSubscription = async () => {
     setIsOpeningPortal(true);
     const popup = window.open("", "_self");
@@ -197,10 +248,20 @@ export default function Account() {
           data={data}
           isOpeningPortal={isOpeningPortal}
           onManageBilling={handleManageSubscription}
+          onAddCredits={() => setIsBuyOpen(true)}
           onLogout={handleLogout}
           onNavigateAdmin={
             user.role === "admin" ? () => navigate("/admin") : undefined
           }
+        />
+        <BuyCreditsDialog
+          open={isBuyOpen}
+          onOpenChange={(o) => {
+            if (!isPurchasing) setIsBuyOpen(o);
+          }}
+          onPurchase={handleBuyCredits}
+          isPurchasing={isPurchasing}
+          currentBalance={data.balance}
         />
       </main>
       <Footer />
