@@ -84,7 +84,7 @@ export function ProjectsSidebar({ activeTaskId, onSelect, onNew, balance }: Proj
   return (
     <aside
       aria-label="Projects"
-      className="hidden w-60 shrink-0 flex-col border-r border-border bg-[hsl(var(--sidebar-background))] md:flex"
+      className="flex h-full w-60 shrink-0 flex-col border-r border-border bg-[hsl(var(--sidebar-background))]"
     >
       <div className="border-b border-border px-3 py-3">
         <button

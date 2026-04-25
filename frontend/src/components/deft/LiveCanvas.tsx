@@ -18,13 +18,11 @@ import {
   CheckCircle2,
   Circle,
   Clock,
-  Coins,
   Download,
   FileText,
   Loader2,
   PauseCircle,
   Play,
-  Square,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { AgentEvent, AgentTaskState } from "@/lib/agentRunApi";
@@ -34,6 +32,7 @@ interface LiveCanvasProps {
   events: AgentEvent[];
   /** Connection status: 'live' (SSE open), 'polling' (REST fallback), 'closed'. */
   connectionStatus?: "live" | "polling" | "closed";
+  /** Reserved — cancel is owned by the StudioHeader strip; this prop is kept for backwards-compat. */
   onCancel?: () => void;
   /** Format a server timestamp string for display. */
   formatTime?: (iso: string) => string;
@@ -95,7 +94,8 @@ export function LiveCanvas({
   formatTime,
   className,
 }: LiveCanvasProps) {
-  const [tab, setTab] = useState<"plan" | "activity" | "artifacts">("activity");
+  void onCancel; // Cancel button now lives in StudioHeader; prop kept for back-compat.
+  const [tab, setTab] = useState<"plan" | "activity" | "artifacts">("plan");
   const activityRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
 
@@ -115,6 +115,8 @@ export function LiveCanvas({
   const burnPct = budgetCredits > 0 ? Math.min(100, (spentCredits / budgetCredits) * 100) : 0;
 
   const terminal = isTerminalState(task.state);
+  const stageStatus: "plan" | "write" | "compile" | "verify" | "live" =
+    terminal && task.state !== "failed" ? "live" : deriveRailStage(events, terminal, task.state);
 
   return (
     <div
@@ -125,51 +127,19 @@ export function LiveCanvas({
       role="region"
       aria-label="Live canvas"
     >
-      {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
-        <div className="flex items-center gap-3 min-w-0">
-          <div
-            className={cn(
-              "h-2 w-2 shrink-0 rounded-full",
-              terminal && task.state === "failed" && "bg-destructive",
-              terminal && task.state !== "failed" && "bg-success",
-              !terminal && connectionStatus === "live" && "animate-pulse bg-accent",
-              !terminal && connectionStatus === "polling" && "bg-warning",
-              !terminal && connectionStatus === "closed" && "bg-muted-foreground",
-            )}
-            aria-hidden
-          />
-          <span className="truncate text-sm font-medium text-foreground">{task.goal}</span>
-          <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
-            {task.state}
-          </span>
-        </div>
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-1.5 text-xs text-muted-foreground" title="Credits burned">
-            <Coins size={12} aria-hidden />
-            <span className="font-mono">
-              {spentCredits.toLocaleString()}
-              <span className="opacity-60"> / {budgetCredits.toLocaleString()}</span>
-            </span>
-          </div>
-          {!terminal && (
-            <button
-              type="button"
-              onClick={onCancel}
-              disabled={!onCancel}
-              aria-label="Cancel run"
-              className="inline-flex items-center gap-1.5 rounded-md border border-destructive/40 px-2 py-1 text-xs text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
-            >
-              <Square size={12} aria-hidden />
-              Cancel
-            </button>
-          )}
-        </div>
-      </div>
+      {/* Five-stage rail */}
+      <StageRail current={stageStatus} terminal={terminal} failed={task.state === "failed"} />
 
       {/* Burn bar */}
       {budgetCredits > 0 && (
-        <div className="h-0.5 w-full bg-secondary" aria-hidden>
+        <div
+          className="h-0.5 w-full bg-secondary"
+          role="progressbar"
+          aria-label="Credit burn"
+          aria-valuenow={spentCredits}
+          aria-valuemin={0}
+          aria-valuemax={budgetCredits}
+        >
           <div
             className={cn(
               "h-full transition-all duration-300",
@@ -177,6 +147,13 @@ export function LiveCanvas({
             )}
             style={{ width: `${burnPct}%` }}
           />
+        </div>
+      )}
+      {/* Connection hint when polling/closed (calm, not alarming) */}
+      {!terminal && connectionStatus !== "live" && (
+        <div className="flex items-center gap-1.5 border-b border-border/60 bg-secondary/30 px-3 py-1 text-[11px] text-muted-foreground">
+          <span className="size-1.5 rounded-full bg-warning" aria-hidden />
+          {connectionStatus === "polling" ? "Polling — stream is reconnecting." : "Disconnected from stream."}
         </div>
       )}
 
@@ -397,6 +374,103 @@ function formatBytes(n: number): string {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
   return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+// ---------------------------------------------------------------------------
+// Five-stage rail — Plan → Write → Compile → Verify → Live
+// ---------------------------------------------------------------------------
+
+const RAIL_STAGES: ReadonlyArray<{ key: "plan" | "write" | "compile" | "verify" | "live"; label: string }> = [
+  { key: "plan", label: "Plan" },
+  { key: "write", label: "Write" },
+  { key: "compile", label: "Compile" },
+  { key: "verify", label: "Verify" },
+  { key: "live", label: "Live" },
+];
+
+function StageRail({
+  current,
+  terminal,
+  failed,
+}: {
+  current: "plan" | "write" | "compile" | "verify" | "live";
+  terminal: boolean;
+  failed: boolean;
+}) {
+  const currentIdx = RAIL_STAGES.findIndex((s) => s.key === current);
+  return (
+    <ol
+      role="list"
+      aria-label="Run progress"
+      className="flex w-full items-center gap-1 border-b border-border/70 bg-surface-1/40 px-3 py-2"
+    >
+      {RAIL_STAGES.map((stage, i) => {
+        const done = i < currentIdx || (terminal && !failed);
+        const active = i === currentIdx && !terminal;
+        const isLast = i === RAIL_STAGES.length - 1;
+        return (
+          <li key={stage.key} className="flex flex-1 items-center gap-1.5">
+            <span
+              aria-current={active ? "step" : undefined}
+              className={cn(
+                "flex items-center gap-1.5 text-[11px] font-medium tracking-wide",
+                active && !failed && "text-accent",
+                active && failed && "text-destructive",
+                done && "text-foreground",
+                !done && !active && "text-muted-foreground",
+              )}
+            >
+              <span
+                className={cn(
+                  "size-1.5 shrink-0 rounded-full",
+                  done && "bg-deploy",
+                  active && !failed && "bg-accent studio-breathe",
+                  active && failed && "bg-destructive",
+                  !done && !active && "bg-muted-foreground/40",
+                )}
+              />
+              <span className="hidden sm:inline">{stage.label}</span>
+            </span>
+            {!isLast && (
+              <span
+                aria-hidden
+                className={cn(
+                  "h-px flex-1",
+                  i < currentIdx ? "bg-deploy/50" : "bg-border",
+                )}
+              />
+            )}
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+function deriveRailStage(
+  events: AgentEvent[],
+  terminal: boolean,
+  state: string,
+): "plan" | "write" | "compile" | "verify" | "live" {
+  if (terminal && state !== "failed") return "live";
+  // Walk recent events backward to find the strongest signal.
+  const window = events.slice(-80);
+  for (let i = window.length - 1; i >= 0; i--) {
+    const e = window[i];
+    const tool = (e.payload?.tool ?? e.payload?.tool_name ?? "") as string;
+    const evType = e.event_type;
+    if (tool === "deploy_preview" || evType === "deploy_started") return "verify";
+    if (tool === "browser_screenshot" || evType === "verify" || tool === "browser_open") return "verify";
+    if (
+      tool === "sandbox_exec" ||
+      tool === "exec" ||
+      /\b(?:vite|tsc|npm|pnpm|build|compile)\b/.test(JSON.stringify(e.payload ?? {}))
+    )
+      return "compile";
+    if (tool === "fs_write" || tool === "fs_edit" || evType === "step_started") return "write";
+    if (evType === "plan" || tool === "plan") return "plan";
+  }
+  return "plan";
 }
 
 // Re-export useful types/icons so the parent doesn't need to import from lucide directly

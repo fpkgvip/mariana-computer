@@ -1,24 +1,27 @@
 /**
  * /build — Deft Studio
  *
- * Two modes:
- *   • IDLE — no active task. A centered prompt bar (the moment of intent),
- *     plus a preflight card showing the quote and tier picker.
- *   • LIVE — split pane. Left = LiveCanvas (plan, activity, artifacts).
- *     Right = PreviewPane iframe pointed at the deployed preview URL.
- *     Header offers "New run" + cancel; sidebar lists past projects.
+ * Three-zone shell:
+ *   • ProjectsSidebar (left rail, slide-over below lg)
+ *   • StudioHeader     (sticky strip: stage chip · title · credits · cancel)
+ *   • Canvas           (IdleStudio when no task, LiveStudio when a run is active)
  *
  * The split is the product. The receipt is the URL.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { ArrowLeft, Plus } from "lucide-react";
 import { Navbar } from "@/components/Navbar";
-import { PromptBar } from "@/components/deft/PromptBar";
-import { PreflightCard } from "@/components/deft/PreflightCard";
-import { LiveCanvas } from "@/components/deft/LiveCanvas";
-import { PreviewPane } from "@/components/deft/PreviewPane";
 import { ProjectsSidebar } from "@/components/deft/ProjectsSidebar";
+import { StudioFrame } from "@/components/deft/studio/StudioFrame";
+import { StudioHeader } from "@/components/deft/studio/StudioHeader";
+import { IdleStudio } from "@/components/deft/studio/IdleStudio";
+import { LiveStudio } from "@/components/deft/studio/LiveStudio";
+import {
+  canCancelStage,
+  creditsFromUsd,
+  deriveStudioStage,
+  durationSeconds,
+} from "@/components/deft/studio/stage";
 import { useCredits, CREDITS_CHANGED_EVENT } from "@/hooks/useCredits";
 import { useAuth } from "@/contexts/AuthContext";
 import {
@@ -38,7 +41,6 @@ import { VaultUnlockDialog } from "@/components/deft/VaultUnlockDialog";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { scanVaultRefs, resolveVaultRefs, VaultRefError } from "@/lib/vaultPromptScan";
 import { track } from "@/lib/analytics";
-import { BRAND } from "@/lib/brand";
 
 const FIRST_PROMPT_FLAG = "deft.firstPromptSubmitted.v1";
 
@@ -69,6 +71,7 @@ export default function Build() {
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [connectionStatus, setConnectionStatus] = useState<"live" | "polling" | "closed">("closed");
   const [starting, setStarting] = useState(false);
+  const [cancelConfirmOpen, setCancelConfirmOpen] = useState(false);
 
   const eventSourceRef = useRef<EventSource | null>(null);
   const lastEventIdRef = useRef<number>(0);
@@ -302,8 +305,9 @@ export default function Build() {
     }
   }, [launchRun, vault.decryptByName]);
 
-  const onCancel = useCallback(async () => {
+  const confirmCancel = useCallback(async () => {
     if (!activeTaskId) return;
+    setCancelConfirmOpen(false);
     try {
       await stopAgentRun(activeTaskId);
       toast("Stop requested");
@@ -324,31 +328,51 @@ export default function Build() {
     setActiveTaskId(null);
   }, [setParams]);
 
+  // Derive header state once per render.
+  const stage = useMemo(() => deriveStudioStage(task, events), [task, events]);
+  const spentCredits = creditsFromUsd(task?.spent_usd);
+  const ceilingCredits = creditsFromUsd(task?.budget_usd);
+  const headerDuration = task ? durationSeconds(task) : undefined;
+  const cancellable = Boolean(task) && canCancelStage(stage);
+
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
       <Navbar />
-      <div className="flex flex-1 overflow-hidden pt-16">
-        <ProjectsSidebar
-          activeTaskId={activeTaskId}
-          onSelect={(id) => {
-            setParams((prev) => {
-              const p = new URLSearchParams(prev);
-              p.set("task", id);
-              return p;
-            });
-          }}
-          onNew={newRun}
-          balance={balance}
-        />
-
-        <main className="relative flex flex-1 overflow-hidden">
+      <div className="flex flex-1 min-h-0 overflow-hidden pt-16">
+        <StudioFrame
+          projects={
+            <ProjectsSidebar
+              activeTaskId={activeTaskId}
+              onSelect={(id) => {
+                setParams((prev) => {
+                  const p = new URLSearchParams(prev);
+                  p.set("task", id);
+                  return p;
+                });
+              }}
+              onNew={newRun}
+              balance={balance}
+            />
+          }
+          header={
+            <StudioHeader
+              title={task?.goal ?? ""}
+              stage={stage}
+              spentCredits={task ? spentCredits : undefined}
+              ceilingCredits={task ? ceilingCredits : undefined}
+              durationSec={headerDuration}
+              canCancel={cancellable}
+              onCancel={() => setCancelConfirmOpen(true)}
+              onNewRun={activeTaskId ? newRun : undefined}
+            />
+          }
+        >
           {activeTaskId && task ? (
             <LiveStudio
               task={task}
               events={events}
               connectionStatus={connectionStatus}
-              onCancel={onCancel}
-              onNew={newRun}
+              onCancel={() => setCancelConfirmOpen(true)}
               taskId={activeTaskId}
             />
           ) : (
@@ -361,8 +385,36 @@ export default function Build() {
               unlimited={user?.role === "admin"}
             />
           )}
-        </main>
+        </StudioFrame>
       </div>
+
+      {/* Cancel confirmation */}
+      <Dialog open={cancelConfirmOpen} onOpenChange={setCancelConfirmOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Cancel this run?</DialogTitle>
+            <DialogDescription>
+              Credits already burned will not be refunded. Pending steps stop within 5 seconds.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="mt-2 flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => setCancelConfirmOpen(false)}
+              className="inline-flex items-center rounded-md border border-border px-3 py-1.5 text-[13px] font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            >
+              Keep running
+            </button>
+            <button
+              type="button"
+              onClick={confirmCancel}
+              className="inline-flex items-center rounded-md bg-destructive px-3 py-1.5 text-[13px] font-medium text-destructive-foreground transition-opacity hover:opacity-90"
+            >
+              Cancel run
+            </button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <Dialog
         open={vaultUnlockOpen}
@@ -387,121 +439,6 @@ export default function Build() {
           <VaultUnlockDialog onUnlocked={onVaultUnlocked} bare />
         </DialogContent>
       </Dialog>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Idle: centered prompt + preflight (clean, focused, single column)
-// ---------------------------------------------------------------------------
-
-interface IdleStudioProps {
-  prompt: string;
-  onPromptChange: (v: string) => void;
-  onStart: (params: { tier: ModelTier; ceiling: number; quote: QuoteResponse }) => void | Promise<void>;
-  balance: number;
-  starting: boolean;
-  unlimited?: boolean;
-}
-
-function IdleStudio({ prompt, onPromptChange, onStart, balance, starting, unlimited }: IdleStudioProps) {
-  return (
-    <div className="relative flex-1 overflow-auto">
-      <div className="absolute inset-0 -z-0 bg-grid opacity-50" aria-hidden />
-      <div className="absolute inset-0 -z-0 bg-vignette" aria-hidden />
-      <div className="relative mx-auto flex w-full max-w-[860px] flex-col gap-5 px-6 py-12 md:py-16">
-        <div className="text-center">
-          <div className="mx-auto mb-4 inline-flex items-center gap-2 rounded-full border border-border/70 bg-surface-1/70 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground backdrop-blur">
-            <span className="size-1.5 rounded-full bg-deploy animate-pulse" />
-            New run
-          </div>
-          <h1 className="text-balance text-3xl font-semibold tracking-[-0.02em] text-foreground sm:text-4xl">
-            Describe what you want.
-          </h1>
-          <p className="mx-auto mt-3 max-w-md text-[14.5px] leading-[1.6] text-muted-foreground">
-            {BRAND.name} plans, writes the code, runs it in a real browser,
-            verifies it works, then deploys. You only pay for software that runs.
-          </p>
-        </div>
-
-        <div className="rounded-2xl border border-border/80 bg-surface-1/85 p-4 shadow-elev-2 backdrop-blur-md focus-within:border-accent/60 focus-within:shadow-[0_0_0_4px_hsl(var(--accent)/0.10),0_18px_48px_-22px_hsl(var(--accent)/0.55)]">
-          <PromptBar
-            initialValue={prompt}
-            onChange={onPromptChange}
-            onSubmit={async (p) => onPromptChange(p)}
-            busy={starting}
-            placeholder="A habit tracker with a streak heatmap and Supabase auth…"
-          />
-        </div>
-
-        {prompt.trim() && (
-          <PreflightCard
-            prompt={prompt}
-            onStart={onStart}
-            balance={balance}
-            starting={starting}
-            unlimited={unlimited}
-          />
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Live: split pane — LiveCanvas left, PreviewPane right
-// ---------------------------------------------------------------------------
-
-interface LiveStudioProps {
-  task: AgentTaskState;
-  events: AgentEvent[];
-  connectionStatus: "live" | "polling" | "closed";
-  onCancel: () => void;
-  onNew: () => void;
-  taskId: string;
-}
-
-function LiveStudio({ task, events, connectionStatus, onCancel, onNew, taskId }: LiveStudioProps) {
-  return (
-    <div className="flex h-full min-h-0 flex-1 flex-col">
-      {/* Sub-bar */}
-      <div className="flex items-center justify-between gap-3 border-b border-border/70 bg-surface-1/40 px-4 py-2.5 backdrop-blur">
-        <button
-          type="button"
-          onClick={onNew}
-          className="inline-flex items-center gap-1.5 rounded-md border border-border/60 bg-surface-1 px-2.5 py-1.5 text-[12px] font-medium text-muted-foreground transition-colors hover:border-accent/50 hover:text-foreground"
-        >
-          <ArrowLeft size={12} /> New run
-        </button>
-
-        <div className="hidden items-center gap-2 truncate text-[12px] text-muted-foreground sm:flex">
-          <span className="truncate">{task.goal}</span>
-        </div>
-
-        <button
-          type="button"
-          onClick={onNew}
-          className="inline-flex items-center gap-1.5 rounded-md bg-accent px-2.5 py-1.5 text-[12px] font-medium text-accent-foreground shadow-[0_4px_14px_-6px_hsl(var(--accent)/0.55)] transition-all hover:brightness-110"
-        >
-          <Plus size={12} /> Start another
-        </button>
-      </div>
-
-      {/* Split */}
-      <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 p-3 lg:grid-cols-[minmax(360px,1fr)_minmax(0,1.35fr)]">
-        <div className="min-h-0">
-          <LiveCanvas
-            task={task}
-            events={events}
-            connectionStatus={connectionStatus}
-            onCancel={onCancel}
-            className="h-full"
-          />
-        </div>
-        <div className="min-h-0">
-          <PreviewPane taskId={taskId} task={task} events={events} className="h-full" />
-        </div>
-      </div>
     </div>
   );
 }

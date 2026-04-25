@@ -284,6 +284,21 @@
   }
   .animate-deploy-pulse { animation: deploy-pulse 1.4s cubic-bezier(0.16,1,0.3,1) 1; }
 
+  /* Studio breath — low-amplitude opacity loop used by the active stage chip and
+     the Live Canvas stage rail.  Calmer than `animate-pulse` (which goes to 0.5
+     hard); this glides between 1.0 and 0.55 so it reads as steady focus, not
+     anxiety. */
+  @keyframes studio-breathe {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.55; }
+  }
+  .studio-breathe {
+    animation: studio-breathe 1.8s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .studio-breathe { animation: none; opacity: 1; }
+  }
+
   /* Cycling caret used in the homepage hero placeholder */
   @keyframes caret { 0%,49%{opacity:1} 50%,100%{opacity:0} }
   .deft-caret::after {
