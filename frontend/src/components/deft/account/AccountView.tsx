@@ -180,8 +180,8 @@ function BalanceCard({
       aria-labelledby="acct-balance"
       className="rounded-xl border border-border/70 bg-surface-1/60 p-5"
     >
-      <div className="flex items-baseline justify-between gap-3">
-        <div>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-baseline sm:justify-between">
+        <div className="min-w-0">
           <SectionLabel>Balance</SectionLabel>
           <p
             id="acct-balance"
@@ -199,7 +199,7 @@ function BalanceCard({
         <button
           type="button"
           onClick={onAddCredits}
-          className="inline-flex items-center gap-1 rounded-md border border-border/70 bg-surface-2/40 px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-2 disabled:opacity-60"
+          className="inline-flex w-full items-center justify-center gap-1 rounded-md border border-border/70 bg-surface-2/40 px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-2 disabled:opacity-60 sm:w-auto"
           disabled={!onAddCredits}
         >
           <Plus size={12} aria-hidden /> Add credits
@@ -282,10 +282,10 @@ function PlanCard({
       aria-labelledby="acct-plan"
       className="rounded-xl border border-border/70 bg-surface-1/60 p-5"
     >
-      <div className="flex items-baseline justify-between gap-3">
-        <div>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-baseline sm:justify-between">
+        <div className="min-w-0">
           <SectionLabel>Plan</SectionLabel>
-          <div className="mt-1 flex items-center gap-2">
+          <div className="mt-1 flex flex-wrap items-center gap-2">
             <p id="acct-plan" className="text-base font-semibold text-foreground">
               {plan.name}
             </p>
@@ -315,7 +315,7 @@ function PlanCard({
           variant="outline"
           onClick={onManageBilling}
           disabled={isOpeningPortal}
-          className="shrink-0 gap-2"
+          className="w-full shrink-0 gap-2 sm:w-auto"
         >
           {isOpeningPortal ? (
             <Loader2 size={14} className="motion-safe:animate-spin" aria-hidden />
