@@ -2,19 +2,18 @@ import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
 import { Link, useNavigate } from "react-router-dom";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUpRight, Sparkles, Globe, ShieldCheck } from "lucide-react";
+import { ArrowUpRight, Sparkles, Eye, Globe } from "lucide-react";
+import { useAuth } from "@/contexts/AuthContext";
 import { BRAND, STORAGE } from "@/lib/brand";
 
 /**
  * Deft homepage — prompt-first.
  *
- * The hero IS the input. No marketing detours, no chrome, no carousel.
- * Cycling placeholder shows what's possible. Submitting routes the user
- * straight into /build with the prompt prefilled — auth is handled there.
- *
- * Below the fold: a single, calm explanation of what happens after you
- * press send. Plan → Build → Ship. Generation is free. Deployment is the
- * only thing we charge for, because that's the only thing that costs us.
+ * The hero IS the input.  The thesis (locked in
+ * docs/positioning/phase_01_positioning.md) sits above it: "The AI developer
+ * that doesn't leave you debugging."  Submitting branches on auth: a logged-in
+ * user goes straight into /build with the prompt prefilled, an unauthenticated
+ * visitor goes to /signup with the prompt preserved through the round-trip.
  */
 
 const CYCLING_PROMPTS = [
@@ -28,16 +27,19 @@ const CYCLING_PROMPTS = [
   "A booking page for a sushi restaurant — calendar, deposits, SMS confirms.",
 ];
 
+// Five-stage pipeline.  These are descriptive technical steps, not marketing
+// verbs.  The last stage is "Live" — a live URL is the receipt.
 const STAGES = [
-  { label: "Plan", caption: "Break the goal into a Plan." },
+  { label: "Plan", caption: "Break the goal into ordered steps." },
   { label: "Write", caption: "Generate every file." },
-  { label: "Build", caption: "Compile, lint, type-check." },
-  { label: "Verify", caption: "Run it. Open it. Catch errors." },
-  { label: "Ship", caption: "Push to a live URL." },
+  { label: "Compile", caption: "Build, lint, type-check." },
+  { label: "Verify", caption: "Open it in a real browser. Catch its own errors." },
+  { label: "Live", caption: "Push to a public URL." },
 ];
 
 export default function Index() {
   const navigate = useNavigate();
+  const { user } = useAuth();
   const [prompt, setPrompt] = useState("");
   const [phIndex, setPhIndex] = useState(0);
   const [phText, setPhText] = useState("");
@@ -88,7 +90,17 @@ export default function Index() {
     } catch {
       /* no-op: storage may be unavailable in private mode */
     }
-    navigate(`/build?prompt=${encodeURIComponent(value)}`);
+    // Auth-aware routing.  An authenticated user lands directly in the
+    // studio with the prompt prefilled; an anonymous visitor goes to
+    // /signup, which forwards them to /build?prompt=... after they create
+    // an account.  We never push an unauth user into /build, since the
+    // ProtectedRoute bounce-to-login would silently drop the prompt.
+    const buildHref = `/build?prompt=${encodeURIComponent(value)}`;
+    if (user) {
+      navigate(buildHref);
+    } else {
+      navigate(`/signup?next=${encodeURIComponent(buildHref)}`);
+    }
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -131,16 +143,16 @@ export default function Index() {
             {/* Eyebrow */}
             <div className="mx-auto mb-7 inline-flex items-center gap-2 rounded-full border border-border/70 bg-surface-1/60 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground backdrop-blur">
               <span className="size-1.5 rounded-full bg-deploy animate-pulse" />
-              Generation is free · pay only when you ship
+              The AI developer with a real computer
             </div>
 
-            {/* Headline */}
+            {/* Headline — locked thesis (Phase 01 positioning) */}
             <h1 className="text-balance text-[44px] font-semibold leading-[1.02] tracking-[-0.035em] sm:text-6xl md:text-[80px] lg:text-[88px]">
-              From a prompt
+              The AI developer
               <br className="hidden sm:block" />{" "}
-              <span className="text-muted-foreground">to a </span>
+              <span className="text-muted-foreground">that doesn{"\u2019"}t leave you </span>
               <span className="relative inline-block">
-                <span className="relative z-10">deployed app</span>
+                <span className="relative z-10">debugging</span>
                 <span
                   className="absolute inset-x-0 bottom-[0.10em] -z-0 h-[0.18em] rounded-full"
                   style={{ background: "hsl(var(--deploy) / 0.55)" }}
@@ -150,11 +162,11 @@ export default function Index() {
               <span className="text-muted-foreground">.</span>
             </h1>
 
-            {/* Sub */}
-            <p className="mx-auto mt-6 max-w-[640px] text-pretty text-[16px] leading-[1.6] text-ink-1 sm:text-lg">
-              {BRAND.name} is one autonomous engineer that plans, writes, builds, verifies,
-              and ships your idea — replacing every vibe-coding tool with one calm,
-              receipt-driven loop.
+            {/* Sub — three-line thesis, condensed */}
+            <p className="mx-auto mt-6 max-w-[680px] text-pretty text-[16px] leading-[1.6] text-ink-1 sm:text-lg">
+              {BRAND.name} runs your app in a real browser, watches its own output,
+              and fixes its own mistakes — before you see them. You describe what
+              you want. {BRAND.name} delivers software that runs.
             </p>
 
             {/* The Prompt — the actual hero. */}
@@ -202,11 +214,11 @@ export default function Index() {
                 <div className="absolute inset-x-3 bottom-2 flex items-center justify-between">
                   <div className="flex items-center gap-1.5 pl-2 text-[11px] text-muted-foreground/80">
                     <Sparkles size={12} className="text-accent" />
-                    <span>Press Enter to build</span>
+                    <span>Press Enter to start</span>
                   </div>
                   <button
                     type="submit"
-                    aria-label="Build it"
+                    aria-label="Start"
                     className={[
                       "inline-flex h-9 items-center gap-1.5 rounded-lg px-3.5 text-[13px] font-medium",
                       "transition-all duration-150",
@@ -215,7 +227,7 @@ export default function Index() {
                         : "bg-surface-3 text-muted-foreground hover:text-foreground",
                     ].join(" ")}
                   >
-                    Build it
+                    Start
                     <ArrowUpRight size={14} />
                   </button>
                 </div>
@@ -240,35 +252,36 @@ export default function Index() {
               </div>
             </form>
 
-            {/* Trust strip */}
+            {/* Trust strip — three concrete behaviors, not defensive badges */}
             <div className="mt-14 flex flex-wrap items-center justify-center gap-x-8 gap-y-3 text-[11px] uppercase tracking-[0.14em] text-muted-foreground/80">
-              <span className="inline-flex items-center gap-1.5"><ShieldCheck size={13} className="text-deploy" /> Vault-encrypted secrets</span>
+              <span className="inline-flex items-center gap-1.5"><Eye size={13} className="text-accent" /> Runs in a real browser</span>
+              <span className="inline-flex items-center gap-1.5"><Sparkles size={13} className="text-deploy" /> Catches its own bugs</span>
               <span className="inline-flex items-center gap-1.5"><Globe size={13} className="text-accent" /> Live preview URL</span>
-              <span className="inline-flex items-center gap-1.5"><span className="size-1.5 rounded-full bg-accent" /> Hard credit ceiling</span>
             </div>
           </div>
         </div>
       </section>
 
-      {/* THE LOOP — Plan → Write → Build → Verify → Ship */}
+      {/* THE LOOP — Plan → Write → Compile → Verify → Live */}
       <section className="relative border-t border-border/60 bg-surface-1/40">
         <div className="container-deft py-24 md:py-32">
           <div className="mx-auto max-w-3xl text-center">
-            <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-accent">The Loop</p>
+            <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-accent">The loop</p>
             <h2 className="mt-3 text-balance text-3xl font-semibold leading-[1.08] tracking-[-0.02em] md:text-5xl">
               Five steps.
               <br className="hidden md:block" />{" "}
-              Always the last one is a live URL.
+              The last one is a live URL.
             </h2>
             <p className="mx-auto mt-5 max-w-xl text-[15px] leading-[1.7] text-ink-1">
-              Most coding agents stop at code. {BRAND.name} doesn't stop until something is
-              running on the open internet. The receipt is the URL.
+              Other coding agents stop at code. {BRAND.name} keeps going until
+              the app actually opens — in a real browser, with the agent
+              watching, fixing what it sees, and only then handing it to you.
             </p>
           </div>
 
           <div className="mt-16 grid gap-px overflow-hidden rounded-2xl border border-border/60 bg-border/50 sm:grid-cols-2 md:grid-cols-5">
             {STAGES.map((s, i) => {
-              const isShip = s.label === "Ship";
+              const isShip = s.label === "Live";
               return (
                 <div
                   key={s.label}
@@ -299,7 +312,7 @@ export default function Index() {
                   {isShip && (
                     <div className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-deploy/30 bg-deploy/[0.06] px-2 py-1 font-mono text-[10.5px] text-deploy animate-deploy-pulse">
                       <span className="size-1.5 rounded-full bg-deploy" />
-                      preview.deft.computer/abcdef
+                      preview.deft.build/abcdef
                     </div>
                   )}
                 </div>
@@ -314,21 +327,22 @@ export default function Index() {
         <div className="container-deft py-24 md:py-32">
           <div className="grid gap-12 lg:grid-cols-[1.1fr_1fr] lg:gap-20">
             <div>
-              <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-accent">Why one tool</p>
+              <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-accent">No debug hell</p>
               <h2 className="mt-3 text-balance text-3xl font-semibold leading-[1.1] tracking-[-0.02em] md:text-[44px]">
-                One agent instead of
-                <br className="hidden md:block" /> a stack of half-finished tabs.
+                The mistakes don{"\u2019"}t become
+                <br className="hidden md:block" /> your mistakes.
               </h2>
               <div className="mt-7 space-y-5 text-[15.5px] leading-[1.75] text-ink-1">
                 <p>
-                  Vibe coding today means stitching a chat tool to a sandbox to a deploy
-                  button to a debugger to a docs site to your terminal — and praying nothing
-                  drifts.
+                  Every other AI coding tool generates code into a void and trusts you
+                  to tell it what went wrong. You become the eyes. You read the console.
+                  You paste the screenshot. You explain the bug to the AI. You do this
+                  for two hours. {BRAND.name} doesn{"\u2019"}t make you do that.
                 </p>
                 <p>
-                  {BRAND.name} is a single, long-running engineer with a private sandbox and
-                  a real deployer. It writes code, runs it, fixes its own errors, and hands
-                  you back a URL. No tabs to wire together. No debug hell.
+                  {BRAND.name} writes the code, then runs the app in a real browser. It
+                  watches the page render. It reads the console. It catches the error
+                  before you do. The version you see is the version that already runs.
                 </p>
               </div>
               <div className="mt-9 flex flex-wrap items-center gap-4">
@@ -336,7 +350,7 @@ export default function Index() {
                   to="/signup"
                   className="inline-flex items-center gap-1.5 rounded-md bg-accent px-5 py-3 text-[14px] font-medium text-accent-foreground shadow-[0_4px_18px_-6px_hsl(var(--accent)/0.55)] transition-all hover:brightness-110"
                 >
-                  Start building free
+                  Try it free
                 </Link>
                 <Link
                   to="/pricing"
@@ -368,8 +382,8 @@ export default function Index() {
                   <div className="mt-3 border-t border-border/70 pt-3">
                     <p className="flex items-center gap-2">
                       <span className="size-1.5 rounded-full bg-deploy animate-pulse" />
-                      <span className="text-deploy">deployed</span>{" "}
-                      <span className="text-foreground">preview.deft.computer/h4b1ts</span>
+                      <span className="text-deploy">live</span>{" "}
+                      <span className="text-foreground">preview.deft.build/h4b1ts</span>
                     </p>
                   </div>
                 </div>
@@ -384,27 +398,27 @@ export default function Index() {
         </div>
       </section>
 
-      {/* PRICING TEASER */}
+      {/* PRICING TEASER — outcome-framed (Phase 01 voice rule) */}
       <section className="relative border-t border-border/60 bg-surface-1/40">
         <div className="container-deft py-24 md:py-28">
           <div className="mx-auto max-w-3xl text-center">
             <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-deploy">Pricing</p>
             <h2 className="mt-3 text-balance text-3xl font-semibold leading-[1.1] tracking-[-0.02em] md:text-5xl">
-              Generation is free.
+              You only pay for
               <br className="hidden md:block" />{" "}
-              <span className="text-deploy">Pay only when you ship.</span>
+              <span className="text-deploy">software that runs.</span>
             </h2>
             <p className="mx-auto mt-5 max-w-xl text-[15px] leading-[1.7] text-ink-1">
-              Plan, write, build, and verify as much as you want. Credits are only spent when
-              {` ${BRAND.name} `} pushes your work to a live URL — because that's the only thing that
-              costs us.
+              Planning, writing, and verifying are free. Credits charge only against
+              successful work. If a step fails and {BRAND.name} can{"\u2019"}t recover, the
+              credits for that step are not deducted.
             </p>
             <div className="mt-9 flex flex-wrap items-center justify-center gap-4">
               <Link
                 to="/signup"
                 className="inline-flex items-center gap-1.5 rounded-md bg-accent px-5 py-3 text-[14px] font-medium text-accent-foreground shadow-[0_4px_18px_-6px_hsl(var(--accent)/0.55)] transition-all hover:brightness-110"
               >
-                Build something now
+                Try it free
               </Link>
               <Link
                 to="/pricing"

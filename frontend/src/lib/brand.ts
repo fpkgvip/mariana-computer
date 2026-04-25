@@ -11,12 +11,12 @@ export const BRAND = {
   name: 'Deft',
   fullName: 'Deft',
   product: 'Deft',
-  tagline: 'One prompt to a deployed app.',
-  shortTagline: 'Prompt. Build. Ship.',
+  tagline: "The AI developer that doesn't leave you debugging.",
+  shortTagline: 'Software that runs.',
   description:
-    'Deft turns a single prompt into a deployed web app. Plan, write, build, verify, ship — no debug hell, no setup, no copy-paste. Generation is free; pay only when you deploy.',
+    "Deft is the AI developer that doesn't leave you debugging. It runs your app in a real browser, watches its own output, and fixes its own mistakes — before you see them. You describe what you want. Deft delivers software that runs.",
   ogDescription:
-    'One prompt. A deployed app. Deft replaces every vibe-coding tool in one autonomous engineer.',
+    "Deft is the AI developer that doesn't leave you debugging. You describe what you want. Deft delivers software that runs.",
 
   // Domains & contact
   domain: 'deft.computer',
@@ -38,7 +38,7 @@ export const BRAND = {
   // Voice descriptors (used in onboarding copy guidance, NOT printed)
   voice: {
     tone: 'calm operator',
-    promise: 'One prompt. A deployed app. No debug hell.',
+    promise: "The AI developer that doesn't leave you debugging.",
   },
 } as const;
 
