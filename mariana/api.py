@@ -1461,6 +1461,23 @@ except Exception as _billing_exc:  # pragma: no cover — best effort
 
 
 # ---------------------------------------------------------------------------
+# Deft vault routes — zero-knowledge secret storage
+# ---------------------------------------------------------------------------
+try:
+    from mariana.vault.router import build_vault_router as _build_vault_router
+
+    _vault_router = _build_vault_router(
+        get_current_user=_get_current_user,
+        get_supabase_url=lambda: _get_config().SUPABASE_URL,
+        get_service_key=lambda: (_supabase_api_key(_get_config()) or ""),
+    )
+    app.include_router(_vault_router)
+    logger.info("vault_routes_registered", route_count=len(_vault_router.routes))
+except Exception as _vault_exc:  # pragma: no cover — best effort
+    logger.warning("vault_routes_registration_failed", error=str(_vault_exc))
+
+
+# ---------------------------------------------------------------------------
 # Billing — hardcoded plan catalogue (matches Supabase plans table)
 # ---------------------------------------------------------------------------
 
