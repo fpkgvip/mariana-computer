@@ -10,36 +10,57 @@ import ProtectedRoute from "@/components/ProtectedRoute";
 import LandingGate from "@/components/LandingGate";
 import { initAnalytics } from "@/lib/analytics";
 import { initObservability, addBreadcrumb } from "@/lib/observability";
-import { useEffect } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import { supabaseConfigError } from "@/lib/supabase";
 import { BRAND } from "@/lib/brand";
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, Loader2 } from "lucide-react";
 
+// Eager-imported routes: highest-traffic entry points where any extra
+// network hop after initial paint hurts perceived speed.
 import Index from "./pages/Index";
-import Research from "./pages/Research";
-import Product from "./pages/Product";
-import Chat from "./pages/Chat";
-import Build from "./pages/Build";
-import Pricing from "./pages/Pricing";
-import Contact from "./pages/Contact";
-import Checkout from "./pages/Checkout";
-import Account from "./pages/Account";
-import Admin from "./pages/Admin";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
-import ResetPassword from "./pages/ResetPassword";
-import Skills from "./pages/Skills";
-import InvestigationGraph from "./pages/InvestigationGraph";
-import Tasks from "./pages/Tasks";
-import TaskDetail from "./pages/TaskDetail";
-import Vault from "./pages/Vault";
 import NotFound from "./pages/NotFound";
-import DevStudio from "./pages/DevStudio";
-import DevAccount from "./pages/DevAccount";
-import DevVault from "./pages/DevVault";
-import DevProjects from "./pages/DevProjects";
-import DevStates from "./pages/DevStates";
-import DevObservability from "./pages/DevObservability";
+
+// Lazy-imported routes: every authenticated app surface and the rest of
+// the marketing site. Each becomes its own chunk so the initial bundle
+// only ships what's needed for the landing render.
+const Research = lazy(() => import("./pages/Research"));
+const Product = lazy(() => import("./pages/Product"));
+const Chat = lazy(() => import("./pages/Chat"));
+const Build = lazy(() => import("./pages/Build"));
+const Pricing = lazy(() => import("./pages/Pricing"));
+const Contact = lazy(() => import("./pages/Contact"));
+const Checkout = lazy(() => import("./pages/Checkout"));
+const Account = lazy(() => import("./pages/Account"));
+const Admin = lazy(() => import("./pages/Admin"));
+const ResetPassword = lazy(() => import("./pages/ResetPassword"));
+const Skills = lazy(() => import("./pages/Skills"));
+const InvestigationGraph = lazy(() => import("./pages/InvestigationGraph"));
+const Tasks = lazy(() => import("./pages/Tasks"));
+const TaskDetail = lazy(() => import("./pages/TaskDetail"));
+const Vault = lazy(() => import("./pages/Vault"));
+const DevStudio = lazy(() => import("./pages/DevStudio"));
+const DevAccount = lazy(() => import("./pages/DevAccount"));
+const DevVault = lazy(() => import("./pages/DevVault"));
+const DevProjects = lazy(() => import("./pages/DevProjects"));
+const DevStates = lazy(() => import("./pages/DevStates"));
+const DevObservability = lazy(() => import("./pages/DevObservability"));
+
+// Suspense fallback shown during chunk fetch. Kept minimal and
+// motion-respectful so users on slow connections see a stable surface
+// instead of a blank screen.
+const RouteFallback = () => (
+  <div
+    role="status"
+    aria-live="polite"
+    aria-label="Loading page"
+    className="flex min-h-screen items-center justify-center bg-background"
+  >
+    <Loader2 size={20} className="motion-safe:animate-spin text-muted-foreground" aria-hidden />
+    <span className="sr-only">Loading page</span>
+  </div>
+);
 
 // BUG-FE-134 fix: Configure sensible defaults so react-query doesn't refetch
 // aggressively on every window focus or mount. staleTime = 30s keeps data fresh
@@ -113,60 +134,62 @@ const App = () => {
           <AuthProvider>
             {/* No onboarding modal — Deft teaches by doing. The first prompt
                IS the onboarding (see Index hero + Build empty state). */}
-            <Routes>
-              <Route
-                path="/"
-                element={
-                  <RouteErrorBoundary routeName="home">
-                    <LandingGate>
-                      <Index />
-                    </LandingGate>
-                  </RouteErrorBoundary>
-                }
-              />
-              <Route path="/research" element={<RouteErrorBoundary routeName="research"><Research /></RouteErrorBoundary>} />
-              <Route path="/product" element={<RouteErrorBoundary routeName="product"><Product /></RouteErrorBoundary>} />
-              {/* Legacy /mariana → /product redirect (rebrand v1.0) */}
-              <Route path="/mariana" element={<Navigate to="/product" replace />} />
-              <Route path="/chat" element={<ProtectedRoute><RouteErrorBoundary routeName="chat"><Chat /></RouteErrorBoundary></ProtectedRoute>} />
-              <Route path="/build" element={<ProtectedRoute><RouteErrorBoundary routeName="build"><Build /></RouteErrorBoundary></ProtectedRoute>} />
-              <Route path="/studio" element={<Navigate to="/build" replace />} />
-              <Route path="/pricing" element={<RouteErrorBoundary routeName="pricing"><Pricing /></RouteErrorBoundary>} />
-              <Route path="/contact" element={<RouteErrorBoundary routeName="contact"><Contact /></RouteErrorBoundary>} />
-              <Route path="/checkout" element={<ProtectedRoute><RouteErrorBoundary routeName="checkout"><Checkout /></RouteErrorBoundary></ProtectedRoute>} />
-              {/* BUG-legacy: /buy-credits now redirects to /checkout for backward compat */}
-              <Route path="/buy-credits" element={<ProtectedRoute><RouteErrorBoundary routeName="checkout"><Checkout /></RouteErrorBoundary></ProtectedRoute>} />
-              <Route path="/account" element={<ProtectedRoute><RouteErrorBoundary routeName="account"><Account /></RouteErrorBoundary></ProtectedRoute>} />
-              <Route path="/skills" element={<ProtectedRoute><RouteErrorBoundary routeName="skills"><Skills /></RouteErrorBoundary></ProtectedRoute>} />
-              <Route path="/graph" element={<ProtectedRoute><RouteErrorBoundary routeName="graph"><InvestigationGraph /></RouteErrorBoundary></ProtectedRoute>} />
-              <Route path="/graph/:taskId" element={<ProtectedRoute><RouteErrorBoundary routeName="graph"><InvestigationGraph /></RouteErrorBoundary></ProtectedRoute>} />
-              <Route path="/tasks" element={<ProtectedRoute><RouteErrorBoundary routeName="tasks"><Tasks /></RouteErrorBoundary></ProtectedRoute>} />
-              <Route path="/tasks/:taskId" element={<ProtectedRoute><RouteErrorBoundary routeName="task detail"><TaskDetail /></RouteErrorBoundary></ProtectedRoute>} />
-              <Route path="/vault" element={<ProtectedRoute><RouteErrorBoundary routeName="vault"><Vault /></RouteErrorBoundary></ProtectedRoute>} />
-              <Route path="/admin" element={<ProtectedRoute><RouteErrorBoundary routeName="admin"><Admin /></RouteErrorBoundary></ProtectedRoute>} />
-              <Route path="/login" element={<RouteErrorBoundary routeName="login"><Login /></RouteErrorBoundary>} />
-              <Route path="/signup" element={<RouteErrorBoundary routeName="signup"><Signup /></RouteErrorBoundary>} />
-              <Route path="/reset-password" element={<RouteErrorBoundary routeName="password reset"><ResetPassword /></RouteErrorBoundary>} />
-              {import.meta.env.DEV && (
-                <Route path="/dev/studio" element={<RouteErrorBoundary routeName="dev studio"><DevStudio /></RouteErrorBoundary>} />
-              )}
-              {import.meta.env.DEV && (
-                <Route path="/dev/account" element={<RouteErrorBoundary routeName="dev account"><DevAccount /></RouteErrorBoundary>} />
-              )}
-              {import.meta.env.DEV && (
-                <Route path="/dev/vault" element={<RouteErrorBoundary routeName="dev vault"><DevVault /></RouteErrorBoundary>} />
-              )}
-              {import.meta.env.DEV && (
-                <Route path="/dev/projects" element={<RouteErrorBoundary routeName="dev projects"><DevProjects /></RouteErrorBoundary>} />
-              )}
-              {import.meta.env.DEV && (
-                <Route path="/dev/states" element={<RouteErrorBoundary routeName="dev states"><DevStates /></RouteErrorBoundary>} />
-              )}
-              {import.meta.env.DEV && (
-                <Route path="/dev/observability" element={<RouteErrorBoundary routeName="dev observability"><DevObservability /></RouteErrorBoundary>} />
-              )}
-              <Route path="*" element={<NotFound />} />
-            </Routes>
+            <Suspense fallback={<RouteFallback />}>
+              <Routes>
+                <Route
+                  path="/"
+                  element={
+                    <RouteErrorBoundary routeName="home">
+                      <LandingGate>
+                        <Index />
+                      </LandingGate>
+                    </RouteErrorBoundary>
+                  }
+                />
+                <Route path="/research" element={<RouteErrorBoundary routeName="research"><Research /></RouteErrorBoundary>} />
+                <Route path="/product" element={<RouteErrorBoundary routeName="product"><Product /></RouteErrorBoundary>} />
+                {/* Legacy /mariana → /product redirect (rebrand v1.0) */}
+                <Route path="/mariana" element={<Navigate to="/product" replace />} />
+                <Route path="/chat" element={<ProtectedRoute><RouteErrorBoundary routeName="chat"><Chat /></RouteErrorBoundary></ProtectedRoute>} />
+                <Route path="/build" element={<ProtectedRoute><RouteErrorBoundary routeName="build"><Build /></RouteErrorBoundary></ProtectedRoute>} />
+                <Route path="/studio" element={<Navigate to="/build" replace />} />
+                <Route path="/pricing" element={<RouteErrorBoundary routeName="pricing"><Pricing /></RouteErrorBoundary>} />
+                <Route path="/contact" element={<RouteErrorBoundary routeName="contact"><Contact /></RouteErrorBoundary>} />
+                <Route path="/checkout" element={<ProtectedRoute><RouteErrorBoundary routeName="checkout"><Checkout /></RouteErrorBoundary></ProtectedRoute>} />
+                {/* BUG-legacy: /buy-credits now redirects to /checkout for backward compat */}
+                <Route path="/buy-credits" element={<ProtectedRoute><RouteErrorBoundary routeName="checkout"><Checkout /></RouteErrorBoundary></ProtectedRoute>} />
+                <Route path="/account" element={<ProtectedRoute><RouteErrorBoundary routeName="account"><Account /></RouteErrorBoundary></ProtectedRoute>} />
+                <Route path="/skills" element={<ProtectedRoute><RouteErrorBoundary routeName="skills"><Skills /></RouteErrorBoundary></ProtectedRoute>} />
+                <Route path="/graph" element={<ProtectedRoute><RouteErrorBoundary routeName="graph"><InvestigationGraph /></RouteErrorBoundary></ProtectedRoute>} />
+                <Route path="/graph/:taskId" element={<ProtectedRoute><RouteErrorBoundary routeName="graph"><InvestigationGraph /></RouteErrorBoundary></ProtectedRoute>} />
+                <Route path="/tasks" element={<ProtectedRoute><RouteErrorBoundary routeName="tasks"><Tasks /></RouteErrorBoundary></ProtectedRoute>} />
+                <Route path="/tasks/:taskId" element={<ProtectedRoute><RouteErrorBoundary routeName="task detail"><TaskDetail /></RouteErrorBoundary></ProtectedRoute>} />
+                <Route path="/vault" element={<ProtectedRoute><RouteErrorBoundary routeName="vault"><Vault /></RouteErrorBoundary></ProtectedRoute>} />
+                <Route path="/admin" element={<ProtectedRoute><RouteErrorBoundary routeName="admin"><Admin /></RouteErrorBoundary></ProtectedRoute>} />
+                <Route path="/login" element={<RouteErrorBoundary routeName="login"><Login /></RouteErrorBoundary>} />
+                <Route path="/signup" element={<RouteErrorBoundary routeName="signup"><Signup /></RouteErrorBoundary>} />
+                <Route path="/reset-password" element={<RouteErrorBoundary routeName="password reset"><ResetPassword /></RouteErrorBoundary>} />
+                {import.meta.env.DEV && (
+                  <Route path="/dev/studio" element={<RouteErrorBoundary routeName="dev studio"><DevStudio /></RouteErrorBoundary>} />
+                )}
+                {import.meta.env.DEV && (
+                  <Route path="/dev/account" element={<RouteErrorBoundary routeName="dev account"><DevAccount /></RouteErrorBoundary>} />
+                )}
+                {import.meta.env.DEV && (
+                  <Route path="/dev/vault" element={<RouteErrorBoundary routeName="dev vault"><DevVault /></RouteErrorBoundary>} />
+                )}
+                {import.meta.env.DEV && (
+                  <Route path="/dev/projects" element={<RouteErrorBoundary routeName="dev projects"><DevProjects /></RouteErrorBoundary>} />
+                )}
+                {import.meta.env.DEV && (
+                  <Route path="/dev/states" element={<RouteErrorBoundary routeName="dev states"><DevStates /></RouteErrorBoundary>} />
+                )}
+                {import.meta.env.DEV && (
+                  <Route path="/dev/observability" element={<RouteErrorBoundary routeName="dev observability"><DevObservability /></RouteErrorBoundary>} />
+                )}
+                <Route path="*" element={<NotFound />} />
+              </Routes>
+            </Suspense>
           </AuthProvider>
         </BrowserRouter>
       </TooltipProvider>

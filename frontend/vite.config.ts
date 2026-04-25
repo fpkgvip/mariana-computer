@@ -17,6 +17,26 @@ export default defineConfig(({ mode }) => ({
     // Vite defaults to false anyway, but explicit is safer — prevents
     // accidentally enabling them via a future config change.
     sourcemap: false,
+    // P19: split the bundle. Vendor libs are stable + cacheable, the
+    // graph + chat surfaces are heavy and only needed by signed-in users,
+    // so they get their own chunks instead of bloating the initial JS.
+    rollupOptions: {
+      output: {
+        manualChunks: (id) => {
+          if (!id.includes("node_modules")) return undefined;
+          if (id.includes("/react/") || id.includes("/react-dom/") || id.includes("/scheduler/")) return "vendor-react";
+          if (id.includes("react-router")) return "vendor-router";
+          if (id.includes("@tanstack/")) return "vendor-query";
+          if (id.includes("@radix-ui/")) return "vendor-radix";
+          if (id.includes("recharts") || id.includes("d3-")) return "vendor-charts";
+          if (id.includes("@supabase/")) return "vendor-supabase";
+          if (id.includes("lucide-react")) return "vendor-icons";
+          if (id.includes("framer-motion") || id.includes("motion-utils")) return "vendor-motion";
+          return "vendor";
+        },
+      },
+    },
+    chunkSizeWarningLimit: 600,
   },
   resolve: {
     alias: {
