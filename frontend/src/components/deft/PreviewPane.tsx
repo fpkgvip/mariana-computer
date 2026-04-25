@@ -182,12 +182,17 @@ export function PreviewPane({ taskId, task, events, className }: PreviewPaneProp
           <span className="truncate text-foreground/90">
             {absoluteUrl ?? "preview.deft.computer/" + (taskId ?? "—")}
           </span>
-          {polling && !manifest?.deployed && (
-            <span className="ml-auto inline-flex items-center gap-1 text-[10px] text-muted-foreground">
-              <Loader2 size={10} className="animate-spin" />
-              waiting
-            </span>
-          )}
+          <StatusPill
+            status={
+              failed && !manifest?.deployed
+                ? "error"
+                : manifest?.deployed
+                  ? "live"
+                  : isRunning
+                    ? "compiling"
+                    : "idle"
+            }
+          />
         </div>
 
         <div className="ml-1 flex items-center gap-1">
@@ -259,7 +264,7 @@ export function PreviewPane({ taskId, task, events, className }: PreviewPaneProp
           <div className="flex h-full w-full items-center justify-center overflow-auto p-3">
             <div
               className={cn(
-                "relative flex items-center justify-center bg-background shadow-[0_30px_120px_-30px_rgba(0,0,0,0.8)] transition-all duration-300",
+                "relative flex items-center justify-center bg-background shadow-[0_30px_120px_-30px_rgba(0,0,0,0.8)] motion-safe:transition-all motion-safe:duration-300",
                 viewport === "desktop" ? "h-full w-full rounded-md" : "rounded-[18px] border border-border/40",
               )}
               style={
@@ -305,6 +310,22 @@ export function PreviewPane({ taskId, task, events, className }: PreviewPaneProp
 
 // ---------------------------------------------------------------------------
 
+function StatusPill({ status }: { status: "idle" | "compiling" | "live" | "error" }) {
+  if (status === "idle") return null;
+  const map = {
+    compiling: { label: "compiling", className: "text-muted-foreground", icon: <Loader2 size={10} className="motion-safe:animate-spin" /> },
+    live: { label: "live", className: "text-deploy", icon: <span className="size-1.5 rounded-full bg-deploy" aria-hidden /> },
+    error: { label: "error", className: "text-destructive", icon: <AlertTriangle size={10} /> },
+  } as const;
+  const v = map[status];
+  return (
+    <span className={cn("ml-auto inline-flex items-center gap-1 text-[10px]", v.className)}>
+      {v.icon}
+      {v.label}
+    </span>
+  );
+}
+
 function FailedState({ reason }: { reason: string }) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-3 px-8 text-center">
@@ -324,6 +345,7 @@ function WaitingState({ stage }: { stage: ReturnType<typeof deriveStage> }) {
     { key: "live", label: "Live", caption: "Pushing to a preview URL" },
   ];
   const currentIdx = items.findIndex((s) => s.key === stage.key);
+  const isIdle = stage.eyebrow === "Idle";
 
   return (
     <div className="flex h-full flex-col items-center justify-center gap-8 px-8 text-center">
@@ -333,7 +355,11 @@ function WaitingState({ stage }: { stage: ReturnType<typeof deriveStage> }) {
           style={{ background: "radial-gradient(closest-side, hsl(var(--accent)/0.45), transparent)" }}
           aria-hidden
         />
-        <Loader2 size={32} className="animate-spin text-accent" />
+        {isIdle ? (
+          <span className="size-3 rounded-full bg-accent/70" aria-hidden />
+        ) : (
+          <Loader2 size={32} className="motion-safe:animate-spin text-accent" />
+        )}
       </div>
       <div className="space-y-1.5">
         <p className="text-[12px] font-medium tracking-[0.02em] text-accent">{stage.eyebrow}</p>
@@ -365,7 +391,7 @@ function WaitingState({ stage }: { stage: ReturnType<typeof deriveStage> }) {
                 <span className="font-medium">{s.label}</span>
                 <span className="ml-2 text-muted-foreground/80">{s.caption}</span>
               </span>
-              {active && <Loader2 size={11} className="animate-spin text-accent" />}
+              {active && !isIdle && <Loader2 size={11} className="motion-safe:animate-spin text-accent" />}
             </li>
           );
         })}
