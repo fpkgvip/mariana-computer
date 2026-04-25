@@ -336,7 +336,7 @@ function WaitingState({ stage }: { stage: ReturnType<typeof deriveStage> }) {
         <Loader2 size={32} className="animate-spin text-accent" />
       </div>
       <div className="space-y-1.5">
-        <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-accent">{stage.eyebrow}</p>
+        <p className="text-[12px] font-medium tracking-[0.02em] text-accent">{stage.eyebrow}</p>
         <h3 className="text-lg font-semibold text-foreground">{stage.title}</h3>
         <p className="text-sm text-muted-foreground">{stage.subtitle}</p>
       </div>

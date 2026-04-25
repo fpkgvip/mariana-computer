@@ -12,10 +12,10 @@ import { BRAND } from "@/lib/brand";
 const API_URL = import.meta.env.VITE_API_URL ?? "";
 
 /**
- * Pricing — restated around the "generation is free, shipping is paid"
- * narrative that defines Deft. Plan IDs ("starter", "pro", "max") match
- * the backend Stripe price catalogue and remain stable; only the labels
- * and copy have been rewritten.
+ * Pricing — restated around the locked thesis: "You only pay for software
+ * that runs." Plan IDs ("starter", "pro", "max") match the backend Stripe
+ * price catalogue and remain stable; only the labels and copy have been
+ * rewritten.
  */
 
 interface Plan {
@@ -35,19 +35,19 @@ interface Plan {
 const plans: Plan[] = [
   {
     id: "starter",
-    name: "Builder",
-    tagline: "For weekend hackers and solo founders.",
+    name: "Starter",
+    tagline: "For weekend projects and solo founders.",
     price: 20,
     credits: 2000,
     deploys: "20 deploys / month",
     domain: "preview.deft.computer subdomain",
     collab: "Solo workspace",
-    cta: "Start building",
+    cta: "Start a project",
     features: [
-      "Unlimited generation, planning & verification",
-      "20 deploys / month to live URLs",
-      "All built-in skills & flagship models",
-      "Vault for encrypted secrets",
+      "Unlimited planning, writing, and verification",
+      "20 deploys to live URLs each month",
+      "All built-in skills and flagship models",
+      "Vault for encrypted API keys",
       "Persistent project history",
       "Community support",
     ],
@@ -55,39 +55,39 @@ const plans: Plan[] = [
   {
     id: "pro",
     name: "Pro",
-    tagline: "For people shipping every week.",
+    tagline: "For people deploying every week.",
     price: 50,
     credits: 5500,
     deploys: "Unlimited deploys",
     domain: "Custom domain on any project",
     collab: "Up to 3 collaborators",
     highlighted: true,
-    cta: "Go pro",
+    cta: "Choose Pro",
     features: [
-      "Everything in Builder",
+      "Everything in Starter",
       "Unlimited deploys to live URLs",
       "Custom domain (yourapp.com) per project",
       "Up to 3 collaborators per workspace",
       "PDF · DOCX · PPTX · XLSX export",
-      "Priority queue & priority support",
+      "Priority queue and priority support",
     ],
   },
   {
     id: "max",
     name: "Max",
-    tagline: "For studios shipping every day.",
+    tagline: "For studios running runs all day.",
     price: 200,
     credits: 25000,
     deploys: "Unlimited deploys",
     domain: "Unlimited custom domains",
     collab: "Unlimited collaborators",
-    cta: "Go max",
+    cta: "Choose Max",
     features: [
       "Everything in Pro",
       "4 concurrent runs, dedicated queue",
       "Unlimited custom domains",
       "Unlimited collaborators",
-      "Image + video generation",
+      "Image and video generation",
       "Priority support with SLA",
     ],
   },
@@ -95,33 +95,33 @@ const plans: Plan[] = [
 
 const faqs = [
   {
-    q: "What does \"generation is free\" actually mean?",
-    a: "Plans include a generous monthly credit budget. Credits are consumed when Deft does work that costs us money — primarily flagship-model tokens and the deploy itself. Planning, light editing, and the verify loop are intentionally cheap, so you never feel the meter while iterating. The only thing that decisively spends credits is shipping a live URL.",
+    q: "What does \"only pay for software that runs\" mean?",
+    a: "Credits are deducted when Deft completes a working step — a passing build, a passing test suite, or a successful deploy. Planning, writing, and the verify loop are intentionally cheap, so you don't feel the meter while iterating. If a step fails and Deft can't recover, the credits for that step are not deducted from your balance.",
   },
   {
-    q: "What is a \"deploy\"?",
-    a: "A deploy is a publish to a live URL. Each Builder plan deploy gives you a unique preview.deft.computer subdomain. On Pro and Max you can attach a custom domain to any project.",
+    q: "What is a deploy?",
+    a: "A deploy is a publish to a live URL. Each Starter deploy gives you a unique preview.deft.computer subdomain. On Pro and Max you can attach a custom domain to any project.",
   },
   {
-    q: "Can I still iterate on a deployed app for free?",
-    a: "Yes. Every redeploy of the same project counts as 1 deploy. On Pro and Max, deploys are unlimited — so iteration is fully free.",
+    q: "Can I keep iterating on a deployed app?",
+    a: "Yes. Every redeploy of the same project counts as one deploy. On Pro and Max, deploys are unlimited, so iteration on a live project doesn't change your budget.",
   },
   {
     q: "Can I upgrade or downgrade?",
-    a: "Yes — changes take effect at your next billing cycle. The billing portal lives in your Account page.",
+    a: "Yes. Changes take effect at your next billing cycle. The billing portal lives in your Account page.",
   },
   {
-    q: "What happens if I run out of credits mid-run?",
-    a: "Runs stop at the credit ceiling you set up-front. Above the plan budget, you can either top up instantly or wait for the next monthly refresh — in-flight runs always finish.",
+    q: "What happens when a run hits the ceiling?",
+    a: "You set a credit ceiling before each run. Deft stops at that ceiling and hands you what it has — a partial receipt, never a surprise charge. To continue, raise the ceiling or top up.",
   },
   {
-    q: "Can I bring my own keys?",
-    a: "Yes. The Vault page lets you store API keys (OpenAI, Anthropic, Stripe, Supabase, etc.) encrypted on-device. Reference them in any prompt with $KEY_NAME and Deft injects them at runtime — keys never touch the database in plaintext.",
+    q: "Can I bring my own API keys?",
+    a: "Yes. The Vault page lets you store keys (OpenAI, Anthropic, Stripe, Supabase, and so on) encrypted on-device. Reference them in any prompt with $KEY_NAME and Deft injects them at runtime; keys never touch the database in plaintext.",
   },
 ];
 
 const topups = [
-  { id: "topup_starter", name: "Builder pack", price: 10, credits: 1000 },
+  { id: "topup_starter", name: "Starter pack", price: 10, credits: 1000 },
   { id: "topup_pro", name: "Pro pack", price: 30, credits: 3000 },
   { id: "topup_max", name: "Max pack", price: 150, credits: 15000 },
 ];
@@ -199,18 +199,19 @@ export default function Pricing() {
         />
 
         <div className="container-deft text-center">
-          <div className="mx-auto mb-5 inline-flex items-center gap-2 rounded-full border border-border/70 bg-surface-1/70 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground backdrop-blur">
+          <div className="mx-auto mb-5 inline-flex items-center gap-2 rounded-full border border-border/70 bg-surface-1/70 px-3 py-1 text-[12px] font-medium tracking-[0.01em] text-muted-foreground backdrop-blur">
             <span className="size-1.5 rounded-full bg-deploy animate-pulse" />
             Pricing
           </div>
           <h1 className="mx-auto max-w-3xl text-balance text-[40px] font-semibold leading-[1.05] tracking-[-0.025em] md:text-[64px]">
-            Generation is free.
+            You only pay for
             <br />
-            <span className="text-deploy">Pay only when you ship.</span>
+            <span className="text-deploy">software that runs.</span>
           </h1>
           <p className="mx-auto mt-6 max-w-xl text-[15.5px] leading-[1.65] text-muted-foreground">
-            Plan, write, build, and verify as much as you want. Credits are only spent when{" "}
-            {BRAND.name} pushes your work to a live URL — because that's the only thing that costs us.
+            Planning, writing, and verifying are free. Credits charge only against successful work.
+            If a step fails and {BRAND.name} can{"\u2019"}t recover, the credits for that step are
+            not deducted from your balance.
           </p>
         </div>
       </section>
@@ -230,14 +231,14 @@ export default function Pricing() {
                 ].join(" ")}
               >
                 {plan.highlighted && (
-                  <div className="absolute -top-3 left-7 inline-flex items-center gap-1.5 rounded-full border border-accent/40 bg-background px-2.5 py-0.5 text-[10.5px] font-medium uppercase tracking-[0.14em] text-accent">
+                  <div className="absolute -top-3 left-7 inline-flex items-center gap-1.5 rounded-full border border-accent/40 bg-background px-2.5 py-0.5 text-[11.5px] font-medium tracking-[0.01em] text-accent">
                     <Sparkles size={10} />
                     Most popular
                   </div>
                 )}
 
                 <div>
-                  <p className="text-[11px] font-medium uppercase tracking-[0.16em] text-muted-foreground">
+                  <p className="text-[12px] font-semibold tracking-[0.01em] text-foreground">
                     {plan.name}
                   </p>
                   <p className="mt-1 text-[13px] text-muted-foreground">{plan.tagline}</p>
@@ -295,7 +296,7 @@ export default function Pricing() {
           </div>
 
           <p className="mt-8 text-center text-[13px] text-muted-foreground">
-            Building something at company scale?{" "}
+            Working at company scale?{" "}
             <Link to="/contact" className="text-foreground underline-offset-4 hover:underline">
               Talk to us
             </Link>{" "}
@@ -308,12 +309,12 @@ export default function Pricing() {
       <section className="relative border-t border-border/60 bg-surface-1/30 py-20">
         <div className="container-deft mx-auto max-w-5xl">
           <div className="mb-10 flex flex-col gap-2">
-            <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-accent">Top-ups</p>
+            <p className="text-[12px] font-medium tracking-[0.02em] text-accent">Top-ups</p>
             <h2 className="text-[28px] font-semibold leading-[1.1] tracking-[-0.02em] md:text-[36px]">
               Need more credits this month?
             </h2>
             <p className="max-w-xl text-[14.5px] leading-[1.65] text-muted-foreground">
-              Top-ups apply instantly and don't expire while your subscription is active.
+              Top-ups apply instantly and don{"\u2019"}t expire while your subscription is active.
             </p>
           </div>
           <div className="grid gap-4 md:grid-cols-3">
@@ -322,7 +323,7 @@ export default function Pricing() {
                 key={tu.id}
                 className="flex flex-col rounded-xl border border-border/70 bg-surface-1 p-6 transition-colors hover:border-border"
               >
-                <p className="text-[11px] font-medium uppercase tracking-[0.16em] text-muted-foreground">
+                <p className="text-[12px] font-semibold tracking-[0.01em] text-foreground">
                   {tu.name}
                 </p>
                 <h3 className="mt-3 text-[32px] font-semibold tracking-[-0.02em] text-foreground">
@@ -337,7 +338,7 @@ export default function Pricing() {
                   disabled={loadingPlanId !== null}
                   className="mt-6 flex w-full items-center justify-center gap-2 rounded-md border border-border/70 bg-surface-2 px-4 py-2.5 text-[13px] font-medium text-foreground transition-colors hover:bg-surface-3 disabled:opacity-60"
                 >
-                  {loadingPlanId === tu.id ? <Loader2 size={14} className="animate-spin" /> : <>Buy now <ArrowRight size={13} /></>}
+                  {loadingPlanId === tu.id ? <Loader2 size={14} className="animate-spin" /> : <>Add credits <ArrowRight size={13} /></>}
                 </button>
               </div>
             ))}
@@ -348,7 +349,7 @@ export default function Pricing() {
       {/* FAQ */}
       <section className="relative py-24">
         <div className="container-deft mx-auto max-w-3xl">
-          <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-accent">FAQ</p>
+          <p className="text-[12px] font-medium tracking-[0.02em] text-accent">FAQ</p>
           <h2 className="mt-3 text-[28px] font-semibold leading-[1.1] tracking-[-0.02em] md:text-[36px]">
             Common questions
           </h2>
@@ -381,7 +382,7 @@ function Stat({ icon, label, caption }: { icon: React.ReactNode; label: string; 
         {icon}
         <span className="capitalize">{label}</span>
       </div>
-      <span className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">{caption}</span>
+      <span className="text-[11px] tracking-[0.01em] text-muted-foreground">{caption}</span>
     </div>
   );
 }

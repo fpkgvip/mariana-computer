@@ -141,7 +141,7 @@ export default function Index() {
         <div className="container-deft w-full">
           <div className="mx-auto max-w-[940px] text-center">
             {/* Eyebrow */}
-            <div className="mx-auto mb-7 inline-flex items-center gap-2 rounded-full border border-border/70 bg-surface-1/60 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground backdrop-blur">
+            <div className="mx-auto mb-7 inline-flex items-center gap-2 rounded-full border border-border/70 bg-surface-1/60 px-3 py-1 text-[12px] font-medium tracking-[0.01em] text-muted-foreground backdrop-blur">
               <span className="size-1.5 rounded-full bg-deploy animate-pulse" />
               The AI developer with a real computer
             </div>
@@ -253,10 +253,10 @@ export default function Index() {
             </form>
 
             {/* Trust strip — three concrete behaviors, not defensive badges */}
-            <div className="mt-14 flex flex-wrap items-center justify-center gap-x-8 gap-y-3 text-[11px] uppercase tracking-[0.14em] text-muted-foreground/80">
-              <span className="inline-flex items-center gap-1.5"><Eye size={13} className="text-accent" /> Runs in a real browser</span>
-              <span className="inline-flex items-center gap-1.5"><Sparkles size={13} className="text-deploy" /> Catches its own bugs</span>
-              <span className="inline-flex items-center gap-1.5"><Globe size={13} className="text-accent" /> Live preview URL</span>
+            <div className="mt-14 flex flex-wrap items-center justify-center gap-x-8 gap-y-3 text-[13px] tracking-[0.01em] text-muted-foreground/85">
+              <span className="inline-flex items-center gap-1.5"><Eye size={14} className="text-accent" /> Runs in a real browser</span>
+              <span className="inline-flex items-center gap-1.5"><Sparkles size={14} className="text-deploy" /> Catches its own bugs</span>
+              <span className="inline-flex items-center gap-1.5"><Globe size={14} className="text-accent" /> Live preview URL</span>
             </div>
           </div>
         </div>
@@ -266,7 +266,7 @@ export default function Index() {
       <section className="relative border-t border-border/60 bg-surface-1/40">
         <div className="container-deft py-24 md:py-32">
           <div className="mx-auto max-w-3xl text-center">
-            <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-accent">The loop</p>
+            <p className="text-[12px] font-medium tracking-[0.02em] text-accent">The loop</p>
             <h2 className="mt-3 text-balance text-3xl font-semibold leading-[1.08] tracking-[-0.02em] md:text-5xl">
               Five steps.
               <br className="hidden md:block" />{" "}
@@ -312,7 +312,7 @@ export default function Index() {
                   {isShip && (
                     <div className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-deploy/30 bg-deploy/[0.06] px-2 py-1 font-mono text-[10.5px] text-deploy animate-deploy-pulse">
                       <span className="size-1.5 rounded-full bg-deploy" />
-                      preview.deft.build/abcdef
+                      preview.deft.computer/abcdef
                     </div>
                   )}
                 </div>
@@ -327,7 +327,7 @@ export default function Index() {
         <div className="container-deft py-24 md:py-32">
           <div className="grid gap-12 lg:grid-cols-[1.1fr_1fr] lg:gap-20">
             <div>
-              <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-accent">No debug hell</p>
+              <p className="text-[12px] font-medium tracking-[0.02em] text-accent">No debugging hell</p>
               <h2 className="mt-3 text-balance text-3xl font-semibold leading-[1.1] tracking-[-0.02em] md:text-[44px]">
                 The mistakes don{"\u2019"}t become
                 <br className="hidden md:block" /> your mistakes.
@@ -368,7 +368,7 @@ export default function Index() {
                   <span className="size-2 rounded-full bg-rose-500/70" />
                   <span className="size-2 rounded-full bg-amber-400/70" />
                   <span className="size-2 rounded-full bg-emerald-400/70" />
-                  <span className="ml-2 font-mono text-[10.5px] uppercase tracking-[0.16em] text-muted-foreground">
+                  <span className="ml-2 font-mono text-[11px] tracking-[0.04em] text-muted-foreground">
                     deft / receipt
                   </span>
                 </div>
@@ -383,7 +383,7 @@ export default function Index() {
                     <p className="flex items-center gap-2">
                       <span className="size-1.5 rounded-full bg-deploy animate-pulse" />
                       <span className="text-deploy">live</span>{" "}
-                      <span className="text-foreground">preview.deft.build/h4b1ts</span>
+                      <span className="text-foreground">preview.deft.computer/h4b1ts</span>
                     </p>
                   </div>
                 </div>
@@ -402,7 +402,7 @@ export default function Index() {
       <section className="relative border-t border-border/60 bg-surface-1/40">
         <div className="container-deft py-24 md:py-28">
           <div className="mx-auto max-w-3xl text-center">
-            <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-deploy">Pricing</p>
+            <p className="text-[12px] font-medium tracking-[0.02em] text-deploy">Pricing</p>
             <h2 className="mt-3 text-balance text-3xl font-semibold leading-[1.1] tracking-[-0.02em] md:text-5xl">
               You only pay for
               <br className="hidden md:block" />{" "}

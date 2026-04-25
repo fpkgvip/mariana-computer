@@ -92,7 +92,7 @@ export default function Login() {
 
             <form onSubmit={handleSubmit} className="mt-9 space-y-4">
               <div>
-                <label htmlFor="email" className="mb-1.5 block text-[11px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
+                <label htmlFor="email" className="mb-1.5 block text-[12px] font-medium tracking-[0.01em] text-muted-foreground">
                   Email
                 </label>
                 <Input
@@ -109,7 +109,7 @@ export default function Login() {
               </div>
               <div>
                 <div className="mb-1.5 flex items-center justify-between">
-                  <label htmlFor="password" className="block text-[11px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
+                  <label htmlFor="password" className="block text-[12px] font-medium tracking-[0.01em] text-muted-foreground">
                     Password
                   </label>
                   <button
@@ -183,7 +183,7 @@ export default function Login() {
                 <span className="size-2 rounded-full bg-rose-500/60" />
                 <span className="size-2 rounded-full bg-amber-400/60" />
                 <span className="size-2 rounded-full bg-deploy animate-pulse" />
-                <span className="ml-2 font-mono text-[10.5px] uppercase tracking-[0.16em] text-muted-foreground">
+                <span className="ml-2 font-mono text-[11px] tracking-[0.04em] text-muted-foreground">
                   deft / receipt
                 </span>
               </div>

@@ -201,7 +201,7 @@ export function PreflightCard({
 
       {/* Tier selector */}
       <fieldset className="mt-4">
-        <legend className="mb-1.5 text-xs uppercase tracking-wide text-muted-foreground">
+        <legend className="mb-1.5 text-xs tracking-wide text-muted-foreground">
           Model tier
         </legend>
         <div className="grid grid-cols-3 gap-2" role="radiogroup">
@@ -229,7 +229,7 @@ export function PreflightCard({
       {/* Ceiling slider */}
       <div className="mt-4">
         <div className="mb-1.5 flex items-baseline justify-between text-xs">
-          <span className="uppercase tracking-wide text-muted-foreground">
+          <span className="tracking-wide text-muted-foreground">
             Credit ceiling
           </span>
           <span className="font-mono text-sm text-foreground">

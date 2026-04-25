@@ -77,7 +77,7 @@ export default function Signup() {
 
         <div className="flex flex-1 items-center">
           <div className="w-full max-w-sm">
-            <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-border/70 bg-surface-1/70 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">
+            <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-border/70 bg-surface-1/70 px-3 py-1 text-[12px] font-medium tracking-[0.01em] text-muted-foreground">
               <Sparkles size={11} className="text-deploy" />
               Free credits to start
             </div>
@@ -92,7 +92,7 @@ export default function Signup() {
 
             <form onSubmit={handleSubmit} className="mt-9 space-y-4">
               <div>
-                <label htmlFor="name" className="mb-1.5 block text-[11px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
+                <label htmlFor="name" className="mb-1.5 block text-[12px] font-medium tracking-[0.01em] text-muted-foreground">
                   Name
                 </label>
                 <Input
@@ -108,7 +108,7 @@ export default function Signup() {
                 />
               </div>
               <div>
-                <label htmlFor="email" className="mb-1.5 block text-[11px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
+                <label htmlFor="email" className="mb-1.5 block text-[12px] font-medium tracking-[0.01em] text-muted-foreground">
                   Email
                 </label>
                 <Input
@@ -124,7 +124,7 @@ export default function Signup() {
                 />
               </div>
               <div>
-                <label htmlFor="password" className="mb-1.5 block text-[11px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
+                <label htmlFor="password" className="mb-1.5 block text-[12px] font-medium tracking-[0.01em] text-muted-foreground">
                   Password
                 </label>
                 <Input
@@ -185,7 +185,7 @@ export default function Signup() {
 
         <div className="relative flex h-full items-center justify-center px-12">
           <div className="w-full max-w-md space-y-6">
-            <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-accent">The Loop</p>
+            <p className="text-[12px] font-medium tracking-[0.02em] text-accent">The loop</p>
             <h2 className="text-balance text-[28px] font-semibold leading-[1.15] tracking-[-0.02em]">
               Five steps. Always the last is a live URL.
             </h2>
