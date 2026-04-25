@@ -13,6 +13,8 @@ import { Footer } from "@/components/Footer";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/lib/supabase";
 import { toast } from "sonner";
+import { errorToast } from "@/lib/errorToast";
+import { addBreadcrumb } from "@/lib/observability";
 import {
   AccountView,
   type AccountData,
@@ -141,6 +143,11 @@ export default function Account() {
   };
 
   const handleBuyCredits = async (packId: string) => {
+    addBreadcrumb({
+      category: "billing",
+      message: "checkout requested",
+      data: { pack_id: packId },
+    });
     setIsPurchasing(true);
     // Open synchronously to keep Safari's user gesture alive (BUG-FE-121).
     const popup = window.open("", "_self");
@@ -182,13 +189,16 @@ export default function Account() {
       if (popup) popup.location.href = data.checkout_url;
       else window.location.href = data.checkout_url;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Unknown error";
-      toast.error("Could not start checkout", { description: msg });
+      errorToast(err, {
+        title: "Could not start checkout",
+        surface: "billing.checkout",
+      });
       setIsPurchasing(false);
     }
   };
 
   const handleManageSubscription = async () => {
+    addBreadcrumb({ category: "billing", message: "portal requested" });
     setIsOpeningPortal(true);
     const popup = window.open("", "_self");
     const ac = new AbortController();
@@ -219,8 +229,10 @@ export default function Account() {
       else window.location.href = data.portal_url;
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") return;
-      const msg = err instanceof Error ? err.message : "Unknown error";
-      toast.error("Could not open billing portal", { description: msg });
+      errorToast(err, {
+        title: "Could not open billing portal",
+        surface: "billing.portal",
+      });
       setIsOpeningPortal(false);
     }
   };

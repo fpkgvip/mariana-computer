@@ -41,6 +41,8 @@ import { VaultUnlockDialog } from "@/components/deft/VaultUnlockDialog";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { scanVaultRefs, resolveVaultRefs, VaultRefError } from "@/lib/vaultPromptScan";
 import { track } from "@/lib/analytics";
+import { errorToast } from "@/lib/errorToast";
+import { addBreadcrumb } from "@/lib/observability";
 
 const FIRST_PROMPT_FLAG = "deft.firstPromptSubmitted.v1";
 
@@ -124,8 +126,7 @@ export default function Build() {
         if (evs.events.length > 0) lastEventIdRef.current = evs.events[evs.events.length - 1].id;
       } catch (err) {
         if ((err as Error).name === "AbortError") return;
-        const msg = err instanceof ApiError ? err.message : "Could not load task";
-        toast.error(msg);
+        errorToast(err, { title: "Could not load task", surface: "build.load_task" });
         return;
       }
 
@@ -247,8 +248,7 @@ export default function Build() {
         toast.success("Run started");
         void quote;
       } catch (err) {
-        const msg = err instanceof ApiError ? err.message : "Could not start run";
-        toast.error(msg);
+        errorToast(err, { title: "Could not start run", surface: "build.start_run" });
       } finally {
         setStarting(false);
       }
@@ -259,6 +259,11 @@ export default function Build() {
   const handleSubmit = useCallback(
     async ({ tier, ceiling, quote }: { tier: ModelTier; ceiling: number; quote: QuoteResponse }) => {
       if (!draftPrompt.trim()) return;
+      addBreadcrumb({
+        category: "build",
+        message: "submit pressed",
+        data: { tier, ceiling, has_vault_refs: scanVaultRefs(draftPrompt).names.length > 0 },
+      });
       const { names } = scanVaultRefs(draftPrompt);
       let vaultEnv: Record<string, string> | undefined;
       if (names.length > 0) {
@@ -313,8 +318,7 @@ export default function Build() {
       toast("Stop requested");
       window.dispatchEvent(new CustomEvent(CREDITS_CHANGED_EVENT));
     } catch (err) {
-      const msg = err instanceof ApiError ? err.message : "Could not stop";
-      toast.error(msg);
+      errorToast(err, { title: "Could not stop run", surface: "build.stop_run" });
     }
   }, [activeTaskId]);
 

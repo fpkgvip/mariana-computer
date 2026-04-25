@@ -9,6 +9,8 @@ import {
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabase";
+import { identifyUser, resetAnalytics } from "@/lib/analytics";
+import { addBreadcrumb, setUserContext } from "@/lib/observability";
 import type { Session } from "@supabase/supabase-js";
 
 /** Core user shape stored in context */
@@ -115,7 +117,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (profile) break;
         await new Promise((r) => setTimeout(r, 500));
       }
-      setUser(buildUser(session, profile));
+      const next = buildUser(session, profile);
+      setUser(next);
+      // Tie analytics + observability to the signed-in user. Both calls are
+      // no-ops when their respective providers are not configured.
+      identifyUser(next.id, {
+        email: next.email,
+        plan: next.subscription_plan,
+        status: next.subscription_status,
+        role: next.role,
+      });
+      setUserContext({ id: next.id, email: next.email });
+      addBreadcrumb({
+        category: "auth",
+        message: "session synced",
+        data: { plan: next.subscription_plan, status: next.subscription_status },
+      });
     } catch (err) {
       console.error("[AuthContext] syncSession error:", err);
       // Still set user with just session data so the app remains usable
@@ -214,6 +231,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // Clear local state anyway — better to be logged out locally than stuck
     }
     setUser(null);
+    setUserContext(null);
+    resetAnalytics();
+    addBreadcrumb({ category: "auth", message: "signed out" });
     // BUG-FE-138 fix: Clear react-query cache so the next user on this tab does
     // not briefly observe the previous user's cached responses.
     try {

@@ -10,6 +10,7 @@
  */
 
 import { supabase } from "@/lib/supabase";
+import { addBreadcrumb } from "@/lib/observability";
 
 const API_BASE = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
 
@@ -97,6 +98,11 @@ export async function apiRequest<T = unknown>(
   } catch (err) {
     // Network / abort. Re-throw aborts as-is so callers can detect.
     if ((err as Error).name === "AbortError") throw err;
+    addBreadcrumb({
+      category: "api",
+      level: "error",
+      message: `network error ${init.method} ${path}`,
+    });
     throw new ApiError(0, "Network error", null);
   }
 
@@ -114,8 +120,19 @@ export async function apiRequest<T = unknown>(
           ? detail.map((d) => (typeof d === "object" && d ? (d as { msg?: string }).msg ?? "validation error" : String(d))).join(", ")
           : body?.message ?? `Request failed (HTTP ${resp.status})`;
     const requestId = resp.headers.get("x-request-id");
+    addBreadcrumb({
+      category: "api",
+      level: resp.status >= 500 ? "error" : "warning",
+      message: `${init.method} ${path} -> ${resp.status}`,
+      data: { request_id: requestId, status: resp.status },
+    });
     throw new ApiError(resp.status, String(detailMsg), body, requestId);
   }
+  addBreadcrumb({
+    category: "api",
+    message: `${init.method} ${path} -> ${resp.status}`,
+    data: { request_id: resp.headers.get("x-request-id") },
+  });
   return payload as T;
 }
 

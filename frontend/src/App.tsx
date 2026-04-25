@@ -9,6 +9,7 @@ import RouteErrorBoundary from "@/components/RouteErrorBoundary";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import LandingGate from "@/components/LandingGate";
 import { initAnalytics } from "@/lib/analytics";
+import { initObservability, addBreadcrumb } from "@/lib/observability";
 import { useEffect } from "react";
 import { supabaseConfigError } from "@/lib/supabase";
 import { BRAND } from "@/lib/brand";
@@ -38,6 +39,7 @@ import DevAccount from "./pages/DevAccount";
 import DevVault from "./pages/DevVault";
 import DevProjects from "./pages/DevProjects";
 import DevStates from "./pages/DevStates";
+import DevObservability from "./pages/DevObservability";
 
 // BUG-FE-134 fix: Configure sensible defaults so react-query doesn't refetch
 // aggressively on every window focus or mount. staleTime = 30s keeps data fresh
@@ -93,7 +95,14 @@ const App = () => {
   // Initialise analytics once at app boot. No-op when VITE_POSTHOG_KEY unset.
   // Wrapped in useEffect to keep rendering pure in StrictMode.
   // eslint-disable-next-line react-hooks/rules-of-hooks
-  useEffect(() => { initAnalytics(); }, []);
+  useEffect(() => {
+    initAnalytics();
+    initObservability();
+    addBreadcrumb({
+      category: "navigation",
+      message: `app boot ${window.location.pathname}`,
+    });
+  }, []);
   return (
   <AppErrorBoundary>
     <QueryClientProvider client={queryClient}>
@@ -152,6 +161,9 @@ const App = () => {
               )}
               {import.meta.env.DEV && (
                 <Route path="/dev/states" element={<RouteErrorBoundary routeName="dev states"><DevStates /></RouteErrorBoundary>} />
+              )}
+              {import.meta.env.DEV && (
+                <Route path="/dev/observability" element={<RouteErrorBoundary routeName="dev observability"><DevObservability /></RouteErrorBoundary>} />
               )}
               <Route path="*" element={<NotFound />} />
             </Routes>
