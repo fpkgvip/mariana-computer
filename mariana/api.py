@@ -1444,6 +1444,23 @@ except Exception as _agent_exc:  # pragma: no cover — best effort
 
 
 # ---------------------------------------------------------------------------
+# Deft billing routes — credit balance + pre-flight quote
+# ---------------------------------------------------------------------------
+try:
+    from mariana.billing.router import build_billing_router as _build_billing_router
+
+    _billing_router = _build_billing_router(
+        get_current_user=_get_current_user,
+        get_supabase_url=lambda: _get_config().SUPABASE_URL,
+        get_service_key=lambda: (_supabase_api_key(_get_config()) or ""),
+    )
+    app.include_router(_billing_router)
+    logger.info("billing_routes_registered", route_count=len(_billing_router.routes))
+except Exception as _billing_exc:  # pragma: no cover — best effort
+    logger.warning("billing_routes_registration_failed", error=str(_billing_exc))
+
+
+# ---------------------------------------------------------------------------
 # Billing — hardcoded plan catalogue (matches Supabase plans table)
 # ---------------------------------------------------------------------------
 
