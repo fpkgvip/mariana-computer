@@ -234,8 +234,6 @@ export default function OnboardingWizard({
     return () => ac.abort();
   }, [open, step, selectedPrompt]);
 
-  const titleId = useMemo(() => `onboarding-step-${step}-title`, [step]);
-
   const stepTitle = useMemo(() => {
     switch (step) {
       case 1: return "Welcome to Deft";
@@ -258,9 +256,9 @@ export default function OnboardingWizard({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="max-w-md" aria-labelledby={titleId}>
+      <DialogContent className="max-w-md">
         <DialogHeader>
-          <DialogTitle id={titleId}>{stepTitle}</DialogTitle>
+          <DialogTitle>{stepTitle}</DialogTitle>
           <DialogDescription>{stepDescription}</DialogDescription>
         </DialogHeader>
 
