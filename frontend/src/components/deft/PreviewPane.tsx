@@ -319,9 +319,9 @@ function WaitingState({ stage }: { stage: ReturnType<typeof deriveStage> }) {
   const items: Array<{ key: string; label: string; caption: string }> = [
     { key: "plan", label: "Plan", caption: "Breaking your goal into steps" },
     { key: "write", label: "Write", caption: "Generating files in the sandbox" },
-    { key: "build", label: "Build", caption: "Compiling, type-checking" },
+    { key: "compile", label: "Compile", caption: "Type-checking and bundling" },
     { key: "verify", label: "Verify", caption: "Running it, catching errors" },
-    { key: "ship", label: "Ship", caption: "Pushing to a live URL" },
+    { key: "live", label: "Live", caption: "Pushing to a preview URL" },
   ];
   const currentIdx = items.findIndex((s) => s.key === stage.key);
 
@@ -378,9 +378,9 @@ function deriveStage(
   events: AgentEvent[],
   manifest: AgentPreviewManifest | null,
   isRunning: boolean,
-): { key: "plan" | "write" | "build" | "verify" | "ship" | "done"; eyebrow: string; title: string; subtitle: string } {
+): { key: "plan" | "write" | "compile" | "verify" | "live" | "done"; eyebrow: string; title: string; subtitle: string } {
   if (manifest?.deployed) {
-    return { key: "done", eyebrow: "Deployed", title: "Your app is live.", subtitle: "Iframe is loading the preview URL." };
+    return { key: "done", eyebrow: "Live", title: "Your app is live.", subtitle: "Iframe is loading the preview URL." };
   }
   // Walk recent events backward to figure out where we are.
   for (let i = events.length - 1; i >= 0 && i >= events.length - 60; i--) {
@@ -388,8 +388,8 @@ function deriveStage(
     const tool = (e.payload?.tool ?? e.payload?.tool_name ?? "") as string;
     if (tool === "deploy_preview")
       return {
-        key: "ship",
-        eyebrow: "Ship",
+        key: "live",
+        eyebrow: "Live",
         title: "Deploying your preview…",
         subtitle: "Snapshotting files and publishing the URL.",
       };
@@ -402,8 +402,8 @@ function deriveStage(
       };
     if (tool === "sandbox_exec" || tool === "exec" || /build|vite|tsc|npm/.test(JSON.stringify(e.payload ?? {})))
       return {
-        key: "build",
-        eyebrow: "Build",
+        key: "compile",
+        eyebrow: "Compile",
         title: "Compiling your project…",
         subtitle: "Type-checking, bundling, optimizing assets.",
       };

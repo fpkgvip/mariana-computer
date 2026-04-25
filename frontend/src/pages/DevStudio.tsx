@@ -19,7 +19,7 @@ import { LiveStudio } from "@/components/deft/studio/LiveStudio";
 import type { AgentEvent, AgentTaskState } from "@/lib/agentRunApi";
 import type { ModelTier, QuoteResponse } from "@/lib/agentApi";
 
-type Mode = "idle" | "live" | "empty";
+type Mode = "idle" | "live" | "empty" | "done";
 
 const MOCK_TASK: AgentTaskState = {
   id: "tsk_dev_1",
@@ -117,11 +117,36 @@ export default function DevStudio() {
         onNewRun: () => goto("idle"),
       };
     }
+    if (mode === "done") {
+      return {
+        title: MOCK_TASK.goal,
+        stage: "live" as const,
+        spentCredits: 312,
+        ceilingCredits: 500,
+        durationSec: 260,
+        canCancel: false,
+        onNewRun: () => goto("idle"),
+      };
+    }
     return {
       title: "",
       stage: "idle" as const,
     };
   }, [mode]);
+
+  const doneTask: AgentTaskState = useMemo(
+    () => ({
+      ...MOCK_TASK,
+      state: "done",
+      spent_usd: 3.12,
+      steps: MOCK_TASK.steps.map((s) => ({ ...s, status: "done" })),
+      artifacts: [
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        { url: "https://preview.deft.computer/tsk_dev_1", path: "index.html" } as any,
+      ],
+    }),
+    [],
+  );
 
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
@@ -133,6 +158,7 @@ export default function DevStudio() {
           <ModeButton current={mode} value="idle" onClick={() => goto("idle")} />
           <ModeButton current={mode} value="empty" onClick={() => goto("empty")} />
           <ModeButton current={mode} value="live" onClick={() => goto("live")} />
+          <ModeButton current={mode} value="done" onClick={() => goto("done")} />
         </div>
       </div>
 
@@ -148,6 +174,15 @@ export default function DevStudio() {
               connectionStatus="live"
               onCancel={() => alert("(dev) cancel")}
               taskId={MOCK_TASK.id}
+            />
+          ) : mode === "done" ? (
+            <LiveStudio
+              task={doneTask}
+              events={MOCK_EVENTS}
+              connectionStatus="live"
+              onCancel={() => {}}
+              taskId={doneTask.id}
+              previewUrl="https://preview.deft.computer/tsk_dev_1"
             />
           ) : (
             <IdleStudio

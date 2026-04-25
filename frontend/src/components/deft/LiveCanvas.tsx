@@ -16,6 +16,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Circle,
   Clock,
   Download,
@@ -98,6 +100,7 @@ export function LiveCanvas({
   const [tab, setTab] = useState<"plan" | "activity" | "artifacts">("plan");
   const activityRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
+  const [collapsed, setCollapsed] = useState(false);
 
   // Auto-scroll activity to bottom on new events when enabled
   useEffect(() => {
@@ -158,31 +161,56 @@ export function LiveCanvas({
       )}
 
       {/* Tabs */}
-      <div role="tablist" aria-label="Canvas panes" className="flex gap-1 border-b border-border px-3 py-2">
-        {(["plan", "activity", "artifacts"] as const).map((t) => (
-          <button
-            key={t}
-            role="tab"
-            type="button"
-            aria-selected={tab === t}
-            onClick={() => setTab(t)}
-            className={cn(
-              "rounded-md px-3 py-1 text-xs font-medium capitalize transition-colors",
-              tab === t
-                ? "bg-secondary text-foreground"
-                : "text-muted-foreground hover:bg-secondary/60 hover:text-foreground",
-            )}
-          >
-            {t}
-            {t === "plan" && plan.length > 0 && <span className="ml-1 opacity-60">({plan.length})</span>}
-            {t === "activity" && events.length > 0 && <span className="ml-1 opacity-60">({events.length})</span>}
-            {t === "artifacts" && artifacts.length > 0 && <span className="ml-1 opacity-60">({artifacts.length})</span>}
-          </button>
-        ))}
+      <div className="flex items-center justify-between border-b border-border px-3 py-2">
+        <div role="tablist" aria-label="Canvas panes" className="flex gap-1">
+          {(["plan", "activity", "artifacts"] as const).map((t) => (
+            <button
+              key={t}
+              role="tab"
+              type="button"
+              aria-selected={tab === t}
+              onClick={() => {
+                setTab(t);
+                if (collapsed) setCollapsed(false);
+              }}
+              className={cn(
+                "rounded-md px-3 py-1 text-xs font-medium capitalize transition-colors",
+                "focus:outline-none focus-visible:ring-2 focus-visible:ring-accent",
+                tab === t
+                  ? "bg-secondary text-foreground"
+                  : "text-muted-foreground hover:bg-secondary/60 hover:text-foreground",
+              )}
+            >
+              {t}
+              {t === "plan" && plan.length > 0 && <span className="ml-1 opacity-60">({plan.length})</span>}
+              {t === "activity" && events.length > 0 && <span className="ml-1 opacity-60">({events.length})</span>}
+              {t === "artifacts" && artifacts.length > 0 && <span className="ml-1 opacity-60">({artifacts.length})</span>}
+            </button>
+          ))}
+        </div>
+        <button
+          type="button"
+          onClick={() => setCollapsed((c) => !c)}
+          aria-label={collapsed ? "Expand panel" : "Collapse panel"}
+          aria-expanded={!collapsed}
+          className={cn(
+            "inline-flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors",
+            "hover:bg-secondary hover:text-foreground",
+            "focus:outline-none focus-visible:ring-2 focus-visible:ring-accent",
+          )}
+        >
+          {collapsed ? <ChevronDown size={14} aria-hidden="true" /> : <ChevronUp size={14} aria-hidden="true" />}
+        </button>
       </div>
 
       {/* Pane content */}
-      <div className="relative flex-1 overflow-hidden">
+      <div
+        className={cn(
+          "relative flex-1 overflow-hidden transition-[max-height] duration-200",
+          collapsed && "hidden",
+        )}
+        aria-hidden={collapsed}
+      >
         {tab === "plan" && (
           <div className="h-full overflow-auto p-3">
             {plan.length === 0 ? (
