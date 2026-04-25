@@ -432,7 +432,13 @@ app.add_middleware(
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Attach a baseline of browser security headers to every response."""
+    """Attach a baseline of browser security headers to every response.
+
+    The /preview/* path is the deployed user app: it must be embeddable in
+    the studio iframe (a different origin) and may load its own bundled
+    JS/CSS, fonts, etc. We therefore skip the strict frame/CSP headers
+    there and let the route handler set its own permissive set.
+    """
 
     _HEADERS = {
         "X-Content-Type-Options": "nosniff",
@@ -442,9 +448,15 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         "Content-Security-Policy": "default-src 'self'",
     }
 
+    # Headers that must NOT be applied to user-deployed preview content.
+    _PREVIEW_SKIP = ("X-Frame-Options", "Content-Security-Policy")
+
     async def dispatch(self, request, call_next):
         response = await call_next(request)
+        is_preview = request.url.path.startswith("/preview/")
         for header, value in self._HEADERS.items():
+            if is_preview and header in self._PREVIEW_SKIP:
+                continue
             # Do not overwrite headers the route handler set deliberately.
             response.headers.setdefault(header, value)
         return response
@@ -1534,6 +1546,9 @@ try:
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Access-Control-Allow-Origin": "*",
             "X-Deft-Preview-Task": task_id,
+            # Preview must be embeddable in the studio iframe (cross-origin).
+            # Override the global SecurityHeaders default of DENY.
+            "Content-Security-Policy": "frame-ancestors *",
         }
         return _FileResponse(str(target), media_type=ctype, headers=headers)
 
