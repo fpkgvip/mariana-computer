@@ -236,22 +236,32 @@ export default function OnboardingWizard({
 
   const titleId = useMemo(() => `onboarding-step-${step}-title`, [step]);
 
+  const stepTitle = useMemo(() => {
+    switch (step) {
+      case 1: return "Welcome to Deft";
+      case 2: return "Set up your Vault";
+      case 3: return "Pick something to build";
+      case 4: return "Your first quote";
+      default: return "Welcome";
+    }
+  }, [step]);
+
+  const stepDescription = useMemo(() => {
+    switch (step) {
+      case 1: return "We'll get you to your first build in under a minute.";
+      case 2: return "Encrypted secrets you can reference safely in any prompt.";
+      case 3: return "Try one of these to see Deft work autonomously.";
+      case 4: return "Pre-flight estimate so you know exactly what you'll spend.";
+      default: return "";
+    }
+  }, [step]);
+
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-w-md" aria-labelledby={titleId}>
         <DialogHeader>
-          <DialogTitle id={titleId}>
-            {step === 1 && "Welcome to Deft"}
-            {step === 2 && "Set up your Vault"}
-            {step === 3 && "Pick something to build"}
-            {step === 4 && "Your first quote"}
-          </DialogTitle>
-          <DialogDescription>
-            {step === 1 && "We'll get you to your first build in under a minute."}
-            {step === 2 && "Encrypted secrets you can reference safely in any prompt."}
-            {step === 3 && "Try one of these to see Deft work autonomously."}
-            {step === 4 && "Pre-flight estimate so you know exactly what you'll spend."}
-          </DialogDescription>
+          <DialogTitle id={titleId}>{stepTitle}</DialogTitle>
+          <DialogDescription>{stepDescription}</DialogDescription>
         </DialogHeader>
 
         <div className="mt-2 flex items-center gap-1.5" aria-label={`Step ${step} of 4`}>
