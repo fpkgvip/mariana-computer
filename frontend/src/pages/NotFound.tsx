@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
 import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
+import { usePageHead } from "@/lib/pageHead";
 
 /**
  * 404 — calm operator voice.  No "Oops", no exclamation marks, no
@@ -8,6 +9,8 @@ import { Footer } from "@/components/Footer";
  * and a way back.
  */
 const NotFound = () => {
+  usePageHead({ title: "Page not found", description: "That page does not exist." });
+
   return (
     <div className="min-h-screen bg-background">
       <Navbar />

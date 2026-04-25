@@ -3,8 +3,14 @@ import { Footer } from "@/components/Footer";
 import { ScrollReveal } from "@/components/ScrollReveal";
 import { Link } from "react-router-dom";
 import { ArrowRight } from "lucide-react";
+import { usePageHead } from "@/lib/pageHead";
 
 export default function Product() {
+  usePageHead({
+    title: "Product",
+    description: "How Deft works: a real browser, a feedback loop that catches its own bugs, and code that actually runs the first time.",
+    path: "/product",
+  });
   return (
     <div className="min-h-screen bg-background">
       <Navbar />

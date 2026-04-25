@@ -8,8 +8,15 @@ import { supabase } from "@/lib/supabase";
 import { BrandMark } from "@/components/BrandMark";
 import { BRAND } from "@/lib/brand";
 import { ArrowRight, Globe, ShieldCheck } from "lucide-react";
+import { usePageHead } from "@/lib/pageHead";
 
 export default function Login() {
+  usePageHead({
+    title: "Log in",
+    description: "Log in to Deft to start a run, manage projects, and check your credit balance.",
+    path: "/login",
+  });
+
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);

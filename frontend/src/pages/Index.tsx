@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUpRight, Sparkles, Eye, Globe } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import { BRAND, STORAGE } from "@/lib/brand";
+import { usePageHead } from "@/lib/pageHead";
 
 /**
  * Deft homepage — prompt-first.
@@ -38,6 +39,13 @@ const STAGES = [
 ];
 
 export default function Index() {
+  usePageHead({
+    title: "Deft \u2014 The AI developer that doesn't leave you debugging",
+    description: "Deft is the AI developer that doesn't leave you debugging. It runs your app in a real browser, watches its own output, and fixes its own mistakes \u2014 before you see them.",
+    path: "/",
+    suffixBrand: false,
+  });
+
   const navigate = useNavigate();
   const { user } = useAuth();
   const [prompt, setPrompt] = useState("");

@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { Mail, MapPin } from "lucide-react";
 import { BRAND } from "@/lib/brand";
+import { usePageHead } from "@/lib/pageHead";
 
 const subjects = ["General inquiry", "Sales", "Support", "Legal", "Partnership"];
 
@@ -21,6 +22,12 @@ const contactInfo = [
 const API_URL = import.meta.env.VITE_API_URL ?? "";
 
 export default function Contact() {
+  usePageHead({
+    title: "Contact",
+    description: "Talk to a human at Deft. Sales, support, partnerships. We respond within one business day.",
+    path: "/contact",
+  });
+
   const [form, setForm] = useState({ name: "", email: "", subject: subjects[0], message: "" });
   const [sending, setSending] = useState(false);
 

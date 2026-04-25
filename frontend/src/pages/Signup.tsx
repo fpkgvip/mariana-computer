@@ -8,8 +8,15 @@ import { track } from "@/lib/analytics";
 import { BrandMark } from "@/components/BrandMark";
 import { BRAND } from "@/lib/brand";
 import { ArrowRight, CheckCircle2, Sparkles } from "lucide-react";
+import { usePageHead } from "@/lib/pageHead";
 
 export default function Signup() {
+  usePageHead({
+    title: "Sign up",
+    description: "Try Deft. 500 free credits to start. No credit card required.",
+    path: "/signup",
+  });
+
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");

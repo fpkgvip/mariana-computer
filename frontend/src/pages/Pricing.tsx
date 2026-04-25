@@ -8,6 +8,7 @@ import { supabase } from "@/lib/supabase";
 import { toast } from "sonner";
 import { track } from "@/lib/analytics";
 import { BRAND } from "@/lib/brand";
+import { usePageHead } from "@/lib/pageHead";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "";
 
@@ -164,6 +165,12 @@ const topups = [
 ];
 
 export default function Pricing() {
+  usePageHead({
+    title: "Pricing",
+    description: "Honest credit-based pricing. Pay $0.01 per credit. Free 500 credits to start. Plans from $29 to $699 a month.",
+    path: "/pricing",
+  });
+
   const { user } = useAuth();
   const navigate = useNavigate();
   const [loadingPlanId, setLoadingPlanId] = useState<string | null>(null);
