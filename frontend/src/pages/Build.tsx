@@ -34,6 +34,9 @@ import { useVault } from "@/hooks/useVault";
 import { VaultUnlockDialog } from "@/components/deft/VaultUnlockDialog";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { scanVaultRefs, resolveVaultRefs, VaultRefError } from "@/lib/vaultPromptScan";
+import { track } from "@/lib/analytics";
+
+const FIRST_PROMPT_FLAG = "deft.firstPromptSubmitted.v1";
 
 const TERMINAL_STATES = new Set(["done", "completed", "failed", "stopped", "cancelled", "error"]);
 
@@ -42,10 +45,21 @@ export default function Build() {
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   const taskIdParam = params.get("task");
+  const promptParam = params.get("prompt");
 
   const { balance, refetch: refetchBalance } = useCredits(0);
 
-  const [draftPrompt, setDraftPrompt] = useState("");
+  const [draftPrompt, setDraftPrompt] = useState(promptParam ?? "");
+
+  // Strip ?prompt=... from URL after seeding so reloading the page doesn't
+  // re-prefill or leak the prompt back into shared links.
+  useEffect(() => {
+    if (!promptParam) return;
+    const next = new URLSearchParams(params);
+    next.delete("prompt");
+    setParams(next, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(taskIdParam);
   const [task, setTask] = useState<AgentTaskState | null>(null);
   const [events, setEvents] = useState<AgentEvent[]>([]);
@@ -222,6 +236,18 @@ export default function Build() {
           ceilingCredits: ceiling,
           vaultEnv,
         });
+        try {
+          if (typeof window !== "undefined" && !window.localStorage.getItem(FIRST_PROMPT_FLAG)) {
+            window.localStorage.setItem(FIRST_PROMPT_FLAG, "1");
+            track("first_prompt_submitted", {
+              tier,
+              ceiling,
+              prompt_length: draftPrompt.trim().length,
+            });
+          }
+        } catch {
+          // ignore
+        }
         refetchBalance();
         setParams((prev) => {
           const p = new URLSearchParams(prev);

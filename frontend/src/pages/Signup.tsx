@@ -4,6 +4,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
+import { track } from "@/lib/analytics";
 
 export default function Signup() {
   const [name, setName] = useState("");
@@ -38,7 +39,14 @@ export default function Signup() {
       // BUG-R2C-03: Only navigate to /chat when signup returned a live session
       // (email confirmation disabled). When email confirmation is required,
       // signup() returns false and the toast is already shown by AuthContext.
-      if (confirmed) navigate("/chat");
+      if (confirmed) {
+        try {
+          track("signup_completed", { method: "password" });
+        } catch {
+          // ignore
+        }
+        navigate("/chat");
+      }
       // else: stay on page — user must confirm email first
     } catch {
       // Error toast already shown by AuthContext.signup()

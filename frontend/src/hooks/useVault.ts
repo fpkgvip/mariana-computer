@@ -33,6 +33,7 @@ import {
 } from "@/lib/vaultApi";
 import { decryptSecret, decryptPreview, b64ToBytes as bytesFromB64 } from "@/lib/vaultCrypto";
 import { ApiError } from "@/lib/api";
+import { track } from "@/lib/analytics";
 
 export const VAULT_CHANGED_EVENT = "deft:vault-changed";
 const DEFAULT_LOCK_MS = 30 * 60 * 1000; // 30 min
@@ -200,6 +201,12 @@ async function unlockWithRecoveryCode(code: string) {
 async function addSecret(name: string, plaintext: string, description?: string) {
   if (!store.masterKey) throw new Error("vault is locked");
   await createSecretOnServer(store.masterKey, name, plaintext, description);
+  // Fire-and-forget analytics — never blocks or throws.
+  try {
+    track("vault_secret_added", { has_description: Boolean(description) });
+  } catch {
+    // ignore
+  }
   bumpActivity();
   await loadSecrets();
 }

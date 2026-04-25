@@ -38,6 +38,7 @@ import {
 } from "@/lib/agentApi";
 import { ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { track } from "@/lib/analytics";
 
 interface PreflightCardProps {
   prompt: string;
@@ -91,6 +92,15 @@ export function PreflightCard({
       try {
         const q = await fetchQuote({ prompt: trimmed, tier }, controller.signal);
         setQuote(q);
+        try {
+          track("quote_generated", {
+            tier,
+            credits_min: q.credits_min,
+            credits_max: q.credits_max,
+          });
+        } catch {
+          // ignore
+        }
         // If user hasn't touched the ceiling, default to the quote max (capped at balance).
         if (!ceilingTouched) {
           setCeiling(Math.min(q.credits_max, balance > 0 ? balance : q.credits_max));

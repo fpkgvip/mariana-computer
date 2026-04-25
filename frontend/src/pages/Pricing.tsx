@@ -7,6 +7,7 @@ import { ArrowRight, Check, Loader2 } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/lib/supabase";
 import { toast } from "sonner";
+import { track } from "@/lib/analytics";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "";
 
@@ -125,6 +126,13 @@ export default function Pricing() {
     }
 
     setLoadingPlanId(planId);
+
+    try {
+      const isTopup = planId.startsWith("topup_");
+      track("checkout_started", { plan_id: planId, kind: isTopup ? "topup" : "subscription" });
+    } catch {
+      // ignore
+    }
 
     // BUG-FE-121 fix: Open the navigation target synchronously on click so
     // Safari honors the user-gesture context. Assigning window.location.href

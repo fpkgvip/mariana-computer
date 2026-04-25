@@ -5,7 +5,11 @@ import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AuthProvider } from "@/contexts/AuthContext";
 import AppErrorBoundary from "@/components/AppErrorBoundary";
+import RouteErrorBoundary from "@/components/RouteErrorBoundary";
 import ProtectedRoute from "@/components/ProtectedRoute";
+import OnboardingWizard from "@/components/OnboardingWizard";
+import { initAnalytics } from "@/lib/analytics";
+import { useEffect } from "react";
 import { supabaseConfigError } from "@/lib/supabase";
 import { BRAND } from "@/lib/brand";
 import { AlertTriangle } from "lucide-react";
@@ -81,6 +85,10 @@ const App = () => {
   if (supabaseConfigError) {
     return <ConfigErrorScreen message={supabaseConfigError} />;
   }
+  // Initialise analytics once at app boot. No-op when VITE_POSTHOG_KEY unset.
+  // Wrapped in useEffect to keep rendering pure in StrictMode.
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  useEffect(() => { initAnalytics(); }, []);
   return (
   <AppErrorBoundary>
     <QueryClientProvider client={queryClient}>
@@ -89,35 +97,36 @@ const App = () => {
         <Sonner />
         <BrowserRouter>
           <AuthProvider>
+            <OnboardingWizard />
             {/* FE-CRIT-01 fix: Protected routes wrapped with ProtectedRoute
                 to prevent rendering before auth is resolved. Public routes
                 (/, /research, /product, /pricing, /contact, /login, /signup,
                 /reset-password) remain unwrapped. */}
             <Routes>
-              <Route path="/" element={<Index />} />
-              <Route path="/research" element={<Research />} />
-              <Route path="/product" element={<Product />} />
+              <Route path="/" element={<RouteErrorBoundary routeName="home"><Index /></RouteErrorBoundary>} />
+              <Route path="/research" element={<RouteErrorBoundary routeName="research"><Research /></RouteErrorBoundary>} />
+              <Route path="/product" element={<RouteErrorBoundary routeName="product"><Product /></RouteErrorBoundary>} />
               {/* Legacy /mariana → /product redirect (rebrand v1.0) */}
               <Route path="/mariana" element={<Navigate to="/product" replace />} />
-              <Route path="/chat" element={<ProtectedRoute><Chat /></ProtectedRoute>} />
-              <Route path="/build" element={<ProtectedRoute><Build /></ProtectedRoute>} />
+              <Route path="/chat" element={<ProtectedRoute><RouteErrorBoundary routeName="chat"><Chat /></RouteErrorBoundary></ProtectedRoute>} />
+              <Route path="/build" element={<ProtectedRoute><RouteErrorBoundary routeName="build"><Build /></RouteErrorBoundary></ProtectedRoute>} />
               <Route path="/studio" element={<Navigate to="/build" replace />} />
-              <Route path="/pricing" element={<Pricing />} />
-              <Route path="/contact" element={<Contact />} />
-              <Route path="/checkout" element={<ProtectedRoute><Checkout /></ProtectedRoute>} />
+              <Route path="/pricing" element={<RouteErrorBoundary routeName="pricing"><Pricing /></RouteErrorBoundary>} />
+              <Route path="/contact" element={<RouteErrorBoundary routeName="contact"><Contact /></RouteErrorBoundary>} />
+              <Route path="/checkout" element={<ProtectedRoute><RouteErrorBoundary routeName="checkout"><Checkout /></RouteErrorBoundary></ProtectedRoute>} />
               {/* BUG-legacy: /buy-credits now redirects to /checkout for backward compat */}
-              <Route path="/buy-credits" element={<ProtectedRoute><Checkout /></ProtectedRoute>} />
-              <Route path="/account" element={<ProtectedRoute><Account /></ProtectedRoute>} />
-              <Route path="/skills" element={<ProtectedRoute><Skills /></ProtectedRoute>} />
-              <Route path="/graph" element={<ProtectedRoute><InvestigationGraph /></ProtectedRoute>} />
-              <Route path="/graph/:taskId" element={<ProtectedRoute><InvestigationGraph /></ProtectedRoute>} />
-              <Route path="/tasks" element={<ProtectedRoute><Tasks /></ProtectedRoute>} />
-              <Route path="/tasks/:taskId" element={<ProtectedRoute><TaskDetail /></ProtectedRoute>} />
-              <Route path="/vault" element={<ProtectedRoute><Vault /></ProtectedRoute>} />
-              <Route path="/admin" element={<ProtectedRoute><Admin /></ProtectedRoute>} />
-              <Route path="/login" element={<Login />} />
-              <Route path="/signup" element={<Signup />} />
-              <Route path="/reset-password" element={<ResetPassword />} />
+              <Route path="/buy-credits" element={<ProtectedRoute><RouteErrorBoundary routeName="checkout"><Checkout /></RouteErrorBoundary></ProtectedRoute>} />
+              <Route path="/account" element={<ProtectedRoute><RouteErrorBoundary routeName="account"><Account /></RouteErrorBoundary></ProtectedRoute>} />
+              <Route path="/skills" element={<ProtectedRoute><RouteErrorBoundary routeName="skills"><Skills /></RouteErrorBoundary></ProtectedRoute>} />
+              <Route path="/graph" element={<ProtectedRoute><RouteErrorBoundary routeName="graph"><InvestigationGraph /></RouteErrorBoundary></ProtectedRoute>} />
+              <Route path="/graph/:taskId" element={<ProtectedRoute><RouteErrorBoundary routeName="graph"><InvestigationGraph /></RouteErrorBoundary></ProtectedRoute>} />
+              <Route path="/tasks" element={<ProtectedRoute><RouteErrorBoundary routeName="tasks"><Tasks /></RouteErrorBoundary></ProtectedRoute>} />
+              <Route path="/tasks/:taskId" element={<ProtectedRoute><RouteErrorBoundary routeName="task detail"><TaskDetail /></RouteErrorBoundary></ProtectedRoute>} />
+              <Route path="/vault" element={<ProtectedRoute><RouteErrorBoundary routeName="vault"><Vault /></RouteErrorBoundary></ProtectedRoute>} />
+              <Route path="/admin" element={<ProtectedRoute><RouteErrorBoundary routeName="admin"><Admin /></RouteErrorBoundary></ProtectedRoute>} />
+              <Route path="/login" element={<RouteErrorBoundary routeName="login"><Login /></RouteErrorBoundary>} />
+              <Route path="/signup" element={<RouteErrorBoundary routeName="signup"><Signup /></RouteErrorBoundary>} />
+              <Route path="/reset-password" element={<RouteErrorBoundary routeName="password reset"><ResetPassword /></RouteErrorBoundary>} />
               <Route path="*" element={<NotFound />} />
             </Routes>
           </AuthProvider>
