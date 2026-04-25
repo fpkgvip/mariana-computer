@@ -17,6 +17,7 @@ import {
   Table,
   X,
   Loader2,
+  type LucideIcon,
 } from "lucide-react";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "";
@@ -104,7 +105,7 @@ const BUILTIN_SKILLS: Skill[] = [
   },
 ];
 
-const CATEGORY_ICONS: Record<string, React.FC<{ size?: number; className?: string }>> = {
+const CATEGORY_ICONS: Record<string, LucideIcon> = {
   "research-report": FileText,
   "financial-analysis": BarChart3,
   "competitive-analysis": Target,
@@ -230,7 +231,7 @@ function CreateSkillModal({
                 onChange={(e) => setSystemPrompt(e.target.value)}
                 rows={3}
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-primary focus:outline-none resize-none"
-                placeholder="Instructions for Mariana when this skill is active..."
+                placeholder="Instructions for Deft when this skill is active..."
               />
             </div>
             <div>
@@ -333,7 +334,7 @@ export default function Skills() {
               </button>
             </div>
             <p className="mt-2 text-sm text-muted-foreground">
-              Skills are reusable playbooks that guide how Mariana approaches different kinds
+              Skills are reusable playbooks that guide how Deft approaches different kinds
               of work — research, building, analysis, automation. Skills are auto-detected from
               your request, or you can pick one manually.
             </p>

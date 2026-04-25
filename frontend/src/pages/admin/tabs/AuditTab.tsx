@@ -102,7 +102,7 @@ export function AuditTab() {
                   </div>
                 </td>
                 <td className="px-3 py-2 max-w-[420px]">
-                  {(r.before || r.after || r.meta) && (
+                  {Boolean(r.before || r.after || r.meta) && (
                     <details>
                       <summary className="cursor-pointer text-xs text-muted-foreground">
                         Inspect

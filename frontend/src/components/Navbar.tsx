@@ -2,9 +2,10 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useState, useEffect, useRef } from "react";
 import { Menu, X, User, LogOut, CreditCard, Settings, ShieldCheck, Inbox } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
+import { BRAND } from "@/lib/brand";
 
 const navLinks = [
-  { label: "Product", href: "/mariana" },
+  { label: "Product", href: "/product" },
   { label: "Examples", href: "/research" },
   { label: "Pricing", href: "/pricing" },
   { label: "Contact", href: "/contact" },
@@ -58,8 +59,8 @@ export function Navbar() {
     >
       <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-6">
         <Link to="/" className="flex items-center gap-2">
-          <span className="font-serif text-lg font-semibold tracking-tight text-foreground">
-            Mariana
+          <span className="text-lg font-semibold tracking-tight text-foreground">
+            {BRAND.name}
           </span>
         </Link>
 
@@ -138,7 +139,7 @@ export function Navbar() {
                 to="/signup"
                 className="rounded-md bg-primary px-4 py-2 text-[13px] font-medium text-primary-foreground transition-all hover:bg-primary/90 hover:shadow-lg hover:shadow-primary/10"
               >
-                Try Mariana
+                Try {BRAND.name}
               </Link>
             </div>
           )}
@@ -205,7 +206,7 @@ export function Navbar() {
                   to="/signup"
                   className="mt-1 rounded-md bg-primary px-4 py-2.5 text-center text-sm font-medium text-primary-foreground"
                 >
-                  Try Mariana
+                  Try {BRAND.name}
                 </Link>
               </>
             )}

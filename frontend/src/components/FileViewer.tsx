@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { X, Download, FileText, Image, FileCode, Table, File, Video, FileSpreadsheet, Presentation } from "lucide-react";
+import { X, Download, FileText, Image, FileCode, Table, File, Video, FileSpreadsheet, Presentation, type LucideIcon } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 
 /* ------------------------------------------------------------------ */
@@ -39,7 +39,7 @@ function getFileExtension(filename: string): string {
   return dot >= 0 ? filename.slice(dot + 1).toLowerCase() : "";
 }
 
-function getFileTypeIcon(filename: string): React.FC<{ size?: number; className?: string }> {
+function getFileTypeIcon(filename: string): LucideIcon {
   const ext = getFileExtension(filename);
   if (["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(ext)) return Image;
   if (["mp4", "webm", "mov"].includes(ext)) return Video;

@@ -15,7 +15,7 @@ export function DangerTab({
 }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [freezeMsg, setFreezeMsg] = useState(
-    "Mariana is temporarily paused for maintenance. Please check back soon.",
+    "Deft is temporarily paused for maintenance. Please check back soon.",
   );
 
   async function toggleFreeze() {
@@ -27,7 +27,7 @@ export function DangerTab({
     if (reason == null) return;
     setBusy("freeze");
     try {
-      await adminApi.setSystemFreeze(next, reason, next ? freezeMsg : null);
+      await adminApi.setSystemFreeze(next, reason, next ? freezeMsg : undefined);
       toast.success(next ? "System frozen" : "System unfrozen");
       onFrozenChange(next);
     } catch (err) {

@@ -379,11 +379,14 @@ const EXTRACT_CITATIONS_CACHE_MAX = 500;
 // Also clears the module-level logout callback list for per-instance stores.
 const _logoutCallbacks: Array<() => void> = [];
 if (typeof window !== "undefined") {
-  window.addEventListener("mariana:logout", () => {
+  // Clear caches on logout. Listens to both new and legacy events for one release.
+  const clearOnLogout = () => {
     renderMarkdownCache.clear();
     extractCitationsCache.clear();
     for (const cb of _logoutCallbacks) cb();
-  });
+  };
+  window.addEventListener("deft:logout", clearOnLogout);
+  window.addEventListener("mariana:logout", clearOnLogout);
 }
 
 function extractCitations(text: string): Array<{ text: string; url: string }> {
@@ -811,10 +814,12 @@ export default function Chat() {
                   },
                   { onConflict: "task_id" }
                 )
-                .then(({ error }) => {
-                  if (error) console.warn("[Chat] Supabase sync error:", error.message);
-                })
-                .catch(() => {});
+                .then(
+                  ({ error }) => {
+                    if (error) console.warn("[Chat] Supabase sync error:", error.message);
+                  },
+                  () => {},
+                );
             }
           }
           return;
@@ -1355,11 +1360,13 @@ export default function Chat() {
         .from("investigations")
         .update({ status })
         .eq("task_id", taskId)
-        .then(({ error }) => {
-          if (error) console.error("[Chat] Failed to update investigation status:", error.message);
-        })
-        // BUG-R15-03: Catch network-level rejections to prevent unhandled promise rejection
-        .catch((err) => console.error("[Chat] Failed to update investigation status (network):", err));
+        .then(
+          ({ error }) => {
+            if (error) console.error("[Chat] Failed to update investigation status:", error.message);
+          },
+          // BUG-R15-03: Catch network-level rejections to prevent unhandled promise rejection
+          (err: unknown) => console.error("[Chat] Failed to update investigation status (network):", err),
+        );
 
       // BUG-R13-01 + BUG-ZBA-05: When completing, re-fetch output paths.
       // First try backend API (canonical source of truth for research_tasks),
@@ -2419,7 +2426,7 @@ export default function Chat() {
       const isTimeout = err instanceof DOMException && err.name === "AbortError";
       if (isTimeout) {
         console.warn("[Chat] chat/respond timed out after 60s, showing fallback plan.");
-        toast.error("Mariana took too long to respond", {
+        toast.error("Deft took too long to respond", {
           description: "Showing a fallback research plan you can approve.",
         });
       } else {
@@ -2618,11 +2625,13 @@ export default function Chat() {
             user_id: user.id, // guaranteed non-null
             ...(conversationId ? { conversation_id: conversationId } : {}),
           })
-          .then(({ error }) => {
-            if (error) console.error("[Chat] Failed to persist investigation:", error.message);
-          })
-          // BUG-R15-03: Catch network-level rejections to prevent unhandled promise rejection
-          .catch((err) => console.error("[Chat] Failed to persist investigation (network):", err));
+          .then(
+            ({ error }) => {
+              if (error) console.error("[Chat] Failed to persist investigation:", error.message);
+            },
+            // BUG-R15-03: Catch network-level rejections to prevent unhandled promise rejection
+            (err: unknown) => console.error("[Chat] Failed to persist investigation (network):", err),
+          );
       }
 
       appendMessage({
@@ -2878,7 +2887,7 @@ export default function Chat() {
     if (lastNonUserMessage?.content) return lastNonUserMessage.content;
     if (pendingPlan) return "Research plan ready for review.";
     if (isClassifying) return "Analyzing your question.";
-    if (isSending) return "Mariana is researching.";
+    if (isSending) return "Deft is working.";
     return "";
   }, [messages, pendingPlan, isClassifying, isSending]);
 
@@ -2903,8 +2912,8 @@ export default function Chat() {
         }`}
       >
         <div className="flex h-16 items-center justify-between border-b border-border px-5">
-          <Link to="/" className="font-serif text-sm font-semibold text-foreground">
-            Mariana
+          <Link to="/" className="text-sm font-semibold tracking-tight text-foreground">
+            Deft
           </Link>
           <button
             onClick={() => setSidebarOpen(false)}
@@ -3092,7 +3101,7 @@ export default function Chat() {
               </button>
               <button
                 onClick={() => {
-                  toast("Sign out of Mariana Computer?", {
+                  toast("Sign out of Deft?", {
                     duration: 6000,
                     action: {
                       label: "Sign out",
@@ -3134,12 +3143,12 @@ export default function Chat() {
             </button>
             <Link
               to="/"
-              className="font-serif text-sm font-semibold text-foreground md:hidden"
+              className="text-sm font-semibold tracking-tight text-foreground md:hidden"
             >
-              Mariana
+              Deft
             </Link>
             <span className="hidden text-xs text-muted-foreground md:inline">
-              Mariana Computer
+              Deft
             </span>
           </div>
 
@@ -3229,11 +3238,11 @@ export default function Chat() {
             {messages.length === 0 && !isSending && !pendingPlan && !conversationLoading && (
               <div className="flex flex-col items-center justify-center py-24 text-center">
                 <h2 className="font-serif text-xl font-semibold text-foreground mb-2">
-                  What should Mariana do for you?
+                  What should Deft do for you?
                 </h2>
                 <p className="text-sm text-muted-foreground max-w-md">
                   Ask a question, build a tool, run an analysis, draft a document, or automate a workflow.
-                  Mariana picks the right approach and works until it's done.
+                  Deft picks the right approach and works until it's done.
                 </p>
               </div>
             )}
@@ -3542,7 +3551,7 @@ export default function Chat() {
                   <textarea
                     value={userFlowInstructions}
                     onChange={(e) => setUserFlowInstructions(e.target.value)}
-                    placeholder="Add any custom instructions for how Mariana should approach this task..."
+                    placeholder="Add any custom instructions for how Deft should approach this task..."
                     rows={2}
                     className="w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-xs text-foreground placeholder:text-muted-foreground/40 outline-none focus:ring-1 focus:ring-accent/50 resize-none"
                   />
@@ -3586,8 +3595,8 @@ export default function Chat() {
                     <Loader2 size={12} className="animate-spin" />
                     <span>
                       {timelineSteps.length === 0
-                        ? "Mariana is setting up the investigation..."
-                        : "Mariana is researching..."}
+                        ? "Deft is setting up the run..."
+                        : "Deft is working..."}
                     </span>
                   </div>
                   {activeTaskId && (
@@ -3716,10 +3725,10 @@ export default function Chat() {
               <input
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                placeholder={user.tokens <= 0 ? "Add credits to continue..." : "Ask Mariana anything..."}
+                placeholder={user.tokens <= 0 ? "Add credits to continue..." : "Ask Deft anything..."}
                 className="min-w-0 flex-1 rounded-md border border-border bg-card px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary/20 sm:px-4"
                 disabled={isSending || isClassifying || user.tokens <= 0}
-                aria-label="Ask Mariana a question"
+                aria-label="Ask Deft a question"
               />
               <button
                 type="submit"

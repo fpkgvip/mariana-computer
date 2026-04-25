@@ -77,7 +77,7 @@ export default class AppErrorBoundary extends Component<
             <div>
               <h1 className="text-lg font-semibold text-foreground">Something went wrong</h1>
               <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                Mariana hit an unexpected application error. Reload the page to restore the session.
+                Deft hit an unexpected application error. Reload the page to restore the session.
               </p>
             </div>
           </div>

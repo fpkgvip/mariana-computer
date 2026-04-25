@@ -1437,10 +1437,10 @@ export default function InvestigationGraph() {
             className="flex items-center gap-1 text-muted-foreground hover:text-foreground transition-colors"
           >
             <ArrowLeft className="w-4 h-4" />
-            <span className="font-medium">Mariana</span>
+            <span className="font-medium">Deft</span>
           </Link>
           <ChevronRight className="w-3.5 h-3.5 text-muted-foreground" />
-          <span className="font-semibold text-foreground" style={{ fontFamily: "'Playfair Display', Georgia, serif" }}>
+          <span className="font-semibold text-foreground tracking-tight">
             Investigation Graph
           </span>
           {taskId && (

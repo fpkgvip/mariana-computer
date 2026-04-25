@@ -4,7 +4,7 @@ import { ScrollReveal } from "@/components/ScrollReveal";
 import { Link } from "react-router-dom";
 import { ArrowRight } from "lucide-react";
 
-export default function Mariana() {
+export default function Product() {
   return (
     <div className="min-h-screen bg-background">
       <Navbar />
@@ -18,7 +18,7 @@ export default function Mariana() {
         </ScrollReveal>
         <ScrollReveal delay={150}>
           <p className="mt-8 max-w-xl text-lg leading-[1.7] text-muted-foreground">
-            Mariana runs inside a full compute environment. It writes and
+            Deft runs inside a full compute environment. It writes and
             executes code, builds applications, browses the web, queries your
             data, and works autonomously until the task is done — not just
             drafted.
@@ -30,7 +30,7 @@ export default function Mariana() {
               to="/chat"
               className="inline-flex items-center gap-2.5 rounded-md bg-primary px-6 py-3 text-sm font-medium text-primary-foreground transition-all hover:bg-primary/90 hover:shadow-xl hover:shadow-primary/10"
             >
-              Try Mariana <ArrowRight size={15} />
+              Try Deft <ArrowRight size={15} />
             </Link>
             <Link
               to="/pricing"
@@ -55,7 +55,7 @@ export default function Mariana() {
               <ScrollReveal delay={100}>
                 <div className="mt-8 space-y-6 text-[16px] leading-[1.8] text-muted-foreground">
                   <p>
-                    When Mariana needs information that isn't in a database, it
+                    When Deft needs information that isn't in a database, it
                     writes a program to get it — a browser script, an API
                     client, a parser for whatever file format it runs into. When
                     it needs to verify a claim, it builds a check and runs it.
@@ -68,7 +68,7 @@ export default function Mariana() {
                     complete web applications — deployed and linkable.
                   </p>
                   <p>
-                    And it works autonomously. Close the tab. Mariana keeps
+                    And it works autonomously. Close the tab. Deft keeps
                     running — executing steps, handling errors, pivoting, and
                     finishing the job. You get notified when it's done.
                   </p>
@@ -79,7 +79,7 @@ export default function Mariana() {
             <ScrollReveal delay={250} className="self-start lg:mt-14">
               <div className="rounded-lg bg-card p-6 shadow-sm ring-1 ring-border">
                 <p className="mb-5 text-[11px] font-medium uppercase tracking-[0.15em] text-muted-foreground">
-                  What Mariana can build during a single task
+                  What Deft can build during a single task
                 </p>
                 <div className="space-y-4 text-[15px] leading-relaxed text-muted-foreground">
                   <p>
@@ -114,10 +114,10 @@ export default function Mariana() {
       <section className="mx-auto max-w-7xl px-6 py-24 md:py-32">
         <ScrollReveal>
           <h2 className="font-serif text-3xl font-semibold text-foreground md:text-4xl">
-            Mariana decides.
+            Deft decides.
           </h2>
           <p className="mt-5 max-w-xl text-[16px] leading-[1.7] text-muted-foreground">
-            You describe what you need. Mariana picks the right approach —
+            You describe what you need. Deft picks the right approach —
             whether that's a ten-second lookup or a multi-hour build.
           </p>
         </ScrollReveal>
@@ -126,12 +126,12 @@ export default function Mariana() {
             {
               label: "Instant",
               time: "Seconds to minutes",
-              desc: "Quick answers, fast lookups, single-file edits, one-shot scripts. No approval needed — Mariana answers immediately.",
+              desc: "Quick answers, fast lookups, single-file edits, one-shot scripts. No approval needed — Deft answers immediately.",
             },
             {
               label: "Standard",
               time: "Minutes to hours",
-              desc: "Multi-step work: reports, dashboards, small apps, data pipelines, document generation. Mariana proposes a plan before it starts.",
+              desc: "Multi-step work: reports, dashboards, small apps, data pipelines, document generation. Deft proposes a plan before it starts.",
             },
             {
               label: "Deep",
@@ -158,7 +158,7 @@ export default function Mariana() {
               What it actually ships
             </h2>
             <p className="mt-5 max-w-2xl text-[16px] leading-[1.7] text-muted-foreground">
-              Mariana doesn't stop at a draft. It runs the code, verifies the
+              Deft doesn't stop at a draft. It runs the code, verifies the
               output, fixes its own mistakes, and hands you something you can
               use today — not a to-do list.
             </p>
@@ -208,7 +208,7 @@ export default function Mariana() {
           <ScrollReveal delay={100}>
             <div className="space-y-6 text-[16px] leading-[1.8] text-muted-foreground">
               <p>
-                Mariana is powered by frontier models — Claude, GPT, Gemini, and
+                Deft is powered by frontier models — Claude, GPT, Gemini, and
                 specialized coding and vision models — routed automatically for
                 each step. It doesn't just run one prompt and return one
                 response. It plans, acts, checks, and revises like a good
@@ -228,7 +228,7 @@ export default function Mariana() {
                 The depth is the point. A one-paragraph summary is fast.
                 Shipping a working tool, cleaning a real dataset, producing a
                 numbers-accurate report — that takes real compute time, and
-                Mariana will use it.
+                Deft will use it.
               </p>
               <p>
                 Some jobs finish in seconds. Others run for hours or days —
@@ -326,7 +326,7 @@ export default function Mariana() {
               Give it a real job.
             </h2>
             <p className="mt-4 text-[16px] leading-[1.7] text-muted-foreground">
-              Describe something you've been meaning to ship. Mariana will plan
+              Describe something you've been meaning to ship. Deft will plan
               it, build it, and hand it back to you — working.
             </p>
             <div className="mt-8 flex flex-wrap items-center gap-5">

@@ -29,7 +29,7 @@ const plans: Plan[] = [
     highlighted: true,
     features: [
       "30,000 credits/month",
-      "Full access to Mariana's compute environment",
+      "Full access to Deft's compute environment",
       "Instant, standard, and deep tasks",
       "All built-in skills (research, coding, analysis, docs)",
       "Deploy apps and tools to live URLs",
@@ -89,7 +89,7 @@ const faqs = [
     a: "In-flight tasks finish. New tasks pause until credits refresh or you add a top-up.",
   },
   {
-    q: "What can Mariana do?",
+    q: "What can Deft do?",
     a: "Pretty much anything you'd hand to a smart teammate with a laptop: build web apps and tools, run research and analysis, generate documents, automate workflows, clean and model data, draft emails and proposals, and connect to your systems.",
   },
   {
@@ -102,17 +102,17 @@ const howItWorks = [
   {
     step: "01",
     title: "Describe what you want",
-    desc: "Type anything — a quick question, a report to write, a tool to build, a workflow to automate. Mariana picks the right approach automatically.",
+    desc: "Type anything — a quick question, a report to write, a tool to build, a workflow to automate. Deft picks the right approach automatically.",
   },
   {
     step: "02",
     title: "Review the plan",
-    desc: "For substantial work, Mariana proposes a plan: steps, tools, data sources, estimated duration. Approve with one click.",
+    desc: "For substantial work, Deft proposes a plan: steps, tools, data sources, estimated duration. Approve with one click.",
   },
   {
     step: "03",
     title: "Get the finished result",
-    desc: "Mariana works autonomously — writing code, running tests, building docs, deploying. You get notified when the deliverable is ready.",
+    desc: "Deft works autonomously — writing code, running tests, building docs, deploying. You get notified when the deliverable is ready.",
   },
 ];
 

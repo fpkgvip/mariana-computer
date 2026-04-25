@@ -6,14 +6,15 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { Mail, MapPin } from "lucide-react";
+import { BRAND } from "@/lib/brand";
 
 const subjects = ["General inquiry", "Sales", "Support", "Legal", "Partnership"];
 
 // BUG-025: Removed placeholder 555 phone number — not a real contact number.
 const contactInfo = [
-  { icon: Mail, label: "Sales", value: "sales@mariana.co" },
-  { icon: Mail, label: "Support", value: "support@mariana.co" },
-  { icon: Mail, label: "Legal", value: "legal@mariana.co" },
+  { icon: Mail, label: "Sales", value: BRAND.saleEmail },
+  { icon: Mail, label: "Support", value: BRAND.supportEmail },
+  { icon: Mail, label: "Legal", value: BRAND.legalEmail },
   { icon: MapPin, label: "Office", value: "140 Broadway, 46th Floor\nNew York, NY 10005" },
 ];
 
@@ -44,7 +45,7 @@ export default function Contact() {
     } catch {
       // If the backend contact endpoint isn't available, instruct the user to email directly
       toast.error("Could not send message", {
-        description: "Please email us directly at support@mariana.co",
+        description: `Please email us directly at ${BRAND.supportEmail}`,
       });
     } finally {
       setSending(false);
@@ -62,7 +63,7 @@ export default function Contact() {
               Get in touch
             </h1>
             <p className="mt-4 max-w-xl text-base text-muted-foreground md:text-lg">
-              Whether you're exploring Mariana for your firm or need help with your account, we're here.
+              Whether you're exploring Deft for your team or need help with your account, we're here.
             </p>
           </ScrollReveal>
 

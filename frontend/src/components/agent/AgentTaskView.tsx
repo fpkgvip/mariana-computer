@@ -142,7 +142,7 @@ export function AgentTaskView({
               return next;
             });
             setFixAttempts((n) => n + 1);
-            pushLine("info", `Fix applied to step ${replaced.id.slice(0, 8)}…`);
+            pushLine("info", `Fix applied to step ${(replaced.id ?? "").slice(0, 8)}…`);
           }
           break;
         }

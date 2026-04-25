@@ -1,8 +1,9 @@
 import { Link } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
+import { BRAND } from "../lib/brand";
 
 const links = [
-  { label: "Product", href: "/mariana" },
+  { label: "Product", href: "/product" },
   { label: "Examples", href: "/research" },
   { label: "Pricing", href: "/pricing" },
   { label: "Contact", href: "/contact" },
@@ -17,14 +18,17 @@ export function Footer() {
         <div className="flex flex-col gap-8 md:flex-row md:items-start md:justify-between">
           {/* Brand */}
           <div>
-            <Link to="/" className="font-serif text-sm font-semibold text-foreground">
-              Mariana
+            <Link to="/" className="text-sm font-semibold tracking-tight text-foreground">
+              {BRAND.name}
             </Link>
             <p className="mt-1 text-xs text-muted-foreground">
-              The AI that actually does the work.
+              {BRAND.shortTagline}
             </p>
-            <a href="mailto:support@mariana.co" className="mt-2 block text-xs text-muted-foreground transition-colors hover:text-foreground">
-              support@mariana.co
+            <a
+              href={`mailto:${BRAND.supportEmail}`}
+              className="mt-2 block text-xs text-muted-foreground transition-colors hover:text-foreground"
+            >
+              {BRAND.supportEmail}
             </a>
           </div>
 
@@ -48,8 +52,8 @@ export function Footer() {
         </div>
 
         <div className="mt-8 border-t border-border pt-6">
-          <p className="text-xs text-muted-foreground/50">
-© {new Date().getFullYear()} Mariana. All rights reserved.
+          <p className="text-xs text-muted-foreground/60">
+            © {new Date().getFullYear()} {BRAND.legalName}. All rights reserved.
           </p>
         </div>
       </div>

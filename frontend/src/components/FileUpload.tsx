@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, DragEvent } from "react";
-import { Paperclip, X, FileText, Image, Table, FileCode, File, Loader2 } from "lucide-react";
+import { Paperclip, X, FileText, Image, Table, FileCode, File, Loader2, type LucideIcon } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/lib/supabase";
 
@@ -66,7 +66,7 @@ function getFileExtension(name: string): string {
   return dot >= 0 ? name.slice(dot).toLowerCase() : "";
 }
 
-function getFileIcon(name: string): React.FC<{ size?: number; className?: string }> {
+function getFileIcon(name: string): LucideIcon {
   const ext = getFileExtension(name);
   if ([".png", ".jpg", ".jpeg"].includes(ext)) return Image;
   if ([".csv", ".xlsx"].includes(ext)) return Table;

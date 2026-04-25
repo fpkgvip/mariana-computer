@@ -33,7 +33,7 @@ const categories: Category[] = [
   "Finance",
 ];
 
-// A curated catalog of tasks teams routinely hand to Mariana. These are
+// A curated catalog of tasks teams routinely hand to Deft. These are
 // illustrative example prompts — click any of them to start a real task.
 const examples: Example[] = [
   {
@@ -182,7 +182,7 @@ export default function Research() {
       <div className="mx-auto max-w-7xl px-6 pb-24 pt-32 md:pt-40">
         <ScrollReveal>
           <h1 className="font-serif text-3xl font-semibold leading-[1.08] tracking-[-0.02em] text-foreground sm:text-4xl md:text-5xl">
-            Examples of things Mariana has built
+            Examples of things Deft has shipped
           </h1>
           <p className="mt-5 max-w-2xl text-lg leading-[1.7] text-muted-foreground">
             Real prompts, real deliverables. Click any example to run it against
@@ -273,7 +273,7 @@ export default function Research() {
               Have something specific in mind?
             </h2>
             <p className="mt-3 text-[15px] leading-[1.7] text-muted-foreground">
-              Describe what you want built, researched, or automated. Mariana
+              Describe what you want built, researched, or automated. Deft
               will plan the work, ask only what's necessary, and start shipping.
             </p>
             <Link

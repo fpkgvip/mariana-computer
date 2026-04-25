@@ -12,6 +12,7 @@ import {
   Beaker,
   Paperclip,
   GitBranch,
+  type LucideIcon,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -81,7 +82,7 @@ export interface StructuredEvent {
 /*  Helpers                                                           */
 /* ------------------------------------------------------------------ */
 
-const ICON_MAP: Record<string, React.FC<{ size?: number; className?: string }>> = {
+const ICON_MAP: Record<string, LucideIcon> = {
   search: Search,
   analyze: BarChart3,
   code: Code,
@@ -94,7 +95,7 @@ const ICON_MAP: Record<string, React.FC<{ size?: number; className?: string }>> 
   subagent: GitBranch,
 };
 
-function getIconForStep(iconName?: string, type?: string): React.FC<{ size?: number; className?: string }> {
+function getIconForStep(iconName?: string, type?: string): LucideIcon {
   if (iconName && ICON_MAP[iconName]) return ICON_MAP[iconName];
   if (type === "file_attached") return Paperclip;
   if (type === "cost_update") return DollarSign;

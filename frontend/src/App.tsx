@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -7,11 +7,12 @@ import { AuthProvider } from "@/contexts/AuthContext";
 import AppErrorBoundary from "@/components/AppErrorBoundary";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import { supabaseConfigError } from "@/lib/supabase";
+import { BRAND } from "@/lib/brand";
 import { AlertTriangle } from "lucide-react";
 
 import Index from "./pages/Index";
 import Research from "./pages/Research";
-import Mariana from "./pages/Mariana";
+import Product from "./pages/Product";
 import Chat from "./pages/Chat";
 import Pricing from "./pages/Pricing";
 import Contact from "./pages/Contact";
@@ -60,7 +61,7 @@ const ConfigErrorScreen = ({ message }: { message: string }) => (
         <div>
           <h1 className="text-lg font-semibold text-foreground">Configuration error</h1>
           <p className="mt-2 text-sm leading-6 text-muted-foreground">
-            Mariana could not start because a required environment variable is missing.
+            {BRAND.name} could not start because a required environment variable is missing.
           </p>
           <pre className="mt-3 rounded-md bg-muted px-3 py-2 text-xs text-foreground overflow-x-auto">
             {message}
@@ -88,12 +89,14 @@ const App = () => {
           <AuthProvider>
             {/* FE-CRIT-01 fix: Protected routes wrapped with ProtectedRoute
                 to prevent rendering before auth is resolved. Public routes
-                (/, /research, /mariana, /pricing, /contact, /login, /signup,
+                (/, /research, /product, /pricing, /contact, /login, /signup,
                 /reset-password) remain unwrapped. */}
             <Routes>
               <Route path="/" element={<Index />} />
               <Route path="/research" element={<Research />} />
-              <Route path="/mariana" element={<Mariana />} />
+              <Route path="/product" element={<Product />} />
+              {/* Legacy /mariana → /product redirect (rebrand v1.0) */}
+              <Route path="/mariana" element={<Navigate to="/product" replace />} />
               <Route path="/chat" element={<ProtectedRoute><Chat /></ProtectedRoute>} />
               <Route path="/pricing" element={<Pricing />} />
               <Route path="/contact" element={<Contact />} />

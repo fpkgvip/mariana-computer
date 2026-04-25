@@ -38,7 +38,7 @@ export function AdminShell({
             <ShieldCheck className="h-6 w-6 text-primary" />
             <div>
               <h1 className="font-serif text-xl font-semibold">
-                Mariana Admin Console
+                Deft Admin Console
               </h1>
               <p className="text-xs text-muted-foreground">
                 v3.7 · full control plane

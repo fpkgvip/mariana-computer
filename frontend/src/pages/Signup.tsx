@@ -50,13 +50,13 @@ export default function Signup() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-6">
       <div className="w-full max-w-sm">
-        <Link to="/" className="mb-10 block font-serif text-lg font-semibold text-foreground">
-          Mariana
+        <Link to="/" className="mb-10 block text-lg font-semibold tracking-tight text-foreground">
+          Deft
         </Link>
 
-        <h1 className="font-serif text-2xl font-semibold text-foreground">Create an account</h1>
+        <h1 className="text-2xl font-semibold tracking-tight text-foreground">Create an account</h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          Start investigating with Mariana.
+          Set a goal. Set a ceiling. Let Deft ship the work.
         </p>
 
         <form onSubmit={handleSubmit} className="mt-8 space-y-4">
