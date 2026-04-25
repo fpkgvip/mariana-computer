@@ -25,27 +25,54 @@ import NotFound from "./pages/NotFound";
 // Lazy-imported routes: every authenticated app surface and the rest of
 // the marketing site. Each becomes its own chunk so the initial bundle
 // only ships what's needed for the landing render.
-const Research = lazy(() => import("./pages/Research"));
-const Product = lazy(() => import("./pages/Product"));
-const Chat = lazy(() => import("./pages/Chat"));
-const Build = lazy(() => import("./pages/Build"));
-const Pricing = lazy(() => import("./pages/Pricing"));
-const Contact = lazy(() => import("./pages/Contact"));
-const Checkout = lazy(() => import("./pages/Checkout"));
-const Account = lazy(() => import("./pages/Account"));
-const Admin = lazy(() => import("./pages/Admin"));
-const ResetPassword = lazy(() => import("./pages/ResetPassword"));
-const Skills = lazy(() => import("./pages/Skills"));
-const InvestigationGraph = lazy(() => import("./pages/InvestigationGraph"));
-const Tasks = lazy(() => import("./pages/Tasks"));
-const TaskDetail = lazy(() => import("./pages/TaskDetail"));
-const Vault = lazy(() => import("./pages/Vault"));
-const DevStudio = lazy(() => import("./pages/DevStudio"));
-const DevAccount = lazy(() => import("./pages/DevAccount"));
-const DevVault = lazy(() => import("./pages/DevVault"));
-const DevProjects = lazy(() => import("./pages/DevProjects"));
-const DevStates = lazy(() => import("./pages/DevStates"));
-const DevObservability = lazy(() => import("./pages/DevObservability"));
+//
+// retryImport: dynamic-import retry wrapper. Two failure modes we care about:
+//   1. transient network blip mid-fetch (retry once after a small delay).
+//   2. chunk hash invalidated by a fresh deploy (the file no longer exists).
+//      In that case the second attempt also fails — reload the page so the
+//      browser pulls the new index.html and asset map. The session-flag guard
+//      prevents a reload loop if the failure is something else.
+function retryImport<T>(loader: () => Promise<T>, name: string): Promise<T> {
+  return loader().catch((err) => {
+    addBreadcrumb({ category: "chunk", message: `retry ${name}`, level: "warning" });
+    return new Promise<T>((resolve, reject) => {
+      setTimeout(() => {
+        loader().then(resolve).catch((err2) => {
+          const key = `chunk-reload:${name}`;
+          if (typeof sessionStorage !== "undefined" && !sessionStorage.getItem(key)) {
+            sessionStorage.setItem(key, "1");
+            addBreadcrumb({ category: "chunk", message: `reload after ${name} failure`, level: "error" });
+            window.location.reload();
+            return;
+          }
+          reject(err2 ?? err);
+        });
+      }, 400);
+    });
+  });
+}
+
+const Research = lazy(() => retryImport(() => import("./pages/Research"), "Research"));
+const Product = lazy(() => retryImport(() => import("./pages/Product"), "Product"));
+const Chat = lazy(() => retryImport(() => import("./pages/Chat"), "Chat"));
+const Build = lazy(() => retryImport(() => import("./pages/Build"), "Build"));
+const Pricing = lazy(() => retryImport(() => import("./pages/Pricing"), "Pricing"));
+const Contact = lazy(() => retryImport(() => import("./pages/Contact"), "Contact"));
+const Checkout = lazy(() => retryImport(() => import("./pages/Checkout"), "Checkout"));
+const Account = lazy(() => retryImport(() => import("./pages/Account"), "Account"));
+const Admin = lazy(() => retryImport(() => import("./pages/Admin"), "Admin"));
+const ResetPassword = lazy(() => retryImport(() => import("./pages/ResetPassword"), "ResetPassword"));
+const Skills = lazy(() => retryImport(() => import("./pages/Skills"), "Skills"));
+const InvestigationGraph = lazy(() => retryImport(() => import("./pages/InvestigationGraph"), "InvestigationGraph"));
+const Tasks = lazy(() => retryImport(() => import("./pages/Tasks"), "Tasks"));
+const TaskDetail = lazy(() => retryImport(() => import("./pages/TaskDetail"), "TaskDetail"));
+const Vault = lazy(() => retryImport(() => import("./pages/Vault"), "Vault"));
+const DevStudio = lazy(() => retryImport(() => import("./pages/DevStudio"), "DevStudio"));
+const DevAccount = lazy(() => retryImport(() => import("./pages/DevAccount"), "DevAccount"));
+const DevVault = lazy(() => retryImport(() => import("./pages/DevVault"), "DevVault"));
+const DevProjects = lazy(() => retryImport(() => import("./pages/DevProjects"), "DevProjects"));
+const DevStates = lazy(() => retryImport(() => import("./pages/DevStates"), "DevStates"));
+const DevObservability = lazy(() => retryImport(() => import("./pages/DevObservability"), "DevObservability"));
 
 // Suspense fallback shown during chunk fetch. Kept minimal and
 // motion-respectful so users on slow connections see a stable surface
