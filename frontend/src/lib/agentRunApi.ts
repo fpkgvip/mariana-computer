@@ -13,6 +13,15 @@ export interface AgentStartParams {
   /** Credit ceiling (1 credit == $0.01). */
   ceilingCredits: number;
   conversationId?: string | null;
+  /**
+   * F4 Vault: ephemeral env injection.  The frontend extracts $KEY_NAME
+   * sentinels from the prompt, decrypts them locally with the user's vault
+   * masterKey, and ships the resulting NAME→plaintext map alongside the
+   * agent start request.  The server stores it in Redis with a TTL bounded
+   * by the task's wall-clock budget and deletes it on terminal state.
+   * Plaintext values NEVER touch localStorage / sessionStorage / disk.
+   */
+  vaultEnv?: Record<string, string>;
 }
 
 export interface AgentStartResponse {
@@ -29,13 +38,17 @@ const TIER_TO_MODEL: Record<ModelTier, string> = {
 
 export function startAgentRun(params: AgentStartParams): Promise<AgentStartResponse> {
   const budget_usd = Math.max(0.1, Math.min(100, params.ceilingCredits / 100));
-  return api.post<AgentStartResponse>("/api/agent", {
+  const body: Record<string, unknown> = {
     goal: params.prompt,
     selected_model: TIER_TO_MODEL[params.tier],
     budget_usd,
     max_duration_hours: params.tier === "max" ? 4 : params.tier === "standard" ? 2 : 1,
     conversation_id: params.conversationId ?? null,
-  });
+  };
+  if (params.vaultEnv && Object.keys(params.vaultEnv).length > 0) {
+    body.vault_env = params.vaultEnv;
+  }
+  return api.post<AgentStartResponse>("/api/agent", body);
 }
 
 export interface AgentTaskState {

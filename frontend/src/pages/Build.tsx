@@ -30,6 +30,10 @@ import { ApiError } from "@/lib/api";
 import type { ModelTier, QuoteResponse } from "@/lib/agentApi";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import { useVault } from "@/hooks/useVault";
+import { VaultUnlockDialog } from "@/components/deft/VaultUnlockDialog";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import { scanVaultRefs, resolveVaultRefs, VaultRefError } from "@/lib/vaultPromptScan";
 
 const TERMINAL_STATES = new Set(["done", "completed", "failed", "stopped", "cancelled", "error"]);
 
@@ -51,6 +55,14 @@ export default function Build() {
   const eventSourceRef = useRef<EventSource | null>(null);
   const lastEventIdRef = useRef<number>(0);
   const pollTimerRef = useRef<number | null>(null);
+
+  // F4 Vault wiring — used to resolve $KEY refs at submit time.
+  const vault = useVault();
+  const [vaultUnlockOpen, setVaultUnlockOpen] = useState(false);
+  const pendingSubmitRef = useRef<
+    | { tier: ModelTier; ceiling: number; quote: QuoteResponse; refs: string[] }
+    | null
+  >(null);
 
   // Auth guard handled by ProtectedRoute, but be defensive
   useEffect(() => {
@@ -195,27 +207,28 @@ export default function Build() {
     };
   }, [activeTaskId]);
 
-  const handleSubmit = useCallback(
-    async ({ tier, ceiling, quote }: { tier: ModelTier; ceiling: number; quote: QuoteResponse }) => {
-      if (!draftPrompt.trim()) return;
+  const launchRun = useCallback(
+    async (
+      tier: ModelTier,
+      ceiling: number,
+      quote: QuoteResponse,
+      vaultEnv: Record<string, string> | undefined,
+    ) => {
       setStarting(true);
       try {
         const resp = await startAgentRun({
           prompt: draftPrompt.trim(),
           tier,
           ceilingCredits: ceiling,
+          vaultEnv,
         });
-        // Refresh balance (start may have reserved credits)
         refetchBalance();
-        // Navigate to the running task
         setParams((prev) => {
           const p = new URLSearchParams(prev);
           p.set("task", resp.task_id);
           return p;
         });
         toast.success("Run started");
-        // Brief: parent quote also returns approximate ceiling so we surface
-        // ETA-from-quote (advisory) immediately while the canvas attaches.
         void quote;
       } catch (err) {
         const msg = err instanceof ApiError ? err.message : "Could not start run";
@@ -226,6 +239,65 @@ export default function Build() {
     },
     [draftPrompt, refetchBalance, setParams],
   );
+
+  const handleSubmit = useCallback(
+    async ({ tier, ceiling, quote }: { tier: ModelTier; ceiling: number; quote: QuoteResponse }) => {
+      if (!draftPrompt.trim()) return;
+
+      // F4 Vault: scan the prompt for $KEY references.  If any are found:
+      //  1. If no vault exists yet — redirect the user to /vault to set one up.
+      //  2. If the vault is locked — open the unlock dialog and resume here.
+      //  3. If unlocked — decrypt all referenced secrets locally and pass them.
+      const { names } = scanVaultRefs(draftPrompt);
+      let vaultEnv: Record<string, string> | undefined;
+      if (names.length > 0) {
+        if (!vault.exists) {
+          toast.error("This prompt references vault secrets but no vault is set up.");
+          navigate("/vault");
+          return;
+        }
+        if (!vault.unlocked) {
+          pendingSubmitRef.current = { tier, ceiling, quote, refs: names };
+          setVaultUnlockOpen(true);
+          return;
+        }
+        try {
+          vaultEnv = await resolveVaultRefs(names, vault.decryptByName);
+        } catch (e) {
+          if (e instanceof VaultRefError) {
+            toast.error(
+              `${e.message}. Add it on the Vault page or remove the $${e.missingName} reference.`,
+            );
+            return;
+          }
+          toast.error("Could not decrypt vault secrets");
+          return;
+        }
+      }
+      await launchRun(tier, ceiling, quote, vaultEnv);
+    },
+    [draftPrompt, launchRun, navigate, vault],
+  );
+
+  // After a successful unlock, retry the queued submission.
+  const onVaultUnlocked = useCallback(async () => {
+    setVaultUnlockOpen(false);
+    const pending = pendingSubmitRef.current;
+    pendingSubmitRef.current = null;
+    if (!pending) return;
+    try {
+      const env = await resolveVaultRefs(pending.refs, vault.decryptByName);
+      await launchRun(pending.tier, pending.ceiling, pending.quote, env);
+    } catch (e) {
+      if (e instanceof VaultRefError) {
+        toast.error(
+          `${e.message}. Add it on the Vault page or remove the $${e.missingName} reference.`,
+        );
+      } else {
+        toast.error("Could not decrypt vault secrets");
+      }
+    }
+  }, [launchRun, vault.decryptByName]);
 
   const onCancel = useCallback(async () => {
     if (!activeTaskId) return;
@@ -316,6 +388,29 @@ export default function Build() {
           </div>
         </main>
       </div>
+      <Dialog
+        open={vaultUnlockOpen}
+        onOpenChange={(o) => {
+          if (!o) {
+            pendingSubmitRef.current = null;
+            setVaultUnlockOpen(false);
+          }
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Unlock vault to use referenced secrets</DialogTitle>
+            <DialogDescription>
+              {pendingSubmitRef.current?.refs?.length
+                ? `Your prompt references ${pendingSubmitRef.current.refs
+                    .map((n) => `$${n}`)
+                    .join(", ")}. Unlock to inject them as env vars for this run only.`
+                : "Unlock your vault to continue."}
+            </DialogDescription>
+          </DialogHeader>
+          <VaultUnlockDialog onUnlocked={onVaultUnlocked} bare />
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

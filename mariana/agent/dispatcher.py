@@ -20,6 +20,7 @@ import structlog
 
 from mariana.agent import tools
 from mariana.agent.models import TOOL_NAMES
+from mariana.vault.runtime import get_task_env
 
 logger = structlog.get_logger(__name__)
 
@@ -111,6 +112,17 @@ async def dispatch(
 
 
 async def _h_code_exec(p: dict[str, Any], *, user_id: str, task_id: str) -> dict[str, Any]:
+    # Vault injection: merge per-task secrets BEHIND any explicit env supplied
+    # by the LLM plan.  Plan values win on conflict so the LLM can shadow a
+    # vault var if it really needs to (rare; typically used for testing).
+    plan_env = _opt(p, "env", {}, dict)
+    vault_env = get_task_env()
+    if vault_env:
+        merged: dict[str, Any] = dict(vault_env)
+        merged.update(plan_env or {})
+        env_for_exec = merged
+    else:
+        env_for_exec = plan_env or {}
     return await tools.exec_code(
         user_id=user_id,
         code=_require(p, "code", str),
@@ -120,7 +132,7 @@ async def _h_code_exec(p: dict[str, Any], *, user_id: str, task_id: str) -> dict
         wall_timeout_sec=int(_opt(p, "wall_timeout_sec", 60, (int, float))),
         mem_mb=int(_opt(p, "mem_mb", 1024, (int, float))),
         cpu_sec=int(_opt(p, "cpu_sec", 60, (int, float))),
-        env=_opt(p, "env", {}, dict),
+        env=env_for_exec,
     )
 
 

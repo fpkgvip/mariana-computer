@@ -51,6 +51,11 @@ class AgentStartRequest(BaseModel):
     selected_model: str = "claude-opus-4-7"
     budget_usd: float = Field(default=5.0, ge=0.1, le=100.0)
     max_duration_hours: float = Field(default=2.0, ge=0.1, le=24.0)
+    # F4 Vault: optional ephemeral env injection.  The frontend decrypts
+    # vaulted secrets locally and sends only the names that the prompt
+    # references, so the server holds plaintext only for the lifetime of
+    # this single task.  Validated server-side; capped at 50 entries.
+    vault_env: dict[str, str] | None = Field(default=None)
 
 
 class AgentStartResponse(BaseModel):
@@ -369,6 +374,17 @@ def make_routes(*, get_current_user, get_db, get_redis, get_stream_user) -> APIR
         db = get_db()
         task_id = str(uuid.uuid4())
 
+        # F4 Vault: validate vault_env early so a malformed payload returns 422
+        # before we burn credits or write a task row.
+        from mariana.vault.runtime import (  # noqa: PLC0415
+            validate_vault_env,
+            store_vault_env,
+        )
+        try:
+            vault_env_validated = validate_vault_env(body.vault_env or {})
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"vault_env: {exc}")
+
         # v3.5: Reserve credits before enqueueing so free-tier users can't
         # burn unlimited agent time. Formula: 500 credits per $1 of budget,
         # capped at 10x the plan's per-task limit. Late import avoids the
@@ -449,6 +465,19 @@ def make_routes(*, get_current_user, get_db, get_redis, get_stream_user) -> APIR
             redis = get_redis()
         except Exception:
             redis = None
+
+        # F4 Vault: stash vault_env in Redis under vault:env:{task_id} with a
+        # TTL that matches the task's max wall-clock budget plus a small
+        # buffer so the loop can read it on first cold start.  We do this
+        # BEFORE enqueueing so the consumer never picks up a task whose
+        # secrets aren't yet in place.
+        if vault_env_validated:
+            ttl_seconds = int(body.max_duration_hours * 3600) + 300
+            try:
+                await store_vault_env(redis, task_id, vault_env_validated, ttl_seconds=ttl_seconds)
+            except Exception as exc:
+                logger.warning("vault_env_store_failed", task_id=task_id, error=str(exc))
+
         try:
             if redis is not None:
                 await _enqueue_agent_task(redis, task_id)

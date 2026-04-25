@@ -40,6 +40,13 @@ from mariana.agent.models import (
     StepStatus,
 )
 from mariana.agent.state import assert_transition, is_terminal
+from mariana.vault.runtime import (
+    clear_vault_env,
+    fetch_vault_env,
+    get_redactor,
+    redact_payload,
+    set_task_context,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -131,13 +138,21 @@ async def _persist_task(db: Any, task: AgentTask) -> None:
 async def _record_event(db: Any, redis: Any, task_id: str, event: AgentEvent) -> None:
     """Append to agent_events and XADD to the Redis stream for SSE."""
     payload = event.model_dump(mode="json")
+    # Vault redaction: scrub every plaintext secret from the payload BEFORE
+    # we serialise it into the truncation check, the DB row, or the SSE
+    # stream.  ``redact_payload`` walks dicts/lists recursively and is a
+    # no-op when no secrets are bound.
+    payload["payload"] = redact_payload(payload.get("payload") or {})
     # Truncate huge payloads so Redis / browser stay responsive.
     enc = json.dumps(payload["payload"])
     if len(enc) > _MAX_EVENT_PAYLOAD_BYTES:
+        # Redact the sample too — belt-and-suspenders against any string that
+        # only became visible after truncation flattening.
+        sample = get_redactor()(enc[:2000])
         payload["payload"] = {
             "_truncated": True,
             "size": len(enc),
-            "sample": enc[:2000] + "…[truncated]",
+            "sample": sample + "…[truncated]",
         }
     try:
         async with db.acquire() as conn:
@@ -278,20 +293,28 @@ def _tail(text: str, max_chars: int) -> str:
 
 
 def _summarise_result(result: dict[str, Any]) -> dict[str, Any]:
-    """Trim a tool result for storage + LLM context without losing signal."""
+    """Trim a tool result for storage + LLM context without losing signal.
+
+    Vault: every string value is run through the active redactor so a tool
+    that echoed a plaintext secret never makes it into ``step.result`` (which
+    is what the planner re-feeds to the LLM during fix attempts).
+    """
+    redactor = get_redactor()
     out: dict[str, Any] = {}
     for k, v in result.items():
         if isinstance(v, str):
             if k in ("stdout",):
-                out[k] = _tail(v, _STEP_STDOUT_TAIL)
+                out[k] = redactor(_tail(v, _STEP_STDOUT_TAIL))
             elif k in ("stderr",):
-                out[k] = _tail(v, _STEP_STDERR_TAIL)
+                out[k] = redactor(_tail(v, _STEP_STDERR_TAIL))
             elif k in ("body", "content", "image_b64", "pdf_b64"):
-                out[k] = _tail(v, 4000) if k == "body" else f"<{len(v)} bytes omitted>"
+                out[k] = redactor(_tail(v, 4000)) if k == "body" else f"<{len(v)} bytes omitted>"
             else:
-                out[k] = _tail(v, 4000)
+                out[k] = redactor(_tail(v, 4000))
         else:
-            out[k] = v
+            # Recursively walk nested structures so e.g. result['artifacts']
+            # entries don't carry plaintext through.
+            out[k] = redact_payload(v)
     return out
 
 
@@ -556,6 +579,20 @@ async def run_agent_task(
     task.max_replans = min(task.max_replans, _HARD_MAX_REPLANS)
     task.max_fix_attempts_per_step = min(task.max_fix_attempts_per_step, _HARD_MAX_FIX_PER_STEP)
 
+    # F4 Vault: pull this task's ephemeral env from Redis (frontend POSTed it
+    # alongside /api/agent) and install both the env and the matching
+    # redactor into the current async context.  Every dispatcher.exec_code
+    # call will see these as real env vars; every event payload + step
+    # result will be auto-redacted before it leaves the process.
+    vault_env: dict[str, str] = {}
+    try:
+        vault_env = await fetch_vault_env(redis, task.id)
+    except Exception as exc:  # pragma: no cover
+        logger.warning("vault_env_fetch_failed", task_id=task.id, error=str(exc))
+    ctx_handle = set_task_context(vault_env)
+    if vault_env:
+        log.info("vault_env_installed", count=len(vault_env), names=sorted(vault_env.keys()))
+
     try:
         # ---- PLAN --------------------------------------------------------
         await _persist_task(db, task)
@@ -701,3 +738,14 @@ async def run_agent_task(
                 await _persist_task(db, task)
             except Exception:
                 pass
+        # Drop the per-task vault context AND the Redis blob.  This is the
+        # only place plaintext can persist server-side, so we delete it as
+        # soon as the loop exits regardless of state.
+        try:
+            ctx_handle.reset()
+        except Exception:
+            pass
+        try:
+            await clear_vault_env(redis, task.id)
+        except Exception:
+            pass
