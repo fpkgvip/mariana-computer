@@ -14,6 +14,7 @@ import Index from "./pages/Index";
 import Research from "./pages/Research";
 import Product from "./pages/Product";
 import Chat from "./pages/Chat";
+import Build from "./pages/Build";
 import Pricing from "./pages/Pricing";
 import Contact from "./pages/Contact";
 import Checkout from "./pages/Checkout";
@@ -98,6 +99,8 @@ const App = () => {
               {/* Legacy /mariana → /product redirect (rebrand v1.0) */}
               <Route path="/mariana" element={<Navigate to="/product" replace />} />
               <Route path="/chat" element={<ProtectedRoute><Chat /></ProtectedRoute>} />
+              <Route path="/build" element={<ProtectedRoute><Build /></ProtectedRoute>} />
+              <Route path="/studio" element={<Navigate to="/build" replace />} />
               <Route path="/pricing" element={<Pricing />} />
               <Route path="/contact" element={<Contact />} />
               <Route path="/checkout" element={<ProtectedRoute><Checkout /></ProtectedRoute>} />

@@ -94,6 +94,9 @@ export function Navbar() {
               </button>
               {userMenuOpen && (
                 <div role="menu" className="absolute right-0 top-full mt-2 w-56 rounded-lg border border-border bg-card py-1 shadow-lg">
+                  <Link role="menuitem" to="/build" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
+                    Studio
+                  </Link>
                   <Link role="menuitem" to="/chat" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
                     Workspace
                   </Link>
@@ -183,6 +186,7 @@ export function Navbar() {
               <>
                 <Link to="/account" className="py-1 text-sm text-muted-foreground">Account</Link>
                 <Link to="/checkout" className="py-1 text-sm text-muted-foreground">Upgrade plan</Link>
+                <Link to="/build" className="py-1 text-sm text-muted-foreground">Studio</Link>
                 <Link to="/chat" className="py-1 text-sm text-muted-foreground">Workspace</Link>
                 <Link to="/tasks" className="py-1 text-sm text-muted-foreground">Tasks</Link>
                 {user.role === "admin" && (
