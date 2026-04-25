@@ -252,7 +252,7 @@ export default function Build() {
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
       <Navbar />
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 overflow-hidden pt-16">
         <ProjectsSidebar
           activeTaskId={activeTaskId}
           onSelect={(id) => {
