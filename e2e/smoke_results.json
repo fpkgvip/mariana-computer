@@ -1,59 +1,138 @@
 {
+  "passed": 22,
+  "failed": 0,
+  "frontend": "https://frontend-tau-navy-80.vercel.app",
+  "backend": "http://77.42.3.206:8080",
+  "timestamp": "2026-04-25T10:23:54.907Z",
   "results": [
     {
-      "name": "home_page_renders",
-      "status": "PASS",
-      "detail": "hero=\"Set a ceiling.Get a receipt.\""
+      "name": "home_renders",
+      "ok": true,
+      "detail": "ok"
     },
     {
-      "name": "pricing_has_3_tiers",
-      "status": "PASS",
-      "detail": ""
+      "name": "pricing_three_tiers",
+      "ok": true,
+      "detail": "ok"
     },
     {
-      "name": "pricing_has_3_topups",
-      "status": "PASS",
-      "detail": ""
+      "name": "pricing_three_topups",
+      "ok": true,
+      "detail": "ok"
     },
     {
-      "name": "api_health_proxy",
-      "status": "PASS",
-      "detail": "{\"status\":\"ok\",\"version\":\"0.1.0\"}"
+      "name": "api_health",
+      "ok": true,
+      "detail": "ok"
     },
     {
-      "name": "api_plans_3_tiers",
-      "status": "PASS",
-      "detail": "ids=max,pro,starter"
+      "name": "api_plans_three_tiers",
+      "ok": true,
+      "detail": "count=3"
     },
     {
-      "name": "signup_form_renders",
-      "status": "PASS",
-      "detail": ""
+      "name": "signup_form",
+      "ok": true,
+      "detail": "ok"
     },
     {
-      "name": "login_form_renders",
-      "status": "PASS",
-      "detail": ""
+      "name": "login_form",
+      "ok": true,
+      "detail": "ok"
     },
     {
       "name": "build_protected",
-      "status": "PASS",
-      "detail": "url=https://frontend-tau-navy-80.vercel.app/login"
+      "ok": true,
+      "detail": "redir"
     },
     {
       "name": "vault_protected",
-      "status": "PASS",
-      "detail": "url=https://frontend-tau-navy-80.vercel.app/login"
+      "ok": true,
+      "detail": "redir"
     },
     {
       "name": "quote_requires_auth",
-      "status": "PASS",
-      "detail": "status=401"
+      "ok": true,
+      "detail": "401"
     },
     {
-      "name": "testrunner_login",
-      "status": "FAIL",
-      "detail": "url=https://frontend-tau-navy-80.vercel.app/login"
+      "name": "login_navigates_to_chat",
+      "ok": true,
+      "detail": "https://frontend-tau-navy-80.vercel.app/chat"
+    },
+    {
+      "name": "onboarding_wizard_appears",
+      "ok": true,
+      "detail": "ok"
+    },
+    {
+      "name": "onboarding_skip_works",
+      "ok": true,
+      "detail": "ok"
+    },
+    {
+      "name": "build_authed",
+      "ok": true,
+      "detail": "https://frontend-tau-navy-80.vercel.app/build"
+    },
+    {
+      "name": "credits_balance",
+      "ok": true,
+      "detail": "bal=5000"
+    },
+    {
+      "name": "authed_quote",
+      "ok": true,
+      "detail": "{\"min\":222,\"max\":628,\"eta_min\":302,\"eta_max\":705}"
+    },
+    {
+      "name": "credits_transactions",
+      "ok": true,
+      "detail": "count=1"
+    },
+    {
+      "name": "vault_page_loads",
+      "ok": true,
+      "detail": "https://frontend-tau-navy-80.vercel.app/vault"
+    },
+    {
+      "name": "pricing_authed",
+      "ok": true,
+      "detail": "ok"
+    },
+    {
+      "name": "no_dialogtitle_warning",
+      "ok": true,
+      "detail": "clean"
+    },
+    {
+      "name": "no_page_errors",
+      "ok": true,
+      "detail": "clean"
+    },
+    {
+      "name": "perf_budget_bundle",
+      "ok": true,
+      "detail": "1177kB"
     }
-  ]
+  ],
+  "consoleMsgs": [
+    {
+      "type": "debug",
+      "text": "[analytics:dev] onboarding_step_viewed {step: 1}"
+    },
+    {
+      "type": "debug",
+      "text": "[analytics:dev] onboarding_skipped {at_step: 1}"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 404 ()"
+    },
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 404 ()"
+    }
+  ],
+  "pageErrors": []
 }
