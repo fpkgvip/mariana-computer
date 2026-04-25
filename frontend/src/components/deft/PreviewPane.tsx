@@ -362,7 +362,7 @@ function WaitingState({ stage }: { stage: ReturnType<typeof deriveStage> }) {
         )}
       </div>
       <div className="space-y-1.5">
-        <p className="text-[12px] font-medium tracking-[0.02em] text-accent">{stage.eyebrow}</p>
+        <p className="text-[12px] font-medium tracking-[0.02em] text-accent-strong">{stage.eyebrow}</p>
         <h3 className="text-lg font-semibold text-foreground">{stage.title}</h3>
         <p className="text-sm text-muted-foreground">{stage.subtitle}</p>
       </div>

@@ -138,7 +138,7 @@ export default function DevProjects() {
               className={cn(
                 "rounded px-2 py-0.5 font-mono uppercase tracking-[0.12em] transition-colors",
                 mode === m
-                  ? "bg-accent/20 text-accent"
+                  ? "bg-accent text-accent-foreground"
                   : "text-muted-foreground hover:bg-secondary hover:text-foreground",
               )}
             >
@@ -230,7 +230,7 @@ export default function DevProjects() {
 
         <main className="flex-1 overflow-auto px-6 py-10 text-xs text-muted-foreground">
           <p>Open the kebab on a row to archive, share read-only, export, or delete.</p>
-          <p className="mt-2 opacity-70">
+          <p className="mt-2">
             Mode: <span className="font-mono text-foreground">{mode}</span>
           </p>
         </main>

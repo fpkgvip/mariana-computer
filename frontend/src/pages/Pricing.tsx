@@ -268,8 +268,8 @@ export default function Pricing() {
                 ].join(" ")}
               >
                 {plan.highlighted && (
-                  <div className="absolute -top-3 left-7 inline-flex items-center gap-1.5 rounded-full border border-accent/40 bg-background px-2.5 py-0.5 text-[11.5px] font-medium tracking-[0.01em] text-accent">
-                    <Sparkles size={10} />
+                  <div className="absolute -top-3 left-7 inline-flex items-center gap-1.5 rounded-full border border-accent/60 bg-background px-2.5 py-0.5 text-[11.5px] font-medium tracking-[0.01em] text-foreground">
+                    <Sparkles size={10} className="text-accent" aria-hidden />
                     Most popular
                   </div>
                 )}
@@ -339,7 +339,7 @@ export default function Pricing() {
             Every paid plan is annotated honestly: 1 credit = $0.01 of compute.
             A run that needs $4 of compute deducts 400 credits, only after the
             step succeeds. Working at company scale?{" "}
-            <Link to="/contact" className="text-foreground underline-offset-4 hover:underline">
+            <Link to="/contact" className="text-foreground underline underline-offset-4 hover:no-underline">
               Talk to us
             </Link>{" "}
             about Enterprise.
@@ -351,7 +351,7 @@ export default function Pricing() {
       <section className="relative border-t border-border/60 bg-surface-1/30 py-20">
         <div className="container-deft mx-auto max-w-5xl">
           <div className="mb-10 flex flex-col gap-2">
-            <p className="text-[12px] font-medium tracking-[0.02em] text-accent">Top-ups</p>
+            <p className="text-[12px] font-medium tracking-[0.02em] text-accent-strong">Top-ups</p>
             <h2 className="text-[28px] font-semibold leading-[1.1] tracking-[-0.02em] md:text-[36px]">
               Need more credits this month?
             </h2>
@@ -391,7 +391,7 @@ export default function Pricing() {
       {/* FAQ */}
       <section className="relative py-24">
         <div className="container-deft mx-auto max-w-3xl">
-          <p className="text-[12px] font-medium tracking-[0.02em] text-accent">FAQ</p>
+          <p className="text-[12px] font-medium tracking-[0.02em] text-accent-strong">FAQ</p>
           <h2 className="mt-3 text-[28px] font-semibold leading-[1.1] tracking-[-0.02em] md:text-[36px]">
             Common questions
           </h2>

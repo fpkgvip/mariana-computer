@@ -353,7 +353,7 @@ export const PromptBar = forwardRef<PromptBarHandle, PromptBarProps>(function Pr
                     )}
                   >
                     <span className="flex items-center gap-2">
-                      <span className="font-mono text-xs text-accent">{c.trigger}</span>
+                      <span className="font-mono text-xs text-accent-strong">{c.trigger}</span>
                       <span>{c.label}</span>
                     </span>
                     <span className="truncate text-xs text-muted-foreground">{c.hint}</span>

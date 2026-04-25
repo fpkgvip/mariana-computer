@@ -34,10 +34,15 @@
     --fg-2: 240 5% 66%;        /* tertiary / muted (passes AA on bg-1) */
     --fg-3: 240 4% 50%;        /* placeholder */
 
-    /* Primary accent — Electric indigo (#6E56CF).  AA on bg-0 (5.6:1). */
+    /* Primary accent — Electric indigo (#6E56CF).  L=58 keeps button text
+       (--accent-foreground on --accent) at 5.03:1 AA. */
     --accent: 254 55% 58%;
     --accent-foreground: 240 12% 99%;
     --accent-muted: 254 50% 16%;
+    /* Brighter accent for small TEXT only (eyebrows, stage chips on accent-muted).
+       L=70 passes AA on both bg-0 (6.6:1) and accent-muted (5.7:1). Never use
+       this as a background. */
+    --accent-strong: 254 65% 72%;
 
     /* Deploy accent — Phosphor green (#00D68F).  Reserved for the
        “magic moment”: live preview ready, deploy successful, success
@@ -139,6 +144,7 @@
     --accent: 254 60% 48%;     /* darker indigo for AA on light */
     --accent-foreground: 0 0% 100%;
     --accent-muted: 254 90% 96%;
+    --accent-strong: 254 60% 38%;  /* darker accent text on light */
 
     --deploy: 158 78% 32%;
     --deploy-foreground: 0 0% 100%;

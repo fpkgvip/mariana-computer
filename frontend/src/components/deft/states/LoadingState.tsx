@@ -22,26 +22,26 @@ export function LoadingRows({
 }: LoadingRowsProps) {
   const rows = Array.from({ length: Math.max(1, count) }, (_, i) => i);
   return (
-    <ul
-      role="status"
-      aria-label="Loading"
-      aria-live="polite"
-      aria-busy="true"
-      className={cn("space-y-2", bare && "space-y-1.5")}
-    >
-      {rows.map((i) => (
-        <li
-          key={i}
-          className={cn(
-            "animate-pulse",
-            rowClassName,
-            bare
-              ? "rounded-md bg-secondary/40"
-              : "rounded-lg border border-border bg-card/40",
-          )}
-        />
-      ))}
-    </ul>
+    // The `role=status` lives on a wrapping div so the inner <ul> retains its
+    // implicit list role — otherwise axe flags every <li> as an orphan because
+    // `status` overrides `list`.
+    <div role="status" aria-label="Loading" aria-live="polite" aria-busy="true">
+      <ul className={cn("space-y-2", bare && "space-y-1.5")}>
+        {rows.map((i) => (
+          <li
+            key={i}
+            className={cn(
+              "animate-pulse",
+              rowClassName,
+              bare
+                ? "rounded-md bg-secondary/40"
+                : "rounded-lg border border-border bg-card/40",
+            )}
+          />
+        ))}
+      </ul>
+      <span className="sr-only">Loading</span>
+    </div>
   );
 }
 

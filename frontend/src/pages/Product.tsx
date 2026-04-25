@@ -141,7 +141,7 @@ export default function Product() {
             <ScrollReveal key={tier.label} delay={i * 80}>
               <div className="rounded-lg bg-card p-6 shadow-sm ring-1 ring-border h-full">
                 <h3 className="text-[15px] font-semibold text-foreground">{tier.label}</h3>
-                <p className="mt-1 font-mono text-xs text-accent">{tier.time}</p>
+                <p className="mt-1 font-mono text-xs text-accent-strong">{tier.time}</p>
                 <p className="mt-3 text-sm leading-[1.7] text-muted-foreground">{tier.desc}</p>
               </div>
             </ScrollReveal>

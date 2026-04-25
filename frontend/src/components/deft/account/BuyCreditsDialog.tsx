@@ -137,7 +137,7 @@ export function BuyCreditsDialog({
                     <p className="text-[14px] font-medium text-foreground">
                       {pack.name}
                       {pack.recommended && (
-                        <span className="ml-2 rounded-full border border-accent/40 bg-accent/[0.08] px-1.5 py-0.5 text-[10.5px] font-medium tracking-[0.01em] text-accent">
+                        <span className="ml-2 rounded-full border border-accent/40 bg-accent/[0.08] px-1.5 py-0.5 text-[10.5px] font-medium tracking-[0.01em] text-accent-strong">
                           Recommended
                         </span>
                       )}

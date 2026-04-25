@@ -258,7 +258,6 @@ function MockProjectsSidebar({
                   active
                     ? "bg-secondary text-foreground"
                     : "text-muted-foreground hover:bg-secondary/60 hover:text-foreground",
-                  archived && "opacity-50",
                 )}
               >
                 <span
@@ -271,14 +270,14 @@ function MockProjectsSidebar({
                   )}
                 />
                 <span className="min-w-0 flex-1">
-                  <span className="line-clamp-2 text-[12px] leading-tight text-foreground">{t.goal}</span>
-                  <span className="mt-1 flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                  <span className={cn("line-clamp-2 text-[12px] leading-tight", archived ? "text-muted-foreground italic" : "text-foreground")}>{t.goal}</span>
+                  <span className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
                     <span>{t.relative}</span>
-                    <span className="opacity-50">·</span>
+                    <span aria-hidden>·</span>
                     <span>${t.spent.toFixed(2)}</span>
                     {archived && (
                       <>
-                        <span className="opacity-50">·</span>
+                        <span aria-hidden>·</span>
                         <span className="uppercase tracking-wide">archived</span>
                       </>
                     )}
@@ -310,7 +309,7 @@ function ModeButton({
       className={
         "rounded px-2 py-0.5 font-mono uppercase tracking-[0.12em] transition-colors " +
         (active
-          ? "bg-accent/20 text-accent"
+          ? "bg-accent text-accent-foreground"
           : "text-muted-foreground hover:bg-secondary hover:text-foreground")
       }
     >

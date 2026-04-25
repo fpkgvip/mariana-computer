@@ -52,7 +52,7 @@ export function Footer() {
         </div>
 
         <div className="mt-8 border-t border-border pt-6">
-          <p className="text-xs text-muted-foreground/60">
+          <p className="text-xs text-muted-foreground">
             © {new Date().getFullYear()} {BRAND.legalName}. All rights reserved.
           </p>
         </div>

@@ -235,7 +235,7 @@ export default function Index() {
 
               {/* Example chips */}
               <div className="mt-5 flex flex-wrap items-center justify-center gap-2 text-[12px]">
-                <span className="text-muted-foreground/70">Try</span>
+                <span className="text-muted-foreground">Try</span>
                 {exampleChips.map((c) => (
                   <button
                     key={c}
@@ -266,7 +266,7 @@ export default function Index() {
       <section className="relative border-t border-border/60 bg-surface-1/40">
         <div className="container-deft py-24 md:py-32">
           <div className="mx-auto max-w-3xl text-center">
-            <p className="text-[12px] font-medium tracking-[0.02em] text-accent">The loop</p>
+            <p className="text-[12px] font-medium tracking-[0.02em] text-accent-strong">The loop</p>
             <h2 className="mt-3 text-balance text-3xl font-semibold leading-[1.08] tracking-[-0.02em] md:text-5xl">
               Five steps.
               <br className="hidden md:block" />{" "}
@@ -327,7 +327,7 @@ export default function Index() {
         <div className="container-deft py-24 md:py-32">
           <div className="grid gap-12 lg:grid-cols-[1.1fr_1fr] lg:gap-20">
             <div>
-              <p className="text-[12px] font-medium tracking-[0.02em] text-accent">No debugging hell</p>
+              <p className="text-[12px] font-medium tracking-[0.02em] text-accent-strong">No debugging hell</p>
               <h2 className="mt-3 text-balance text-3xl font-semibold leading-[1.1] tracking-[-0.02em] md:text-[44px]">
                 The mistakes don{"\u2019"}t become
                 <br className="hidden md:block" /> your mistakes.

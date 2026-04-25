@@ -182,9 +182,9 @@ export function LiveCanvas({
               )}
             >
               {t}
-              {t === "plan" && plan.length > 0 && <span className="ml-1 opacity-60">({plan.length})</span>}
-              {t === "activity" && events.length > 0 && <span className="ml-1 opacity-60">({events.length})</span>}
-              {t === "artifacts" && artifacts.length > 0 && <span className="ml-1 opacity-60">({artifacts.length})</span>}
+              {t === "plan" && plan.length > 0 && <span className="ml-1">({plan.length})</span>}
+              {t === "activity" && events.length > 0 && <span className="ml-1">({events.length})</span>}
+              {t === "artifacts" && artifacts.length > 0 && <span className="ml-1">({artifacts.length})</span>}
             </button>
           ))}
         </div>
@@ -368,7 +368,7 @@ function eventChipClass(type: string): string {
   if (type.includes("error") || type.includes("failed")) return "bg-destructive/15 text-destructive";
   if (type.includes("approval")) return "bg-warning/15 text-warning";
   if (type.includes("tool") || type.includes("browser") || type.includes("sandbox"))
-    return "bg-[hsl(var(--accent-muted))] text-accent";
+    return "bg-[hsl(var(--accent-muted))] text-accent-strong";
   if (type.includes("step_finished") || type.includes("done")) return "bg-success/15 text-success";
   return "bg-secondary text-muted-foreground";
 }
@@ -442,7 +442,7 @@ function StageRail({
               aria-current={active ? "step" : undefined}
               className={cn(
                 "flex items-center gap-1.5 text-[11px] font-medium tracking-wide",
-                active && !failed && "text-accent",
+                active && !failed && "text-accent-strong",
                 active && failed && "text-destructive",
                 done && "text-foreground",
                 !done && !active && "text-muted-foreground",

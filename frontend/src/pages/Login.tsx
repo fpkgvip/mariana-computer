@@ -159,7 +159,7 @@ export default function Login() {
           </div>
         </div>
 
-        <p className="mt-12 text-[11px] text-muted-foreground/70">
+        <p className="mt-12 text-[11px] text-muted-foreground">
           By continuing you agree to our{" "}
           <Link to="/legal/terms" className="hover:text-foreground">Terms</Link> and{" "}
           <Link to="/legal/privacy" className="hover:text-foreground">Privacy</Link>.

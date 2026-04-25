@@ -187,7 +187,7 @@ function ModeBtn({
       className={
         "rounded px-2 py-0.5 font-mono uppercase tracking-[0.12em] transition-colors " +
         (active
-          ? "bg-accent/20 text-accent"
+          ? "bg-accent text-accent-foreground"
           : "text-muted-foreground hover:bg-secondary hover:text-foreground")
       }
     >

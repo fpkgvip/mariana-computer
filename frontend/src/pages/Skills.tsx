@@ -397,7 +397,7 @@ export default function Skills() {
                             <span
                               className={`inline-flex rounded-full px-1.5 py-0.5 text-[9px] font-medium ring-1 ring-inset ${
                                 skill.category === "built-in"
-                                  ? "bg-accent/10 text-accent ring-accent/20"
+                                  ? "bg-accent/10 text-accent-strong ring-accent/20"
                                   : "bg-blue-500/10 text-blue-400 ring-blue-500/20"
                               }`}
                             >

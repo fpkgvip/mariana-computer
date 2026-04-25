@@ -158,7 +158,7 @@ function HeaderRow({ name, email, role }: { name: string; email: string; role: "
         </p>
       </div>
       {role === "admin" && (
-        <span className="inline-flex items-center gap-1 rounded-full bg-accent/15 px-2.5 py-0.5 text-[11px] font-medium text-accent ring-1 ring-accent/30">
+        <span className="inline-flex items-center gap-1 rounded-full bg-accent/15 px-2.5 py-0.5 text-[11px] font-medium text-accent-strong ring-1 ring-accent/30">
           <ShieldCheck size={11} aria-hidden /> Admin
         </span>
       )}

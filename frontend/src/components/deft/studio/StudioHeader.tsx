@@ -129,7 +129,7 @@ export function StudioHeader({
             <span className="tabular">
               <span className="font-mono text-foreground">{spentCredits.toLocaleString()}</span>
               {ceilingCredits ? (
-                <span className="opacity-60"> / {ceilingCredits.toLocaleString()}</span>
+                <span> / {ceilingCredits.toLocaleString()}</span>
               ) : null}{" "}
               credits
             </span>
@@ -176,7 +176,7 @@ function StageChip({ stage }: { stage: StudioStage }) {
   const cls = cn(
     "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium",
     stage === "live" && "border-deploy/50 bg-deploy/10 text-deploy",
-    active && "border-accent/40 bg-[hsl(var(--accent-muted))] text-accent",
+    active && "border-accent/40 bg-[hsl(var(--accent-muted))] text-accent-strong",
     stage === "error" && "border-destructive/40 bg-destructive/10 text-destructive",
     stage === "idle" && "border-border bg-secondary text-muted-foreground",
   );

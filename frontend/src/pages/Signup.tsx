@@ -167,7 +167,7 @@ export default function Signup() {
           </div>
         </div>
 
-        <p className="mt-12 text-[11px] text-muted-foreground/70">
+        <p className="mt-12 text-[11px] text-muted-foreground">
           By creating an account you agree to our{" "}
           <Link to="/legal/terms" className="hover:text-foreground">Terms</Link> and{" "}
           <Link to="/legal/privacy" className="hover:text-foreground">Privacy</Link>.
@@ -186,7 +186,7 @@ export default function Signup() {
 
         <div className="relative flex h-full items-center justify-center px-12">
           <div className="w-full max-w-md space-y-6">
-            <p className="text-[12px] font-medium tracking-[0.02em] text-accent">The loop</p>
+            <p className="text-[12px] font-medium tracking-[0.02em] text-accent-strong">The loop</p>
             <h2 className="text-balance text-[28px] font-semibold leading-[1.15] tracking-[-0.02em]">
               Five steps. The last one is a live URL.
             </h2>

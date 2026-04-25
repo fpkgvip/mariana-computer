@@ -39,7 +39,7 @@ export function EmptyState({
           {icon}
         </span>
         <div className="text-foreground/80">{title}</div>
-        {description ? <div className="opacity-70">{description}</div> : null}
+        {description ? <div>{description}</div> : null}
         {action ? <div className="mt-1.5">{action}</div> : null}
       </div>
     );
