@@ -11,11 +11,31 @@
  *  - Filterable by free-text search (client-side)
  *  - Clicking a row navigates to ?task=<id>
  *  - Auto-refreshes every 8s when present
+ *  - Archive / Share read-only / Export / Delete from a kebab menu (P12)
+ *  - "Show archived" toggle reveals soft-archived rows
+ *
+ * Mutations are optimistic — we update local state immediately and best-effort
+ * call the backend. The backend endpoints for archive/share/export are
+ * frontend-only stubs in this build (out of scope per the locked plan); the
+ * real wiring lands in a later phase.
  */
 import { useEffect, useMemo, useState } from "react";
-import { Coins, FolderOpen, Loader2, Plus, Search, AlertTriangle, CheckCircle2 } from "lucide-react";
+import {
+  AlertTriangle,
+  Archive,
+  Coins,
+  FolderOpen,
+  Loader2,
+  Plus,
+  Search,
+} from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { ProjectRow, type ProjectRowData } from "./projects/ProjectRow";
+import { ArchiveProjectDialog } from "./projects/ArchiveProjectDialog";
+import { ShareProjectDialog } from "./projects/ShareProjectDialog";
+import { ExportProjectDialog, type ExportFormat } from "./projects/ExportProjectDialog";
+import { DeleteProjectDialog } from "./projects/DeleteProjectDialog";
 
 interface AgentTaskRow {
   id: string;
@@ -28,6 +48,7 @@ interface AgentTaskRow {
   updated_at: string;
   has_final_answer: boolean;
   error: string | null;
+  archived?: boolean;
 }
 
 interface AgentTaskList {
@@ -45,12 +66,29 @@ interface ProjectsSidebarProps {
 }
 
 const POLL_INTERVAL_MS = 8_000;
+const SHARE_BASE_URL =
+  (typeof window !== "undefined" && window.location.origin) || "https://deft.computer";
+
+type DialogKind = "archive" | "share" | "export" | "delete";
+
+interface ActiveDialog {
+  kind: DialogKind;
+  task: ProjectRowData;
+}
 
 export function ProjectsSidebar({ activeTaskId, onSelect, onNew, balance }: ProjectsSidebarProps) {
   const [tasks, setTasks] = useState<AgentTaskRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
+  const [showArchived, setShowArchived] = useState(false);
+
+  // Local override map: id → { archived?: boolean; deleted?: boolean }.
+  // Lets the UI react instantly to mutations without waiting for the next poll.
+  const [overrides, setOverrides] = useState<Record<string, { archived?: boolean; deleted?: boolean }>>({});
+
+  const [dialog, setDialog] = useState<ActiveDialog | null>(null);
+  const [pending, setPending] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -75,11 +113,92 @@ export function ProjectsSidebar({ activeTaskId, onSelect, onNew, balance }: Proj
     };
   }, []);
 
+  const merged = useMemo<ProjectRowData[]>(() => {
+    return tasks
+      .filter((t) => !overrides[t.id]?.deleted)
+      .map((t) => ({
+        id: t.id,
+        goal: t.goal,
+        state: t.state,
+        created_at: t.created_at,
+        spent_usd: t.spent_usd,
+        archived: overrides[t.id]?.archived ?? t.archived ?? t.state === "archived",
+      }));
+  }, [tasks, overrides]);
+
   const visible = useMemo(() => {
     const q = filter.trim().toLowerCase();
-    if (!q) return tasks;
-    return tasks.filter((t) => t.goal.toLowerCase().includes(q));
-  }, [filter, tasks]);
+    return merged.filter((t) => {
+      if (!showArchived && t.archived) return false;
+      if (q && !t.goal.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [merged, filter, showArchived]);
+
+  const archivedCount = merged.filter((t) => t.archived).length;
+
+  const closeDialog = () => {
+    if (pending) return;
+    setDialog(null);
+  };
+
+  const handleArchive = async () => {
+    if (!dialog) return;
+    setPending(true);
+    setOverrides((prev) => ({ ...prev, [dialog.task.id]: { ...prev[dialog.task.id], archived: true } }));
+    try {
+      await api.post(`/api/agent/${dialog.task.id}/archive`, {}).catch(() => undefined);
+    } finally {
+      setPending(false);
+      setDialog(null);
+    }
+  };
+
+  const handleRestore = (task: ProjectRowData) => {
+    setOverrides((prev) => ({ ...prev, [task.id]: { ...prev[task.id], archived: false } }));
+    void api.post(`/api/agent/${task.id}/restore`, {}).catch(() => undefined);
+  };
+
+  const handleExport = async (format: ExportFormat) => {
+    if (!dialog) return;
+    setPending(true);
+    try {
+      // Frontend-only stub — emits a JSON snapshot from the row data so the
+      // confirm-modal flow can be exercised end-to-end without a backend.
+      const blob =
+        format === "json"
+          ? new Blob([JSON.stringify(dialog.task, null, 2)], { type: "application/json" })
+          : new Blob(
+              [
+                `Run: ${dialog.task.goal}\nID: ${dialog.task.id}\nSpent: $${dialog.task.spent_usd.toFixed(2)}\n`,
+              ],
+              { type: "application/zip" },
+            );
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `deft-run-${dialog.task.id}.${format}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } finally {
+      setPending(false);
+      setDialog(null);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!dialog) return;
+    setPending(true);
+    setOverrides((prev) => ({ ...prev, [dialog.task.id]: { ...prev[dialog.task.id], deleted: true } }));
+    try {
+      await api.delete(`/api/agent/${dialog.task.id}`).catch(() => undefined);
+    } finally {
+      setPending(false);
+      setDialog(null);
+    }
+  };
+
+  const dialogTask = dialog?.task ?? null;
 
   return (
     <aside
@@ -118,6 +237,22 @@ export function ProjectsSidebar({ activeTaskId, onSelect, onNew, balance }: Proj
             className="w-full rounded-md border border-border bg-input py-1.5 pl-7 pr-2 text-xs text-foreground outline-none placeholder:text-[hsl(var(--fg-3))] focus:border-accent"
           />
         </label>
+        {archivedCount > 0 && (
+          <button
+            type="button"
+            onClick={() => setShowArchived((v) => !v)}
+            aria-pressed={showArchived}
+            className={cn(
+              "mt-2 inline-flex items-center gap-1.5 rounded-md px-1.5 py-1 text-[10px] uppercase tracking-wide transition-colors",
+              showArchived
+                ? "text-foreground hover:text-muted-foreground"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            <Archive size={10} aria-hidden />
+            {showArchived ? "Hide archived" : `Show archived (${archivedCount})`}
+          </button>
+        )}
       </div>
 
       <div className="flex-1 overflow-auto px-2 py-2">
@@ -139,72 +274,49 @@ export function ProjectsSidebar({ activeTaskId, onSelect, onNew, balance }: Proj
         ) : (
           <ul className="space-y-0.5">
             {visible.map((t) => (
-              <li key={t.id}>
-                <button
-                  type="button"
-                  onClick={() => onSelect(t.id)}
-                  aria-current={activeTaskId === t.id ? "true" : undefined}
-                  className={cn(
-                    "flex w-full items-start gap-2 rounded-md px-2 py-2 text-left text-xs transition-colors",
-                    activeTaskId === t.id
-                      ? "bg-secondary text-foreground"
-                      : "text-muted-foreground hover:bg-secondary/60 hover:text-foreground",
-                  )}
-                >
-                  <StateDot state={t.state} />
-                  <span className="min-w-0 flex-1">
-                    <span className="line-clamp-2 text-[12px] leading-tight text-foreground">
-                      {t.goal}
-                    </span>
-                    <span className="mt-1 flex items-center gap-1.5 text-[10px] text-muted-foreground">
-                      <span>{relativeTime(t.created_at)}</span>
-                      <span className="opacity-50">·</span>
-                      <span>${t.spent_usd.toFixed(2)}</span>
-                    </span>
-                  </span>
-                </button>
-              </li>
+              <ProjectRow
+                key={t.id}
+                task={t}
+                active={activeTaskId === t.id}
+                onSelect={() => onSelect(t.id)}
+                onArchive={() => setDialog({ kind: "archive", task: t })}
+                onRestore={() => handleRestore(t)}
+                onShare={() => setDialog({ kind: "share", task: t })}
+                onExport={() => setDialog({ kind: "export", task: t })}
+                onDelete={() => setDialog({ kind: "delete", task: t })}
+              />
             ))}
           </ul>
         )}
       </div>
+
+      <ArchiveProjectDialog
+        open={dialog?.kind === "archive"}
+        onOpenChange={(o) => (!o ? closeDialog() : undefined)}
+        projectName={dialogTask?.goal ?? ""}
+        onConfirm={handleArchive}
+        pending={pending}
+      />
+      <ShareProjectDialog
+        open={dialog?.kind === "share"}
+        onOpenChange={(o) => (!o ? closeDialog() : undefined)}
+        projectName={dialogTask?.goal ?? ""}
+        shareUrl={`${SHARE_BASE_URL}/r/${dialogTask?.id ?? ""}`}
+      />
+      <ExportProjectDialog
+        open={dialog?.kind === "export"}
+        onOpenChange={(o) => (!o ? closeDialog() : undefined)}
+        projectName={dialogTask?.goal ?? ""}
+        onExport={handleExport}
+        pending={pending}
+      />
+      <DeleteProjectDialog
+        open={dialog?.kind === "delete"}
+        onOpenChange={(o) => (!o ? closeDialog() : undefined)}
+        projectName={dialogTask?.goal ?? ""}
+        onConfirm={handleDelete}
+        pending={pending}
+      />
     </aside>
   );
-}
-
-function StateDot({ state }: { state: string }) {
-  const cls = (() => {
-    switch (state) {
-      case "done":
-      case "completed":
-        return "bg-success";
-      case "failed":
-      case "error":
-        return "bg-destructive";
-      case "stopped":
-      case "cancelled":
-        return "bg-muted-foreground";
-      case "plan":
-      case "act":
-      case "running":
-        return "bg-accent animate-pulse";
-      default:
-        return "bg-muted-foreground";
-    }
-  })();
-  return <span className={cn("mt-1 h-2 w-2 shrink-0 rounded-full", cls)} aria-label={state} />;
-}
-
-function relativeTime(iso: string): string {
-  try {
-    const ts = new Date(iso).getTime();
-    if (!Number.isFinite(ts)) return "";
-    const diff = Math.floor((Date.now() - ts) / 1000);
-    if (diff < 60) return `${diff}s ago`;
-    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-    if (diff < 86_400) return `${Math.floor(diff / 3600)}h ago`;
-    return `${Math.floor(diff / 86_400)}d ago`;
-  } catch {
-    return "";
-  }
 }
