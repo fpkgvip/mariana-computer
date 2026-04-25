@@ -46,6 +46,16 @@ export const TIER_DESCRIPTION: Record<ModelTier, string> = {
   max: "Top reasoning. Best for hard or large tasks.",
 };
 
+/**
+ * One-line trade-off shown in tooltip when hovering a tier card.
+ * Calm copy — no superlatives, no marketing.
+ */
+export const TIER_TRADEOFF: Record<ModelTier, string> = {
+  lite: "~3× faster, ~2× cheaper. May miss tricky edge cases.",
+  standard: "Balanced reasoning and cost. The sensible default.",
+  max: "Slowest and priciest. Solves what Standard can't.",
+};
+
 export function fetchQuote(
   body: QuoteRequest,
   signal?: AbortSignal,

@@ -4,19 +4,21 @@
  * Sits below the Prompt Bar after the user types a prompt.
  *
  * Renders the receipt promise: estimated credit range, estimated duration,
- * tier picker (lite/standard/max), credit ceiling slider. The user must click
- * "Start" to actually launch the run. The quote is advisory; the ceiling is a
- * contract enforced server-side.
+ * tier picker (Lite/Standard/Max with trade-off tooltip), credit ceiling
+ * with discrete stops + numeric twin. The user must click "Start" to
+ * launch the run. The quote is advisory; the ceiling is a contract enforced
+ * server-side.
  *
  * Behaviors:
  *  - Debounces /api/agent/quote 350ms after the user stops typing
  *  - Cancels in-flight quote requests when the prompt changes
  *  - Shows skeleton + spinner while fetching
- *  - Surfaces 402-class errors clearly (insufficient balance)
+ *  - Surfaces 402-class errors clearly with calm copy + Add-credits link
  *  - Disables Start when the user has no balance OR ceiling > balance
+ *  - Admins (`unlimited`) skip the ceiling row entirely
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import {
   AlertCircle,
   Clock,
@@ -24,7 +26,6 @@ import {
   Loader2,
   Play,
   ShieldCheck,
-  Sparkles,
 } from "lucide-react";
 import {
   fetchQuote,
@@ -35,6 +36,7 @@ import {
   type QuoteResponse,
   TIER_DESCRIPTION,
   TIER_LABEL,
+  TIER_TRADEOFF,
 } from "@/lib/agentApi";
 import { ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -50,12 +52,20 @@ interface PreflightCardProps {
   defaultTier?: ModelTier;
   /** Show inline busy spinner on Start (e.g. while POST /api/agent/run dispatches). */
   starting?: boolean;
-  /** Admins are billed internally; bypass balance/ceiling guards. */
+  /** Admins are billed internally; bypass balance/ceiling guards and hide the row. */
   unlimited?: boolean;
   className?: string;
 }
 
 const QUOTE_DEBOUNCE_MS = 350;
+
+/** Discrete ceiling stops shown as chips. UNLIMITED renders for admins only (hidden in unlimited mode). */
+const CEILING_STOPS: Array<{ label: string; value: number }> = [
+  { label: "100", value: 100 },
+  { label: "250", value: 250 },
+  { label: "500", value: 500 },
+  { label: "1,000", value: 1_000 },
+];
 
 export function PreflightCard({
   prompt,
@@ -73,6 +83,7 @@ export function PreflightCard({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const ceilingInputId = useId();
 
   const trimmed = prompt.trim();
 
@@ -132,16 +143,14 @@ export function PreflightCard({
   if (!trimmed) return null;
 
   const insufficient = unlimited ? false : quote ? balance < quote.credits_min : false;
-  const ceilingBelowMin = quote ? ceiling < quote.credits_min : false;
+  const ceilingBelowMin = quote && !unlimited ? ceiling < quote.credits_min : false;
   const ceilingDollars = (ceiling / 100).toFixed(2);
 
-  const ceilingFloor = quote ? quote.credits_max * 2 : 100;
-  const ceilingMax = unlimited
-    ? ceilingFloor
-    : quote
-      ? Math.max(quote.credits_max * 2, balance)
-      : Math.max(100, balance);
+  const ceilingFloor = quote ? Math.max(quote.credits_max * 2, 100) : 100;
   const ceilingMin = quote ? Math.max(1, Math.floor(quote.credits_min * 0.5)) : 1;
+  const ceilingMax = quote
+    ? Math.max(ceilingFloor, balance > 0 ? balance : ceilingFloor)
+    : Math.max(100, balance);
   const effectiveCeilingMax = Math.max(ceilingMin, ceilingMax);
 
   const canStart = Boolean(quote) && !insufficient && !ceilingBelowMin && !starting && !loading;
@@ -158,45 +167,48 @@ export function PreflightCard({
     >
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2 text-sm font-medium text-foreground">
-          <ShieldCheck size={14} className="text-accent" aria-hidden />
+          <ShieldCheck size={14} className="text-accent" aria-hidden="true" />
           Pre-flight
         </div>
         <span className="text-[11px] tracking-wide text-muted-foreground">
-          Set a ceiling. Pay only for what runs.
+          {unlimited ? "Internal account" : "Set a ceiling. Pay only for what runs."}
         </span>
       </div>
 
-      {/* Quote line */}
-      <div className="mt-3 flex flex-wrap items-baseline gap-x-4 gap-y-1">
-        {loading && !quote ? (
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Loader2 size={14} className="animate-spin" aria-hidden />
-            Estimating…
-          </div>
-        ) : error ? (
-          <div className="flex items-center gap-2 text-sm text-destructive">
-            <AlertCircle size={14} aria-hidden />
-            {error}
-          </div>
-        ) : quote ? (
-          <>
-            <div className="flex items-center gap-1.5 text-base font-semibold text-foreground">
-              <Coins size={14} className="text-accent" aria-hidden />
-              {formatCreditsRange(quote.credits_min, quote.credits_max)}
-              <span className="text-sm font-normal text-muted-foreground">
-                ({formatDollarsRange(quote.credits_min, quote.credits_max)})
-              </span>
+      {/* Quote line + provenance */}
+      <div className="mt-3 space-y-1">
+        <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+          {loading && !quote ? (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 size={14} className="animate-spin" aria-hidden="true" />
+              Estimating…
             </div>
-            <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
-              <Clock size={12} aria-hidden />
-              {formatEtaRange(quote.eta_seconds_min, quote.eta_seconds_max)}
+          ) : error ? (
+            <div className="flex items-center gap-2 text-sm text-destructive">
+              <AlertCircle size={14} aria-hidden="true" />
+              {error}
             </div>
-            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <Sparkles size={11} aria-hidden />
-              complexity {quote.complexity_score.toFixed(2)}
-            </div>
-          </>
-        ) : null}
+          ) : quote ? (
+            <>
+              <div className="flex items-center gap-1.5 text-base font-semibold text-foreground">
+                <Coins size={14} className="text-accent" aria-hidden="true" />
+                {formatCreditsRange(quote.credits_min, quote.credits_max)}
+                <span className="text-sm font-normal text-muted-foreground">
+                  ({formatDollarsRange(quote.credits_min, quote.credits_max)})
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                <Clock size={12} aria-hidden="true" />
+                {formatEtaRange(quote.eta_seconds_min, quote.eta_seconds_max)}
+              </div>
+            </>
+          ) : null}
+        </div>
+        {quote && !loading && !error && (
+          <p className="text-[11px] text-muted-foreground">
+            Based on your last 50 runs.
+          </p>
+        )}
       </div>
 
       {/* Tier selector */}
@@ -212,8 +224,10 @@ export function PreflightCard({
               role="radio"
               aria-checked={tier === t}
               onClick={() => setTier(t)}
+              title={TIER_TRADEOFF[t]}
               className={cn(
-                "flex flex-col items-start rounded-lg border px-3 py-2 text-left transition-colors duration-150",
+                "group relative flex flex-col items-start rounded-lg border px-3 py-2 text-left transition-colors duration-150",
+                "focus:outline-none focus-visible:ring-2 focus-visible:ring-accent",
                 tier === t
                   ? "border-accent bg-[hsl(var(--accent-muted))] text-foreground"
                   : "border-border bg-secondary text-muted-foreground hover:border-[hsl(var(--bg-4))] hover:text-foreground",
@@ -221,56 +235,114 @@ export function PreflightCard({
             >
               <span className="text-sm font-medium">{TIER_LABEL[t]}</span>
               <span className="text-[11px] leading-snug">{TIER_DESCRIPTION[t]}</span>
+              {/* Hover trade-off tooltip — visible on hover/focus */}
+              <span
+                role="tooltip"
+                className={cn(
+                  "pointer-events-none absolute left-0 right-0 top-full z-20 mt-1.5 rounded-md border border-border bg-popover px-2.5 py-1.5 text-[11px] leading-snug text-foreground shadow-md",
+                  "opacity-0 translate-y-1 transition-all duration-150",
+                  "group-hover:opacity-100 group-hover:translate-y-0",
+                  "group-focus-visible:opacity-100 group-focus-visible:translate-y-0",
+                )}
+              >
+                {TIER_TRADEOFF[t]}
+              </span>
             </button>
           ))}
         </div>
       </fieldset>
 
-      {/* Ceiling slider */}
-      <div className="mt-4">
-        <div className="mb-1.5 flex items-baseline justify-between text-xs">
-          <span className="tracking-wide text-muted-foreground">
-            Credit ceiling
-          </span>
-          <span className="font-mono text-sm text-foreground">
-            {ceiling.toLocaleString()} <span className="text-muted-foreground">credits · ${ceilingDollars}</span>
-          </span>
+      {/* Ceiling — hidden for unlimited (admin) accounts */}
+      {!unlimited && (
+        <div className="mt-4">
+          <div className="mb-1.5 flex items-baseline justify-between text-xs">
+            <label htmlFor={ceilingInputId} className="tracking-wide text-muted-foreground">
+              Credit ceiling
+            </label>
+            <span className="font-mono text-sm text-foreground">
+              <input
+                id={ceilingInputId}
+                type="number"
+                min={ceilingMin}
+                max={effectiveCeilingMax}
+                step={1}
+                value={Math.max(ceilingMin, Math.min(ceiling, effectiveCeilingMax))}
+                onChange={(e) => {
+                  const n = Number(e.target.value);
+                  if (Number.isFinite(n)) {
+                    setCeiling(n);
+                    setCeilingTouched(true);
+                  }
+                }}
+                aria-label="Credit ceiling (numeric)"
+                className={cn(
+                  "w-20 rounded border border-border bg-secondary px-1.5 py-0.5 text-right text-sm text-foreground",
+                  "focus:outline-none focus-visible:ring-2 focus-visible:ring-accent",
+                )}
+              />{" "}
+              <span className="text-muted-foreground">credits · ${ceilingDollars}</span>
+            </span>
+          </div>
+          <input
+            type="range"
+            min={ceilingMin}
+            max={effectiveCeilingMax}
+            step={1}
+            value={Math.max(ceilingMin, Math.min(ceiling, effectiveCeilingMax))}
+            onChange={(e) => {
+              setCeiling(Number(e.target.value));
+              setCeilingTouched(true);
+            }}
+            className={cn(
+              "h-1.5 w-full appearance-none rounded-full bg-secondary outline-none",
+              "[&::-webkit-slider-thumb]:appearance-none",
+              "[&::-webkit-slider-thumb]:h-4",
+              "[&::-webkit-slider-thumb]:w-4",
+              "[&::-webkit-slider-thumb]:rounded-full",
+              "[&::-webkit-slider-thumb]:bg-accent",
+              "[&::-webkit-slider-thumb]:cursor-pointer",
+              "[&::-moz-range-thumb]:h-4",
+              "[&::-moz-range-thumb]:w-4",
+              "[&::-moz-range-thumb]:rounded-full",
+              "[&::-moz-range-thumb]:bg-accent",
+              "[&::-moz-range-thumb]:border-0",
+              "[&::-moz-range-thumb]:cursor-pointer",
+            )}
+            aria-label="Credit ceiling"
+            aria-valuemin={ceilingMin}
+            aria-valuemax={effectiveCeilingMax}
+            aria-valuenow={ceiling}
+          />
+          {/* Discrete stops */}
+          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+            {CEILING_STOPS.map((s) => {
+              const active = ceiling === s.value;
+              const reachable = s.value <= effectiveCeilingMax;
+              return (
+                <button
+                  key={s.value}
+                  type="button"
+                  onClick={() => {
+                    setCeiling(s.value);
+                    setCeilingTouched(true);
+                  }}
+                  disabled={!reachable}
+                  className={cn(
+                    "rounded-md border px-2 py-0.5 text-[11px] transition-colors",
+                    "focus:outline-none focus-visible:ring-2 focus-visible:ring-accent",
+                    active
+                      ? "border-accent bg-[hsl(var(--accent-muted))] text-foreground"
+                      : "border-border bg-secondary text-muted-foreground hover:text-foreground",
+                    !reachable && "cursor-not-allowed opacity-40",
+                  )}
+                >
+                  {s.label}
+                </button>
+              );
+            })}
+          </div>
         </div>
-        <input
-          type="range"
-          min={ceilingMin}
-          max={effectiveCeilingMax}
-          step={1}
-          value={Math.max(ceilingMin, Math.min(ceiling, effectiveCeilingMax))}
-          onChange={(e) => {
-            setCeiling(Number(e.target.value));
-            setCeilingTouched(true);
-          }}
-          className={cn(
-            "h-1.5 w-full appearance-none rounded-full bg-secondary outline-none",
-            "[&::-webkit-slider-thumb]:appearance-none",
-            "[&::-webkit-slider-thumb]:h-4",
-            "[&::-webkit-slider-thumb]:w-4",
-            "[&::-webkit-slider-thumb]:rounded-full",
-            "[&::-webkit-slider-thumb]:bg-accent",
-            "[&::-webkit-slider-thumb]:cursor-pointer",
-            "[&::-moz-range-thumb]:h-4",
-            "[&::-moz-range-thumb]:w-4",
-            "[&::-moz-range-thumb]:rounded-full",
-            "[&::-moz-range-thumb]:bg-accent",
-            "[&::-moz-range-thumb]:border-0",
-            "[&::-moz-range-thumb]:cursor-pointer",
-          )}
-          aria-label="Credit ceiling"
-          aria-valuemin={ceilingMin}
-          aria-valuemax={effectiveCeilingMax}
-          aria-valuenow={ceiling}
-        />
-        <div className="mt-1 flex justify-between text-[10px] text-muted-foreground">
-          <span>{ceilingMin.toLocaleString()}</span>
-          <span>{effectiveCeilingMax.toLocaleString()}</span>
-        </div>
-      </div>
+      )}
 
       {/* Footer: balance + Start */}
       <div className="mt-4 flex items-center justify-between gap-3">
@@ -295,15 +367,16 @@ export function PreflightCard({
           aria-label="Start run"
           className={cn(
             "inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-all duration-150",
+            "focus:outline-none focus-visible:ring-2 focus-visible:ring-accent",
             canStart
               ? "bg-accent text-accent-foreground hover:opacity-90 active:scale-[0.98]"
               : "cursor-not-allowed bg-secondary text-muted-foreground",
           )}
         >
           {starting ? (
-            <Loader2 size={14} className="animate-spin" aria-hidden />
+            <Loader2 size={14} className="animate-spin" aria-hidden="true" />
           ) : (
-            <Play size={14} aria-hidden />
+            <Play size={14} aria-hidden="true" />
           )}
           Start
         </button>
@@ -314,15 +387,20 @@ export function PreflightCard({
           role="alert"
           className="mt-3 flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
         >
-          <AlertCircle size={12} className="mt-0.5 shrink-0" aria-hidden />
-          {insufficient
-            ? `This run needs at least ${quote.credits_min} credits to start.`
-            : `Raise the ceiling to at least ${quote.credits_min} credits to start this run.`}{" "}
-          {insufficient && (
-            <a className="ml-1 font-medium underline" href="/checkout">
-              Add credits
-            </a>
-          )}
+          <AlertCircle size={12} className="mt-0.5 shrink-0" aria-hidden="true" />
+          <span>
+            {insufficient
+              ? `Not enough credits. This run needs at least ${quote.credits_min.toLocaleString()} to start.`
+              : `Raise the ceiling to at least ${quote.credits_min.toLocaleString()} credits to start.`}
+            {insufficient && (
+              <>
+                {" "}
+                <a className="font-medium underline underline-offset-2" href="/checkout">
+                  Add credits
+                </a>
+              </>
+            )}
+          </span>
         </div>
       )}
     </div>
