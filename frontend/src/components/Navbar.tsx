@@ -1,6 +1,6 @@
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useState, useEffect, useRef } from "react";
-import { Menu, X, User, LogOut, CreditCard, Settings, ShieldCheck, Inbox } from "lucide-react";
+import { Menu, X, User, LogOut, CreditCard, Settings, ShieldCheck, Inbox, KeyRound } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import { BRAND } from "@/lib/brand";
 
@@ -103,6 +103,9 @@ export function Navbar() {
                   <Link role="menuitem" to="/tasks" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
                     <Inbox size={13} /> Tasks
                   </Link>
+                  <Link role="menuitem" to="/vault" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
+                    <KeyRound size={13} /> Vault
+                  </Link>
                   <Link role="menuitem" to="/account" className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground hover:bg-secondary hover:text-foreground">
                     <Settings size={13} /> Account
                   </Link>
@@ -189,6 +192,7 @@ export function Navbar() {
                 <Link to="/build" className="py-1 text-sm text-muted-foreground">Studio</Link>
                 <Link to="/chat" className="py-1 text-sm text-muted-foreground">Workspace</Link>
                 <Link to="/tasks" className="py-1 text-sm text-muted-foreground">Tasks</Link>
+                <Link to="/vault" className="py-1 text-sm text-muted-foreground">Vault</Link>
                 {user.role === "admin" && (
                   <Link to="/admin" className="py-1 text-sm text-muted-foreground">Admin</Link>
                 )}

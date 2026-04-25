@@ -27,6 +27,7 @@ import Skills from "./pages/Skills";
 import InvestigationGraph from "./pages/InvestigationGraph";
 import Tasks from "./pages/Tasks";
 import TaskDetail from "./pages/TaskDetail";
+import Vault from "./pages/Vault";
 import NotFound from "./pages/NotFound";
 
 // BUG-FE-134 fix: Configure sensible defaults so react-query doesn't refetch
@@ -112,6 +113,7 @@ const App = () => {
               <Route path="/graph/:taskId" element={<ProtectedRoute><InvestigationGraph /></ProtectedRoute>} />
               <Route path="/tasks" element={<ProtectedRoute><Tasks /></ProtectedRoute>} />
               <Route path="/tasks/:taskId" element={<ProtectedRoute><TaskDetail /></ProtectedRoute>} />
+              <Route path="/vault" element={<ProtectedRoute><Vault /></ProtectedRoute>} />
               <Route path="/admin" element={<ProtectedRoute><Admin /></ProtectedRoute>} />
               <Route path="/login" element={<Login />} />
               <Route path="/signup" element={<Signup />} />
