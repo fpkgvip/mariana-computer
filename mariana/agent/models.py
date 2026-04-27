@@ -139,6 +139,21 @@ class AgentTask(BaseModel):
     budget_usd: float = 5.0
     spent_usd: float = 0.0
 
+    # M-01 fix: credit reservation accounting.
+    # ``reserved_credits`` is the up-front Supabase deduction made by
+    # ``POST /api/agent`` (canonical 100 credits/USD).  The runtime settles
+    # this in :func:`mariana.agent.loop._settle_agent_credits` once the task
+    # reaches a terminal state — refunding unused credits via ``add_credits``
+    # or deducting the overrun via ``deduct_credits``.  ``credits_settled``
+    # makes settlement idempotent: any subsequent call observes the flag and
+    # short-circuits, so a retried orchestrator pass cannot double-charge or
+    # double-refund.  Neither field is persisted to Postgres in this
+    # release; they live on the in-memory task instance for the duration of
+    # one orchestrator run, which is the only window in which settlement
+    # runs.
+    reserved_credits: int = 0
+    credits_settled: bool = False
+
     # Retry budgets — global caps so the loop can't spin forever.
     max_fix_attempts_per_step: int = 5
     max_replans: int = 3

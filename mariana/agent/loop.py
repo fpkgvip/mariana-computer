@@ -262,6 +262,156 @@ def _budget_exceeded(task: AgentTask, started_at: float) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# M-01: credit settlement
+# ---------------------------------------------------------------------------
+
+
+async def _settle_agent_credits(task: AgentTask) -> None:
+    """Reconcile reserved credits against actual ``spent_usd`` at task end.
+
+    Mirrors the research-task settlement in ``mariana/main.py:_deduct_user_credits``.
+    Conversion is **100 credits per $1** — the canonical platform rule used
+    by the frontend ``creditsFromUsd`` helper and the Pricing page.
+
+    * No-op if ``credits_settled`` is already True or no credits were reserved.
+    * ``delta = final_tokens - reserved`` where ``final_tokens = int(spent_usd * 100)``.
+    * ``delta == 0`` → noop, just flip the flag.
+    * ``delta > 0``  → user spent more than reserved → deduct the overrun via
+      the ``deduct_credits`` RPC.
+    * ``delta < 0``  → reservation exceeded actual cost → refund the unused
+      portion via the ``add_credits`` RPC.
+
+    The function always sets ``credits_settled = True`` once it has attempted
+    a reconciliation, even if the RPC call returned a non-2xx status — this
+    is what makes the helper safe to call from a retried orchestrator pass
+    without double-charging or double-refunding.  Errors are logged with
+    ``agent_credits_settle_*`` keys for ops-time investigation.
+
+    Late imports avoid the api.py ↔ agent.loop circular import.
+    """
+    if task.credits_settled or task.reserved_credits <= 0:
+        return
+
+    # Late import to dodge the circular dependency between mariana.api and
+    # the agent loop.  These helpers already exist in api.py and centralise
+    # the Supabase URL / api-key wiring.
+    from mariana.api import (  # noqa: PLC0415
+        _get_config as _get_cfg,
+        _supabase_api_key,
+    )
+
+    cfg = _get_cfg()
+    api_key = _supabase_api_key(cfg)
+    if not getattr(cfg, "SUPABASE_URL", "") or not api_key:
+        # Without Supabase wiring there is nothing to settle.  Mark settled
+        # so the next call doesn't keep retrying a dead service.
+        task.credits_settled = True
+        logger.info(
+            "agent_credits_settle_skipped_no_supabase",
+            task_id=task.id,
+            reserved=task.reserved_credits,
+        )
+        return
+
+    final_tokens = int(task.spent_usd * 100)
+    delta = final_tokens - task.reserved_credits
+
+    if delta == 0:
+        task.credits_settled = True
+        logger.info(
+            "agent_credits_settle_noop",
+            task_id=task.id,
+            user_id=task.user_id,
+            reserved=task.reserved_credits,
+            final_tokens=final_tokens,
+        )
+        return
+
+    import httpx  # type: ignore[import]  # noqa: PLC0415
+
+    headers = {
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            if delta > 0:
+                # User spent more than reserved → take the overrun.
+                rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/deduct_credits"
+                resp = await client.post(
+                    rpc_url,
+                    json={"target_user_id": task.user_id, "amount": delta},
+                    headers=headers,
+                )
+                # Set the flag regardless of HTTP outcome so a retry of the
+                # finally block can't double-charge.  A logged failure here
+                # is reconciled offline.
+                task.credits_settled = True
+                if resp.status_code in (200, 204):
+                    logger.info(
+                        "agent_credits_settle_extra_deduct_ok",
+                        task_id=task.id,
+                        user_id=task.user_id,
+                        reserved=task.reserved_credits,
+                        final_tokens=final_tokens,
+                        extra_deducted=delta,
+                    )
+                else:
+                    logger.error(
+                        "agent_credits_settle_extra_deduct_failed",
+                        task_id=task.id,
+                        user_id=task.user_id,
+                        reserved=task.reserved_credits,
+                        final_tokens=final_tokens,
+                        extra=delta,
+                        status=resp.status_code,
+                    )
+                return
+
+            # delta < 0 → refund unused reservation.
+            refund = abs(delta)
+            rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/add_credits"
+            resp = await client.post(
+                rpc_url,
+                json={"p_user_id": task.user_id, "p_credits": refund},
+                headers=headers,
+            )
+            task.credits_settled = True
+            if resp.status_code in (200, 204):
+                logger.info(
+                    "agent_credits_settle_refund_ok",
+                    task_id=task.id,
+                    user_id=task.user_id,
+                    reserved=task.reserved_credits,
+                    final_tokens=final_tokens,
+                    refunded=refund,
+                )
+            else:
+                logger.error(
+                    "agent_credits_settle_refund_failed",
+                    task_id=task.id,
+                    user_id=task.user_id,
+                    reserved=task.reserved_credits,
+                    final_tokens=final_tokens,
+                    refund=refund,
+                    status=resp.status_code,
+                )
+    except Exception as exc:  # noqa: BLE001
+        # Defensive: never let a settlement error bubble out of the finally
+        # block in run_task.  Mark settled so we don't loop on a permanently
+        # broken Supabase config.
+        task.credits_settled = True
+        logger.error(
+            "agent_credits_settle_exception",
+            task_id=task.id,
+            user_id=task.user_id,
+            reserved=task.reserved_credits,
+            error=str(exc),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Step execution
 # ---------------------------------------------------------------------------
 
@@ -734,6 +884,18 @@ async def run_agent_task(
         return task
     finally:
         if is_terminal(task.state):
+            # M-01: settle reserved credits BEFORE the final persist so the
+            # ``credits_settled`` flag (and any post-settlement state) lands
+            # in the same UPSERT.  Wrapped in try/except so a settlement
+            # error never crashes the finally block.
+            try:
+                await _settle_agent_credits(task)
+            except Exception as _settle_exc:  # noqa: BLE001
+                logger.error(
+                    "agent_credits_settle_finally_error",
+                    task_id=task.id,
+                    error=str(_settle_exc),
+                )
             try:
                 await _persist_task(db, task)
             except Exception:

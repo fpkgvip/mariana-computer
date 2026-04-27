@@ -398,10 +398,23 @@ def make_routes(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=f"vault_env: {exc}")
 
-        # v3.5: Reserve credits before enqueueing so free-tier users can't
-        # burn unlimited agent time. Formula: 500 credits per $1 of budget,
-        # capped at 10x the plan's per-task limit. Late import avoids the
-        # circular dependency between api.py and this module.
+        # M-01 fix: Reserve credits before enqueueing using the canonical
+        # platform conversion of **100 credits per $1** (i.e. 1 credit ==
+        # $0.01).  This matches ``frontend/src/components/deft/studio/stage.ts``
+        # ``creditsFromUsd`` and the Pricing page copy ("1c = $0.01"), and it
+        # matches the agent runtime's enforcement: ``mariana/agent/loop.py``
+        # halts at ``spent_usd >= budget_usd`` measured in the same dollars
+        # the user paid for.  The previous formula ``max(200, budget_usd*500)``
+        # over-collected by 5x because the runtime/UI ceiling is the
+        # 100c/USD value but the reservation used 500c/USD.
+        #
+        # Settled at task completion (refund unused, deduct overage) by
+        # ``mariana/agent/loop.py:_settle_agent_credits`` once the task
+        # reaches a terminal state (DONE / FAILED / HALTED).  The narrow
+        # pre-enqueue insert-failure refund below is kept for the case where
+        # the row never makes it into Postgres (so the loop never runs).
+        # Late import avoids the circular dependency between api.py and
+        # this module.
         reserved_credits = 0
         try:
             from mariana.api import (  # noqa: PLC0415
@@ -410,16 +423,17 @@ def make_routes(
                 _supabase_add_credits as _refund,
             )
             cfg = _get_cfg()
-            # Conservative estimate: 500 credits per $ of budget. Quick tasks
-            # cost ~200 credits, deep ones up to ~5000. Refunded on error.
-            reserved_credits = max(200, int(body.budget_usd * 500))
+            # Canonical: 100 credits per $1 of budget, with a 100-credit
+            # floor for sub-$1 tasks so we cover the planner round-trip.
+            reserved_credits = max(100, int(body.budget_usd * 100))
             if cfg.SUPABASE_URL and cfg.SUPABASE_ANON_KEY:
                 result = await _deduct(current_user["user_id"], reserved_credits, cfg)
                 if result == "insufficient":
                     raise HTTPException(
                         status_code=402,
                         detail=(
-                            f"Insufficient credits. This task needs ~{reserved_credits} credits. "
+                            f"Insufficient credits. This task needs ~{reserved_credits} credits "
+                            f"(at 100 credits/$ canonical conversion). "
                             f"Subscribe or upgrade your plan on the Pricing page."
                         ),
                     )
@@ -443,6 +457,10 @@ def make_routes(
             budget_usd=body.budget_usd,
             max_duration_hours=body.max_duration_hours,
             state=AgentState.PLAN,
+            # M-01: hand the reservation amount to the runtime so the loop
+            # can settle it (refund unused, deduct overage) at terminal
+            # state.  ``credits_settled`` defaults to False on a fresh task.
+            reserved_credits=reserved_credits,
         )
 
         # Refund-on-DB-failure guard: if the INSERT blows up, credits are
