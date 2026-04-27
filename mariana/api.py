@@ -5893,6 +5893,18 @@ async def _handle_checkout_completed(
     if update_payload and cfg.SUPABASE_URL and _supabase_api_key(cfg):
         await _supabase_patch_profile(user_id, update_payload, cfg)
 
+    # H-01: resolve pi_id from session. For subscriptions the PaymentIntent
+    # may be on the latest invoice; for payment-mode sessions it's at top level.
+    # Don't crash if absent — just pass None.
+    _checkout_pi_id: str | None = session_obj.get("payment_intent") or None
+    if not _checkout_pi_id and subscription_id:
+        try:
+            _latest_inv = (sub if 'sub' in dir() else {}).get("latest_invoice") or {}
+            if isinstance(_latest_inv, dict):
+                _checkout_pi_id = _latest_inv.get("payment_intent") or None
+        except Exception:  # noqa: BLE001
+            pass
+
     if credits_to_add > 0:
         await _grant_credits_for_event(
             user_id=user_id,
@@ -5901,6 +5913,7 @@ async def _handle_checkout_completed(
             ref_id=event_id,
             expires_at=period_end,
             cfg=cfg,
+            pi_id=_checkout_pi_id,
         )
 
     logger.info(
@@ -5966,6 +5979,9 @@ async def _handle_invoice_paid(
         except (TypeError, ValueError):
             period_end_iso = None
 
+    # H-01: invoice.paid carries payment_intent at top level.
+    _invoice_pi_id: str | None = invoice_obj.get("payment_intent") or None
+
     await _grant_credits_for_event(
         user_id=user_id,
         credits=int(plan["credits_per_month"]),
@@ -5973,6 +5989,7 @@ async def _handle_invoice_paid(
         ref_id=event_id,
         expires_at=period_end_iso,
         cfg=cfg,
+        pi_id=_invoice_pi_id,
     )
 
     if cfg.SUPABASE_URL and _supabase_api_key(cfg):
@@ -6030,6 +6047,7 @@ async def _handle_payment_intent_succeeded(
         ref_id=event_id,
         expires_at=None,
         cfg=cfg,
+        pi_id=pi_obj.get("id"),  # H-01: link pi_id for refund/dispute lookup
     )
     logger.info(
         "topup_granted",
@@ -6047,11 +6065,17 @@ async def _grant_credits_for_event(
     ref_id: str,
     expires_at: str | None,
     cfg: AppConfig,
+    pi_id: str | None = None,
+    charge_id: str | None = None,
 ) -> None:
     """Idempotent grant via the ledger RPC. ``ref_id`` should be the Stripe event id.
 
     Replays of the same Stripe event collapse to a single bucket because the
     grant_credits RPC is idempotent on (ref_type, ref_id).
+
+    H-01: When pi_id is provided and the grant is new (status != 'duplicate'),
+    insert a row into stripe_payment_grants so that refund/dispute handlers can
+    perform an exact, scoped lookup rather than a global latest-grant fallback.
     """
     from mariana.billing.ledger import grant_credits as _grant_rpc, LedgerError
 
@@ -6065,7 +6089,7 @@ async def _grant_credits_for_event(
         )
         raise HTTPException(status_code=503, detail="Credit ledger unavailable")
     try:
-        await _grant_rpc(
+        result = await _grant_rpc(
             supabase_url=cfg.SUPABASE_URL,
             service_key=api_key,
             user_id=user_id,
@@ -6085,6 +6109,39 @@ async def _grant_credits_for_event(
         )
         # Surface as 500 so Stripe retries via the outer handler
         raise HTTPException(status_code=503, detail="Credit grant failed") from exc
+
+    # H-01: persist pi_id mapping so refund/dispute handlers can look up the
+    # exact grant by payment_intent_id rather than falling back globally.
+    grant_status = result.get("status") if isinstance(result, dict) else None
+    if pi_id and grant_status != "duplicate":
+        pg_url = f"{cfg.SUPABASE_URL}/rest/v1/stripe_payment_grants"
+        pg_headers = {
+            "apikey": api_key,
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=ignore-duplicates,return=minimal",
+        }
+        pg_payload: dict[str, Any] = {
+            "payment_intent_id": pi_id,
+            "user_id": user_id,
+            "credits": int(credits),
+            "event_id": ref_id,
+            "source": source,
+        }
+        if charge_id:
+            pg_payload["charge_id"] = charge_id
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(pg_url, json=pg_payload, headers=pg_headers)
+        except Exception as exc:  # noqa: BLE001
+            # Non-fatal: log and continue. The grant itself succeeded; the
+            # mapping row can be repaired manually if needed.
+            logger.error(
+                "stripe_payment_grants_insert_failed",
+                pi_id=pi_id,
+                user_id=user_id,
+                error=str(exc),
+            )
 
 
 async def _get_user_id_for_customer(
@@ -6213,42 +6270,17 @@ async def _lookup_grant_tx_for_payment_intent(
     payment_intent_id: str,
     cfg: AppConfig,
 ) -> dict[str, Any] | None:
-    """Look up the original credit grant transaction linked to a PaymentIntent.
+    """Look up the original credit grant linked to a PaymentIntent.
 
-    The grant was recorded with ref_type='stripe_event' and ref_id=<the
-    payment_intent.succeeded (or invoice.paid) event_id>. We cannot look up
-    by event_id directly from a charge object — instead we query all grant
-    transactions where metadata or a separate index can link them.  Since
-    Stripe provides the payment_intent on the charge, we look for grant rows
-    whose bucket was created with a ref_id that corresponds to a
-    payment_intent.succeeded event for that PI.
+    H-01 fix: queries stripe_payment_grants (the explicit pi-to-grant mapping
+    table written at grant time). Returns user_id, credits, event_id if found.
 
-    Approach: query credit_transactions where type='grant' AND ref_type=
-    'stripe_event', then filter by metadata containing the payment_intent_id
-    as a fallback.  The reliable path is to query by payment_intent_id stored
-    in the bucket metadata if present; otherwise return the most recent grant
-    row for this user that was created around the same time.
+    The global latest-grant fallback that previously existed here has been
+    removed. It was vulnerable to cross-account credit misattribution: a
+    refund for user B could resolve to user A's most recent grant row.
 
-    Because our payment_intent.succeeded handler embeds the PI id in the
-    Stripe event id (the event carries pi_obj.id), we instead query Stripe
-    for the event that belongs to this PaymentIntent, then look up the grant
-    by that event_id.  To keep this handler offline-testable without a live
-    Stripe call, we store the PI id in the transaction metadata at grant time
-    (B-04 note: this was not added before; we fall back to listing grant txs
-    and matching by metadata["pi_id"] when available, otherwise just take
-    the first match by payment_intent_id in the REST query).
-
-    Simpler pragmatic approach used here: query credit_transactions with
-    ``metadata->>'pi_id' = payment_intent_id`` first; if nothing, fall back
-    to querying all grant rows and accept the first one whose bucket
-    ref_id matches a payment_intent.succeeded event for this PI.
-
-    For the purposes of B-04, the reliable path is: we store metadata
-    in the grant row that includes the payment_intent id.  The existing
-    _grant_credits_for_event does NOT do that yet; but we can still locate
-    the grant by querying the stripe_webhook_events table for the
-    payment_intent.succeeded event_id that processed this PI, then looking
-    up the credit_transactions row with that ref_id.
+    If no exact mapping exists, log and return None so the caller skips the
+    reversal rather than debiting an unrelated user.
     """
     api_key = _supabase_api_key(cfg)
     if not cfg.SUPABASE_URL or not api_key:
@@ -6258,53 +6290,157 @@ async def _lookup_grant_tx_for_payment_intent(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    # Query: find grant transactions where the linked bucket has a ref_id
-    # matching a payment_intent.succeeded event for this PI.  The simplest
-    # approach: search credit_transactions joined with stripe_webhook_events
-    # via RPC — but we don't have that RPC.  Instead use the REST API to
-    # query credit_transactions directly filtering by type='grant' AND
-    # ref_type='stripe_event'.  We then match on metadata->>'pi_id' if set,
-    # or simply accept the first match (correct for the common case where
-    # each payment_intent creates exactly one grant).
-    url = f"{cfg.SUPABASE_URL}/rest/v1/credit_transactions"
-    params: dict[str, str] = {
-        "type": "eq.grant",
-        "ref_type": "eq.stripe_event",
-        "order": "created_at.desc",
-        "limit": "50",
-        "select": "id,user_id,credits,ref_id,metadata",
-    }
-    # Filter by pi_id in metadata if Supabase supports it (PostgREST jsonb filter).
-    params["metadata->>pi_id"] = f"eq.{payment_intent_id}"
+    url = (
+        f"{cfg.SUPABASE_URL}/rest/v1/stripe_payment_grants"
+        f"?payment_intent_id=eq.{payment_intent_id}"
+        f"&select=user_id,credits,event_id"
+    )
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            resp = await client.get(url, params=params, headers=headers)
+            resp = await client.get(url, headers=headers)
         except httpx.HTTPError as exc:
-            logger.error("grant_tx_lookup_network_error", pi_id=payment_intent_id, error=str(exc))
+            logger.error(
+                "grant_lookup_network_error",
+                pi_id=payment_intent_id,
+                error=str(exc),
+            )
             return None
-    if resp.status_code == 200:
-        rows = resp.json() or []
-        if rows:
-            return rows[0]
-    # Fallback: drop the pi_id filter and return the first grant row.
-    # This is correct when there is exactly one grant per user per payment.
-    params_fallback: dict[str, str] = {
-        "type": "eq.grant",
-        "ref_type": "eq.stripe_event",
-        "order": "created_at.desc",
-        "limit": "1",
-        "select": "id,user_id,credits,ref_id,metadata",
+    if resp.status_code != 200:
+        logger.error(
+            "grant_lookup_failed",
+            pi_id=payment_intent_id,
+            status=resp.status_code,
+        )
+        return None
+    rows = resp.json() or []
+    if not rows:
+        logger.warning(
+            "grant_lookup_no_exact_mapping",
+            pi_id=payment_intent_id,
+        )
+        return None
+    return rows[0]
+
+async def _record_dispute_reversal_or_skip(
+    charge_obj: dict[str, Any],
+    dispute_obj: dict[str, Any] | None,
+    event_id: str,
+    event_type: str,
+    user_id: str,
+    credits: int,
+    cfg: AppConfig,
+) -> bool:
+    """Check if this reversal has already been processed; record it if not.
+
+    H-02 fix: deduplicates reversal events on a stable business key rather
+    than the Stripe event_id, so that charge.dispute.created and
+    charge.dispute.funds_withdrawn for the same dispute both resolve to the
+    same reversal_key and the second event is a no-op.
+
+    Returns True if the reversal was already recorded (caller should skip).
+    Returns False if the reversal is new (caller should proceed then call this
+    again after success — but we insert BEFORE returning False so the caller
+    just needs to call once; the INSERT uses ignore-duplicates so it is safe).
+    """
+    api_key = _supabase_api_key(cfg)
+    if not cfg.SUPABASE_URL or not api_key:
+        return False
+
+    dispute_id: str | None = None
+    if dispute_obj and dispute_obj.get("id"):
+        dispute_id = dispute_obj["id"]
+        reversal_key = f"dispute:{dispute_id}"
+    else:
+        charge_id = charge_obj.get("id") or ""
+        reversal_key = f"charge:{charge_id}:reversal"
+
+    headers = {
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
     }
-    async with httpx.AsyncClient(timeout=10.0) as client:
+
+    # SELECT — check for existing row.
+    check_url = (
+        f"{cfg.SUPABASE_URL}/rest/v1/stripe_dispute_reversals"
+        f"?reversal_key=eq.{reversal_key}"
+        f"&select=reversal_key"
+    )
+    async with httpx.AsyncClient(timeout=5.0) as client:
         try:
-            resp2 = await client.get(url, params=params_fallback, headers=headers)
+            resp = await client.get(check_url, headers=headers)
         except httpx.HTTPError as exc:
-            logger.error("grant_tx_fallback_lookup_network_error", pi_id=payment_intent_id, error=str(exc))
-            return None
-    if resp2.status_code == 200:
-        rows2 = resp2.json() or []
-        return rows2[0] if rows2 else None
-    return None
+            logger.error(
+                "dispute_reversal_check_network_error",
+                reversal_key=reversal_key,
+                error=str(exc),
+            )
+            # On network error, allow reversal to proceed (idempotent RPC will guard).
+            return False
+
+    if resp.status_code == 200 and resp.json():
+        logger.info(
+            "dispute_reversal_already_processed",
+            reversal_key=reversal_key,
+            event_id=event_id,
+        )
+        return True  # skip
+
+    return False  # proceed
+
+
+async def _insert_dispute_reversal(
+    charge_obj: dict[str, Any],
+    dispute_obj: dict[str, Any] | None,
+    event_id: str,
+    event_type: str,
+    user_id: str,
+    credits: int,
+    pi_id: str | None,
+    cfg: AppConfig,
+) -> None:
+    """Insert a stripe_dispute_reversals row after a successful reversal.
+
+    Uses ignore-duplicates so retries (e.g. Stripe webhook delivery retry) are safe.
+    """
+    api_key = _supabase_api_key(cfg)
+    if not cfg.SUPABASE_URL or not api_key:
+        return
+
+    dispute_id: str | None = None
+    if dispute_obj and dispute_obj.get("id"):
+        dispute_id = dispute_obj["id"]
+        reversal_key = f"dispute:{dispute_id}"
+    else:
+        charge_id = charge_obj.get("id") or ""
+        reversal_key = f"charge:{charge_id}:reversal"
+
+    headers = {
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=ignore-duplicates,return=minimal",
+    }
+    payload: dict[str, Any] = {
+        "reversal_key": reversal_key,
+        "user_id": user_id,
+        "charge_id": charge_obj.get("id"),
+        "dispute_id": dispute_id,
+        "payment_intent_id": pi_id,
+        "credits": credits,
+        "first_event_id": event_id,
+        "first_event_type": event_type,
+    }
+    insert_url = f"{cfg.SUPABASE_URL}/rest/v1/stripe_dispute_reversals"
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            await client.post(insert_url, json=payload, headers=headers)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "dispute_reversal_insert_failed",
+                reversal_key=reversal_key,
+                error=str(exc),
+            )
 
 
 async def _reverse_credits_for_charge(
@@ -6312,14 +6448,18 @@ async def _reverse_credits_for_charge(
     cfg: AppConfig,
     *,
     event_id: str,
+    dispute_obj: dict[str, Any] | None = None,
+    event_type: str = "charge.refunded",
 ) -> None:
     """Core reversal logic shared by charge.refunded and dispute handlers.
 
-    1. Resolve the payment_intent_id from the charge object.
-    2. Look up the original grant transaction via credit_transactions.
-    3. Compute pro-rata credits to debit (full or partial).
-    4. Call refund_credits RPC which debits the user's balance and records a
+    1. H-02: Dedup check via stripe_dispute_reversals (stable reversal_key).
+    2. Resolve the payment_intent_id from the charge object.
+    3. Look up the original grant via stripe_payment_grants (H-01).
+    4. Compute pro-rata credits to debit (full or partial).
+    5. Call refund_credits RPC which debits the user's balance and records a
        type='refund' transaction row (idempotent on ref_id=event_id).
+    6. H-02: Insert into stripe_dispute_reversals after success.
     """
     from mariana.billing.ledger import refund_credits as _refund_rpc, LedgerError
 
@@ -6345,6 +6485,19 @@ async def _reverse_credits_for_charge(
     original_credits: int = int(grant_tx["credits"])
     amount_total: int = int(charge_obj.get("amount") or 0)
     amount_refunded: int = int(charge_obj.get("amount_refunded") or charge_obj.get("amount") or 0)
+
+    # H-02: dedup check before computing/executing the reversal.
+    already_done = await _record_dispute_reversal_or_skip(
+        charge_obj=charge_obj,
+        dispute_obj=dispute_obj,
+        event_id=event_id,
+        event_type=event_type,
+        user_id=user_id,
+        credits=original_credits,
+        cfg=cfg,
+    )
+    if already_done:
+        return
 
     # Pro-rata: if partial refund, scale credits proportionally.
     if amount_total > 0 and amount_refunded < amount_total:
@@ -6402,6 +6555,18 @@ async def _reverse_credits_for_charge(
         pi_id=pi_id,
     )
 
+    # H-02: record successful reversal so duplicate events are deduped.
+    await _insert_dispute_reversal(
+        charge_obj=charge_obj,
+        dispute_obj=dispute_obj,
+        event_id=event_id,
+        event_type=event_type,
+        user_id=user_id,
+        credits=credits_to_debit,
+        pi_id=pi_id,
+        cfg=cfg,
+    )
+
 
 async def _handle_charge_refunded(
     charge_obj: dict[str, Any],
@@ -6413,8 +6578,15 @@ async def _handle_charge_refunded(
 
     B-04 fix: previously this event was unhandled (fell to the `else` branch).
     Now we look up the grant, compute pro-rata debits, and call refund_credits.
+    H-02: uses reversal_key='charge:<id>:reversal' for dedup.
     """
-    await _reverse_credits_for_charge(charge_obj, cfg, event_id=event_id)
+    await _reverse_credits_for_charge(
+        charge_obj,
+        cfg,
+        event_id=event_id,
+        dispute_obj=None,
+        event_type="charge.refunded",
+    )
 
 
 async def _handle_charge_dispute_created(
@@ -6428,6 +6600,7 @@ async def _handle_charge_dispute_created(
     B-04 fix: we reverse on dispute creation so the user cannot spend disputed
     credits while the chargeback is in flight. The dispute amount equals the
     original charge amount so full reversal is always applied.
+    H-02: uses reversal_key='dispute:<id>' for dedup against funds_withdrawn.
     """
     # Dispute objects have `charge` (id) and `payment_intent` (id); both
     # mirror the original charge. Build a pseudo-charge dict so we can reuse
@@ -6438,7 +6611,13 @@ async def _handle_charge_dispute_created(
         "amount": dispute_obj.get("amount"),
         "amount_refunded": dispute_obj.get("amount"),  # full reversal
     }
-    await _reverse_credits_for_charge(charge_dict, cfg, event_id=event_id)
+    await _reverse_credits_for_charge(
+        charge_dict,
+        cfg,
+        event_id=event_id,
+        dispute_obj=dispute_obj,
+        event_type="charge.dispute.created",
+    )
 
 
 async def _handle_charge_dispute_funds_withdrawn(
@@ -6449,12 +6628,9 @@ async def _handle_charge_dispute_funds_withdrawn(
 ) -> None:
     """Process charge.dispute.funds_withdrawn: funds have been taken by Stripe.
 
-    B-04 fix: this is the definitive financial event confirming the chargeback
-    succeeded. Reverse any remaining credits (if dispute.created already ran,
-    the refund_credits RPC will return 'duplicate' on the same event_id —
-    but this is a different event_id so we record a new reversal row.  If
-    dispute.created already ran, the user's balance was already zeroed; the
-    new refund will attempt to debit 0 and the RPC will return 'no_credits').
+    B-04 fix: this is the definitive financial event confirming the chargeback.
+    H-02: reversal_key='dispute:<id>' matches the key from dispute.created, so
+    if dispute.created already ran, this event is a no-op via dedup check.
     """
     charge_dict: dict[str, Any] = {
         "id": dispute_obj.get("charge"),
@@ -6462,7 +6638,13 @@ async def _handle_charge_dispute_funds_withdrawn(
         "amount": dispute_obj.get("amount"),
         "amount_refunded": dispute_obj.get("amount"),  # full reversal
     }
-    await _reverse_credits_for_charge(charge_dict, cfg, event_id=event_id)
+    await _reverse_credits_for_charge(
+        charge_dict,
+        cfg,
+        event_id=event_id,
+        dispute_obj=dispute_obj,
+        event_type="charge.dispute.funds_withdrawn",
+    )
 
 
 # ---------------------------------------------------------------------------

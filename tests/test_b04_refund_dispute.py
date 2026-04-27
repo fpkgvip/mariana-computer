@@ -229,15 +229,11 @@ def _grant_tx_response(
     credits: int = 3000,
     event_id: str = "evt_pi_1",
 ) -> _FakeResp:
-    """Canned response for credit_transactions REST lookup."""
+    """Canned response for stripe_payment_grants REST lookup (H-01)."""
     return _FakeResp(200, [{
-        "id": "tx-uuid-1",
         "user_id": user_id,
-        "type": "grant",
         "credits": credits,
-        "ref_type": "stripe_event",
-        "ref_id": event_id,
-        "metadata": {"source": "topup"},
+        "event_id": event_id,
     }])
 
 
@@ -274,7 +270,8 @@ async def test_full_refund_reverses_full_grant():
     refund_resp = _refund_rpc_response(credits_debited=original_credits)
     client = _RecordingClient(
         by_path={
-            "/rest/v1/credit_transactions": grant_tx_resp,
+            "stripe_payment_grants": grant_tx_resp,
+            "stripe_dispute_reversals": _FakeResp(200, []),
             "rpc/refund_credits": refund_resp,
         }
     )
@@ -320,7 +317,8 @@ async def test_partial_refund_reverses_pro_rata():
     refund_resp = _refund_rpc_response(credits_debited=expected_debited)
     client = _RecordingClient(
         by_path={
-            "/rest/v1/credit_transactions": grant_tx_resp,
+            "stripe_payment_grants": grant_tx_resp,
+            "stripe_dispute_reversals": _FakeResp(200, []),
             "rpc/refund_credits": refund_resp,
         }
     )
@@ -356,7 +354,7 @@ async def test_refund_of_unknown_charge_is_noop(caplog):
     import logging
     cfg = _cfg()
     client = _RecordingClient(
-        by_path={"/rest/v1/credit_transactions": _no_grant_tx_response()}
+        by_path={"stripe_payment_grants": _no_grant_tx_response()}
     )
 
     with patch.object(httpx, "AsyncClient", return_value=client), caplog.at_level(logging.WARNING):
@@ -392,7 +390,8 @@ async def test_dispute_funds_withdrawn_reverses_grant():
     refund_resp = _refund_rpc_response(credits_debited=original_credits)
     client = _RecordingClient(
         by_path={
-            "/rest/v1/credit_transactions": grant_tx_resp,
+            "stripe_payment_grants": grant_tx_resp,
+            "stripe_dispute_reversals": _FakeResp(200, []),
             "rpc/refund_credits": refund_resp,
         }
     )
@@ -433,7 +432,8 @@ async def test_refund_event_replay_is_idempotent():
     dup_resp = _duplicate_refund_rpc_response()
     client = _RecordingClient(
         by_path={
-            "/rest/v1/credit_transactions": grant_tx_resp,
+            "stripe_payment_grants": grant_tx_resp,
+            "stripe_dispute_reversals": _FakeResp(200, []),
             "rpc/refund_credits": dup_resp,
         }
     )
@@ -473,7 +473,8 @@ async def test_refund_of_subscription_invoice_reverses_grant():
     refund_resp = _refund_rpc_response(credits_debited=plan_credits)
     client = _RecordingClient(
         by_path={
-            "/rest/v1/credit_transactions": grant_tx_resp,
+            "stripe_payment_grants": grant_tx_resp,
+            "stripe_dispute_reversals": _FakeResp(200, []),
             "rpc/refund_credits": refund_resp,
         }
     )
@@ -513,7 +514,8 @@ async def test_original_grant_lookup_uses_stripe_event_ref_type():
     refund_resp = _refund_rpc_response(credits_debited=1000)
     client = _RecordingClient(
         by_path={
-            "/rest/v1/credit_transactions": grant_tx_resp,
+            "stripe_payment_grants": grant_tx_resp,
+            "stripe_dispute_reversals": _FakeResp(200, []),
             "rpc/refund_credits": refund_resp,
         }
     )
@@ -530,13 +532,13 @@ async def test_original_grant_lookup_uses_stripe_event_ref_type():
             event_id="evt_ref_lookup_1",
         )
 
-    # Verify the GET request contained the right filters.
-    get_calls = [c for c in client.calls if c["method"] == "GET" and "credit_transactions" in c["url"]]
-    assert len(get_calls) >= 1
-    params = get_calls[0].get("params") or {}
-    params_str = str(params)
-    assert "stripe_event" in params_str, f"Expected ref_type filter in params: {params_str}"
-    assert "grant" in params_str, f"Expected type=grant filter in params: {params_str}"
+    # Verify the GET request hit stripe_payment_grants (H-01 fix).
+    get_calls = [c for c in client.calls if c["method"] == "GET" and "stripe_payment_grants" in c["url"]]
+    assert len(get_calls) >= 1, (
+        f"Expected stripe_payment_grants GET call, got: {[c['url'] for c in client.calls if c['method'] == 'GET']}"
+    )
+    # payment_intent_id filter must be in the URL
+    assert "payment_intent_id=eq.pi_lookup" in get_calls[0]["url"]
 
 
 # ---------------------------------------------------------------------------
@@ -614,7 +616,8 @@ async def test_dispute_created_no_reversal_logged(caplog):
     refund_resp = _refund_rpc_response(credits_debited=original_credits)
     client = _RecordingClient(
         by_path={
-            "/rest/v1/credit_transactions": grant_tx_resp,
+            "stripe_payment_grants": grant_tx_resp,
+            "stripe_dispute_reversals": _FakeResp(200, []),
             "rpc/refund_credits": refund_resp,
         }
     )
@@ -658,7 +661,8 @@ async def test_partial_refund_already_spent_credits_no_error():
     })
     client = _RecordingClient(
         by_path={
-            "/rest/v1/credit_transactions": grant_tx_resp,
+            "stripe_payment_grants": grant_tx_resp,
+            "stripe_dispute_reversals": _FakeResp(200, []),
             "rpc/refund_credits": spent_refund_resp,
         }
     )
