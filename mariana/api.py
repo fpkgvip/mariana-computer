@@ -1260,6 +1260,8 @@ async def _require_investigation_owner(
 # ---------------------------------------------------------------------------
 _STREAM_TOKEN_SECRET: bytes | None = None
 _STREAM_TOKEN_TTL_SECONDS = 120  # 2 minutes — client must refresh
+_PREVIEW_TOKEN_TTL_SECONDS = 60 * 60 * 4  # 4 hours — typical iframe session
+_PREVIEW_COOKIE_PREFIX = "deft_preview_"  # one cookie per task, scoped path
 
 
 def _get_stream_token_secret() -> bytes:
@@ -1311,6 +1313,46 @@ def _mint_stream_token(user_id: str, task_id: str) -> str:
     payload = f"{user_id}|{task_id}|{exp}"
     sig = hmac.new(_get_stream_token_secret(), payload.encode(), hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
+
+
+def _mint_preview_token(user_id: str, task_id: str) -> str:
+    """Create a short-lived HMAC-signed token authorising preview asset reads.
+
+    F-01: Same construction as stream tokens but a different scope marker so
+    a stream token cannot be replayed against the preview route or vice versa.
+    Payload: ``preview|{user_id}|{task_id}|{exp_timestamp}``.
+    """
+    exp = int(time.time()) + _PREVIEW_TOKEN_TTL_SECONDS
+    payload = f"preview|{user_id}|{task_id}|{exp}"
+    sig = hmac.new(_get_stream_token_secret(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
+
+
+def _verify_preview_token(token: str, task_id: str) -> str | None:
+    """Return the user_id encoded in a preview token, or ``None`` on any failure.
+
+    F-01: rejection is silent (None) so route handlers can fall back to an
+    Authorization-header check rather than 401-ing iframe subresource loads.
+    """
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode()).decode()
+        parts = decoded.split("|")
+        if len(parts) != 5:
+            return None
+        scope, user_id, tok_task_id, exp_str, sig = parts
+        if scope != "preview":
+            return None
+        payload = f"{scope}|{user_id}|{tok_task_id}|{exp_str}"
+        expected_sig = hmac.new(_get_stream_token_secret(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            return None
+        if tok_task_id != task_id:
+            return None
+        if int(exp_str) + 5 < int(time.time()):  # 5s clock skew grace
+            return None
+        return user_id
+    except Exception:
+        return None
 
 
 def _verify_stream_token(token: str, task_id: str) -> str:
@@ -1511,28 +1553,96 @@ try:
     _PREVIEW_ROOT_PATH.mkdir(parents=True, exist_ok=True)
     _SAFE_PREVIEW_TASK = _re_preview.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 
+    def _read_preview_manifest(task_id: str) -> dict[str, Any] | None:
+        """Return the parsed manifest for a deployed preview, or None."""
+        manifest_file = _PREVIEW_ROOT_PATH / task_id / "_deft_manifest.json"
+        if not manifest_file.is_file():
+            return None
+        try:
+            return json.loads(manifest_file.read_text("utf-8"))
+        except Exception:
+            return None
+
+    async def _authorize_preview_request(
+        request: Request,
+        task_id: str,
+    ) -> str | None:
+        """F-01: enforce ownership on every preview asset request.
+
+        Resolution order:
+          1. Signed preview cookie (set by /api/preview/{task_id} when the owner
+             polls the manifest). This is what iframe subresources carry.
+          2. ?preview_token=... query string (allows manual sharing of a single
+             URL even when third-party cookies are blocked, e.g. inside an
+             embedded iframe across origins).
+          3. Authorization: Bearer <jwt> header (used by direct backend hits
+             from API clients and tests).
+
+        Returns the authenticated user_id on success, or None if the request
+        is unauthenticated. Owner check vs. the manifest is performed by the
+        caller because manifests may be missing.
+        """
+        cookie_name = f"{_PREVIEW_COOKIE_PREFIX}{task_id}"
+        cookie_token = request.cookies.get(cookie_name)
+        if cookie_token:
+            user_id = _verify_preview_token(cookie_token, task_id)
+            if user_id:
+                return user_id
+        query_token = request.query_params.get("preview_token")
+        if query_token:
+            user_id = _verify_preview_token(query_token, task_id)
+            if user_id:
+                return user_id
+        # Authorization header fallback — tolerated for tooling/admin checks.
+        auth_header = request.headers.get("authorization") or ""
+        if auth_header.lower().startswith("bearer "):
+            jwt_token = auth_header.split(" ", 1)[1].strip()
+            try:
+                user = await _authenticate_supabase_token(jwt_token)
+                return user.get("user_id")
+            except Exception:
+                return None
+        return None
+
+    async def _enforce_preview_owner(request: Request, task_id: str) -> None:
+        """Raise HTTPException unless the request is by the preview owner.
+
+        Returning 404 (not 403) for unauthenticated/unknown previews matches
+        the existing manifest-route behavior and avoids leaking task-id
+        existence to anonymous probes.
+        """
+        manifest = _read_preview_manifest(task_id)
+        if manifest is None:
+            raise HTTPException(404, "preview not found")
+        owner = manifest.get("user_id") or ""
+        user_id = await _authorize_preview_request(request, task_id)
+        if not user_id:
+            raise HTTPException(401, "preview authentication required")
+        if owner and owner != user_id and not _is_admin_user(user_id):
+            raise HTTPException(403, "not your preview")
+
     @app.get("/preview/{task_id}", include_in_schema=False)
-    async def preview_root_redirect(task_id: str):  # noqa: ANN201
+    async def preview_root_redirect(task_id: str, request: Request):  # noqa: ANN201
         # Redirect /preview/<id> -> /preview/<id>/index.html so iframe paths
         # resolve correctly relative to the entry document.
         from fastapi.responses import RedirectResponse  # noqa: PLC0415
         if not _SAFE_PREVIEW_TASK.match(task_id):
             raise HTTPException(404, "preview not found")
+        await _enforce_preview_owner(request, task_id)
         return RedirectResponse(url=f"/preview/{task_id}/index.html", status_code=302)
 
     @app.get("/preview/{task_id}/{file_path:path}", include_in_schema=False)
-    async def preview_static(task_id: str, file_path: str):  # noqa: ANN201
+    async def preview_static(task_id: str, file_path: str, request: Request):  # noqa: ANN201
         """Serve files from the per-task preview snapshot.
 
-        Security: task_id whitelist; resolved path must stay inside the
-        task root.  Cache-Control: no-cache to keep the iframe live during
-        rapid redeploys.  CORS: open (the frontend iframe lives on a
-        different origin than the backend).
+        F-01: every asset request is owner-gated. Path checks remain in place
+        as defense in depth.
         """
         if not _SAFE_PREVIEW_TASK.match(task_id):
             raise HTTPException(404, "preview not found")
         if "\x00" in file_path or ".." in file_path.split("/"):
             raise HTTPException(400, "invalid path")
+        await _enforce_preview_owner(request, task_id)
         root = (_PREVIEW_ROOT_PATH / task_id).resolve()
         if not root.is_dir():
             raise HTTPException(404, "preview not found")
@@ -1557,35 +1667,57 @@ try:
         }
         return _FileResponse(str(target), media_type=ctype, headers=headers)
 
+    def _set_preview_cookie(response: Response, task_id: str, token: str) -> None:
+        """Attach an HttpOnly preview cookie scoped to /preview/{task_id}."""
+        response.set_cookie(
+            key=f"{_PREVIEW_COOKIE_PREFIX}{task_id}",
+            value=token,
+            max_age=_PREVIEW_TOKEN_TTL_SECONDS,
+            path=f"/preview/{task_id}",
+            httponly=True,
+            secure=True,
+            samesite="lax",
+        )
+
     @app.get("/api/preview/{task_id}", tags=["Status"])
     async def preview_manifest(
         task_id: str,
+        response: Response,
         current_user: dict = Depends(_get_current_user),  # noqa: B008
     ) -> dict[str, Any]:
-        """Return the manifest for a task's deployed preview, if any."""
+        """Return the manifest for a task's deployed preview, if any.
+
+        F-01: when the caller is the verified owner, mints a preview cookie
+        scoped to /preview/{task_id} so iframe subresource loads can pass the
+        owner check without exposing the JWT to the iframe document.
+        """
         if not _SAFE_PREVIEW_TASK.match(task_id):
             raise HTTPException(404, "preview not found")
-        manifest_file = _PREVIEW_ROOT_PATH / task_id / "_deft_manifest.json"
-        if not manifest_file.is_file():
-            return {"task_id": task_id, "deployed": False}
-        try:
-            data = json.loads(manifest_file.read_text("utf-8"))
-        except Exception:
+        manifest = _read_preview_manifest(task_id)
+        if manifest is None:
             return {"task_id": task_id, "deployed": False}
         # Owners only — sanity check user_id; admins always allowed.
-        owner = data.get("user_id")
-        if owner and owner != current_user.get("user_id") and not _is_admin_user(current_user.get("user_id", "")):
+        owner = manifest.get("user_id")
+        user_id = current_user.get("user_id", "")
+        if owner and owner != user_id and not _is_admin_user(user_id):
             raise HTTPException(403, "not your preview")
-        rel_url = f"/preview/{task_id}/{data.get('entry') or 'index.html'}"
+        # Mint and attach the preview cookie. The cookie path is scoped so it
+        # is only sent for /preview/{task_id}/... requests.
+        try:
+            preview_token = _mint_preview_token(user_id or owner or "", task_id)
+            _set_preview_cookie(response, task_id, preview_token)
+        except Exception as cookie_err:  # pragma: no cover — cookie best-effort
+            logger.warning("preview_cookie_set_failed", task_id=task_id, error=str(cookie_err))
+        rel_url = f"/preview/{task_id}/{manifest.get('entry') or 'index.html'}"
         return {
             "task_id": task_id,
             "deployed": True,
             "url": rel_url,
-            "entry": data.get("entry"),
-            "label": data.get("label"),
-            "files": int(data.get("files") or 0),
-            "total_bytes": int(data.get("total_bytes") or 0),
-            "created_at": data.get("created_at"),
+            "entry": manifest.get("entry"),
+            "label": manifest.get("label"),
+            "files": int(manifest.get("files") or 0),
+            "total_bytes": int(manifest.get("total_bytes") or 0),
+            "created_at": manifest.get("created_at"),
         }
 
     logger.info("preview_routes_registered", root=str(_PREVIEW_ROOT_PATH))

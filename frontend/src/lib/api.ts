@@ -84,6 +84,9 @@ export async function apiRequest<T = unknown>(
     method: opts.method ?? "GET",
     headers,
     signal: opts.signal,
+    // F-01: same-origin cookies (e.g. preview cookies set by /api/preview/{id})
+    // must be carried back so iframe subresources can pass the owner check.
+    credentials: "same-origin",
   };
   if (opts.body !== undefined) {
     init.body =
