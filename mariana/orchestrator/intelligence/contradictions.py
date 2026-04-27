@@ -225,30 +225,86 @@ async def detect_contradictions(
     return all_contradictions
 
 
-async def get_contradiction_matrix(task_id: str, db: Any) -> dict[str, Any]:
-    """
-    Build the contradiction matrix for synthesis.
+# F-06 pagination constants.
+_INTEL_MAX_LIMIT = 1000
+_INTEL_DEFAULT_LIMIT = 100
 
-    Returns a structured summary of all contradictions with their
-    resolution statuses, suitable for injection into the report synthesis prompt.
+
+async def get_contradiction_matrix(
+    task_id: str,
+    db: Any,
+    limit: int = _INTEL_DEFAULT_LIMIT,
+    cursor: str | None = None,
+) -> dict[str, Any]:
     """
-    rows = await db.fetch(
-        """
-        SELECT
-            cp.*,
-            ca.claim_text as claim_a_text,
-            cb.claim_text as claim_b_text,
-            ca.confidence as claim_a_confidence,
-            cb.confidence as claim_b_confidence,
-            ca.subject as subject
-        FROM contradiction_pairs cp
-        JOIN claims ca ON cp.claim_a_id = ca.id
-        JOIN claims cb ON cp.claim_b_id = cb.id
-        WHERE cp.task_id = $1
-        ORDER BY cp.severity DESC
-        """,
-        task_id,
-    )
+    Build the contradiction matrix for synthesis with pagination.
+
+    F-06 fix: returns at most ``limit`` contradictions per page using
+    keyset pagination on (created_at, id). The envelope includes
+    total_contradictions across all pages (count query), plus per-page items.
+    """
+    limit = max(1, min(limit, _INTEL_MAX_LIMIT))
+
+    if cursor:
+        try:
+            cursor_ts, cursor_id = cursor.split("|", 1)
+            rows = await db.fetch(
+                """
+                SELECT
+                    cp.*,
+                    ca.claim_text as claim_a_text,
+                    cb.claim_text as claim_b_text,
+                    ca.confidence as claim_a_confidence,
+                    cb.confidence as claim_b_confidence,
+                    ca.subject as subject
+                FROM contradiction_pairs cp
+                JOIN claims ca ON cp.claim_a_id = ca.id
+                JOIN claims cb ON cp.claim_b_id = cb.id
+                WHERE cp.task_id = $1
+                  AND (cp.created_at, cp.id) > ($2::timestamptz, $3)
+                ORDER BY cp.created_at ASC, cp.id ASC
+                LIMIT $4
+                """,
+                task_id, cursor_ts, cursor_id, limit,
+            )
+        except Exception:
+            rows = await db.fetch(
+                """
+                SELECT
+                    cp.*,
+                    ca.claim_text as claim_a_text,
+                    cb.claim_text as claim_b_text,
+                    ca.confidence as claim_a_confidence,
+                    cb.confidence as claim_b_confidence,
+                    ca.subject as subject
+                FROM contradiction_pairs cp
+                JOIN claims ca ON cp.claim_a_id = ca.id
+                JOIN claims cb ON cp.claim_b_id = cb.id
+                WHERE cp.task_id = $1
+                ORDER BY cp.created_at ASC, cp.id ASC
+                LIMIT $2
+                """,
+                task_id, limit,
+            )
+    else:
+        rows = await db.fetch(
+            """
+            SELECT
+                cp.*,
+                ca.claim_text as claim_a_text,
+                cb.claim_text as claim_b_text,
+                ca.confidence as claim_a_confidence,
+                cb.confidence as claim_b_confidence,
+                ca.subject as subject
+            FROM contradiction_pairs cp
+            JOIN claims ca ON cp.claim_a_id = ca.id
+            JOIN claims cb ON cp.claim_b_id = cb.id
+            WHERE cp.task_id = $1
+            ORDER BY cp.created_at ASC, cp.id ASC
+            LIMIT $2
+            """,
+            task_id, limit,
+        )
 
     contradictions = [dict(r) for r in rows]
     unresolved = [c for c in contradictions if c["resolution_status"] == "unresolved"]

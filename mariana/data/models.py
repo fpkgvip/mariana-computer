@@ -223,6 +223,9 @@ class ResearchTask(BaseModel):
     output_pdf_path: str | None = Field(default=None, description="Path to generated PDF report")
     output_docx_path: str | None = Field(default=None, description="Path to generated DOCX report")
     metadata: dict[str, Any] = Field(default_factory=dict, description="Arbitrary extension fields")
+    # F-05 fix: relational owner FK column.  Nullable for backward-compat with
+    # rows created before this column existed; all new rows must supply this.
+    user_id: str | None = Field(default=None, description="Owner UUID (FK to auth.users)")
 
 
 class Hypothesis(BaseModel):

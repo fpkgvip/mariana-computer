@@ -141,7 +141,22 @@ ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID", "")
 
 
 _ADMIN_ROLE_CACHE: dict[str, tuple[float, bool]] = {}
-_ADMIN_ROLE_CACHE_TTL = 30.0  # seconds
+# B-20 fix: Positive caching dropped entirely — stale positive decisions after
+# role revocation allowed revoked admins to keep calling admin endpoints for up
+# to 30 s.  Negative results (non-admin) are still cached briefly (5 s) to
+# avoid hammering the DB on repeated non-admin calls, but a revoked admin sees
+# a fresh DB check on every request.  This is the lowest-risk fix: only
+# negative-cache entries use the TTL; positive-cache entries are never stored.
+_ADMIN_ROLE_CACHE_NEGATIVE_TTL = 5.0  # seconds — safe to cache negatives
+
+
+def _clear_admin_cache(user_id: str) -> None:
+    """Immediately evict a user from the admin role cache.
+
+    Call this whenever an admin role is granted or revoked so the next
+    request gets a fresh DB check rather than a cached stale decision.
+    """
+    _ADMIN_ROLE_CACHE.pop(user_id, None)
 
 
 def _is_admin_user(user_id: str) -> bool:
@@ -149,7 +164,12 @@ def _is_admin_user(user_id: str) -> bool:
 
     Two-path check:
     1. Fast path — matches env-configured ADMIN_USER_ID (bootstrap admin).
-    2. DB path — profiles.role = 'admin' for this user_id. Cached 30s.
+    2. DB path — profiles.role = 'admin' for this user_id.
+
+    B-20 fix: Positive decisions are NEVER cached.  Only negative decisions
+    are cached for up to 5 s to reduce DB load on unauthenticated probes.
+    This ensures that role revocations take effect immediately (within one
+    request round-trip) rather than after a 30 s stale-cache window.
 
     BUG-0006 fix: When ADMIN_USER_ID is empty and the DB lookup fails or
     no admin row exists, no user is treated as admin.
@@ -159,12 +179,16 @@ def _is_admin_user(user_id: str) -> bool:
     if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
         return True
 
-    # DB-backed admin check with short TTL cache
+    # Check negative-result cache only (positive decisions bypass cache).
     import time as _time
     now = _time.time()
     cached = _ADMIN_ROLE_CACHE.get(user_id)
-    if cached and now - cached[0] < _ADMIN_ROLE_CACHE_TTL:
-        return cached[1]
+    if cached is not None:
+        cached_at, cached_result = cached
+        # Only honour cached negative results within the short TTL.
+        if not cached_result and now - cached_at < _ADMIN_ROLE_CACHE_NEGATIVE_TTL:
+            return False
+        # Cached positive or expired: fall through to fresh DB check.
 
     is_admin = False
     try:
@@ -190,7 +214,12 @@ def _is_admin_user(user_id: str) -> bool:
     except Exception:  # noqa: BLE001 — never leak exceptions from auth gate
         is_admin = False
 
-    _ADMIN_ROLE_CACHE[user_id] = (now, is_admin)
+    # Only cache negative results; positive results always re-checked.
+    if not is_admin:
+        _ADMIN_ROLE_CACHE[user_id] = (now, False)
+    else:
+        # Evict any stale negative entry so subsequent checks are fresh too.
+        _ADMIN_ROLE_CACHE.pop(user_id, None)
     return is_admin
 
 # BUG-API-024: Allow-list of valid task status values. Clients that pass
@@ -348,14 +377,44 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# BUG-API-039: Rate limiting via slowapi middleware.
+# BUG-API-039 / B-21: Rate limiting via slowapi middleware.
 # NOTE: Per-endpoint @limiter.limit() decorators are NOT used because they
 # are incompatible with ``from __future__ import annotations`` (they wrap the
 # function signature and break FastAPI's parameter introspection, causing 422
 # on all decorated POST endpoints).  The global default_limits applies to
 # all endpoints uniformly.  For tighter per-route limits, configure at the
 # reverse-proxy / ingress layer (nginx, Cloudflare, etc.).
-limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
+#
+# B-21 fix: slowapi Limiter is constructed with a Redis storage URI when
+# REDIS_URL is configured, so all workers/instances share rate-limit counters.
+# When Redis is not configured the limiter falls back to in-memory storage
+# (per-process) and a WARNING is emitted at startup so operators are informed.
+# The _redis_rate_limit_url is read directly from env at module-load time so
+# that slowapi's storage is wired before the app is constructed (lifespan runs
+# after the middleware stack is assembled).
+_redis_rate_limit_url: str | None = os.environ.get("REDIS_URL") or None
+
+if _SLOWAPI_AVAILABLE:
+    if _redis_rate_limit_url:
+        # Redis-backed: shared across all workers/instances.
+        limiter = Limiter(
+            key_func=get_remote_address,
+            default_limits=["60/minute"],
+            storage_uri=_redis_rate_limit_url,
+        )
+    else:
+        # Per-process fallback — warn at import time so it surfaces in logs.
+        import warnings as _warnings
+        _warnings.warn(
+            "B-21: REDIS_URL not configured — rate limiter is per-process only. "
+            "With multiple workers each worker gets an independent counter; "
+            "effective limit = N × 60 req/min. Set REDIS_URL for shared limiting.",
+            RuntimeWarning,
+            stacklevel=1,
+        )
+        limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
+else:
+    limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])  # type: ignore[assignment]
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 if _SLOWAPI_AVAILABLE:
@@ -1238,12 +1297,25 @@ async def _require_investigation_owner(
     except (ValueError, AttributeError):
         raise HTTPException(status_code=400, detail="Invalid task ID format")
     db = _get_db()
-    row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
+    # F-05 fix: read the relational user_id column in addition to metadata so
+    # that the FK column is the authoritative ownership signal going forward.
+    row = await db.fetchrow(
+        "SELECT user_id, metadata FROM research_tasks WHERE id = $1", task_id
+    )
     if row is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
     if _is_admin_user(current_user["user_id"]):
         return current_user
 
+    # F-05: prefer the relational column; fall back to metadata for rows that
+    # pre-date this column (backward-compat during cutover).
+    fk_user_id = str(row["user_id"]) if row["user_id"] is not None else None
+    if fk_user_id is not None:
+        if fk_user_id != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="You do not own this investigation")
+        return current_user
+
+    # Fallback: metadata-based check for legacy rows where user_id column is NULL.
     metadata = row.get("metadata") or {}
     if isinstance(metadata, str):
         try:
@@ -1395,10 +1467,20 @@ async def _require_investigation_owner_header_or_query(
     except (ValueError, AttributeError):
         raise HTTPException(status_code=400, detail="Invalid task ID format")
     db = _get_db()
-    row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
+    # F-05 fix: read relational user_id column in addition to metadata.
+    row = await db.fetchrow(
+        "SELECT user_id, metadata FROM research_tasks WHERE id = $1", task_id
+    )
     if row is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
     if _is_admin_user(current_user["user_id"]):
+        return current_user
+
+    # F-05: prefer FK column; fall back to metadata for legacy rows.
+    fk_user_id = str(row["user_id"]) if row["user_id"] is not None else None
+    if fk_user_id is not None:
+        if fk_user_id != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="You do not own this investigation")
         return current_user
 
     metadata = row.get("metadata") or {}
@@ -3001,6 +3083,8 @@ async def start_investigation(
         # immediately after POST sees the task (read-your-writes).
         db = _get_db()
         _parsed_created_at = datetime.fromisoformat(created_at)
+        # F-05 fix: pass user_id explicitly so the relational FK column is
+        # populated alongside the metadata JSONB copy.
         _task_model = _ResearchTask(
             id=task_id,
             topic=body.topic,
@@ -3012,6 +3096,7 @@ async def start_investigation(
             ai_call_counter=0,
             created_at=_parsed_created_at,
             metadata=task_payload,
+            user_id=current_user["user_id"],
         )
         await _db_insert_research_task(db, _task_model)
 
@@ -3247,7 +3332,7 @@ async def get_investigation(
         SELECT id, topic, budget_usd, status, current_state,
                total_spent_usd, ai_call_counter, created_at,
                started_at, completed_at, output_pdf_path, output_docx_path,
-               metadata
+               metadata, user_id
         FROM research_tasks
         WHERE id = $1
         """,
@@ -3255,16 +3340,22 @@ async def get_investigation(
     )
     if row is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
-    # Verify ownership
-    metadata = row.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:  # BUG-API-036: Guard against malformed JSON in metadata
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    task_user_id = metadata.get("user_id", "")
-    if not _is_admin_user(current_user["user_id"]) and task_user_id != current_user["user_id"]:
-        raise HTTPException(status_code=403, detail="You do not own this investigation")
+    # F-05 fix: prefer FK column for ownership; fall back to metadata.
+    if not _is_admin_user(current_user["user_id"]):
+        fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
+        if fk_uid is not None:
+            if fk_uid != current_user["user_id"]:
+                raise HTTPException(status_code=403, detail="You do not own this investigation")
+        else:
+            metadata = row.get("metadata") or {}
+            if isinstance(metadata, str):
+                try:  # BUG-API-036: Guard against malformed JSON in metadata
+                    metadata = json.loads(metadata)
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+            task_user_id = metadata.get("user_id", "")
+            if task_user_id != current_user["user_id"]:
+                raise HTTPException(status_code=403, detail="You do not own this investigation")
     return _row_to_task_summary(row)
 
 
@@ -3288,21 +3379,27 @@ async def kill_investigation(
     task_id = _validate_task_id(task_id)  # BUG-API-001: reject non-UUID before DB
 
     # BUG-S3-01 fix: Verify ownership before allowing kill.
+    # F-05 fix: prefer relational user_id FK for ownership.
     row = await db.fetchrow(
-        "SELECT metadata FROM research_tasks WHERE id = $1",
+        "SELECT user_id, metadata FROM research_tasks WHERE id = $1",
         task_id,
     )
     if row is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
-    metadata = row.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    task_user_id = metadata.get("user_id", "")
-    if not _is_admin_user(current_user["user_id"]) and task_user_id != current_user["user_id"]:
-        raise HTTPException(status_code=403, detail="You do not own this investigation")
+    if not _is_admin_user(current_user["user_id"]):
+        fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
+        if fk_uid is not None:
+            task_user_id = fk_uid
+        else:
+            metadata = row.get("metadata") or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+            task_user_id = metadata.get("user_id", "")
+        if task_user_id != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="You do not own this investigation")
 
     # BUG-021: Atomic conditional UPDATE to avoid race condition
     result = await db.execute(
@@ -3350,22 +3447,27 @@ async def stop_investigation(
     db = _get_db()
     task_id = _validate_task_id(task_id)  # BUG-API-001: reject non-UUID before DB
 
-    # Verify ownership
+    # Verify ownership — F-05: prefer relational user_id FK.
     row = await db.fetchrow(
-        "SELECT metadata, status FROM research_tasks WHERE id = $1",
+        "SELECT user_id, metadata, status FROM research_tasks WHERE id = $1",
         task_id,
     )
     if row is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
-    metadata = row.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    task_user_id = metadata.get("user_id", "")
-    if not _is_admin_user(current_user["user_id"]) and task_user_id != current_user["user_id"]:
-        raise HTTPException(status_code=403, detail="You do not own this investigation")
+    if not _is_admin_user(current_user["user_id"]):
+        fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
+        if fk_uid is not None:
+            task_user_id = fk_uid
+        else:
+            metadata = row.get("metadata") or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+            task_user_id = metadata.get("user_id", "")
+        if task_user_id != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="You do not own this investigation")
 
     # BUG-API-011: Return 409 when task is already in a terminal state (matches kill_investigation behavior)
     current_status = row.get("status", "")
@@ -4039,19 +4141,26 @@ async def stream_logs(
                         # instead of swallowing silently.
                         try:
                             db = _get_db()
-                            row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
+                            # F-05: include relational user_id column for ownership.
+                            row = await db.fetchrow("SELECT user_id, metadata FROM research_tasks WHERE id = $1", task_id)
                             if row is None:
                                 yield {"data": json.dumps({"error": "task_deleted"}), "event": "error"}
                                 break
-                            meta = row.get("metadata") or {}
-                            if isinstance(meta, str):
-                                try:
-                                    meta = json.loads(meta)
-                                except (json.JSONDecodeError, TypeError):
-                                    meta = {}
-                            if not _is_admin_user(_sse_user_id) and meta.get("user_id") != _sse_user_id:
-                                yield {"data": json.dumps({"error": "authentication_revoked"}), "event": "error"}
-                                break
+                            if not _is_admin_user(_sse_user_id):
+                                fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
+                                if fk_uid is not None:
+                                    _owner_id = fk_uid
+                                else:
+                                    meta = row.get("metadata") or {}
+                                    if isinstance(meta, str):
+                                        try:
+                                            meta = json.loads(meta)
+                                        except (json.JSONDecodeError, TypeError):
+                                            meta = {}
+                                    _owner_id = meta.get("user_id", "")
+                                if _owner_id != _sse_user_id:
+                                    yield {"data": json.dumps({"error": "authentication_revoked"}), "event": "error"}
+                                    break
                         except HTTPException as exc:
                             # _get_db() raises HTTPException(503) when the pool is
                             # missing — treat as transient and retry next cycle.
@@ -4143,19 +4252,26 @@ async def stream_logs(
                     # BUG-API-010 / BUG-API-009: log transient errors so they
                     # are not silently masked; retry on the next cycle.
                     try:
-                        row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
+                        # F-05: prefer relational user_id FK for auth re-check.
+                        row = await db.fetchrow("SELECT user_id, metadata FROM research_tasks WHERE id = $1", task_id)
                         if row is None:
                             yield {"data": json.dumps({"error": "task_deleted"}), "event": "error"}
                             break
-                        meta = row.get("metadata") or {}
-                        if isinstance(meta, str):
-                            try:
-                                meta = json.loads(meta)
-                            except (json.JSONDecodeError, TypeError):
-                                meta = {}
-                        if not _is_admin_user(_sse_user_id) and meta.get("user_id") != _sse_user_id:
-                            yield {"data": json.dumps({"error": "authentication_revoked"}), "event": "error"}
-                            break
+                        if not _is_admin_user(_sse_user_id):
+                            fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
+                            if fk_uid is not None:
+                                _owner_id2 = fk_uid
+                            else:
+                                meta = row.get("metadata") or {}
+                                if isinstance(meta, str):
+                                    try:
+                                        meta = json.loads(meta)
+                                    except (json.JSONDecodeError, TypeError):
+                                        meta = {}
+                                _owner_id2 = meta.get("user_id", "")
+                            if _owner_id2 != _sse_user_id:
+                                yield {"data": json.dumps({"error": "authentication_revoked"}), "event": "error"}
+                                break
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "sse_auth_recheck_failed",
@@ -4402,23 +4518,28 @@ async def list_investigation_files(
     db = _get_db()
     task_id = _validate_task_id(task_id)  # BUG-API-001: reject non-UUID before DB/Path
 
-    # Verify user owns the investigation
+    # Verify user owns the investigation — F-05: prefer relational user_id FK.
     row = await db.fetchrow(
-        "SELECT metadata FROM research_tasks WHERE id = $1",
+        "SELECT user_id, metadata FROM research_tasks WHERE id = $1",
         task_id,
     )
     if row is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
 
-    metadata = row.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    task_user_id = metadata.get("user_id", "")
-    if not _is_admin_user(current_user["user_id"]) and task_user_id != current_user["user_id"]:
-        raise HTTPException(status_code=403, detail="You do not own this investigation")
+    if not _is_admin_user(current_user["user_id"]):
+        fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
+        if fk_uid is not None:
+            task_user_id: str = fk_uid
+        else:
+            metadata = row.get("metadata") or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+            task_user_id = metadata.get("user_id", "")
+        if task_user_id != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="You do not own this investigation")
 
     files_dir = Path(cfg.DATA_ROOT) / "files" / task_id
     if not files_dir.is_dir():
@@ -4458,23 +4579,28 @@ async def download_investigation_file(
     db = _get_db()
     task_id = _validate_task_id(task_id)  # BUG-API-001: reject non-UUID before DB/Path
 
-    # Verify user owns the investigation
+    # Verify user owns the investigation — F-05: prefer relational user_id FK.
     row = await db.fetchrow(
-        "SELECT metadata FROM research_tasks WHERE id = $1",
+        "SELECT user_id, metadata FROM research_tasks WHERE id = $1",
         task_id,
     )
     if row is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
 
-    metadata = row.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    task_user_id = metadata.get("user_id", "")
-    if not _is_admin_user(current_user["user_id"]) and task_user_id != current_user["user_id"]:
-        raise HTTPException(status_code=403, detail="You do not own this investigation")
+    if not _is_admin_user(current_user["user_id"]):
+        fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
+        if fk_uid is not None:
+            task_user_id: str = fk_uid
+        else:
+            metadata = row.get("metadata") or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+            task_user_id = metadata.get("user_id", "")
+        if task_user_id != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="You do not own this investigation")
 
     files_dir = Path(cfg.DATA_ROOT) / "files" / task_id
     files_root = files_dir.resolve()
@@ -4605,23 +4731,28 @@ async def upload_investigation_files(
     db = _get_db()
     task_id = _validate_task_id(task_id)  # BUG-API-001: reject non-UUID before DB/Path
 
-    # Verify user owns the investigation
+    # Verify user owns the investigation — F-05: prefer relational user_id FK.
     row = await db.fetchrow(
-        "SELECT metadata FROM research_tasks WHERE id = $1",
+        "SELECT user_id, metadata FROM research_tasks WHERE id = $1",
         task_id,
     )
     if row is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
 
-    metadata = row.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    task_user_id = metadata.get("user_id", "")
-    if not _is_admin_user(current_user["user_id"]) and task_user_id != current_user["user_id"]:
-        raise HTTPException(status_code=403, detail="You do not own this investigation")
+    if not _is_admin_user(current_user["user_id"]):
+        fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
+        if fk_uid is not None:
+            task_user_id: str = fk_uid
+        else:
+            metadata = row.get("metadata") or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+            task_user_id = metadata.get("user_id", "")
+        if task_user_id != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="You do not own this investigation")
 
     if len(files) > _UPLOAD_MAX_FILES_PER_INVESTIGATION:
         raise HTTPException(
@@ -6847,61 +6978,44 @@ async def admin_list_investigations(
 @app.post(
     "/api/admin/users/{user_id}/credits",
     tags=["Admin"],
-    summary="Set or adjust credits for a user (admin only)",
+    summary="Set or adjust credits for a user (admin only) [v1 — aliased to v2 path]",
 )
 async def admin_set_credits(
     user_id: str,
     body: AdminSetCreditsRequest,
     request: Request,
-    _: dict[str, str] = Depends(_require_admin),
+    caller: dict[str, str] = Depends(_require_admin),
 ) -> JSONResponse:
     """
     Set the absolute credit balance for a user, or add/subtract a delta.
 
-    Uses the ``admin_set_credits`` SECURITY DEFINER function in Supabase
-    so no service-role key is needed.
+    B-17 fix: This v1 endpoint is now an alias for the v2 ledger-aware path.
+    Internally it calls ``admin_adjust_credits`` (same RPC as the v2 endpoint)
+    via ``_admin_rpc_call``, which writes to credit_transactions and audit_log.
+    The old direct call to ``admin_set_credits`` RPC (which previously bypassed
+    the ledger) has been removed; migration 012 also makes admin_set_credits
+    itself ledger-aware as defence-in-depth.
+
+    The response shape is preserved: {user_id, new_balance} so existing callers
+    are unaffected.
     """
-    cfg = _get_config()
-    if not cfg.SUPABASE_URL:
-        raise HTTPException(status_code=503, detail="Supabase not configured")
-
-    # BUG-API-030 / BUG-API-048: normalize auth header before forwarding.
-    # Loop6 / B-01: api_key uses service_role so the API-gateway accepts
-    # the request; the Authorization JWT still drives the Postgres role
-    # and auth.uid() inside admin_set_credits.
-    auth_header = _normalize_bearer_auth_header(
-        request.headers.get("authorization") or request.headers.get("Authorization")
+    # B-17 fix: delegate to admin_adjust_credits (same as v2) instead of the
+    # old admin_set_credits RPC with a raw httpx call that bypassed _admin_rpc_call.
+    mode = "delta" if body.delta else "set"
+    new_balance = await _admin_rpc_call(
+        request,
+        "admin_adjust_credits",
+        {
+            "p_caller": caller["user_id"],
+            "p_target": user_id,
+            "p_mode": mode,
+            "p_amount": body.credits,
+            "p_reason": "v1-endpoint-alias",
+        },
     )
-    api_key = _supabase_api_key(cfg) or ""
-
-    url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/admin_set_credits"
-    headers = {
-        "apikey": api_key,
-        "Authorization": auth_header,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "target_user_id": user_id,
-        "new_credits": body.credits,
-        "is_delta": body.delta,
-    }
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(url, headers=headers, json=payload)
-
-    if resp.status_code != 200:
-        detail = resp.text[:200] if resp.text else "Unknown error"
-        logger.error(
-            "admin_set_credits_failed",
-            user_id=user_id,
-            status=resp.status_code,
-            detail=detail,
-        )
-        raise HTTPException(status_code=502, detail=f"Failed to update credits: {detail}")
-
-    new_balance = resp.json()
     logger.info(
-        "admin_credits_updated",
+        "admin_credits_updated_v1_alias",
+        actor=caller["user_id"],
         user_id=user_id,
         new_balance=new_balance,
         delta=body.delta,
@@ -7029,6 +7143,78 @@ def _admin_supabase_headers(request: Request, cfg: AppConfig) -> dict[str, str]:
     }
 
 
+async def _audit_or_503(
+    request: Request,
+    actor: str,
+    action: str,
+    target_type: str,
+    target_id: str,
+    *,
+    before: Any = None,
+    after: Any = None,
+    metadata: Any = None,
+) -> None:
+    """Write an audit log row or raise HTTPException(503).
+
+    B-18 fix: admin mutation routes previously swallowed audit-log failures
+    with ``except HTTPException: pass``, meaning a state change could commit
+    without any audit trail.  This helper makes the audit write mandatory:
+    if admin_audit_insert fails, a 503 is raised so the caller can signal
+    the failure to the operator.  Routes that do not need the state change
+    to be atomic with the audit write should still use this helper — the
+    503 response tells the caller to retry (the mutation already committed,
+    but the operator is alerted that the audit row is missing).
+    """
+    try:
+        await _admin_rpc_call(
+            request,
+            "admin_audit_insert",
+            {
+                "p_actor_id": actor,
+                "p_action": action,
+                "p_target_type": target_type,
+                "p_target_id": target_id,
+                "p_before": before,
+                "p_after": after,
+                "p_metadata": metadata,
+                "p_ip": request.client.host if request.client else None,
+                "p_user_agent": request.headers.get("user-agent"),
+            },
+        )
+    except HTTPException as exc:
+        logger.critical(
+            "audit_write_failed",
+            actor=actor,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            status=exc.status_code,
+            detail=exc.detail,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Audit log write failed for action '{action}' — "
+                "mutation committed but audit trail is incomplete. "
+                "Operator investigation required."
+            ),
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.critical(
+            "audit_write_unexpected_error",
+            actor=actor,
+            action=action,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Audit log write failed unexpectedly for action '{action}'. "
+                "Operator investigation required."
+            ),
+        ) from exc
+
+
 async def _admin_rpc_call(
     request: Request,
     fn: str,
@@ -7136,6 +7322,10 @@ async def admin_user_set_role(
             "p_new_role": body.role,
         },
     )
+    # B-20 fix: immediately evict the target from the admin role cache so
+    # role revocations (admin → user) take effect on the very next request
+    # rather than after the old 30 s TTL.
+    _clear_admin_cache(user_id)
     logger.info("admin_role_set", actor=caller["user_id"], target=user_id, role=body.role)
     return JSONResponse(content={"user_id": user_id, "role": body.role})
 
@@ -7382,25 +7572,15 @@ async def admin_feature_flags_upsert(
     )
     if resp.status_code not in (200, 201):
         raise HTTPException(status_code=502, detail=f"Upsert feature_flag failed: {resp.text[:200]}")
-    # Audit the change
-    try:
-        await _admin_rpc_call(
-            request,
-            "admin_audit_insert",
-            {
-                "p_actor_id": caller["user_id"],
-                "p_action": "feature_flag.upsert",
-                "p_target_type": "feature_flag",
-                "p_target_id": body.key,
-                "p_before": None,
-                "p_after": payload,
-                "p_metadata": None,
-                "p_ip": request.client.host if request.client else None,
-                "p_user_agent": request.headers.get("user-agent"),
-            },
-        )
-    except HTTPException:
-        pass
+    # B-18 fix: audit write is now mandatory — 503 on failure.
+    await _audit_or_503(
+        request,
+        actor=caller["user_id"],
+        action="feature_flag.upsert",
+        target_type="feature_flag",
+        target_id=body.key,
+        after=payload,
+    )
     data = resp.json()
     return JSONResponse(content=data[0] if isinstance(data, list) and data else data)
 
@@ -7419,24 +7599,14 @@ async def admin_feature_flags_delete(
     )
     if resp.status_code not in (200, 204):
         raise HTTPException(status_code=502, detail=f"Delete feature_flag failed: {resp.text[:200]}")
-    try:
-        await _admin_rpc_call(
-            request,
-            "admin_audit_insert",
-            {
-                "p_actor_id": caller["user_id"],
-                "p_action": "feature_flag.delete",
-                "p_target_type": "feature_flag",
-                "p_target_id": key,
-                "p_before": None,
-                "p_after": None,
-                "p_metadata": None,
-                "p_ip": request.client.host if request.client else None,
-                "p_user_agent": request.headers.get("user-agent"),
-            },
-        )
-    except HTTPException:
-        pass
+    # B-18 fix: audit write is now mandatory — 503 on failure.
+    await _audit_or_503(
+        request,
+        actor=caller["user_id"],
+        action="feature_flag.delete",
+        target_type="feature_flag",
+        target_id=key,
+    )
     return JSONResponse(content={"key": key, "deleted": True})
 
 
@@ -7592,24 +7762,14 @@ async def admin_danger_flush_redis(
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Flush failed: {exc}") from exc
     logger.warning("admin_danger_flush_redis", actor=caller["user_id"])
-    try:
-        await _admin_rpc_call(
-            request,
-            "admin_audit_insert",
-            {
-                "p_actor_id": caller["user_id"],
-                "p_action": "danger.flush_redis",
-                "p_target_type": "system",
-                "p_target_id": "redis",
-                "p_before": None,
-                "p_after": None,
-                "p_metadata": None,
-                "p_ip": request.client.host if request.client else None,
-                "p_user_agent": request.headers.get("user-agent"),
-            },
-        )
-    except HTTPException:
-        pass
+    # B-18 fix: audit write is now mandatory — 503 on failure.
+    await _audit_or_503(
+        request,
+        actor=caller["user_id"],
+        action="danger.flush_redis",
+        target_type="system",
+        target_id="redis",
+    )
     return JSONResponse(content={"flushed": True})
 
 
@@ -7632,24 +7792,15 @@ async def admin_danger_halt_running(
     except Exception:
         pass
     logger.warning("admin_danger_halt_running", actor=caller["user_id"], halted=halted)
-    try:
-        await _admin_rpc_call(
-            request,
-            "admin_audit_insert",
-            {
-                "p_actor_id": caller["user_id"],
-                "p_action": "danger.halt_running",
-                "p_target_type": "system",
-                "p_target_id": "research_tasks",
-                "p_before": None,
-                "p_after": {"halted": halted},
-                "p_metadata": None,
-                "p_ip": request.client.host if request.client else None,
-                "p_user_agent": request.headers.get("user-agent"),
-            },
-        )
-    except HTTPException:
-        pass
+    # B-18 fix: audit write is now mandatory — 503 on failure.
+    await _audit_or_503(
+        request,
+        actor=caller["user_id"],
+        action="danger.halt_running",
+        target_type="system",
+        target_id="research_tasks",
+        after={"halted": halted},
+    )
     return JSONResponse(content={"halted": halted})
 
 
@@ -7665,15 +7816,28 @@ async def admin_danger_halt_running(
     summary="Gracefully shut down the API server",
 )
 async def graceful_shutdown(
+    request: Request,
     x_admin_key: str | None = Header(None),
+    caller: dict[str, str] = Depends(_require_admin),
 ) -> ShutdownResponse:
     """
     Initiate a graceful server shutdown.
 
     Marks all RUNNING tasks as HALTED in the DB and schedules process
-    termination via ``asyncio``.  Requires X-Admin-Key header matching
-    ADMIN_SECRET_KEY config value.  Use with care in production.
+    termination via ``asyncio``.
+
+    B-19 fix: now requires BOTH:
+      1. A valid Supabase JWT belonging to a confirmed admin user (via
+         ``_require_admin`` FastAPI dependency, which calls ``_is_admin_user``).
+      2. The shared X-Admin-Key header matching ADMIN_SECRET_KEY (secondary
+         factor / defence-in-depth).
+
+    Previously only the header secret was checked; any party who obtained the
+    secret key (e.g. via a leaked env var or log scrape) could trigger a
+    shutdown without any identity check or audit trail.
     """
+    # Check 1: admin JWT is verified by the _require_admin dependency above.
+    # Check 2: shared secret header (defence-in-depth, secondary factor).
     # BUG-009 + BUG-S2-03: Require admin key to prevent unauthenticated shutdown.
     # When ADMIN_SECRET_KEY is not configured, ALL shutdown requests are rejected
     # (previously an empty key allowed anyone to shut down the server).
@@ -7685,6 +7849,7 @@ async def graceful_shutdown(
     # the admin key byte-by-byte.
     if not hmac.compare_digest((x_admin_key or "").encode("utf-8"), admin_key.encode("utf-8")):
         raise HTTPException(status_code=401, detail="Unauthorized")
+    logger.warning("graceful_shutdown_initiated", actor=caller["user_id"])
     db: asyncpg.Pool | None = _db_pool
     if db is not None:
         try:
@@ -8080,17 +8245,23 @@ async def submit_feedback(
     # P0-FIX-4: Verify the task belongs to the current user before accepting feedback.
     if body.task_id:
         validated_task_id = _validate_task_id(body.task_id)  # BUG-API-001
-        row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", validated_task_id)
+        # F-05: prefer relational user_id FK for ownership.
+        row = await db.fetchrow("SELECT user_id, metadata FROM research_tasks WHERE id = $1", validated_task_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Investigation not found")
         if not _is_admin_user(current_user["user_id"]):
-            meta = row.get("metadata") or {}
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except (json.JSONDecodeError, TypeError):
-                    meta = {}
-            if meta.get("user_id") != current_user["user_id"]:
+            fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
+            if fk_uid is not None:
+                _fb_owner = fk_uid
+            else:
+                meta = row.get("metadata") or {}
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except (json.JSONDecodeError, TypeError):
+                        meta = {}
+                _fb_owner = meta.get("user_id", "")
+            if _fb_owner != current_user["user_id"]:
                 raise HTTPException(status_code=403, detail="Not authorized to submit feedback for this investigation")
 
     event_id = await record_feedback(
@@ -8223,6 +8394,25 @@ async def get_outcome(
 # ---------------------------------------------------------------------------
 
 
+def _build_next_cursor(items: list[dict], ts_key: str = "created_at", id_key: str = "id") -> str | None:
+    """Build a keyset pagination cursor from the last item in a page."""
+    if not items:
+        return None
+    last = items[-1]
+    ts = last.get(ts_key)
+    item_id = last.get(id_key)
+    if ts is None or item_id is None:
+        return None
+    if hasattr(ts, "isoformat"):
+        ts = ts.isoformat()
+    return f"{ts}|{item_id}"
+
+
+# F-06: shared Query parameters for paginated intelligence endpoints.
+_INTEL_LIMIT_QUERY = Query(default=100, ge=1, le=1000)
+_INTEL_CURSOR_QUERY = Query(default=None)
+
+
 @app.get(
     "/api/intelligence/{task_id}/claims",
     summary="Get evidence ledger (all extracted claims)",
@@ -8230,13 +8420,21 @@ async def get_outcome(
 )
 async def get_claims(
     task_id: str,
+    limit: int = _INTEL_LIMIT_QUERY,
+    cursor: str | None = _INTEL_CURSOR_QUERY,
     current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
-    """Fetch all atomic claims extracted from research findings."""
+    """Fetch atomic claims extracted from research findings (paginated).
+
+    F-06: returns envelope ``{items, next_cursor, limit}``.
+    """
     db = _get_db()
     from mariana.orchestrator.intelligence.evidence_ledger import get_evidence_ledger  # noqa: PLC0415
-    claims = await get_evidence_ledger(task_id, db)
-    return JSONResponse(content=_jsonable({"claims": claims, "count": len(claims)}))
+    claims = await get_evidence_ledger(task_id, db, limit=limit, cursor=cursor)
+    # Serialize any datetime objects.
+    serialized = _jsonable(claims)
+    next_cursor = _build_next_cursor(claims)
+    return JSONResponse(content={"items": serialized, "next_cursor": next_cursor, "limit": limit})
 
 
 @app.get(
@@ -8262,14 +8460,21 @@ async def get_claims_summary(
 )
 async def get_source_scores(
     task_id: str,
+    limit: int = _INTEL_LIMIT_QUERY,
+    cursor: str | None = _INTEL_CURSOR_QUERY,
     current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
-    """Fetch credibility scores for all sources in an investigation."""
+    """Fetch credibility scores for sources in an investigation (paginated).
+
+    F-06: returns envelope ``{items, next_cursor, limit, average_credibility}``.
+    """
     db = _get_db()
     from mariana.orchestrator.intelligence.credibility import get_source_scores, get_average_credibility  # noqa: PLC0415
-    scores = await get_source_scores(task_id, db)
+    scores = await get_source_scores(task_id, db, limit=limit, cursor=cursor)
     avg = await get_average_credibility(task_id, db)
-    return JSONResponse(content=_jsonable({"scores": scores, "count": len(scores), "average_credibility": avg}))
+    serialized = _jsonable(scores)
+    next_cursor = _build_next_cursor(scores)
+    return JSONResponse(content={"items": serialized, "next_cursor": next_cursor, "limit": limit, "average_credibility": avg})
 
 
 @app.get(
@@ -8279,13 +8484,27 @@ async def get_source_scores(
 )
 async def get_contradictions(
     task_id: str,
+    limit: int = _INTEL_LIMIT_QUERY,
+    cursor: str | None = _INTEL_CURSOR_QUERY,
     current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
-    """Fetch detected contradictions between claims."""
+    """Fetch detected contradictions between claims (paginated).
+
+    F-06: the response envelope wraps the contradiction matrix fields plus
+    ``next_cursor`` and ``limit`` for page navigation.
+    """
     db = _get_db()
     from mariana.orchestrator.intelligence.contradictions import get_contradiction_matrix  # noqa: PLC0415
-    matrix = await get_contradiction_matrix(task_id, db)
-    return JSONResponse(content=_jsonable(matrix))
+    matrix = await get_contradiction_matrix(task_id, db, limit=limit, cursor=cursor)
+    # Build next_cursor from last item in contradictions list.
+    next_cursor = _build_next_cursor(matrix.get("contradictions", []))
+    serialized = _jsonable(matrix)
+    serialized["next_cursor"] = next_cursor
+    serialized["limit"] = limit
+    # Wrap in {items, ...} envelope for consistency.
+    items = serialized.pop("contradictions", [])
+    serialized["items"] = items
+    return JSONResponse(content=serialized)
 
 
 @app.get(
@@ -8295,14 +8514,29 @@ async def get_contradictions(
 )
 async def get_hypothesis_rankings(
     task_id: str,
+    limit: int = _INTEL_LIMIT_QUERY,
+    cursor: str | None = _INTEL_CURSOR_QUERY,
     current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
-    """Fetch Bayesian posterior rankings for all hypotheses."""
+    """Fetch Bayesian posterior rankings for hypotheses (paginated).
+
+    F-06: returns envelope ``{items, next_cursor, limit, winner}``.
+    """
     db = _get_db()
     from mariana.orchestrator.intelligence.hypothesis_engine import get_hypothesis_rankings, get_winning_hypothesis  # noqa: PLC0415
-    rankings = await get_hypothesis_rankings(task_id, db)
+    rankings = await get_hypothesis_rankings(task_id, db, limit=limit, cursor=cursor)
     winner = await get_winning_hypothesis(task_id, db)
-    return JSONResponse(content=_jsonable({"rankings": rankings, "winner": winner}))
+    # Build next_cursor from _cursor_ts / _cursor_id fields added by helper.
+    next_cursor: str | None = None
+    if rankings:
+        last = rankings[-1]
+        cts = last.get("_cursor_ts")
+        cid = last.get("_cursor_id")
+        if cts and cid:
+            next_cursor = f"{cts}|{cid}"
+    # Strip internal cursor fields from output.
+    clean_rankings = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rankings]
+    return JSONResponse(content=_jsonable({"items": clean_rankings, "next_cursor": next_cursor, "limit": limit, "winner": winner}))
 
 
 @app.get(
@@ -8366,27 +8600,64 @@ async def get_temporal(
 )
 async def get_perspectives(
     task_id: str,
+    limit: int = _INTEL_LIMIT_QUERY,
+    cursor: str | None = _INTEL_CURSOR_QUERY,
     current_user: dict[str, str] = Depends(_require_investigation_owner),
 ) -> JSONResponse:
-    """Fetch multi-perspective synthesis (bull/bear/skeptic/expert views)."""
+    """Fetch multi-perspective synthesis (paginated).
+
+    F-06: returns envelope ``{items, next_cursor, limit}``.
+    """
     db = _get_db()
-    rows = await db.fetch(
-        """
-        SELECT id, task_id, perspective, synthesis_text, confidence, key_arguments,
-               cited_claim_ids, created_at
-        FROM perspective_syntheses
-        WHERE task_id = $1
-        ORDER BY created_at DESC
-        """,
-        task_id,
-    )
+    # Clamp limit server-side (mirrors intelligence helper constants).
+    clamped_limit = max(1, min(limit, 1000))
+    if cursor:
+        try:
+            cursor_ts, cursor_id = cursor.split("|", 1)
+            rows = await db.fetch(
+                """
+                SELECT id, task_id, perspective, synthesis_text, confidence, key_arguments,
+                       cited_claim_ids, created_at
+                FROM perspective_syntheses
+                WHERE task_id = $1
+                  AND (created_at, id) > ($2::timestamptz, $3)
+                ORDER BY created_at ASC, id ASC
+                LIMIT $4
+                """,
+                task_id, cursor_ts, cursor_id, clamped_limit,
+            )
+        except Exception:
+            rows = await db.fetch(
+                """
+                SELECT id, task_id, perspective, synthesis_text, confidence, key_arguments,
+                       cited_claim_ids, created_at
+                FROM perspective_syntheses
+                WHERE task_id = $1
+                ORDER BY created_at ASC, id ASC
+                LIMIT $2
+                """,
+                task_id, clamped_limit,
+            )
+    else:
+        rows = await db.fetch(
+            """
+            SELECT id, task_id, perspective, synthesis_text, confidence, key_arguments,
+                   cited_claim_ids, created_at
+            FROM perspective_syntheses
+            WHERE task_id = $1
+            ORDER BY created_at ASC, id ASC
+            LIMIT $2
+            """,
+            task_id, clamped_limit,
+        )
     from mariana.data.db import _row_to_dict  # noqa: PLC0415
     perspectives = [_row_to_dict(r) for r in rows]
-    # Serialize datetimes
+    # Serialize datetimes (guard against already-string values).
     for p in perspectives:
-        if p.get("created_at"):
+        if p.get("created_at") and hasattr(p["created_at"], "isoformat"):
             p["created_at"] = p["created_at"].isoformat()
-    return JSONResponse(content=_jsonable({"perspectives": perspectives, "count": len(perspectives)}))
+    next_cursor = _build_next_cursor(perspectives)
+    return JSONResponse(content=_jsonable({"items": perspectives, "next_cursor": next_cursor, "limit": clamped_limit}))
 
 
 @app.get(

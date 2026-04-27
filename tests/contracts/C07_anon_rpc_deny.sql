@@ -42,12 +42,13 @@ DECLARE
     'spend_credits',
     'grant_credits',
     'refund_credits',
-    'handle_new_user'
+    'handle_new_user',
+    'admin_audit_insert'  -- B-12: service_role only
   ];
+  -- B-12 fix: admin_audit_insert moved to group_a (service_role only)
   group_b text[] := ARRAY[
     'admin_set_credits',
     'admin_adjust_credits',
-    'admin_audit_insert',
     'admin_count_profiles',
     'admin_list_profiles'
   ];

@@ -21,17 +21,17 @@ Every YAML finding appears under exactly one canonical.  Merge rules from the ta
 | B-08 | A4-02 | P1 | frontend | Navbar / BuyCredits show stale profiles.tokens — never auto-refreshes after spend or webhook | **FIXED 2026-04-27** (Navbar.tsx + BuyCredits.tsx use useCredits() hook; hook extended with focus/visibilitychange/30s poll; 7 vitest tests added) |
 | B-09 | A4-03 | P1 | frontend | Full JWT access token exposed in SSE query string when stream-token mint fails or is absent | **FIXED 2026-04-27** (stream-token mint enforced in Chat.tsx + AgentTaskView.tsx + agentRunApi.ts; fallback-to-JWT removed; 30 tests added across TS and Python) |
 | B-10 | A4-04 | P1 | frontend | No Content-Security-Policy or any security header in vercel.json | **FIXED 2026-04-27** (vercel.json headers + vitest contract) |
-| B-11 | A1-05 | P2 | db | admin_count_profiles / admin_list_profiles use inline auth.uid() check instead of is_admin + missing search_path |
-| B-12 | A1-06, A5-06 | P2 | db | admin_audit_insert publicly executable — anonymous / any-user forge or pollute audit log |
-| B-13 | A1-07, A5-07 | P2 | db | expire_credits callable by anon — DoS by repeated full-table credit sweep |
-| B-14 | A5-08 | P2 | db | handle_new_user trigger failure leaves phantom auth.users without profiles row |
-| B-15 | A1-10 | P2 | db | credit_buckets / credit_transactions FKs reference auth.users not profiles — CASCADE DELETE inconsistency |
-| B-16 | A1-11 | P2 | db | admin_set_credits updates profiles.tokens but skips credit_buckets ledger — R3 admin path |
-| B-17 | A2-04 | P2 | api | Legacy admin credits endpoint keeps direct-token mutation path alive alongside newer v2 endpoint |
-| B-18 | A2-05 | P2 | api | Multiple admin mutation routes silently ignore audit-log failures after state already changed |
-| B-19 | A2-06 | P2 | api | Shutdown route bypasses JWT admin check — controlled only by shared header secret |
-| B-20 | A2-07 | P2 | api | Admin authorization cache holds stale positive decisions up to 30 s after role revocation |
-| B-21 | A5-05 | P2 | api | In-process rate limiter not shared across workers/instances — bypassable by horizontal fan-out |
+| B-11 | A1-05 | P2 | db | admin_count_profiles / admin_list_profiles use inline auth.uid() check instead of is_admin + missing search_path | **FIXED 2026-04-27** (mig 011: rewrote both functions to call public.is_admin(auth.uid()); SET search_path = public, pg_temp; C10 contract added) |
+| B-12 | A1-06, A5-06 | P2 | db | admin_audit_insert publicly executable — anonymous / any-user forge or pollute audit log | **FIXED 2026-04-27** (mig 011: REVOKE EXECUTE FROM anon, authenticated; GRANT to service_role only; body checks auth.uid() == p_actor_id; C11 contract added) |
+| B-13 | A1-07, A5-07 | P2 | db | expire_credits callable by anon — DoS by repeated full-table credit sweep | **FIXED 2026-04-27** (mig 011: REVOKE EXECUTE FROM anon, authenticated; GRANT to service_role only; idempotent; C12 contract added) |
+| B-14 | A5-08 | P2 | db | handle_new_user trigger failure leaves phantom auth.users without profiles row | **FIXED 2026-04-27** (mig 011: EXCEPTION handler wraps body; ON CONFLICT (id) DO NOTHING on profiles INSERT; credit_buckets INSERT in nested sub-transaction; re-raises to roll back auth.users; SECURITY DEFINER + search_path; C13 contract added) |
+| B-15 | A1-10 | P2 | db | credit_buckets / credit_transactions FKs reference auth.users not profiles — CASCADE DELETE inconsistency | **FIXED 2026-04-27** (mig 011: dropped FK to auth.users; added FK to public.profiles(id) ON DELETE CASCADE on both tables; orphan pre-check aborts migration if orphans found; C14 contract added) |
+| B-16 | A1-11 | P2 | db | admin_set_credits updates profiles.tokens but skips credit_buckets ledger — R3 admin path | **FIXED 2026-04-27** (mig 012: admin_set_credits now inserts credit_buckets[source='admin_grant'] + credit_transactions[type='grant'/'spend'] rows; approach (a) direct set path; B-05 invariant preserved; applied local+live; C15 contract + 5 pytest tests) |
+| B-17 | A2-04 | P2 | api | Legacy admin credits endpoint keeps direct-token mutation path alive alongside newer v2 endpoint | **FIXED 2026-04-27** (api.py: v1 endpoint /api/admin/users/{uid}/credits now delegates to admin_adjust_credits via _admin_rpc_call instead of direct admin_set_credits httpx call; 4 regression tests) |
+| B-18 | A2-05 | P2 | api | Multiple admin mutation routes silently ignore audit-log failures after state already changed | **FIXED 2026-04-27** (api.py: _audit_or_503 helper added; all 4 silent except HTTPException: pass audit swallows replaced; admin_feature_flags_upsert/delete + admin_danger_flush_redis/halt_running now return 503 on audit failure; 7 regression tests) |
+| B-19 | A2-06 | P2 | api | Shutdown route bypasses JWT admin check — controlled only by shared header secret | **FIXED 2026-04-27** (api.py: graceful_shutdown now requires _require_admin dependency (Supabase JWT + is_admin check) in addition to X-Admin-Key header; 5 regression tests) |
+| B-20 | A2-07 | P2 | api | Admin authorization cache holds stale positive decisions up to 30 s after role revocation | **FIXED 2026-04-27** (api.py: positive decisions no longer cached; negative results cached 5s max; _clear_admin_cache() helper added; admin_user_set_role calls _clear_admin_cache on role change; 6 regression tests) |
+| B-21 | A5-05 | P2 | api | In-process rate limiter not shared across workers/instances — bypassable by horizontal fan-out | **FIXED 2026-04-27** (api.py: slowapi Limiter constructed with storage_uri=REDIS_URL when configured; falls back to per-process with RuntimeWarning when REDIS_URL absent; 6 regression tests) |
 | B-22 | A3-03 | P2 | orchestrator | Atomic credit probe refund uses wrong RPC parameter names — 1 credit lost per probe call |
 | B-23 | A3-01 | P2 | orchestrator | branch_manager imports non-existent get_config — all AppConfig thresholds silently use hardcoded defaults |
 | B-24 | A3-02 | P2 | orchestrator | Module-level _metadata_lock serializes all concurrent investigations on a single asyncio.Lock |
@@ -84,17 +84,17 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 | 8 | B-06 | P1 | migration | none | B-01 | db | **FIXED** |
 | 9 | B-07 | P1 | migration | B-22 | B-01 | db | **FIXED** |
 | 10 | B-08 | P1 | frontend_patch | none | none | frontend | **FIXED** |
-| 11 | B-11 | P2 | migration | none | none | db |
-| 12 | B-12 | P2 | migration | none | B-01 | db |
-| 13 | B-13 | P2 | migration | none | B-01 | db |
-| 14 | B-14 | P2 | migration | none | B-02 | db |
-| 15 | B-15 | P2 | migration | none | none | db |
-| 16 | B-16 | P2 | migration | B-17 | B-01, B-05 | db |
-| 17 | B-17 | P2 | api_patch | none | B-05, B-16 | api.py |
-| 18 | B-18 | P2 | api_patch | none | none | api.py |
-| 19 | B-19 | P2 | api_patch | none | none | api.py |
-| 20 | B-20 | P2 | api_patch | none | none | api.py |
-| 21 | B-21 | P2 | api_patch | none | B-01 | api.py |
+| 11 | B-11 | P2 | migration | none | none | db | **FIXED** (mig 011) |
+| 12 | B-12 | P2 | migration | none | B-01 | db | **FIXED** (mig 011) |
+| 13 | B-13 | P2 | migration | none | B-01 | db | **FIXED** (mig 011) |
+| 14 | B-14 | P2 | migration | none | B-02 | db | **FIXED** (mig 011) |
+| 15 | B-15 | P2 | migration | none | none | db | **FIXED** (mig 011) |
+| 16 | B-16 | P2 | migration | B-17 | B-01, B-05 | db | **FIXED** |
+| 17 | B-17 | P2 | api_patch | none | B-05, B-16 | api.py | **FIXED** |
+| 18 | B-18 | P2 | api_patch | none | none | api.py | **FIXED** |
+| 19 | B-19 | P2 | api_patch | none | none | api.py | **FIXED** |
+| 20 | B-20 | P2 | api_patch | none | none | api.py | **FIXED** |
+| 21 | B-21 | P2 | api_patch | none | B-01 | api.py | **FIXED** |
 | 22 | B-22 | P2 | api_patch | none | B-07 | api.py (orchestrator) |
 | 23 | B-23 | P2 | api_patch | none | none | api.py (orchestrator) |
 | 24 | B-24 | P2 | api_patch | none | none | api.py (orchestrator) |

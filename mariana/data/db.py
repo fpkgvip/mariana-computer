@@ -50,6 +50,8 @@ _ALLOWED_TASK_COLUMNS: frozenset[str] = frozenset({
     "error_message", "output_pdf_path", "output_docx_path", "metadata",
     # BUG-D1-11 fix: include dedicated schema columns so update_research_task can set them
     "quality_tier", "user_flow_instructions", "continuous_mode", "dont_kill_branches",
+    # F-05 fix: relational owner column
+    "user_id",
 })
 
 _ALLOWED_BRANCH_COLUMNS: frozenset[str] = frozenset({
@@ -120,8 +122,13 @@ CREATE TABLE IF NOT EXISTS research_tasks (
     quality_tier        TEXT        DEFAULT 'balanced',
     user_flow_instructions TEXT     DEFAULT '',
     continuous_mode     BOOLEAN     DEFAULT FALSE,
-    dont_kill_branches  BOOLEAN     DEFAULT FALSE
+    dont_kill_branches  BOOLEAN     DEFAULT FALSE,
+    -- F-05 fix: relational owner FK so that deleting auth.users cascades here.
+    -- Nullable to allow rows inserted before this column existed; new rows
+    -- must always supply user_id.
+    user_id             UUID        REFERENCES auth.users(id) ON DELETE CASCADE
 );
+CREATE INDEX IF NOT EXISTS idx_research_tasks_user_id ON research_tasks(user_id);
 
 CREATE TABLE IF NOT EXISTS hypotheses (
     id              TEXT        PRIMARY KEY,
@@ -686,7 +693,18 @@ async def insert_research_task(pool: asyncpg.Pool, task: ResearchTask) -> None:
         # BUG-D1-03 fix: include quality_tier, user_flow_instructions, continuous_mode,
         # dont_kill_branches so their dedicated DB columns are populated at INSERT time.
         # These are read from task.metadata (set by the API before calling insert).
+        # F-05 fix: also populate the relational user_id column from metadata or the
+        # dedicated model field (whichever is set).
         _meta = task.metadata or {}
+        # Resolve user_id: prefer task.user_id if set; fall back to metadata.
+        _user_id_raw = getattr(task, "user_id", None) or _meta.get("user_id")
+        import uuid as _uuid_mod  # noqa: PLC0415
+        _user_id: _uuid_mod.UUID | None = None
+        if _user_id_raw:
+            try:
+                _user_id = _uuid_mod.UUID(str(_user_id_raw))
+            except (ValueError, AttributeError):
+                _user_id = None
         await conn.execute(
             """
             INSERT INTO research_tasks (
@@ -695,14 +713,16 @@ async def insert_research_task(pool: asyncpg.Pool, task: ResearchTask) -> None:
                 created_at, started_at, completed_at, error_message,
                 output_pdf_path, output_docx_path, metadata,
                 quality_tier, user_flow_instructions,
-                continuous_mode, dont_kill_branches
+                continuous_mode, dont_kill_branches,
+                user_id
             ) VALUES (
                 $1, $2, $3, $4, $5,
                 $6, $7, $8,
                 $9, $10, $11, $12,
                 $13, $14, $15,
                 $16, $17,
-                $18, $19
+                $18, $19,
+                $20
             )
             ON CONFLICT (id) DO NOTHING
             """,
@@ -725,6 +745,7 @@ async def insert_research_task(pool: asyncpg.Pool, task: ResearchTask) -> None:
             _meta.get("user_flow_instructions", ""),
             bool(_meta.get("continuous_mode", False)),
             bool(_meta.get("dont_kill_branches", False)),
+            _user_id,
         )
     logger.debug("Inserted ResearchTask id=%s", task.id)
 

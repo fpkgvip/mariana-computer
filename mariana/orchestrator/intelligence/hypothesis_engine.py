@@ -243,24 +243,70 @@ async def bayesian_update(
     return updated_posteriors
 
 
-async def get_hypothesis_rankings(task_id: str, db: Any) -> list[dict[str, Any]]:
-    """
-    Get all hypotheses ranked by posterior probability.
+# F-06 pagination constants.
+_INTEL_MAX_LIMIT = 1000
+_INTEL_DEFAULT_LIMIT = 100
 
-    Returns list ordered by posterior descending, with evidence chain summaries.
+
+async def get_hypothesis_rankings(
+    task_id: str,
+    db: Any,
+    limit: int = _INTEL_DEFAULT_LIMIT,
+    cursor: str | None = None,
+) -> list[dict[str, Any]]:
     """
-    rows = await db.fetch(
-        """
-        SELECT
-            hp.hypothesis_id, hp.prior, hp.posterior, hp.evidence_updates,
-            h.statement, h.status, h.score
-        FROM hypothesis_priors hp
-        JOIN hypotheses h ON hp.hypothesis_id = h.id
-        WHERE hp.task_id = $1
-        ORDER BY hp.posterior DESC
-        """,
-        task_id,
-    )
+    Get hypotheses ranked by posterior probability with pagination.
+
+    F-06 fix: accepts ``limit`` (capped at 1000) and ``cursor`` (last_updated|id)
+    for keyset pagination. Ordered by last_updated ASC, id ASC.
+    """
+    limit = max(1, min(limit, _INTEL_MAX_LIMIT))
+
+    if cursor:
+        try:
+            cursor_ts, cursor_id = cursor.split("|", 1)
+            rows = await db.fetch(
+                """
+                SELECT
+                    hp.id, hp.hypothesis_id, hp.prior, hp.posterior, hp.evidence_updates,
+                    hp.last_updated, h.statement, h.status, h.score
+                FROM hypothesis_priors hp
+                JOIN hypotheses h ON hp.hypothesis_id = h.id
+                WHERE hp.task_id = $1
+                  AND (hp.last_updated, hp.id) > ($2::timestamptz, $3)
+                ORDER BY hp.last_updated ASC, hp.id ASC
+                LIMIT $4
+                """,
+                task_id, cursor_ts, cursor_id, limit,
+            )
+        except Exception:
+            rows = await db.fetch(
+                """
+                SELECT
+                    hp.id, hp.hypothesis_id, hp.prior, hp.posterior, hp.evidence_updates,
+                    hp.last_updated, h.statement, h.status, h.score
+                FROM hypothesis_priors hp
+                JOIN hypotheses h ON hp.hypothesis_id = h.id
+                WHERE hp.task_id = $1
+                ORDER BY hp.last_updated ASC, hp.id ASC
+                LIMIT $2
+                """,
+                task_id, limit,
+            )
+    else:
+        rows = await db.fetch(
+            """
+            SELECT
+                hp.id, hp.hypothesis_id, hp.prior, hp.posterior, hp.evidence_updates,
+                hp.last_updated, h.statement, h.status, h.score
+            FROM hypothesis_priors hp
+            JOIN hypotheses h ON hp.hypothesis_id = h.id
+            WHERE hp.task_id = $1
+            ORDER BY hp.last_updated ASC, hp.id ASC
+            LIMIT $2
+            """,
+            task_id, limit,
+        )
 
     rankings = []
     for r in rows:
@@ -280,6 +326,9 @@ async def get_hypothesis_rankings(task_id: str, db: Any) -> list[dict[str, Any]]
             "branch_score": float(r["score"]) if r["score"] else None,
             "evidence_count": len(evidence_updates) if isinstance(evidence_updates, list) else 0,
             "posterior_change": float(r["posterior"]) - float(r["prior"]),
+            # F-06: expose cursor fields so the API can build next_cursor.
+            "_cursor_ts": r["last_updated"].isoformat() if r["last_updated"] else None,
+            "_cursor_id": r["id"],
         })
 
     return rankings

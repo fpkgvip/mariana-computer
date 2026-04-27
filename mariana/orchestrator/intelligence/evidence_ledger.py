@@ -195,23 +195,77 @@ async def extract_claims_from_finding(
     return inserted
 
 
-async def get_evidence_ledger(task_id: str, db: Any) -> list[dict[str, Any]]:
-    """
-    Retrieve the full evidence ledger (all claims) for a research task.
+# F-06: hard server-side cap for all paginated intelligence helpers.
+_INTEL_MAX_LIMIT = 1000
+_INTEL_DEFAULT_LIMIT = 100
 
-    Returns claims ordered by confidence descending.
+
+async def get_evidence_ledger(
+    task_id: str,
+    db: Any,
+    limit: int = _INTEL_DEFAULT_LIMIT,
+    cursor: str | None = None,
+) -> list[dict[str, Any]]:
     """
-    rows = await db.fetch(
-        """
-        SELECT c.*, f.content as finding_content, h.statement as hypothesis_statement
-        FROM claims c
-        LEFT JOIN findings f ON c.finding_id = f.id
-        LEFT JOIN hypotheses h ON c.hypothesis_id = h.id
-        WHERE c.task_id = $1
-        ORDER BY c.confidence DESC
-        """,
-        task_id,
-    )
+    Retrieve evidence ledger (claims) for a research task with pagination.
+
+    F-06 fix: accepts ``limit`` (capped at 1000) and ``cursor`` (ISO-8601
+    timestamp of the last seen created_at for keyset pagination).
+    Returns at most ``limit`` rows ordered by created_at ASC, id ASC.
+    """
+    # Clamp limit to hard server cap.
+    limit = max(1, min(limit, _INTEL_MAX_LIMIT))
+
+    if cursor:
+        # Keyset: cursor encodes "created_at|id" of the last row on the
+        # previous page so we can efficiently skip past it.
+        try:
+            cursor_ts, cursor_id = cursor.split("|", 1)
+            rows = await db.fetch(
+                """
+                SELECT c.*, f.content as finding_content, h.statement as hypothesis_statement
+                FROM claims c
+                LEFT JOIN findings f ON c.finding_id = f.id
+                LEFT JOIN hypotheses h ON c.hypothesis_id = h.id
+                WHERE c.task_id = $1
+                  AND (c.created_at, c.id) > ($2::timestamptz, $3)
+                ORDER BY c.created_at ASC, c.id ASC
+                LIMIT $4
+                """,
+                task_id,
+                cursor_ts,
+                cursor_id,
+                limit,
+            )
+        except (ValueError, Exception):
+            # Bad cursor — fall back to first page.
+            rows = await db.fetch(
+                """
+                SELECT c.*, f.content as finding_content, h.statement as hypothesis_statement
+                FROM claims c
+                LEFT JOIN findings f ON c.finding_id = f.id
+                LEFT JOIN hypotheses h ON c.hypothesis_id = h.id
+                WHERE c.task_id = $1
+                ORDER BY c.created_at ASC, c.id ASC
+                LIMIT $2
+                """,
+                task_id,
+                limit,
+            )
+    else:
+        rows = await db.fetch(
+            """
+            SELECT c.*, f.content as finding_content, h.statement as hypothesis_statement
+            FROM claims c
+            LEFT JOIN findings f ON c.finding_id = f.id
+            LEFT JOIN hypotheses h ON c.hypothesis_id = h.id
+            WHERE c.task_id = $1
+            ORDER BY c.created_at ASC, c.id ASC
+            LIMIT $2
+            """,
+            task_id,
+            limit,
+        )
     return [dict(r) for r in rows]
 
 

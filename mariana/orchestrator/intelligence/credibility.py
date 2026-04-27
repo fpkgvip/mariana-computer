@@ -345,18 +345,63 @@ async def score_source(
     return result
 
 
-async def get_source_scores(task_id: str, db: Any) -> list[dict[str, Any]]:
-    """Retrieve all source scores for a task, ordered by composite score."""
-    rows = await db.fetch(
-        """
-        SELECT ss.*, s.url, s.title
-        FROM source_scores ss
-        JOIN sources s ON ss.source_id = s.id
-        WHERE ss.task_id = $1
-        ORDER BY ss.composite_score DESC
-        """,
-        task_id,
-    )
+# F-06 pagination constants (mirrors evidence_ledger.py).
+_INTEL_MAX_LIMIT = 1000
+_INTEL_DEFAULT_LIMIT = 100
+
+
+async def get_source_scores(
+    task_id: str,
+    db: Any,
+    limit: int = _INTEL_DEFAULT_LIMIT,
+    cursor: str | None = None,
+) -> list[dict[str, Any]]:
+    """Retrieve source scores for a task with pagination.
+
+    F-06 fix: accepts ``limit`` (capped at 1000) and ``cursor`` (created_at|id)
+    for keyset pagination. Ordered by created_at ASC, id ASC.
+    """
+    limit = max(1, min(limit, _INTEL_MAX_LIMIT))
+
+    if cursor:
+        try:
+            cursor_ts, cursor_id = cursor.split("|", 1)
+            rows = await db.fetch(
+                """
+                SELECT ss.*, s.url, s.title
+                FROM source_scores ss
+                JOIN sources s ON ss.source_id = s.id
+                WHERE ss.task_id = $1
+                  AND (ss.created_at, ss.id) > ($2::timestamptz, $3)
+                ORDER BY ss.created_at ASC, ss.id ASC
+                LIMIT $4
+                """,
+                task_id, cursor_ts, cursor_id, limit,
+            )
+        except Exception:
+            rows = await db.fetch(
+                """
+                SELECT ss.*, s.url, s.title
+                FROM source_scores ss
+                JOIN sources s ON ss.source_id = s.id
+                WHERE ss.task_id = $1
+                ORDER BY ss.created_at ASC, ss.id ASC
+                LIMIT $2
+                """,
+                task_id, limit,
+            )
+    else:
+        rows = await db.fetch(
+            """
+            SELECT ss.*, s.url, s.title
+            FROM source_scores ss
+            JOIN sources s ON ss.source_id = s.id
+            WHERE ss.task_id = $1
+            ORDER BY ss.created_at ASC, ss.id ASC
+            LIMIT $2
+            """,
+            task_id, limit,
+        )
     return [dict(r) for r in rows]
 
 
