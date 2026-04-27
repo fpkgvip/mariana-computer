@@ -12,12 +12,12 @@ Every YAML finding appears under exactly one canonical.  Merge rules from the ta
 | Canonical | Lens IDs merged | Severity | Surface | Title |
 |-----------|----------------|----------|---------|-------|
 | B-01 | A1-01, A1-03, A1-04, A5-01, A5-03 | P0 | db | Anon-callable SECURITY DEFINER RPCs — credit inflation/drain, IDOR, role escalation via JSONB merge | **FIXED 2026-04-27** (mig 005 split-revoke + api.py service_role) |
-| B-02 | A1-02, A1-17, A5-04 | P1 | db | SECURITY DEFINER functions missing SET search_path — schema-shadowing attack vector |
+| B-02 | A1-02, A1-17, A5-04 | P1 | db | SECURITY DEFINER functions missing SET search_path — schema-shadowing attack vector | **FIXED 2026-04-27** (mig 007 SET search_path on 10 SECURITY DEFINER fns) |
 | B-03 | A2-01 | P1 | api | Stripe webhook marks event processed before business logic succeeds — lost credit grants on retry | **FIXED 2026-04-27** (two-phase claim/finalize + 8 regression tests) |
 | B-04 | A2-02 | P1 | api | Stripe refund and dispute events never reverse previously granted credits | **FIXED 2026-04-27** (refund_credits RPC corrected to debit; charge.refunded/dispute handlers added; 10 regression tests) |
-| B-05 | A1-08, A2-03 | P1 | cross | add_credits / deduct_credits bypass credit_buckets/credit_transactions ledger — R6 drift |
-| B-06 | A5-02 | P1 | db | admin_set_credits absolute write races concurrent spend — last-writer-wins, audit dirty read |
-| B-07 | A1-09, A5-10 | P1 | db | spend_credits no SELECT FOR UPDATE — two-tab concurrent spend underflows; balance_after racy |
+| B-05 | A1-08, A2-03 | P1 | cross | add_credits / deduct_credits bypass credit_buckets/credit_transactions ledger — R6 drift | **FIXED 2026-04-27** (mig 007 grant/spend/refund/expire sync profiles.tokens; one-shot backfill on live) |
+| B-06 | A5-02 | P1 | db | admin_set_credits absolute write races concurrent spend — last-writer-wins, audit dirty read | **FIXED 2026-04-27** (mig 007 admin_set_credits SELECT...FOR UPDATE) |
+| B-07 | A1-09, A5-10 | P1 | db | spend_credits no SELECT FOR UPDATE — two-tab concurrent spend underflows; balance_after racy | **FIXED 2026-04-27** (verified pg_advisory_xact_lock already in place; mig 007 also adds profiles.tokens sync) |
 | B-08 | A4-02 | P1 | frontend | Navbar / BuyCredits show stale profiles.tokens — never auto-refreshes after spend or webhook | **FIXED 2026-04-27** (Navbar.tsx + BuyCredits.tsx use useCredits() hook; hook extended with focus/visibilitychange/30s poll; 7 vitest tests added) |
 | B-09 | A4-03 | P1 | frontend | Full JWT access token exposed in SSE query string when stream-token mint fails or is absent | **FIXED 2026-04-27** (stream-token mint enforced in Chat.tsx + AgentTaskView.tsx + agentRunApi.ts; fallback-to-JWT removed; 30 tests added across TS and Python) |
 | B-10 | A4-04 | P1 | frontend | No Content-Security-Policy or any security header in vercel.json | **FIXED 2026-04-27** (vercel.json headers + vitest contract) |
@@ -72,11 +72,11 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 | 2 | B-10 | P1 | frontend | none | none | frontend | **FIXED** |
 | 3 | B-03 | P1 | api_patch | B-04 | none | api.py | **FIXED** |
 | 4 | B-09 | P1 | config | none | none | frontend | **FIXED** |
-| 5 | B-02 | P1 | migration | B-14 | B-01 | db |
+| 5 | B-02 | P1 | migration | B-14 | B-01 | db | **FIXED** |
 | 6 | B-04 | P1 | api_patch | none | B-03 | api.py | **FIXED** |
-| 7 | B-05 | P1 | api_patch | B-16, B-17 | B-01 | db + api.py |
-| 8 | B-06 | P1 | migration | none | B-01 | db |
-| 9 | B-07 | P1 | migration | B-22 | B-01 | db |
+| 7 | B-05 | P1 | api_patch | B-16, B-17 | B-01 | db + api.py | **FIXED** |
+| 8 | B-06 | P1 | migration | none | B-01 | db | **FIXED** |
+| 9 | B-07 | P1 | migration | B-22 | B-01 | db | **FIXED** |
 | 10 | B-08 | P1 | frontend_patch | none | none | frontend | **FIXED** |
 | 11 | B-11 | P2 | migration | none | none | db |
 | 12 | B-12 | P2 | migration | none | B-01 | db |
