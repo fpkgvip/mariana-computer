@@ -1,0 +1,1778 @@
+{
+  "tool": "list_tables",
+  "result": {
+    "tables": [
+      {
+        "name": "public.vault_secrets",
+        "rls_enabled": true,
+        "rows": 0,
+        "columns": [
+          {
+            "name": "id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "gen_random_uuid()"
+          },
+          {
+            "name": "user_id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "name",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "check": "name ~ '^[A-Z][A-Z0-9_]{0,63}$'::text"
+          },
+          {
+            "name": "description",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "value_iv",
+            "data_type": "bytea",
+            "format": "bytea",
+            "options": [
+              "updatable"
+            ],
+            "check": "octet_length(value_iv) = 12"
+          },
+          {
+            "name": "value_blob",
+            "data_type": "bytea",
+            "format": "bytea",
+            "options": [
+              "updatable"
+            ],
+            "check": "octet_length(value_blob) >= 16 AND octet_length(value_blob) <= 65552"
+          },
+          {
+            "name": "preview_iv",
+            "data_type": "bytea",
+            "format": "bytea",
+            "options": [
+              "updatable"
+            ],
+            "check": "octet_length(preview_iv) = 12"
+          },
+          {
+            "name": "preview_blob",
+            "data_type": "bytea",
+            "format": "bytea",
+            "options": [
+              "updatable"
+            ],
+            "check": "octet_length(preview_blob) >= 16 AND octet_length(preview_blob) <= 64"
+          },
+          {
+            "name": "created_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "clock_timestamp()"
+          },
+          {
+            "name": "updated_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "clock_timestamp()"
+          }
+        ],
+        "primary_keys": [
+          "id"
+        ],
+        "foreign_key_constraints": [
+          {
+            "name": "vault_secrets_user_id_fkey",
+            "source": "public.vault_secrets.user_id",
+            "target": "auth.users.id"
+          }
+        ]
+      },
+      {
+        "name": "public.admin_tasks",
+        "rls_enabled": true,
+        "rows": 26,
+        "columns": [
+          {
+            "name": "id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "gen_random_uuid()"
+          },
+          {
+            "name": "title",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "description",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "priority",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "'P2'::text",
+            "check": "priority = ANY (ARRAY['P0'::text, 'P1'::text, 'P2'::text, 'P3'::text])"
+          },
+          {
+            "name": "category",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "check": "category = ANY (ARRAY['cost'::text, 'security'::text, 'growth'::text, 'quality'::text, 'ops'::text, 'product'::text, 'infra'::text])"
+          },
+          {
+            "name": "status",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "'open'::text",
+            "check": "status = ANY (ARRAY['open'::text, 'in_progress'::text, 'blocked'::text, 'done'::text, 'wontfix'::text])"
+          },
+          {
+            "name": "assigned_to",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "due_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "completed_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "created_by",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "created_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "now()"
+          },
+          {
+            "name": "updated_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "now()"
+          }
+        ],
+        "primary_keys": [
+          "id"
+        ],
+        "foreign_key_constraints": [
+          {
+            "name": "admin_tasks_assigned_to_fkey",
+            "source": "public.admin_tasks.assigned_to",
+            "target": "auth.users.id"
+          },
+          {
+            "name": "admin_tasks_created_by_fkey",
+            "source": "public.admin_tasks.created_by",
+            "target": "auth.users.id"
+          }
+        ]
+      },
+      {
+        "name": "public.stripe_events",
+        "rls_enabled": true,
+        "rows": 0,
+        "columns": [
+          {
+            "name": "event_id",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "event_type",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "user_id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "payload",
+            "data_type": "jsonb",
+            "format": "jsonb",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "processed_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "now()"
+          },
+          {
+            "name": "result",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "check": "result = ANY (ARRAY['processed'::text, 'skipped'::text, 'error'::text])"
+          },
+          {
+            "name": "error",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          }
+        ],
+        "primary_keys": [
+          "event_id"
+        ],
+        "foreign_key_constraints": [
+          {
+            "name": "stripe_events_user_id_fkey",
+            "source": "public.stripe_events.user_id",
+            "target": "auth.users.id"
+          }
+        ]
+      },
+      {
+        "name": "public.credit_transactions",
+        "rls_enabled": true,
+        "rows": 1,
+        "columns": [
+          {
+            "name": "id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "gen_random_uuid()"
+          },
+          {
+            "name": "user_id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "type",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "check": "type = ANY (ARRAY['grant'::text, 'spend'::text, 'refund'::text, 'expiry'::text])"
+          },
+          {
+            "name": "credits",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "check": "credits > 0"
+          },
+          {
+            "name": "bucket_id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "ref_type",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "ref_id",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "balance_after",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "check": "balance_after >= 0"
+          },
+          {
+            "name": "metadata",
+            "data_type": "jsonb",
+            "format": "jsonb",
+            "options": [
+              "nullable",
+              "updatable"
+            ],
+            "default_value": "'{}'::jsonb"
+          },
+          {
+            "name": "created_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "clock_timestamp()"
+          }
+        ],
+        "primary_keys": [
+          "id"
+        ],
+        "foreign_key_constraints": [
+          {
+            "name": "credit_transactions_user_id_fkey",
+            "source": "public.credit_transactions.user_id",
+            "target": "auth.users.id"
+          },
+          {
+            "name": "credit_transactions_bucket_id_fkey",
+            "source": "public.credit_transactions.bucket_id",
+            "target": "public.credit_buckets.id"
+          }
+        ]
+      },
+      {
+        "name": "public.plans",
+        "rls_enabled": true,
+        "rows": 4,
+        "columns": [
+          {
+            "name": "id",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "name",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "description",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "price_monthly",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "0"
+          },
+          {
+            "name": "credits_monthly",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "0"
+          },
+          {
+            "name": "features",
+            "data_type": "jsonb",
+            "format": "jsonb",
+            "options": [
+              "nullable",
+              "updatable"
+            ],
+            "default_value": "'[]'::jsonb"
+          },
+          {
+            "name": "stripe_price_id",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "is_public",
+            "data_type": "boolean",
+            "format": "bool",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "true"
+          },
+          {
+            "name": "sort_order",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "0"
+          },
+          {
+            "name": "coming_soon",
+            "data_type": "boolean",
+            "format": "bool",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "false"
+          }
+        ],
+        "primary_keys": [
+          "id"
+        ]
+      },
+      {
+        "name": "public.conversation_messages",
+        "rls_enabled": true,
+        "rows": 191,
+        "columns": [
+          {
+            "name": "id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "gen_random_uuid()"
+          },
+          {
+            "name": "conversation_id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "role",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "check": "role = ANY (ARRAY['user'::text, 'assistant'::text, 'system'::text])"
+          },
+          {
+            "name": "content",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "type",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "'text'::text",
+            "check": "type = ANY (ARRAY['text'::text, 'code'::text, 'status'::text, 'error'::text, 'plan'::text])"
+          },
+          {
+            "name": "metadata",
+            "data_type": "jsonb",
+            "format": "jsonb",
+            "options": [
+              "nullable",
+              "updatable"
+            ],
+            "default_value": "'{}'::jsonb"
+          },
+          {
+            "name": "created_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "now()"
+          }
+        ],
+        "primary_keys": [
+          "id"
+        ],
+        "foreign_key_constraints": [
+          {
+            "name": "conversation_messages_conversation_id_fkey",
+            "source": "public.conversation_messages.conversation_id",
+            "target": "public.conversations.id"
+          }
+        ]
+      },
+      {
+        "name": "public.audit_log",
+        "rls_enabled": true,
+        "rows": 0,
+        "columns": [
+          {
+            "name": "id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "gen_random_uuid()"
+          },
+          {
+            "name": "actor_id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "actor_email",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "action",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "target_type",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "target_id",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "before",
+            "data_type": "jsonb",
+            "format": "jsonb",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "after",
+            "data_type": "jsonb",
+            "format": "jsonb",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "metadata",
+            "data_type": "jsonb",
+            "format": "jsonb",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "ip_address",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "user_agent",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "created_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "now()"
+          }
+        ],
+        "primary_keys": [
+          "id"
+        ],
+        "foreign_key_constraints": [
+          {
+            "name": "audit_log_actor_id_fkey",
+            "source": "public.audit_log.actor_id",
+            "target": "auth.users.id"
+          }
+        ]
+      },
+      {
+        "name": "public.system_status",
+        "rls_enabled": true,
+        "rows": 1,
+        "columns": [
+          {
+            "name": "id",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "1",
+            "check": "id = 1"
+          },
+          {
+            "name": "frozen",
+            "data_type": "boolean",
+            "format": "bool",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "false"
+          },
+          {
+            "name": "frozen_reason",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "frozen_by",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "frozen_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "maintenance_message",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "updated_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "now()"
+          }
+        ],
+        "primary_keys": [
+          "id"
+        ],
+        "foreign_key_constraints": [
+          {
+            "name": "system_status_frozen_by_fkey",
+            "source": "public.system_status.frozen_by",
+            "target": "auth.users.id"
+          }
+        ]
+      },
+      {
+        "name": "public.usage_rollup_daily",
+        "rls_enabled": true,
+        "rows": 0,
+        "columns": [
+          {
+            "name": "day",
+            "data_type": "date",
+            "format": "date",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "user_id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "task_count",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "0"
+          },
+          {
+            "name": "credits_spent",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "0"
+          },
+          {
+            "name": "tokens_used",
+            "data_type": "bigint",
+            "format": "int8",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "0"
+          },
+          {
+            "name": "tool_calls",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "0"
+          },
+          {
+            "name": "errors",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "0"
+          },
+          {
+            "name": "model_breakdown",
+            "data_type": "jsonb",
+            "format": "jsonb",
+            "options": [
+              "nullable",
+              "updatable"
+            ],
+            "default_value": "'{}'::jsonb"
+          },
+          {
+            "name": "updated_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "now()"
+          }
+        ],
+        "primary_keys": [
+          "day",
+          "user_id"
+        ],
+        "foreign_key_constraints": [
+          {
+            "name": "usage_rollup_daily_user_id_fkey",
+            "source": "public.usage_rollup_daily.user_id",
+            "target": "auth.users.id"
+          }
+        ]
+      },
+      {
+        "name": "public.user_vaults",
+        "rls_enabled": true,
+        "rows": 0,
+        "columns": [
+          {
+            "name": "user_id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "kdf_algorithm",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "'argon2id'::text",
+            "check": "kdf_algorithm = 'argon2id'::text"
+          },
+          {
+            "name": "kdf_memory_kib",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "65536",
+            "check": "kdf_memory_kib >= 16384 AND kdf_memory_kib <= 1048576"
+          },
+          {
+            "name": "kdf_iterations",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "3",
+            "check": "kdf_iterations >= 1 AND kdf_iterations <= 16"
+          },
+          {
+            "name": "kdf_parallelism",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "4",
+            "check": "kdf_parallelism >= 1 AND kdf_parallelism <= 16"
+          },
+          {
+            "name": "passphrase_salt",
+            "data_type": "bytea",
+            "format": "bytea",
+            "options": [
+              "updatable"
+            ],
+            "check": "octet_length(passphrase_salt) = 16"
+          },
+          {
+            "name": "passphrase_iv",
+            "data_type": "bytea",
+            "format": "bytea",
+            "options": [
+              "updatable"
+            ],
+            "check": "octet_length(passphrase_iv) = 12"
+          },
+          {
+            "name": "passphrase_blob",
+            "data_type": "bytea",
+            "format": "bytea",
+            "options": [
+              "updatable"
+            ],
+            "check": "octet_length(passphrase_blob) >= 16 AND octet_length(passphrase_blob) <= 96"
+          },
+          {
+            "name": "recovery_salt",
+            "data_type": "bytea",
+            "format": "bytea",
+            "options": [
+              "updatable"
+            ],
+            "check": "octet_length(recovery_salt) = 16"
+          },
+          {
+            "name": "recovery_iv",
+            "data_type": "bytea",
+            "format": "bytea",
+            "options": [
+              "updatable"
+            ],
+            "check": "octet_length(recovery_iv) = 12"
+          },
+          {
+            "name": "recovery_blob",
+            "data_type": "bytea",
+            "format": "bytea",
+            "options": [
+              "updatable"
+            ],
+            "check": "octet_length(recovery_blob) >= 16 AND octet_length(recovery_blob) <= 96"
+          },
+          {
+            "name": "verifier_iv",
+            "data_type": "bytea",
+            "format": "bytea",
+            "options": [
+              "updatable"
+            ],
+            "check": "octet_length(verifier_iv) = 12"
+          },
+          {
+            "name": "verifier_blob",
+            "data_type": "bytea",
+            "format": "bytea",
+            "options": [
+              "updatable"
+            ],
+            "check": "octet_length(verifier_blob) >= 16 AND octet_length(verifier_blob) <= 128"
+          },
+          {
+            "name": "created_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "clock_timestamp()"
+          },
+          {
+            "name": "updated_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "clock_timestamp()"
+          }
+        ],
+        "primary_keys": [
+          "user_id"
+        ],
+        "foreign_key_constraints": [
+          {
+            "name": "user_vaults_user_id_fkey",
+            "source": "public.user_vaults.user_id",
+            "target": "auth.users.id"
+          }
+        ]
+      },
+      {
+        "name": "public.profiles",
+        "rls_enabled": true,
+        "rows": 13,
+        "columns": [
+          {
+            "name": "id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "email",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "full_name",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "tokens",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "500"
+          },
+          {
+            "name": "plan",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "'flagship'::text"
+          },
+          {
+            "name": "created_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "now()"
+          },
+          {
+            "name": "updated_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "now()"
+          },
+          {
+            "name": "role",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "'user'::text"
+          },
+          {
+            "name": "stripe_customer_id",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "stripe_subscription_id",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "subscription_status",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ],
+            "default_value": "'none'::text"
+          },
+          {
+            "name": "subscription_plan",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ],
+            "default_value": "'none'::text"
+          },
+          {
+            "name": "subscription_current_period_end",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "suspended_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "suspended_reason",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "admin_notes",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          }
+        ],
+        "primary_keys": [
+          "id"
+        ],
+        "foreign_key_constraints": [
+          {
+            "name": "profiles_id_fkey",
+            "source": "public.profiles.id",
+            "target": "auth.users.id"
+          },
+          {
+            "name": "investigations_user_id_fkey",
+            "source": "public.investigations.user_id",
+            "target": "public.profiles.id"
+          },
+          {
+            "name": "conversations_user_id_fkey",
+            "source": "public.conversations.user_id",
+            "target": "public.profiles.id"
+          }
+        ]
+      },
+      {
+        "name": "public.messages",
+        "rls_enabled": true,
+        "rows": 0,
+        "columns": [
+          {
+            "name": "id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "gen_random_uuid()"
+          },
+          {
+            "name": "investigation_id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "role",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "check": "role = ANY (ARRAY['user'::text, 'assistant'::text, 'system'::text])"
+          },
+          {
+            "name": "content",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "type",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ],
+            "default_value": "'text'::text",
+            "check": "type = ANY (ARRAY['text'::text, 'code'::text, 'status'::text])"
+          },
+          {
+            "name": "created_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "now()"
+          }
+        ],
+        "primary_keys": [
+          "id"
+        ],
+        "foreign_key_constraints": [
+          {
+            "name": "messages_investigation_id_fkey",
+            "source": "public.messages.investigation_id",
+            "target": "public.investigations.id"
+          }
+        ]
+      },
+      {
+        "name": "public.feature_flags",
+        "rls_enabled": true,
+        "rows": 10,
+        "columns": [
+          {
+            "name": "key",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "enabled",
+            "data_type": "boolean",
+            "format": "bool",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "false"
+          },
+          {
+            "name": "description",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "rollout_percentage",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "0",
+            "check": "rollout_percentage >= 0 AND rollout_percentage <= 100"
+          },
+          {
+            "name": "enabled_user_ids",
+            "data_type": "ARRAY",
+            "format": "_uuid",
+            "options": [
+              "nullable",
+              "updatable"
+            ],
+            "default_value": "'{}'::uuid[]"
+          },
+          {
+            "name": "enabled_plans",
+            "data_type": "ARRAY",
+            "format": "_text",
+            "options": [
+              "nullable",
+              "updatable"
+            ],
+            "default_value": "'{}'::text[]"
+          },
+          {
+            "name": "updated_by",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "updated_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "now()"
+          },
+          {
+            "name": "created_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "now()"
+          }
+        ],
+        "primary_keys": [
+          "key"
+        ],
+        "foreign_key_constraints": [
+          {
+            "name": "feature_flags_updated_by_fkey",
+            "source": "public.feature_flags.updated_by",
+            "target": "auth.users.id"
+          }
+        ]
+      },
+      {
+        "name": "public.conversations",
+        "rls_enabled": true,
+        "rows": 88,
+        "columns": [
+          {
+            "name": "id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "gen_random_uuid()"
+          },
+          {
+            "name": "user_id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "title",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "'New conversation'::text"
+          },
+          {
+            "name": "created_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "now()"
+          },
+          {
+            "name": "updated_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "now()"
+          }
+        ],
+        "primary_keys": [
+          "id"
+        ],
+        "foreign_key_constraints": [
+          {
+            "name": "conversations_user_id_fkey",
+            "source": "public.conversations.user_id",
+            "target": "public.profiles.id"
+          },
+          {
+            "name": "conversation_messages_conversation_id_fkey",
+            "source": "public.conversation_messages.conversation_id",
+            "target": "public.conversations.id"
+          },
+          {
+            "name": "investigations_conversation_id_fkey",
+            "source": "public.investigations.conversation_id",
+            "target": "public.conversations.id"
+          }
+        ]
+      },
+      {
+        "name": "public.investigations",
+        "rls_enabled": true,
+        "rows": 113,
+        "columns": [
+          {
+            "name": "id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "gen_random_uuid()"
+          },
+          {
+            "name": "user_id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "ticker",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ],
+            "default_value": "''::text"
+          },
+          {
+            "name": "hypothesis",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ],
+            "default_value": "''::text"
+          },
+          {
+            "name": "status",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "'PENDING'::text"
+          },
+          {
+            "name": "depth",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "'deep'::text"
+          },
+          {
+            "name": "model",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "'fast'::text"
+          },
+          {
+            "name": "budget_usd",
+            "data_type": "numeric",
+            "format": "numeric",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "50.00"
+          },
+          {
+            "name": "backend_investigation_id",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "created_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "now()"
+          },
+          {
+            "name": "updated_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "now()"
+          },
+          {
+            "name": "task_id",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable",
+              "unique"
+            ]
+          },
+          {
+            "name": "topic",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "duration_hours",
+            "data_type": "double precision",
+            "format": "float8",
+            "options": [
+              "nullable",
+              "updatable"
+            ],
+            "default_value": "2.0"
+          },
+          {
+            "name": "output_pdf_path",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "output_docx_path",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "conversation_id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          }
+        ],
+        "primary_keys": [
+          "id"
+        ],
+        "foreign_key_constraints": [
+          {
+            "name": "investigations_user_id_fkey",
+            "source": "public.investigations.user_id",
+            "target": "public.profiles.id"
+          },
+          {
+            "name": "messages_investigation_id_fkey",
+            "source": "public.messages.investigation_id",
+            "target": "public.investigations.id"
+          },
+          {
+            "name": "investigations_conversation_id_fkey",
+            "source": "public.investigations.conversation_id",
+            "target": "public.conversations.id"
+          }
+        ]
+      },
+      {
+        "name": "public.credit_buckets",
+        "rls_enabled": true,
+        "rows": 1,
+        "columns": [
+          {
+            "name": "id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "gen_random_uuid()"
+          },
+          {
+            "name": "user_id",
+            "data_type": "uuid",
+            "format": "uuid",
+            "options": [
+              "updatable"
+            ]
+          },
+          {
+            "name": "source",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "updatable"
+            ],
+            "check": "source = ANY (ARRAY['signup_grant'::text, 'plan_renewal'::text, 'topup'::text, 'admin_grant'::text, 'refund'::text])"
+          },
+          {
+            "name": "original_credits",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "check": "original_credits >= 0"
+          },
+          {
+            "name": "remaining_credits",
+            "data_type": "integer",
+            "format": "int4",
+            "options": [
+              "updatable"
+            ],
+            "check": "remaining_credits >= 0"
+          },
+          {
+            "name": "granted_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "clock_timestamp()"
+          },
+          {
+            "name": "expires_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "ref_type",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "ref_id",
+            "data_type": "text",
+            "format": "text",
+            "options": [
+              "nullable",
+              "updatable"
+            ]
+          },
+          {
+            "name": "created_at",
+            "data_type": "timestamp with time zone",
+            "format": "timestamptz",
+            "options": [
+              "updatable"
+            ],
+            "default_value": "clock_timestamp()"
+          }
+        ],
+        "primary_keys": [
+          "id"
+        ],
+        "foreign_key_constraints": [
+          {
+            "name": "credit_buckets_user_id_fkey",
+            "source": "public.credit_buckets.user_id",
+            "target": "auth.users.id"
+          },
+          {
+            "name": "credit_transactions_bucket_id_fkey",
+            "source": "public.credit_transactions.bucket_id",
+            "target": "public.credit_buckets.id"
+          }
+        ]
+      }
+    ]
+  },
+  "connector": "supabase",
+  "structure": "JSON object with 1 keys: tables"
+}
