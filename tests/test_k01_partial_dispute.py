@@ -1,18 +1,22 @@
-"""J-02 regression suite: dispute after partial refund debits only the
-incremental remaining credits, not the full grant.
+"""K-01 regression suite: partial-amount disputes (dispute.amount < charge.amount)
+must debit only the disputed portion, not the full original grant.
 
 Bug fixed:
-- dispute.created used dispute.amount as full amount_refunded, so a full-amount
-  dispute after a partial refund would over-debit (e.g. 30 + 100 = 130 for a
-  100-credit grant).
-- Fix: _reverse_credits_for_charge subtracts already_reversed credits (summed
-  across all prior reversal rows for this charge_id) before debiting.
+- _handle_charge_dispute_created and _handle_charge_dispute_funds_withdrawn build
+  a pseudo-charge with amount = amount_refunded = dispute.amount. In
+  _reverse_credits_for_charge that always trips the else branch (target = full
+  grant) regardless of what fraction of the original charge was disputed.
+- Fix: persist the original charge.amount on stripe_payment_grants
+  (charge_amount column, migration 020). When dispute_obj is present,
+  _reverse_credits_for_charge overrides amount_total with grant_tx['charge_amount']
+  so the pro-rata branch sees the true ratio dispute.amount / charge.amount.
 
-Test inventory (>=4):
-  1. partial_refund_30_then_full_dispute_debits_30_then_70
-  2. partial_refund_30_then_partial_dispute_70_debits_30_then_70
-  3. full_refund_then_full_dispute_refund_debits_100_dispute_skipped
-  4. dispute_only_no_prior_refund_debits_full_grant_regression
+Test inventory (>=2 per task brief):
+  1. partial_dispute_30_percent_no_prior_refund_debits_30
+  2. partial_refund_20_then_partial_dispute_30_total_debit_30
+  3. full_amount_dispute_no_prior_refund_debits_full_grant_regression
+  4. partial_dispute_funds_withdrawn_path_also_pro_rata
+  5. legacy_grant_without_charge_amount_falls_back_to_old_behaviour
 """
 
 from __future__ import annotations
@@ -26,11 +30,6 @@ import pytest
 
 from mariana import api as mod
 from mariana.config import AppConfig
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _cfg() -> AppConfig:
@@ -60,30 +59,22 @@ def _patch_supabase_api_key():
         yield
 
 
-def _grant_resp(user_id: str = "user-j02", credits: int = 100) -> _FakeResp:
-    return _FakeResp(200, [{"user_id": user_id, "credits": credits, "event_id": "evt_grant"}])
-
-
-def _no_row() -> _FakeResp:
-    return _FakeResp(200, [])
-
-
 def _refund_rpc_ok() -> _FakeResp:
     return _FakeResp(200, {"status": "reversed", "credits_debited": 1, "balance_after": 0})
 
 
 class _StatefulClient:
-    """Simulates the database state across sequential refund + dispute calls.
+    """Simulates DB state for grants + dispute_reversals across sequential calls.
 
-    Tracks inserted stripe_dispute_reversals rows and uses them to answer
-    both the _sum_reversed_credits_for_charge query (charge_id=eq.<id>)
-    and the dedup check (reversal_key=eq.<key>).
+    K-01: returns charge_amount in stripe_payment_grants response so the
+    reversal flow can compute pro-rata correctly when dispute_obj is set.
     """
 
-    def __init__(self, grant_credits: int = 100):
+    def __init__(self, grant_credits: int = 100, charge_amount: int | None = 10000) -> None:
         self.calls: list[dict] = []
         self.inserted_reversals: list[dict] = []
         self.grant_credits = grant_credits
+        self.charge_amount = charge_amount
 
     async def __aenter__(self):
         return self
@@ -99,8 +90,10 @@ class _StatefulClient:
         if "rpc/refund_credits" in url:
             return _refund_rpc_ok()
         if "rpc/process_charge_reversal" in url:
-            # K-02 RPC simulation: dedup, sum, compute incremental, synthesize
-            # refund_credits call so existing assertions still find it.
+            # K-02 RPC path — simulate the SECURITY DEFINER function:
+            # 1. dedup on reversal_key
+            # 2. sum credits_already_reversed by charge_id
+            # 3. compute incremental, call refund_credits, INSERT dedup row
             payload = json or {}
             reversal_key = payload.get("p_reversal_key")
             charge_id = payload.get("p_charge_id")
@@ -128,6 +121,8 @@ class _StatefulClient:
             )
             if incremental <= 0:
                 return _FakeResp(200, {"status": "already_satisfied", "credits": 0})
+            # Record the refund call so existing assertions over rpc/refund_credits
+            # continue to function for K-02 tests.
             self.calls.append(
                 {
                     "method": "POST",
@@ -146,7 +141,14 @@ class _StatefulClient:
     async def get(self, url: str, params=None, headers=None):
         self.calls.append({"method": "GET", "url": url, "params": params})
         if "stripe_payment_grants" in url:
-            return _grant_resp(credits=self.grant_credits)
+            row: dict[str, Any] = {
+                "user_id": "user-k01",
+                "credits": self.grant_credits,
+                "event_id": "evt_grant",
+            }
+            if self.charge_amount is not None:
+                row["charge_amount"] = self.charge_amount
+            return _FakeResp(200, [row])
         if "stripe_dispute_reversals" in url:
             params = params or {}
             charge_id_filter = ""
@@ -183,186 +185,180 @@ def _credits_arg(call: dict) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 1. Partial refund 30%, then full-amount dispute → debit 30, then 70
+# 1. Partial dispute, no prior refund — debit only the disputed portion
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_partial_refund_30_then_full_dispute_debits_30_then_70():
-    """$100 charge with 100-credit grant.
-    charge.refunded at 30%  → debit 30.
-    charge.dispute.created at full amount → debit 70 (not 100).
-    Total: 100. No over-clawback."""
+async def test_partial_dispute_30_percent_no_prior_refund_debits_30():
+    """$100 charge / 100-credit grant. Stripe emits dispute.created with
+    dispute.amount=3000 (30% of charge). The handler must debit 30 credits,
+    not the full 100."""
     cfg = _cfg()
-    client = _StatefulClient(grant_credits=100)
-
-    with patch.object(httpx, "AsyncClient", return_value=client):
-        # Step 1: partial refund 30%
-        await mod._handle_charge_refunded(
-            {"id": "ch_j02", "payment_intent": "pi_j02", "amount": 10000, "amount_refunded": 3000},
-            cfg,
-            event_id="evt_ref_j02",
-        )
-        # Step 2: full-amount dispute on same charge
-        await mod._handle_charge_dispute_created(
-            {
-                "id": "dp_j02",
-                "charge": "ch_j02",
-                "payment_intent": "pi_j02",
-                "amount": 10000,
-            },
-            cfg,
-            event_id="evt_disp_j02",
-        )
-
-    calls = _refund_calls(client)
-    assert len(calls) == 2, f"Expected 2 refund RPC calls (refund + dispute), got {len(calls)}"
-
-    debit1 = _credits_arg(calls[0])
-    debit2 = _credits_arg(calls[1])
-    assert debit1 == 30, f"Refund debit should be 30, got {debit1}"
-    assert debit2 == 70, (
-        f"Dispute debit should be 70 (incremental after 30 already reversed), got {debit2}"
-    )
-    total = debit1 + debit2
-    assert total == 100, f"Total debit must not exceed 100, got {total}"
-
-
-# ---------------------------------------------------------------------------
-# 2. Partial refund 30%, partial dispute 70% → debit 30, then 70
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_partial_refund_30_then_partial_dispute_70_debits_30_then_70():
-    """$100 charge: 30% partial refund, then dispute for 70% of the charge.
-    Refund debits 30. Dispute target = 100 (because _handle_charge_dispute_created
-    sets charge_dict amount=dispute.amount=amount_refunded=7000, so amount_refunded
-    >= amount_total → target = original_credits = 100). already_reversed=30.
-    incremental = 100 - 30 = 70.
-
-    Note: _handle_charge_dispute_created builds:
-      charge_dict = {amount: 7000, amount_refunded: 7000}
-    Since amount_refunded == amount_total, the full-reversal branch fires:
-      target_credits = original_credits = 100
-    already_reversed = 30 (from prior refund)
-    incremental = max(0, 100 - 30) = 70.
-    Total debited: 30 + 70 = 100. No over-clawback.
-    """
-    cfg = _cfg()
-    client = _StatefulClient(grant_credits=100)
-
-    with patch.object(httpx, "AsyncClient", return_value=client):
-        await mod._handle_charge_refunded(
-            {"id": "ch_j02b", "payment_intent": "pi_j02b", "amount": 10000, "amount_refunded": 3000},
-            cfg,
-            event_id="evt_ref_j02b",
-        )
-        await mod._handle_charge_dispute_created(
-            {
-                "id": "dp_j02b",
-                "charge": "ch_j02b",
-                "payment_intent": "pi_j02b",
-                "amount": 7000,
-            },
-            cfg,
-            event_id="evt_disp_j02b",
-        )
-
-    calls = _refund_calls(client)
-    assert len(calls) == 2, f"Expected 2 refund RPC calls, got {len(calls)}"
-
-    debit1 = _credits_arg(calls[0])
-    debit2 = _credits_arg(calls[1])
-    assert debit1 == 30, f"Refund debit should be 30, got {debit1}"
-    # _handle_charge_dispute_created: amount=7000, amount_refunded=7000
-    # → amount_refunded >= amount_total → target = 100 (full grant)
-    # already_reversed = 30 → incremental = 70
-    assert debit2 == 70, (
-        f"Dispute incremental debit should be 70 (100 target - 30 already), got {debit2}"
-    )
-    total = debit1 + debit2
-    assert total == 100, f"Total debit must not exceed original grant of 100, got {total}"
-
-
-# ---------------------------------------------------------------------------
-# 3. Full refund 100%, then full dispute → refund debits 100, dispute skipped (0)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_full_refund_then_full_dispute_dispute_records_zero():
-    """Full refund first debits all 100 credits. A subsequent full-amount dispute
-    finds already_reversed=100, incremental=0, and records a 0-credit dedup row
-    without calling the refund RPC for any positive amount."""
-    cfg = _cfg()
-    client = _StatefulClient(grant_credits=100)
-
-    with patch.object(httpx, "AsyncClient", return_value=client):
-        # Full refund
-        await mod._handle_charge_refunded(
-            {"id": "ch_j02c", "payment_intent": "pi_j02c", "amount": 10000, "amount_refunded": 10000},
-            cfg,
-            event_id="evt_ref_j02c",
-        )
-        # Full dispute on same charge
-        await mod._handle_charge_dispute_created(
-            {
-                "id": "dp_j02c",
-                "charge": "ch_j02c",
-                "payment_intent": "pi_j02c",
-                "amount": 10000,
-            },
-            cfg,
-            event_id="evt_disp_j02c",
-        )
-
-    calls = _refund_calls(client)
-    # Only the refund should trigger the RPC; dispute incremental=0 skips RPC
-    assert len(calls) == 1, (
-        f"Only the refund should call refund_credits; dispute with 0 incremental must skip RPC. "
-        f"Got {len(calls)} calls."
-    )
-    debit1 = _credits_arg(calls[0])
-    assert debit1 == 100, f"Full refund should debit all 100 credits, got {debit1}"
-
-    # The dispute should still have inserted a 0-credit dedup row
-    dispute_inserts = [
-        r for r in client.inserted_reversals if r.get("reversal_key", "").startswith("dispute:")
-    ]
-    assert len(dispute_inserts) >= 1, (
-        "Dispute must still insert a 0-credit dedup row to prevent future re-processing"
-    )
-    assert dispute_inserts[0].get("credits", -1) == 0, (
-        f"Dispute dedup row credits should be 0, got {dispute_inserts[0].get('credits')}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# 4. Dispute only (no prior refund) → debits full grant (regression)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_dispute_only_no_prior_refund_debits_full_grant_regression():
-    """Regression: when no prior refund reversal exists for a charge, a
-    dispute.created for the full amount must still debit all 100 credits."""
-    cfg = _cfg()
-    client = _StatefulClient(grant_credits=100)
+    client = _StatefulClient(grant_credits=100, charge_amount=10000)
 
     with patch.object(httpx, "AsyncClient", return_value=client):
         await mod._handle_charge_dispute_created(
             {
-                "id": "dp_j02d",
-                "charge": "ch_j02d",
-                "payment_intent": "pi_j02d",
-                "amount": 10000,
+                "id": "dp_k01",
+                "charge": "ch_k01",
+                "payment_intent": "pi_k01",
+                "amount": 3000,
             },
             cfg,
-            event_id="evt_disp_j02d",
+            event_id="evt_disp_k01",
         )
 
     calls = _refund_calls(client)
     assert len(calls) == 1, f"Expected 1 refund RPC call, got {len(calls)}"
     debit = _credits_arg(calls[0])
-    assert debit == 100, f"Full dispute with no prior refund should debit all 100 credits, got {debit}"
+    assert debit == 30, (
+        f"Partial dispute (3000/10000) on a 100-credit grant must debit 30, got {debit}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. Combined K-01 + J-02: partial refund 20%, then partial dispute 30%
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_partial_refund_20_then_partial_dispute_30_total_debit_30():
+    """$100 charge / 100-credit grant.
+    Step 1: charge.refunded with cumulative amount_refunded=2000 (20%) → debit 20.
+    Step 2: charge.dispute.created with dispute.amount=3000 (30% of charge) →
+    target=30, already_reversed=20, incremental=10. Total = 30."""
+    cfg = _cfg()
+    client = _StatefulClient(grant_credits=100, charge_amount=10000)
+
+    with patch.object(httpx, "AsyncClient", return_value=client):
+        await mod._handle_charge_refunded(
+            {
+                "id": "ch_k01b",
+                "payment_intent": "pi_k01b",
+                "amount": 10000,
+                "amount_refunded": 2000,
+            },
+            cfg,
+            event_id="evt_ref_k01b",
+        )
+        await mod._handle_charge_dispute_created(
+            {
+                "id": "dp_k01b",
+                "charge": "ch_k01b",
+                "payment_intent": "pi_k01b",
+                "amount": 3000,
+            },
+            cfg,
+            event_id="evt_disp_k01b",
+        )
+
+    calls = _refund_calls(client)
+    assert len(calls) == 2, f"Expected 2 refund RPC calls, got {len(calls)}"
+    debit1 = _credits_arg(calls[0])
+    debit2 = _credits_arg(calls[1])
+    assert debit1 == 20, f"Partial refund 20% should debit 20, got {debit1}"
+    assert debit2 == 10, (
+        f"Partial dispute 30% after 20% prior refund: target=30, already=20, "
+        f"incremental=10 expected, got {debit2}"
+    )
+    assert debit1 + debit2 == 30, f"Total debit must be 30, got {debit1 + debit2}"
+
+
+# ---------------------------------------------------------------------------
+# 3. Regression: full-amount dispute with no prior refund still debits all 100
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_full_amount_dispute_no_prior_refund_debits_full_grant_regression():
+    """Regression: when dispute.amount == charge.amount the full 100-credit
+    grant must still be debited (matches previous J-02 invariant)."""
+    cfg = _cfg()
+    client = _StatefulClient(grant_credits=100, charge_amount=10000)
+
+    with patch.object(httpx, "AsyncClient", return_value=client):
+        await mod._handle_charge_dispute_created(
+            {
+                "id": "dp_k01c",
+                "charge": "ch_k01c",
+                "payment_intent": "pi_k01c",
+                "amount": 10000,
+            },
+            cfg,
+            event_id="evt_disp_k01c",
+        )
+
+    calls = _refund_calls(client)
+    assert len(calls) == 1, f"Expected 1 refund RPC call, got {len(calls)}"
+    debit = _credits_arg(calls[0])
+    assert debit == 100, f"Full-amount dispute should debit all 100, got {debit}"
+
+
+# ---------------------------------------------------------------------------
+# 4. Funds-withdrawn path is also pro-rata
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_partial_dispute_funds_withdrawn_path_also_pro_rata():
+    """charge.dispute.funds_withdrawn must debit pro-rata when dispute.amount
+    < charge.amount (symmetric with charge.dispute.created)."""
+    cfg = _cfg()
+    client = _StatefulClient(grant_credits=100, charge_amount=10000)
+
+    with patch.object(httpx, "AsyncClient", return_value=client):
+        await mod._handle_charge_dispute_funds_withdrawn(
+            {
+                "id": "dp_k01d",
+                "charge": "ch_k01d",
+                "payment_intent": "pi_k01d",
+                "amount": 4500,
+            },
+            cfg,
+            event_id="evt_disp_k01d_fw",
+        )
+
+    calls = _refund_calls(client)
+    assert len(calls) == 1, f"Expected 1 refund RPC call, got {len(calls)}"
+    debit = _credits_arg(calls[0])
+    assert debit == 45, (
+        f"Partial dispute funds_withdrawn (4500/10000) should debit 45, got {debit}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5. Legacy grant without charge_amount falls back to current behaviour
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_legacy_grant_without_charge_amount_falls_back_to_old_behaviour():
+    """For legacy stripe_payment_grants rows that pre-date the charge_amount
+    backfill, the reversal flow must NOT crash. It falls back to the existing
+    behaviour (full grant debit on dispute, since charge_obj.amount equals
+    dispute.amount in the pseudo-charge)."""
+    cfg = _cfg()
+    client = _StatefulClient(grant_credits=100, charge_amount=None)
+
+    with patch.object(httpx, "AsyncClient", return_value=client):
+        await mod._handle_charge_dispute_created(
+            {
+                "id": "dp_k01e",
+                "charge": "ch_k01e",
+                "payment_intent": "pi_k01e",
+                "amount": 3000,
+            },
+            cfg,
+            event_id="evt_disp_k01e",
+        )
+
+    calls = _refund_calls(client)
+    assert len(calls) == 1, f"Expected 1 refund RPC call, got {len(calls)}"
+    debit = _credits_arg(calls[0])
+    # Legacy fallback: charge_amount unknown, so reversal uses charge_obj.amount
+    # (= dispute.amount = 3000) and falls into the else branch (target = full grant).
+    # This is documented as best-effort for legacy rows.
+    assert debit == 100, (
+        f"Legacy row without charge_amount: documented fallback debits full grant, got {debit}"
+    )

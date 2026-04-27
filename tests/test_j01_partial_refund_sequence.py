@@ -100,6 +100,49 @@ class _StatefulClient:
             return _FakeResp(201, {})
         if "rpc/refund_credits" in url:
             return _refund_rpc_ok()
+        if "rpc/process_charge_reversal" in url:
+            # K-02 RPC simulation: dedup, sum, compute incremental, synthesize
+            # refund_credits call so existing assertions still find it.
+            payload = json or {}
+            reversal_key = payload.get("p_reversal_key")
+            charge_id = payload.get("p_charge_id")
+            target = int(payload.get("p_target_credits") or 0)
+            for row in self.inserted_reversals:
+                if row.get("reversal_key") == reversal_key:
+                    return _FakeResp(200, {"status": "duplicate", "credits": 0})
+            already = sum(
+                int(r.get("credits") or 0)
+                for r in self.inserted_reversals
+                if r.get("charge_id") == charge_id
+            )
+            incremental = max(0, target - already)
+            self.inserted_reversals.append(
+                {
+                    "reversal_key": reversal_key,
+                    "user_id": payload.get("p_user_id"),
+                    "charge_id": charge_id,
+                    "dispute_id": payload.get("p_dispute_id"),
+                    "payment_intent_id": payload.get("p_payment_intent_id"),
+                    "credits": incremental,
+                    "first_event_id": payload.get("p_first_event_id"),
+                    "first_event_type": payload.get("p_first_event_type"),
+                }
+            )
+            if incremental <= 0:
+                return _FakeResp(200, {"status": "already_satisfied", "credits": 0})
+            self.calls.append(
+                {
+                    "method": "POST",
+                    "url": "https://supabase.test/rest/v1/rpc/refund_credits",
+                    "json": {
+                        "p_user_id": payload.get("p_user_id"),
+                        "p_credits": incremental,
+                        "p_ref_type": "stripe_event",
+                        "p_ref_id": reversal_key,
+                    },
+                }
+            )
+            return _FakeResp(200, {"status": "reversed", "credits": incremental})
         return _FakeResp(200, {})
 
     async def get(self, url: str, params=None, headers=None):

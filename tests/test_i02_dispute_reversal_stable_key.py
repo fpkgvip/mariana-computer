@@ -70,6 +70,7 @@ class _RecordingClient:
         self.default_response = default_response or _FakeResp(200, {})
         self.by_path = by_path or {}
         self.calls: list[dict[str, Any]] = []
+        self.inserted_reversals: list[dict[str, Any]] = []
 
     async def __aenter__(self):
         return self
@@ -79,6 +80,47 @@ class _RecordingClient:
 
     async def post(self, url: str, json=None, headers=None):
         self.calls.append({"method": "POST", "url": url, "json": json})
+        if "rpc/process_charge_reversal" in url:
+            payload = json or {}
+            reversal_key = payload.get("p_reversal_key")
+            charge_id = payload.get("p_charge_id")
+            target = int(payload.get("p_target_credits") or 0)
+            for row in self.inserted_reversals:
+                if row.get("reversal_key") == reversal_key:
+                    return _FakeResp(200, {"status": "duplicate", "credits": 0})
+            already = sum(
+                int(r.get("credits") or 0)
+                for r in self.inserted_reversals
+                if r.get("charge_id") == charge_id
+            )
+            incremental = max(0, target - already)
+            self.inserted_reversals.append(
+                {
+                    "reversal_key": reversal_key,
+                    "user_id": payload.get("p_user_id"),
+                    "charge_id": charge_id,
+                    "dispute_id": payload.get("p_dispute_id"),
+                    "payment_intent_id": payload.get("p_payment_intent_id"),
+                    "credits": incremental,
+                    "first_event_id": payload.get("p_first_event_id"),
+                    "first_event_type": payload.get("p_first_event_type"),
+                }
+            )
+            if incremental <= 0:
+                return _FakeResp(200, {"status": "already_satisfied", "credits": 0})
+            self.calls.append(
+                {
+                    "method": "POST",
+                    "url": "https://supabase.test/rest/v1/rpc/refund_credits",
+                    "json": {
+                        "p_user_id": payload.get("p_user_id"),
+                        "p_credits": incremental,
+                        "p_ref_type": "stripe_event",
+                        "p_ref_id": reversal_key,
+                    },
+                }
+            )
+            return _FakeResp(200, {"status": "reversed", "credits": incremental})
         for path, resp in self.by_path.items():
             if path in url:
                 return resp
@@ -202,6 +244,18 @@ async def test_concurrent_dispute_events_same_dispute_only_one_refund_via_rpc_de
                 else:
                     # Second concurrent call: RPC dedupes on reversal_key
                     return _refund_duplicate()
+            if "rpc/process_charge_reversal" in url:
+                # K-02 path: process_charge_reversal acquires a per-charge
+                # advisory lock and dedupes on reversal_key. Simulate both
+                # racing handlers reaching the RPC; the SQL function serializes
+                # them: the first wins and calls refund_credits, the second
+                # returns duplicate without invoking refund_credits.
+                refund_call_count["n"] += 1
+                payload = json or {}
+                if refund_call_count["n"] == 1:
+                    actual_debits.append(int(payload.get("p_target_credits") or 0))
+                    return _FakeResp(200, {"status": "reversed", "credits": int(payload.get("p_target_credits") or 0)})
+                return _FakeResp(200, {"status": "duplicate", "credits": 0})
             return _FakeResp(201, {})
 
         async def get(self, url: str, params=None, headers=None):
@@ -230,7 +284,7 @@ async def test_concurrent_dispute_events_same_dispute_only_one_refund_via_rpc_de
             ),
         )
 
-    assert refund_call_count["n"] == 2, "Both events should call refund_credits (race)"
+    assert refund_call_count["n"] == 2, "Both racing events must reach the reversal RPC"
     assert len(actual_debits) == 1, (
         "Only ONE actual debit should have landed (second collapsed by RPC dedup)"
     )
@@ -243,9 +297,14 @@ async def test_concurrent_dispute_events_same_dispute_only_one_refund_via_rpc_de
 
 @pytest.mark.asyncio
 async def test_record_dispute_reversal_or_skip_still_short_circuits_when_row_exists():
-    """The SELECT fast-path still works: if a row already exists in
-    stripe_dispute_reversals, _reverse_credits_for_charge must return without
-    calling refund_credits at all."""
+    """If a stripe_dispute_reversals row already exists for this reversal_key,
+    the reversal flow must short-circuit without calling refund_credits.
+
+    K-02: dedup now happens inside process_charge_reversal under a per-charge
+    advisory lock. We seed the simulated server-side state so the RPC sees
+    the existing key and returns status='duplicate' without invoking
+    refund_credits.
+    """
     cfg = _cfg()
 
     client = _RecordingClient(
@@ -255,6 +314,11 @@ async def test_record_dispute_reversal_or_skip_still_short_circuits_when_row_exi
             "rpc/refund_credits": _refund_ok(),
         }
     )
+    client.inserted_reversals.append({
+        "reversal_key": "dispute:dp_Y",
+        "charge_id": "ch_Y",
+        "credits": 1000,
+    })
 
     with patch.object(httpx, "AsyncClient", return_value=client):
         await mod._handle_charge_dispute_created(
@@ -265,7 +329,8 @@ async def test_record_dispute_reversal_or_skip_still_short_circuits_when_row_exi
 
     refund_calls = [c for c in client.calls if "rpc/refund_credits" in c["url"]]
     assert len(refund_calls) == 0, (
-        "SELECT short-circuit must prevent refund_credits when reversal row already exists"
+        "refund_credits must not fire when reversal_key dedup row already exists; "
+        "process_charge_reversal must return status='duplicate'"
     )
 
 
@@ -296,8 +361,13 @@ def test_compute_reversal_key_returns_charge_format_when_no_dispute():
 
 @pytest.mark.asyncio
 async def test_insert_dispute_reversal_records_first_event_id():
-    """_insert_dispute_reversal must include first_event_id=event_id in the payload
-    so the triggering webhook can be traced even though ref_id is now reversal_key."""
+    """The reversal RPC payload must include first_event_id=event_id so the
+    triggering webhook can be traced even though ref_id is now reversal_key.
+
+    K-02: insertion of stripe_dispute_reversals happens server-side inside
+    process_charge_reversal. We assert on the RPC payload (which carries
+    p_first_event_id) and on the simulated server-side state.
+    """
     cfg = _cfg()
     event_id = "evt_forensic_999"
 
@@ -316,15 +386,22 @@ async def test_insert_dispute_reversal_records_first_event_id():
             event_id=event_id,
         )
 
-    insert_calls = [
+    rpc_calls = [
         c for c in client.calls
-        if c["method"] == "POST" and "stripe_dispute_reversals" in c["url"]
+        if c["method"] == "POST" and "rpc/process_charge_reversal" in c["url"]
     ]
-    assert len(insert_calls) == 1, "Must insert one row into stripe_dispute_reversals"
-    body = insert_calls[0]["json"]
-    assert body.get("first_event_id") == event_id, (
-        f"first_event_id must be the triggering event_id='{event_id}', got {body.get('first_event_id')!r}"
+    assert len(rpc_calls) == 1, "process_charge_reversal must be invoked once"
+    body = rpc_calls[0]["json"]
+    assert body.get("p_first_event_id") == event_id, (
+        f"p_first_event_id must be the triggering event_id='{event_id}', got {body.get('p_first_event_id')!r}"
     )
-    assert body.get("reversal_key") == "dispute:dp_forensic", (
-        f"reversal_key must be 'dispute:dp_forensic', got {body.get('reversal_key')!r}"
+    assert body.get("p_reversal_key") == "dispute:dp_forensic", (
+        f"p_reversal_key must be 'dispute:dp_forensic', got {body.get('p_reversal_key')!r}"
     )
+    # Server-side dedup row must persist with both fields.
+    persisted = [
+        r for r in client.inserted_reversals
+        if r.get("reversal_key") == "dispute:dp_forensic"
+    ]
+    assert len(persisted) == 1
+    assert persisted[0].get("first_event_id") == event_id

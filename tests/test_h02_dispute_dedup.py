@@ -67,6 +67,7 @@ class _RecordingClient:
         self.by_path = by_path or {}
         self.by_path_method = by_path_method or {}
         self.calls: list[dict[str, Any]] = []
+        self.inserted_reversals: list[dict[str, Any]] = []
 
     async def __aenter__(self):
         return self
@@ -76,6 +77,47 @@ class _RecordingClient:
 
     async def post(self, url: str, json=None, headers=None):
         self.calls.append({"method": "POST", "url": url, "json": json})
+        if "rpc/process_charge_reversal" in url:
+            payload = json or {}
+            reversal_key = payload.get("p_reversal_key")
+            charge_id = payload.get("p_charge_id")
+            target = int(payload.get("p_target_credits") or 0)
+            for row in self.inserted_reversals:
+                if row.get("reversal_key") == reversal_key:
+                    return _FakeResp(200, {"status": "duplicate", "credits": 0})
+            already = sum(
+                int(r.get("credits") or 0)
+                for r in self.inserted_reversals
+                if r.get("charge_id") == charge_id
+            )
+            incremental = max(0, target - already)
+            self.inserted_reversals.append(
+                {
+                    "reversal_key": reversal_key,
+                    "user_id": payload.get("p_user_id"),
+                    "charge_id": charge_id,
+                    "dispute_id": payload.get("p_dispute_id"),
+                    "payment_intent_id": payload.get("p_payment_intent_id"),
+                    "credits": incremental,
+                    "first_event_id": payload.get("p_first_event_id"),
+                    "first_event_type": payload.get("p_first_event_type"),
+                }
+            )
+            if incremental <= 0:
+                return _FakeResp(200, {"status": "already_satisfied", "credits": 0})
+            self.calls.append(
+                {
+                    "method": "POST",
+                    "url": "https://supabase.test/rest/v1/rpc/refund_credits",
+                    "json": {
+                        "p_user_id": payload.get("p_user_id"),
+                        "p_credits": incremental,
+                        "p_ref_type": "stripe_event",
+                        "p_ref_id": reversal_key,
+                    },
+                }
+            )
+            return _FakeResp(200, {"status": "reversed", "credits": incremental})
         for (path, method), resp in self.by_path_method.items():
             if method == "POST" and path in url:
                 return resp
@@ -212,6 +254,47 @@ async def test_dispute_created_then_funds_withdrawn_same_dispute_only_one_revers
                 return _FakeResp(201, {})
             if "rpc/refund_credits" in url:
                 return _refund_rpc_resp()
+            if "rpc/process_charge_reversal" in url:
+                payload = json or {}
+                rkey = payload.get("p_reversal_key")
+                cid = payload.get("p_charge_id")
+                target = int(payload.get("p_target_credits") or 0)
+                for row in _SharedStateClient._inserted_reversals:
+                    if row.get("reversal_key") == rkey:
+                        return _FakeResp(200, {"status": "duplicate", "credits": 0})
+                already = sum(
+                    int(r.get("credits") or 0)
+                    for r in _SharedStateClient._inserted_reversals
+                    if r.get("charge_id") == cid
+                )
+                incremental = max(0, target - already)
+                _SharedStateClient._inserted_reversals.append(
+                    {
+                        "reversal_key": rkey,
+                        "user_id": payload.get("p_user_id"),
+                        "charge_id": cid,
+                        "dispute_id": payload.get("p_dispute_id"),
+                        "payment_intent_id": payload.get("p_payment_intent_id"),
+                        "credits": incremental,
+                        "first_event_id": payload.get("p_first_event_id"),
+                        "first_event_type": payload.get("p_first_event_type"),
+                    }
+                )
+                if incremental <= 0:
+                    return _FakeResp(200, {"status": "already_satisfied", "credits": 0})
+                self.calls.append(
+                    {
+                        "method": "POST",
+                        "url": "https://supabase.test/rest/v1/rpc/refund_credits",
+                        "json": {
+                            "p_user_id": payload.get("p_user_id"),
+                            "p_credits": incremental,
+                            "p_ref_type": "stripe_event",
+                            "p_ref_id": rkey,
+                        },
+                    }
+                )
+                return _FakeResp(200, {"status": "reversed", "credits": incremental})
             return _FakeResp(200, {})
 
         async def get(self, url: str, params=None, headers=None):
@@ -293,9 +376,16 @@ async def test_dispute_created_then_funds_withdrawn_same_dispute_only_one_revers
 
 @pytest.mark.asyncio
 async def test_charge_refunded_then_dispute_created_both_process_different_keys():
-    """charge.refunded uses reversal_key='charge:<id>:reversal'.
+    """charge.refunded uses reversal_key='refund_event:<event_id>'.
     charge.dispute.created uses reversal_key='dispute:<dispute_id>'.
-    These are different keys, so both events should process independently."""
+
+    Both events reach the process_charge_reversal RPC (different keys, no
+    dedup short-circuit). The first fully reverses 3000; the second observes
+    already_reversed=3000 and lands status='already_satisfied' with
+    incremental=0. This is the correct economic outcome under J-01/J-02:
+    a charge that has already been fully refunded must not be debited a second
+    time when a dispute lands on the same charge.
+    """
     cfg = _cfg()
     charge_id = "ch_2"
     dispute_id = "dp_2"
@@ -304,7 +394,6 @@ async def test_charge_refunded_then_dispute_created_both_process_different_keys(
     grant_resp = _grant_lookup_resp(credits=3000)
     no_row = _no_reversal_row()
 
-    # Both events see no existing reversal for their respective keys
     client = _RecordingClient(
         by_path={
             "stripe_payment_grants": grant_resp,
@@ -314,23 +403,34 @@ async def test_charge_refunded_then_dispute_created_both_process_different_keys(
     )
 
     with patch.object(httpx, "AsyncClient", return_value=client):
-        # charge.refunded
         await mod._handle_charge_refunded(
             {"id": charge_id, "payment_intent": "pi_2", "amount": 3000, "amount_refunded": 3000},
             cfg,
             event_id="evt_refund_2",
         )
-        # charge.dispute.created (same charge, different event type)
         await mod._handle_charge_dispute_created(
             {"id": dispute_id, "charge": charge_id, "payment_intent": "pi_2", "amount": 3000},
             cfg,
             event_id="evt_dispute_created_2",
         )
 
-    refund_calls = [c for c in client.calls if "rpc/refund_credits" in c["url"]]
-    assert len(refund_calls) == 2, (
-        "charge.refunded and charge.dispute.created use different reversal keys and must both fire"
+    rpc_calls = [c for c in client.calls if "rpc/process_charge_reversal" in c["url"]]
+    assert len(rpc_calls) == 2, (
+        "both events must reach the reversal RPC (different reversal_keys, "
+        "no fast-path collapse)"
     )
+    # Distinct reversal keys: refund_event:<event_id> vs dispute:<dispute_id>.
+    keys = [c["json"]["p_reversal_key"] for c in rpc_calls]
+    assert keys[0] == "refund_event:evt_refund_2"
+    assert keys[1] == "dispute:dp_2"
+    # Only the first event should produce an actual debit; the second is
+    # already_satisfied because charge ch_2 was fully reversed.
+    refund_calls = [c for c in client.calls if "rpc/refund_credits" in c["url"]]
+    assert len(refund_calls) == 1, (
+        "only the first event debits credits; second observes "
+        "already_reversed=3000 and lands no incremental debit"
+    )
+    assert refund_calls[0]["json"]["p_credits"] == 3000
 
 
 # ---------------------------------------------------------------------------
@@ -341,13 +441,18 @@ async def test_charge_refunded_then_dispute_created_both_process_different_keys(
 @pytest.mark.asyncio
 async def test_successful_reversal_inserts_into_stripe_dispute_reversals():
     """After a successful credit reversal, a row must be inserted into
-    stripe_dispute_reversals so subsequent duplicate events are deduped."""
+    stripe_dispute_reversals so subsequent duplicate events are deduped.
+
+    K-02: insert now happens server-side inside process_charge_reversal as
+    part of the single atomic transaction. We verify the RPC was invoked
+    with the correct reversal_key + first_event_id payload, and that the
+    server-side dedup row landed in our state simulator.
+    """
     cfg = _cfg()
 
     grant_resp = _grant_lookup_resp(credits=1500)
     no_row = _no_reversal_row()
     refund_resp = _refund_rpc_resp(credits=1500)
-    insert_resp = _FakeResp(201, {})
 
     client = _RecordingClient(
         by_path={
@@ -369,16 +474,21 @@ async def test_successful_reversal_inserts_into_stripe_dispute_reversals():
             event_id="evt_dc_3",
         )
 
-    insert_calls = [
+    rpc_calls = [
         c for c in client.calls
-        if c["method"] == "POST" and "stripe_dispute_reversals" in c["url"]
+        if c["method"] == "POST" and "rpc/process_charge_reversal" in c["url"]
     ]
-    assert len(insert_calls) == 1, (
-        "stripe_dispute_reversals row must be inserted after successful reversal"
+    assert len(rpc_calls) == 1, (
+        "process_charge_reversal must be invoked once for a successful reversal"
     )
-    body = insert_calls[0]["json"]
-    assert body["reversal_key"] == "dispute:dp_3"
-    assert body["first_event_id"] == "evt_dc_3"
+    body = rpc_calls[0]["json"]
+    assert body["p_reversal_key"] == "dispute:dp_3"
+    assert body["p_first_event_id"] == "evt_dc_3"
+    # Server-side dedup row must have landed (simulated by the RPC mock).
+    assert any(
+        r.get("reversal_key") == "dispute:dp_3"
+        for r in client.inserted_reversals
+    ), "server-side dedup row must be persisted by process_charge_reversal"
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +499,13 @@ async def test_successful_reversal_inserts_into_stripe_dispute_reversals():
 @pytest.mark.asyncio
 async def test_preexisting_reversal_row_short_circuits_refund_rpc():
     """If stripe_dispute_reversals already has a row for the reversal_key,
-    _reverse_credits_for_charge must return early without calling refund_credits."""
+    _reverse_credits_for_charge must return early without calling refund_credits.
+
+    K-02: dedup now happens inside process_charge_reversal (single SECURITY
+    DEFINER RPC). We seed the client's inserted_reversals with the pre-existing
+    row so the RPC simulator returns status='duplicate' and never synthesizes
+    a refund_credits call.
+    """
     cfg = _cfg()
 
     existing_row = _existing_reversal_row("dispute:dp_4")
@@ -402,6 +518,11 @@ async def test_preexisting_reversal_row_short_circuits_refund_rpc():
             "rpc/refund_credits": _refund_rpc_resp(),
         }
     )
+    client.inserted_reversals.append({
+        "reversal_key": "dispute:dp_4",
+        "charge_id": "ch_4",
+        "credits": 2000,
+    })
 
     with patch.object(httpx, "AsyncClient", return_value=client):
         await mod._handle_charge_dispute_funds_withdrawn(
@@ -417,7 +538,8 @@ async def test_preexisting_reversal_row_short_circuits_refund_rpc():
 
     refund_calls = [c for c in client.calls if "rpc/refund_credits" in c["url"]]
     assert len(refund_calls) == 0, (
-        "refund_credits must not be called when stripe_dispute_reversals already has this key"
+        "refund_credits must not fire when reversal_key dedup row already exists; "
+        "process_charge_reversal must return status='duplicate'"
     )
 
 
@@ -454,6 +576,14 @@ async def test_reversal_key_formatting_dispute_vs_no_dispute_paths():
                 inserted_keys.append(json.get("reversal_key", ""))
             if "rpc/refund_credits" in url:
                 return refund_resp
+            if "rpc/process_charge_reversal" in url:
+                # Capture the reversal_key directly from the RPC payload since
+                # the dedup row insert now happens server-side.
+                payload = json or {}
+                rkey = payload.get("p_reversal_key", "")
+                if rkey:
+                    inserted_keys.append(rkey)
+                return _FakeResp(200, {"status": "reversed", "credits": int(payload.get("p_target_credits") or 0)})
             return _FakeResp(201, {})
 
         async def get(self, url: str, params=None, headers=None):

@@ -5905,6 +5905,11 @@ async def _handle_checkout_completed(
         except Exception:  # noqa: BLE001
             pass
 
+    # K-01: capture the charge amount so the reversal flow can compute
+    # pro-rata for partial-amount disputes. checkout sessions in
+    # subscription mode use amount_total (cents) as the canonical paid amount.
+    _checkout_charge_amount: int | None = session_obj.get("amount_total")
+
     if credits_to_add > 0:
         await _grant_credits_for_event(
             user_id=user_id,
@@ -5914,6 +5919,7 @@ async def _handle_checkout_completed(
             expires_at=period_end,
             cfg=cfg,
             pi_id=_checkout_pi_id,
+            charge_amount=_checkout_charge_amount,
         )
 
     logger.info(
@@ -5981,6 +5987,9 @@ async def _handle_invoice_paid(
 
     # H-01: invoice.paid carries payment_intent at top level.
     _invoice_pi_id: str | None = invoice_obj.get("payment_intent") or None
+    # K-01: invoice.amount_paid (cents) is the canonical paid amount and
+    # equals the eventual charge.amount for paid invoices.
+    _invoice_charge_amount: int | None = invoice_obj.get("amount_paid") or invoice_obj.get("total")
 
     await _grant_credits_for_event(
         user_id=user_id,
@@ -5990,6 +5999,7 @@ async def _handle_invoice_paid(
         expires_at=period_end_iso,
         cfg=cfg,
         pi_id=_invoice_pi_id,
+        charge_amount=_invoice_charge_amount,
     )
 
     if cfg.SUPABASE_URL and _supabase_api_key(cfg):
@@ -6040,6 +6050,18 @@ async def _handle_payment_intent_succeeded(
         )
         return
 
+    # K-01: capture the charge amount (cents) so the reversal flow can
+    # compute pro-rata for partial-amount disputes. payment_intent.amount
+    # equals the eventual charge.amount for top-ups (single-charge PI).
+    _topup_charge_amount: int | None = pi_obj.get("amount") or pi_obj.get("amount_received")
+    _topup_charge_id: str | None = pi_obj.get("latest_charge")
+    if not _topup_charge_id:
+        _charges = (pi_obj.get("charges") or {}).get("data") or []
+        if _charges:
+            _topup_charge_id = _charges[0].get("id")
+            if not _topup_charge_amount:
+                _topup_charge_amount = _charges[0].get("amount")
+
     await _grant_credits_for_event(
         user_id=user_id,
         credits=int(topup["credits"]),
@@ -6048,6 +6070,8 @@ async def _handle_payment_intent_succeeded(
         expires_at=None,
         cfg=cfg,
         pi_id=pi_obj.get("id"),  # H-01: link pi_id for refund/dispute lookup
+        charge_id=_topup_charge_id,
+        charge_amount=_topup_charge_amount,
     )
     logger.info(
         "topup_granted",
@@ -6067,6 +6091,7 @@ async def _grant_credits_for_event(
     cfg: AppConfig,
     pi_id: str | None = None,
     charge_id: str | None = None,
+    charge_amount: int | None = None,
 ) -> None:
     """Idempotent grant via the ledger RPC. ``ref_id`` should be the Stripe event id.
 
@@ -6076,6 +6101,10 @@ async def _grant_credits_for_event(
     H-01: When pi_id is provided and the grant is new (status != 'duplicate'),
     insert a row into stripe_payment_grants so that refund/dispute handlers can
     perform an exact, scoped lookup rather than a global latest-grant fallback.
+
+    K-01: charge_amount (Stripe charge.amount in cents) is persisted on the
+    grant row so partial-amount disputes can compute pro-rata reversal. The
+    column is nullable on legacy rows where the value was not captured.
     """
     from mariana.billing.ledger import grant_credits as _grant_rpc, LedgerError
 
@@ -6130,6 +6159,10 @@ async def _grant_credits_for_event(
         }
         if charge_id:
             pg_payload["charge_id"] = charge_id
+        # K-01: capture original charge.amount so the reversal flow can
+        # compute pro-rata for partial-amount disputes.
+        if charge_amount is not None and int(charge_amount) > 0:
+            pg_payload["charge_amount"] = int(charge_amount)
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 await client.post(pg_url, json=pg_payload, headers=pg_headers)
@@ -6293,7 +6326,9 @@ async def _lookup_grant_tx_for_payment_intent(
     url = (
         f"{cfg.SUPABASE_URL}/rest/v1/stripe_payment_grants"
         f"?payment_intent_id=eq.{payment_intent_id}"
-        f"&select=user_id,credits,event_id"
+        # K-01: include charge_amount so the reversal flow can compute pro-rata
+        # for partial-amount disputes. Legacy rows return NULL here.
+        f"&select=user_id,credits,event_id,charge_amount"
     )
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
@@ -6516,18 +6551,22 @@ async def _reverse_credits_for_charge(
 ) -> None:
     """Core reversal logic shared by charge.refunded and dispute handlers.
 
-    1. H-02: Dedup check via stripe_dispute_reversals (stable reversal_key).
-    2. Resolve the payment_intent_id from the charge object.
-    3. Look up the original grant via stripe_payment_grants (H-01).
-    4. Compute pro-rata TARGET credits for this event from the charge payload.
-    5. J-01/J-02: Subtract already_reversed credits for this charge so each
-       event debits only the incremental delta.
-    6. Call refund_credits RPC which debits the user's balance and records a
-       type='refund' transaction row (idempotent on ref_id=reversal_key).
-    7. H-02: Insert into stripe_dispute_reversals after success.
-    """
-    from mariana.billing.ledger import refund_credits as _refund_rpc, LedgerError
+    K-02 fix: the dedup check, sum-of-already-reversed, refund_credits call,
+    and dedup-row INSERT all run inside a single SECURITY DEFINER PL/pgSQL
+    function (process_charge_reversal, migration 021) that takes a per-charge
+    pg_advisory_xact_lock at entry. Two concurrent webhook handlers for the
+    same charge serialize at the lock; the second observes the first's INSERT
+    and computes the correct incremental delta. The check-then-act TOCTOU is
+    closed.
 
+    Steps:
+      1. Resolve the payment_intent_id from the charge object.
+      2. Look up the original grant via stripe_payment_grants (H-01).
+      3. Compute pro-rata TARGET credits for this event from the charge
+         payload (K-01: dispute path uses stored charge_amount as amount_total).
+      4. POST to /rpc/process_charge_reversal which atomically dedups, sums
+         already-reversed, calls refund_credits, and inserts the dedup row.
+    """
     pi_id: str | None = charge_obj.get("payment_intent")
     if not pi_id:
         logger.warning(
@@ -6551,74 +6590,43 @@ async def _reverse_credits_for_charge(
     amount_total: int = int(charge_obj.get("amount") or 0)
     amount_refunded: int = int(charge_obj.get("amount_refunded") or charge_obj.get("amount") or 0)
 
+    # K-01 fix: when handling a dispute, the pseudo-charge built by
+    # _handle_charge_dispute_* sets amount = amount_refunded = dispute.amount.
+    # That collapses partial-amount disputes (dispute.amount < charge.amount)
+    # into the full-reversal else branch and over-debits the entire grant.
+    # If the original charge.amount was captured at grant time on
+    # stripe_payment_grants.charge_amount, override amount_total with it so
+    # the pro-rata branch fires correctly. Legacy rows without charge_amount
+    # fall back to the prior behaviour and emit a warning.
+    if dispute_obj is not None:
+        stored_charge_amount = grant_tx.get("charge_amount")
+        if stored_charge_amount is not None and int(stored_charge_amount) > 0:
+            amount_total = int(stored_charge_amount)
+        else:
+            logger.warning(
+                "charge_reversal_dispute_legacy_grant_no_charge_amount",
+                pi_id=pi_id,
+                charge_id=charge_obj.get("id"),
+                event_id=event_id,
+                dispute_id=(dispute_obj.get("id") if dispute_obj else None),
+            )
+
     # J-01 fix: for refund events, use per-event key; for dispute events, keep
     # the per-dispute key (H-02 intentional collapse across created/funds_withdrawn).
     reversal_key = _compute_reversal_key(
         charge_obj, dispute_obj, refund_event_id=refund_event_id
     )
 
-    # H-02: dedup check before computing/executing the reversal.
-    already_done = await _record_dispute_reversal_or_skip(
-        charge_obj=charge_obj,
-        dispute_obj=dispute_obj,
-        event_id=event_id,
-        event_type=event_type,
-        user_id=user_id,
-        credits=original_credits,
-        cfg=cfg,
-        refund_event_id=refund_event_id,
-    )
-    if already_done:
-        return
-
     # Pro-rata: compute TARGET cumulative reversal for this event's payload.
+    # K-01 has already overridden amount_total above for the dispute path.
     if amount_total > 0 and amount_refunded < amount_total:
         import math as _math
         target_credits = _math.floor(original_credits * amount_refunded / amount_total)
     else:
         target_credits = original_credits
 
-    # J-01/J-02 fix: subtract credits already reversed for this charge so that
-    # sequential partial refunds and refund-then-dispute sequences each debit
-    # only the incremental delta.
-    charge_id = charge_obj.get("id") or ""
-    already_reversed = await _sum_reversed_credits_for_charge(charge_id, cfg)
-    incremental_debit = max(0, target_credits - already_reversed)
-
-    if incremental_debit <= 0:
-        logger.info(
-            "charge_reversal_already_satisfied",
-            charge_id=charge_id,
-            target_credits=target_credits,
-            already_reversed=already_reversed,
-            event_id=event_id,
-        )
-        # Still record the dedup row so this exact event is not re-processed.
-        await _insert_dispute_reversal(
-            charge_obj=charge_obj,
-            dispute_obj=dispute_obj,
-            event_id=event_id,
-            event_type=event_type,
-            user_id=user_id,
-            credits=0,
-            pi_id=pi_id,
-            cfg=cfg,
-            refund_event_id=refund_event_id,
-        )
-        return
-
-    credits_to_debit = incremental_debit
-
-    if credits_to_debit <= 0:
-        logger.warning(
-            "charge_reversal_zero_credits",
-            pi_id=pi_id,
-            original_credits=original_credits,
-            amount_refunded=amount_refunded,
-            amount_total=amount_total,
-            event_id=event_id,
-        )
-        return
+    if target_credits < 0:
+        target_credits = 0
 
     api_key = _supabase_api_key(cfg)
     if not cfg.SUPABASE_URL or not api_key:
@@ -6629,52 +6637,71 @@ async def _reverse_credits_for_charge(
         )
         raise HTTPException(status_code=503, detail="Credit ledger unavailable")
 
+    charge_id = charge_obj.get("id") or ""
+    dispute_id_for_rpc: str | None = dispute_obj.get("id") if dispute_obj else None
+
+    rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/process_charge_reversal"
+    rpc_headers = {
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    rpc_payload: dict[str, Any] = {
+        "p_user_id": user_id,
+        "p_charge_id": charge_id,
+        "p_dispute_id": dispute_id_for_rpc,
+        "p_payment_intent_id": pi_id,
+        "p_reversal_key": reversal_key,
+        "p_target_credits": int(target_credits),
+        "p_first_event_id": event_id,
+        "p_first_event_type": event_type,
+    }
+
+    # K-02: single atomic call. The RPC takes a per-charge advisory lock,
+    # dedups by reversal_key, sums prior credits, calls refund_credits, and
+    # inserts the dedup row — all in one transaction. Two concurrent
+    # webhooks on the same charge serialize at the lock.
     try:
-        # I-02 fix: key idempotency on stable reversal_key (not event_id).
-        # Both dispute.created (evt_A) and dispute.funds_withdrawn (evt_B) for the
-        # same dispute map to the same reversal_key, so if both bypass the SELECT
-        # short-circuit, refund_credits collapses the second call server-side.
-        # J-01 fix: refund events use per-event reversal_key so sequential
-        # partial refunds never collapse at the RPC layer either.
-        result = await _refund_rpc(
-            supabase_url=cfg.SUPABASE_URL,
-            service_key=api_key,
-            user_id=user_id,
-            credits=credits_to_debit,
-            ref_type="stripe_event",
-            ref_id=reversal_key,
-        )
-    except LedgerError as exc:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(rpc_url, json=rpc_payload, headers=rpc_headers)
+    except httpx.HTTPError as exc:
         logger.error(
-            "charge_reversal_rpc_failed",
+            "charge_reversal_rpc_network_error",
             user_id=user_id,
-            credits=credits_to_debit,
+            charge_id=charge_id,
             event_id=event_id,
             error=str(exc),
         )
         raise HTTPException(status_code=503, detail="Credit reversal failed") from exc
 
-    status = result.get("status") if isinstance(result, dict) else None
+    if resp.status_code >= 400:
+        logger.error(
+            "charge_reversal_rpc_failed",
+            user_id=user_id,
+            charge_id=charge_id,
+            event_id=event_id,
+            status=resp.status_code,
+            body=(resp.text or "")[:500],
+        )
+        raise HTTPException(status_code=503, detail="Credit reversal failed")
+
+    try:
+        result = resp.json() if resp.text else {}
+    except ValueError:
+        result = {}
+    rpc_status = result.get("status") if isinstance(result, dict) else None
+    rpc_credits = result.get("credits") if isinstance(result, dict) else None
+
     logger.info(
         "stripe_refund_processed",
         event_id=event_id,
         user_id=user_id,
-        credits_debited=credits_to_debit,
-        rpc_status=status,
+        target_credits=int(target_credits),
+        credits_debited=int(rpc_credits) if isinstance(rpc_credits, (int, float)) else None,
+        rpc_status=rpc_status,
         pi_id=pi_id,
-    )
-
-    # H-02: record successful reversal so duplicate events are deduped.
-    await _insert_dispute_reversal(
-        charge_obj=charge_obj,
-        dispute_obj=dispute_obj,
-        event_id=event_id,
-        event_type=event_type,
-        user_id=user_id,
-        credits=credits_to_debit,
-        pi_id=pi_id,
-        cfg=cfg,
-        refund_event_id=refund_event_id,
+        charge_id=charge_id,
+        reversal_key=reversal_key,
     )
 
 
