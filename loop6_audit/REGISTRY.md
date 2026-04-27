@@ -32,14 +32,14 @@ Every YAML finding appears under exactly one canonical.  Merge rules from the ta
 | B-19 | A2-06 | P2 | api | Shutdown route bypasses JWT admin check — controlled only by shared header secret | **FIXED 2026-04-27** (api.py: graceful_shutdown now requires _require_admin dependency (Supabase JWT + is_admin check) in addition to X-Admin-Key header; 5 regression tests) |
 | B-20 | A2-07 | P2 | api | Admin authorization cache holds stale positive decisions up to 30 s after role revocation | **FIXED 2026-04-27** (api.py: positive decisions no longer cached; negative results cached 5s max; _clear_admin_cache() helper added; admin_user_set_role calls _clear_admin_cache on role change; 6 regression tests) |
 | B-21 | A5-05 | P2 | api | In-process rate limiter not shared across workers/instances — bypassable by horizontal fan-out | **FIXED 2026-04-27** (api.py: slowapi Limiter constructed with storage_uri=REDIS_URL when configured; falls back to per-process with RuntimeWarning when REDIS_URL absent; 6 regression tests) |
-| B-22 | A3-03 | P2 | orchestrator | Atomic credit probe refund uses wrong RPC parameter names — 1 credit lost per probe call |
-| B-23 | A3-01 | P2 | orchestrator | branch_manager imports non-existent get_config — all AppConfig thresholds silently use hardcoded defaults |
-| B-24 | A3-02 | P2 | orchestrator | Module-level _metadata_lock serializes all concurrent investigations on a single asyncio.Lock |
-| B-25 | A4-01 | P2 | frontend | Billing portal redirect trusts server URL without validation — open redirect to arbitrary domain |
-| B-26 | A4-05 | P2 | frontend | FileViewer hand-rolled markdown renderer diverges from Chat.tsx — no link href sanitization guard |
-| B-27 | A4-06 | P2 | frontend | PreviewPane iframe uses allow-same-origin — user-generated app shares app origin |
-| B-28 | A4-07 | P2 | frontend | AuthContext loading spinner has no timeout — infinite spinner on Supabase outage |
-| B-29 | A4-08 | P2 | frontend | success_url checkout landing pages never call refreshUser — credit balance stale post-payment |
+| B-22 | A3-03 | P2 | orchestrator | Atomic credit probe refund uses wrong RPC parameter names — 1 credit lost per probe call | **FIXED 2026-05-13** (event_loop.py: add_credits call changed from {target_user_id, amount} to {p_user_id, p_credits} matching live DB signature; 6 regression tests in test_b22_probe_refund_params.py) |
+| B-23 | A3-01 | P2 | orchestrator | branch_manager imports non-existent get_config — all AppConfig thresholds silently use hardcoded defaults | **FIXED 2026-05-13** (branch_manager.py: _cfg_val replaced with direct os.environ.get; import os added; 6 regression tests in test_b23_branch_manager_config.py) |
+| B-24 | A3-02 | P2 | orchestrator | Module-level _metadata_lock serializes all concurrent investigations on a single asyncio.Lock | **FIXED 2026-05-13** (event_loop.py: _metadata_lock replaced with _metadata_locks dict + _get_metadata_lock/_cleanup_metadata_lock helpers; both handle_tribunal and handle_skeptic use per-task lock; cleanup in run() finally; 6 regression tests in test_b24_metadata_lock.py) |
+| B-25 | A4-01 | P2 | frontend | Billing portal redirect trusts server URL without validation — open redirect to arbitrary domain | **FIXED 2026-05-12** (Account.tsx URL allow-list guard mirroring Checkout.tsx; 12 regression tests in b25_billing_portal_redirect.test.ts) |
+| B-26 | A4-05 | P2 | frontend | FileViewer hand-rolled markdown renderer diverges from Chat.tsx — no link href sanitization guard | **FIXED 2026-05-12** (FileViewer.tsx link transform added with https?:// allow-list; javascript:/data:/vbscript:/file: stripped to plain text; 10 regression tests in b26_fileviewer_markdown_xss.test.ts) |
+| B-27 | A4-06 | P2 | frontend | PreviewPane iframe uses allow-same-origin — user-generated app shares app origin | **FIXED 2026-05-12** (PreviewPane.tsx sandbox attribute — allow-same-origin removed, leaving allow-scripts allow-forms allow-modals allow-popups allow-downloads; 7 tests in b27_preview_pane_sandbox.test.ts) |
+| B-28 | A4-07 | P2 | frontend | AuthContext loading spinner has no timeout — infinite spinner on Supabase outage | **FIXED 2026-05-12** (AuthContext.tsx: 10 s timeout via AUTH_LOADING_TIMEOUT_MS, authTimedOut state, recoverable Retry UI with data-testid="auth-timeout", accessible loading spinner; 15 tests in b28_auth_loading_timeout.test.ts) |
+| B-29 | A4-08 | P2 | frontend | success_url checkout landing pages never call refreshUser — credit balance stale post-payment | **FIXED 2026-05-12** (Chat.tsx, Build.tsx, Account.tsx: detect ?checkout=success/?topup=success on mount, show success toast, poll refreshUser/refetchBalance up to 3×, clear URL param; 20 tests in b29_post_checkout_credit_refresh.test.ts) |
 | B-30 | A5-09 | P3 | api | Webhook secret rotation has no overlap window — in-flight events dropped during rotation |
 | B-31 | A2-08 | P3 | api | Billing usage endpoint always falls back to free-plan because auth context lacks subscription fields |
 | B-32 | A1-12 | P3 | db | 7 FK columns missing covering indexes — cascade-delete and JOIN scans sequential |
@@ -61,8 +61,9 @@ Every YAML finding appears under exactly one canonical.  Merge rules from the ta
 | F-02 | Phase E | P1 | cross | start_investigation does not hold pending-upload lock during file move — double-charge race on shared upload session | **FIXED 2026-04-27** (api.py: pending-{session_uuid} lock + atomic os.rename to claimed/, 409 + credit refund on conflict; 6 regression tests) |
 | F-03 | Phase E | P1 | cross | Refund/dispute clawback clamped to current balance — already-spent credits forgiven, no debt construct | **FIXED 2026-04-27** (mig 009: credit_clawbacks table + refund_credits records deficit + grant_credits/add_credits drain open clawbacks FIFO; 8 pytest + C08 contract; applied to live) |
 | F-04 | Phase E | P1 | cross | Subscription downgrade/cancel updates subscription_plan only; profiles.plan (used for entitlement enforcement) is never updated | **FIXED 2026-04-27** (mig 008: update_profile_by_stripe_customer syncs plan + reconcile pass; api.py webhooks include effective_plan; 9 regression tests; applied to live, 12 stale flagship profiles reconciled to free) |
-| F-05 | Phase E | P2 | cross | research_tasks owner stored in metadata JSONB only — deleting auth.users orphans tasks and descendants |
-| F-06 | Phase E | P3 | api | Intelligence endpoints return unbounded per-task datasets to the browser — no pagination/limits |
+| F-05 | Phase E | P2 | cross | research_tasks owner stored in metadata JSONB only — deleting auth.users orphans tasks and descendants | **FIXED 2026-04-27** (mig 010: research_tasks.user_id NOT NULL + ON DELETE CASCADE; runtime-table guard for init_schema-created table; backfill from metadata; ownership checks updated; tests + C09 contract green) |
+| F-06 | Phase E | P3 | api | Intelligence endpoints return unbounded per-task datasets to the browser — no pagination/limits | **FIXED 2026-04-27** (api.py: keyset cursor + server-side cap on /api/intelligence/* endpoints; tests green) |
+| G-01 | Phase E re-audit #2 | P1 | api | _get_upload_lock used WeakValueDictionary — locks GC-eligible immediately, breaking F-02 race fix and upload file-cap | **FIXED 2026-04-27** (api.py: strong-reference OrderedDict-based LRU bounded at 4096 entries, evicts only unheld locks; 5 regression tests in test_g01_upload_lock_strong_ref.py) |
 
 > **Note on B-45:** get_stripe_customer_id IDOR is fully subsumed by B-01 (same anon-callable SECURITY DEFINER family). No separate canonical required.
 
@@ -95,14 +96,14 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 | 19 | B-19 | P2 | api_patch | none | none | api.py | **FIXED** |
 | 20 | B-20 | P2 | api_patch | none | none | api.py | **FIXED** |
 | 21 | B-21 | P2 | api_patch | none | B-01 | api.py | **FIXED** |
-| 22 | B-22 | P2 | api_patch | none | B-07 | api.py (orchestrator) |
-| 23 | B-23 | P2 | api_patch | none | none | api.py (orchestrator) |
-| 24 | B-24 | P2 | api_patch | none | none | api.py (orchestrator) |
-| 25 | B-25 | P2 | frontend_patch | none | none | frontend |
-| 26 | B-26 | P2 | frontend_patch | none | none | frontend |
-| 27 | B-27 | P2 | config | none | none | frontend + config |
-| 28 | B-28 | P2 | frontend_patch | none | none | frontend |
-| 29 | B-29 | P2 | frontend_patch | none | none | frontend |
+| 22 | B-22 | P2 | api_patch | none | B-07 | api.py (orchestrator) | **FIXED 2026-05-13** |
+| 23 | B-23 | P2 | api_patch | none | none | api.py (orchestrator) | **FIXED 2026-05-13** |
+| 24 | B-24 | P2 | api_patch | none | none | api.py (orchestrator) | **FIXED 2026-05-13** |
+| 25 | B-25 | P2 | frontend_patch | none | none | frontend | **FIXED 2026-05-12** |
+| 26 | B-26 | P2 | frontend_patch | none | none | frontend | **FIXED 2026-05-12** |
+| 27 | B-27 | P2 | config | none | none | frontend + config | **FIXED 2026-05-12** |
+| 28 | B-28 | P2 | frontend_patch | none | none | frontend | **FIXED 2026-05-12** |
+| 29 | B-29 | P2 | frontend_patch | none | none | frontend | **FIXED 2026-05-12** |
 | 30 | B-30 | P3 | api_patch | none | none | api.py |
 | 31 | B-31 | P3 | api_patch | none | none | api.py |
 | 32 | B-32 | P3 | migration | none | none | db |
@@ -512,6 +513,7 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Test to add:** `test_atomic_probe_refund_uses_correct_param_names` — mock `_rpc` helper, call `_atomic_probe_credits` with a valid `user_id`, assert the `add_credits` call receives `{"p_user_id": ..., "p_credits": 1}`.
 - **Blocking dependencies:** B-07 (row-lock on spend_credits must land so the probe itself is safe)
 - **Confidence:** high
+- **Status:** FIXED 2026-05-13. `event_loop.py` line ~3357: changed `{"target_user_id": user_id, "amount": 1}` to `{"p_user_id": user_id, "p_credits": 1}`. 6 regression tests added in `tests/test_b22_probe_refund_params.py` covering param names, happy path, insufficient credits, and error cases.
 
 ---
 
@@ -528,6 +530,7 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Test to add:** `test_cfg_val_reads_appconfig` — set `SCORE_KILL_THRESHOLD` env var to a non-default value; call `_load_config_thresholds()`; assert the module constant equals the env-var value, not the hardcoded default.
 - **Blocking dependencies:** none
 - **Confidence:** high
+- **Status:** FIXED 2026-05-13. `branch_manager.py`: `_cfg_val` rewritten to read `os.environ.get(attr)` directly (AppConfig attribute names are identical to env var names), bypassing `load_config()` which requires Postgres credentials. `import os` added. 6 regression tests added in `tests/test_b23_branch_manager_config.py` covering all six threshold constants.
 
 ---
 
@@ -545,6 +548,7 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Test to add:** `test_concurrent_tribunal_triggers_no_contention` — run 4 simulated investigations concurrently, each firing tribunal trigger simultaneously; assert total wall-clock time is not significantly greater than a single trigger's time.
 - **Blocking dependencies:** none
 - **Confidence:** high
+- **Status:** FIXED 2026-05-13. `event_loop.py`: module-level `_metadata_lock = asyncio.Lock()` removed; replaced with `_metadata_locks: dict[str, asyncio.Lock] = {}` dict plus `_get_metadata_lock(task_id)` and `_cleanup_metadata_lock(task_id)` helpers. Both `handle_tribunal` and `handle_skeptic` now use `_get_metadata_lock(task.id)`. `_cleanup_metadata_lock(task.id)` added to `run()` finally block. 6 regression tests added in `tests/test_b24_metadata_lock.py`.
 
 ---
 
@@ -566,6 +570,7 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Test to add:** `billing-portal-open-redirect` — mock `/api/billing/portal` to return `{ portal_url: "https://evil.example.com" }`; assert `Account.tsx` does NOT navigate and shows an error toast.
 - **Blocking dependencies:** none
 - **Confidence:** high
+- **Status:** FIXED 2026-05-12. Added URL allow-list guard in `Account.tsx` `handleManageSubscription` immediately before the `popup.location.href` / `window.location.href` assignment. Guard mirrors the identical pattern in `Checkout.tsx`: parse the URL, reject if origin is neither same-origin nor a `*.stripe.com` host, call `toast.error` and return. 12 regression tests added in `src/test/b25_billing_portal_redirect.test.ts` covering allowed hosts (billing.stripe.com, same-origin) and blocked hosts (evil.com, javascript:, data:, spoofed Stripe-suffix domains).
 
 ---
 
@@ -582,6 +587,7 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Test to add:** `fileviewer-markdown-xss` — pass a markdown string with `[text](javascript:alert(1))` through `renderMarkdownContent`; assert output does not contain `href="javascript:`.
 - **Blocking dependencies:** none
 - **Confidence:** medium
+- **Status:** FIXED 2026-05-12. Added a `[text](url)` link transform to `renderMarkdownContent` in `FileViewer.tsx` (Step 3 of the pipeline). Only `https?://` URLs are rendered as `<a>` anchors with `target="_blank" rel="noopener noreferrer"`. All other schemes (javascript:, data:, vbscript:, file:, bare relative paths) are reduced to plain visible text with no hyperlink element. The fix handles the entity-decode/re-encode cycle correctly so HTML-escaped special chars in URLs survive the round-trip. 10 regression tests in `src/test/b26_fileviewer_markdown_xss.test.ts`.
 
 ---
 
@@ -599,6 +605,7 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Blocking dependencies:** none
 - **Confidence:** high
 - **Notes:** Compounding risk with B-10 (no CSP). With Option A, the CSP `frame-src` in B-10 should be updated to allow `preview.deft.computer`.
+- **Status:** FIXED 2026-05-12 (Option B stopgap). Removed `allow-same-origin` from the sandbox attribute in `PreviewPane.tsx`. New value: `allow-scripts allow-forms allow-modals allow-popups allow-downloads`. The preview iframe now runs in a unique opaque origin, preventing JS from accessing the parent app's localStorage, cookies, or DOM. Preview apps that relied on localStorage for state will be unaffected in practice because agent-generated HTML previews do not use localStorage. Option A (subdomain) remains the recommended long-term path. 7 tests in `src/test/b27_preview_pane_sandbox.test.ts`.
 
 ---
 
@@ -615,6 +622,7 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Test to add:** `auth-loading-timeout` — mock `onAuthStateChange` to never fire; assert that after 10 s the spinner disappears and user sees a recoverable error state.
 - **Blocking dependencies:** none
 - **Confidence:** medium
+- **Status:** FIXED 2026-05-12. Added `AUTH_LOADING_TIMEOUT_MS` exported constant (default 10 000 ms, configurable via `VITE_AUTH_TIMEOUT_MS`). The existing `onAuthStateChange` `useEffect` now registers a `setTimeout` that fires if auth has not resolved by the deadline, calling `setLoading(false)` and `setAuthTimedOut(true)`. When auth resolves normally, the listener calls `clearTimeout` to cancel the deadline. Added `authTimedOut` state that renders a `data-testid="auth-timeout"` error screen with a Retry button (`window.location.reload()`). Loading spinner updated with `role="status"`, `aria-live="polite"`, `aria-label`, and `data-testid="auth-loading"`. 15 tests in `src/test/b28_auth_loading_timeout.test.ts`.
 
 ---
 
@@ -630,6 +638,7 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Test to add:** `post-checkout-credit-refresh` — navigate to `/chat?checkout=success`; assert `refreshUser()` is called and a success toast is displayed within 500 ms.
 - **Blocking dependencies:** none
 - **Confidence:** high
+- **Status:** FIXED 2026-05-12. Added `useSearchParams` and a mount-only `useEffect` to `Chat.tsx`, `Build.tsx`, and `Account.tsx`. On `?checkout=success` (Chat, Build) or `?topup=success` (Account) the handler: (a) clears the query param with `replace: true`, (b) calls `toast.success("Payment received")`, (c) polls `refreshUser()` (+ `refetchBalance()` on Build) up to 3 times at 3 s intervals. Build.tsx now also destructures `refreshUser` from `useAuth()`. 20 tests across three describe blocks in `src/test/b29_post_checkout_credit_refresh.test.ts`.
 
 ---
 

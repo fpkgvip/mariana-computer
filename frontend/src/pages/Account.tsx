@@ -7,7 +7,7 @@
  * the activity card shows the empty state instead of fabricating rows.
  */
 import { useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
 import { useAuth } from "@/contexts/AuthContext";
@@ -72,8 +72,9 @@ interface UsageResponse {
 }
 
 export default function Account() {
-  const { user, logout } = useAuth();
+  const { user, logout, refreshUser } = useAuth();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [isOpeningPortal, setIsOpeningPortal] = useState(false);
   const [isBuyOpen, setIsBuyOpen] = useState(false);
   const [isPurchasing, setIsPurchasing] = useState(false);
@@ -91,6 +92,35 @@ export default function Account() {
     return () => {
       portalAbortRef.current?.abort();
     };
+  }, []);
+
+  // B-29 fix: Detect Stripe success redirect (?topup=success) on mount.
+  // Account.tsx uses ?topup=success as the success_url for top-up checkout.
+  // Show a success toast and poll refreshUser() so the credit balance updates
+  // after the webhook fires (typically 2-10 s after the redirect).
+  useEffect(() => {
+    if (searchParams.get("topup") !== "success") return;
+
+    // Clear the param immediately to prevent re-triggers on refresh.
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete("topup");
+      return next;
+    }, { replace: true });
+
+    toast.success("Payment received", {
+      description: "Credits are updating — this may take a few seconds.",
+    });
+
+    // Poll refreshUser up to 3 times with 3 s intervals.
+    let attempts = 0;
+    const poll = () => {
+      attempts++;
+      refreshUser().catch((e) => console.warn("[Account] post-topup refreshUser failed:", e));
+      if (attempts < 3) setTimeout(poll, 3000);
+    };
+    setTimeout(poll, 3000);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally runs once on mount
   }, []);
 
   useEffect(() => {
@@ -225,6 +255,25 @@ export default function Account() {
       }
       const data: { portal_url: string } = await res.json();
       if (!data.portal_url) throw new Error("No portal URL received from server");
+
+      // B-25 fix: Validate the server-returned portal URL before navigating.
+      // Mirrors the same allow-list guard already used in Checkout.tsx.
+      // Prevents open redirect if the backend is compromised or returns a
+      // crafted response (SSRF, supply-chain attack, future logic bug).
+      try {
+        const parsed = new URL(data.portal_url);
+        const isSameOrigin = parsed.origin === window.location.origin;
+        const isStripe = parsed.hostname.endsWith(".stripe.com");
+        if (!isSameOrigin && !isStripe) {
+          throw new Error("Untrusted portal URL");
+        }
+      } catch (urlErr) {
+        const msg = urlErr instanceof Error ? urlErr.message : "Invalid portal URL";
+        toast.error("Invalid billing portal URL received from server", { description: msg });
+        setIsOpeningPortal(false);
+        return;
+      }
+
       if (popup) popup.location.href = data.portal_url;
       else window.location.href = data.portal_url;
     } catch (err) {

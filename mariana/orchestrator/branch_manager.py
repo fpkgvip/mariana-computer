@@ -15,6 +15,7 @@ re-declared here so the module is testable without a live config object.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -46,11 +47,25 @@ _DEFAULT_BUDGET_HARD_CAP: float = 75.00
 
 
 def _cfg_val(attr: str, default: float) -> float:
-    """Read a config value from AppConfig, falling back to default."""
+    """Read a float config value, falling back to *default* if unset.
+
+    B-23 fix: previously imported non-existent ``get_config`` which caused
+    an ImportError caught silently by the bare ``except Exception``, so all
+    six thresholds always resolved to their module-level hardcoded defaults
+    and operator environment overrides were silently ignored.
+
+    The fix reads the value directly from environment variables (the AppConfig
+    attribute names are identical to the env-var names).  This avoids calling
+    ``load_config()`` — which requires POSTGRES_DSN / POSTGRES_PASSWORD — from
+    a lightweight helper that only needs scalar float values.  If the env var is
+    absent or cannot be converted to float, the default is returned.
+    """
+    raw = os.environ.get(attr)
+    if raw is None:
+        return default
     try:
-        from mariana.config import get_config  # noqa: PLC0415
-        return float(getattr(get_config(), attr, default))
-    except Exception:
+        return float(raw)
+    except (ValueError, TypeError):
         return default
 
 

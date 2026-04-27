@@ -88,9 +88,19 @@ function buildUser(session: Session, profile: ProfileRow | null): User {
   };
 }
 
+/** B-28: Maximum ms to wait for Supabase onAuthStateChange before giving up.
+ *  Configurable via VITE_AUTH_TIMEOUT_MS env var (default 10000).
+ *  On outage / slow network the app would show an infinite spinner without this. */
+export const AUTH_LOADING_TIMEOUT_MS: number =
+  typeof import.meta !== "undefined" && (import.meta as Record<string, unknown>).env
+    ? Number((import.meta as Record<string, Record<string, string>>).env.VITE_AUTH_TIMEOUT_MS ?? 10000)
+    : 10000;
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  // B-28: Track whether the auth timeout fired so we can show a retry UI.
+  const [authTimedOut, setAuthTimedOut] = useState(false);
   // BUG-FE-138 fix: Access the shared react-query client so we can clear cached
   // queries on logout. Otherwise the next user to sign in on the same tab could
   // briefly see the previous user's cached data.
@@ -149,21 +159,39 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let mounted = true;
 
+    // B-28: Timeout guard — if Supabase onAuthStateChange never fires (service
+    // outage, network issue, misconfigured env), stop the infinite spinner after
+    // AUTH_LOADING_TIMEOUT_MS and surface a recoverable error state.
+    const timeoutId = setTimeout(() => {
+      if (mounted && loading) {
+        console.warn("[AuthContext] Auth initialization timed out — treating as unauthenticated.");
+        setLoading(false);
+        setAuthTimedOut(true);
+        setUser(null);
+      }
+    }, AUTH_LOADING_TIMEOUT_MS);
+
     // Listen for all auth events including INITIAL_SESSION
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
       if (!mounted) return;
+      // Auth responded — cancel the timeout so we don't fire it after a late response.
+      clearTimeout(timeoutId);
       syncSession(session).finally(() => {
-        if (mounted) setLoading(false);
+        if (mounted) {
+          setLoading(false);
+          setAuthTimedOut(false);
+        }
       });
     });
 
     return () => {
       mounted = false;
+      clearTimeout(timeoutId);
       subscription.unsubscribe();
     };
-  }, [syncSession]);
+  }, [syncSession]); // eslint-disable-line react-hooks/exhaustive-deps -- loading intentionally excluded: we only want to set up the timer once on mount
 
   /**
    * Sign in with email + password.
@@ -266,11 +294,40 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [syncSession]);
 
-  // BUG-015: Show a loading spinner instead of a blank screen while session loads
+  // BUG-015: Show a loading spinner instead of a blank screen while session loads.
+  // B-28: Also show a timeout error if Supabase never responded.
   if (loading) {
     return (
-      <div className="flex h-screen items-center justify-center bg-background">
-        <div className="h-5 w-5 animate-spin rounded-full border-2 border-border border-t-primary" />
+      <div
+        role="status"
+        aria-live="polite"
+        aria-label="Authenticating"
+        data-testid="auth-loading"
+        className="flex h-screen items-center justify-center bg-background"
+      >
+        <div aria-hidden className="h-5 w-5 animate-spin rounded-full border-2 border-border border-t-primary" />
+        <span className="sr-only">Authenticating</span>
+      </div>
+    );
+  }
+
+  // B-28: Auth timed out — show a recoverable error screen instead of an infinite spinner.
+  if (authTimedOut) {
+    return (
+      <div
+        role="alert"
+        data-testid="auth-timeout"
+        className="flex h-screen flex-col items-center justify-center gap-4 bg-background p-8 text-center"
+      >
+        <p className="text-sm text-muted-foreground">
+          Authentication is taking longer than expected. Check your connection and try again.
+        </p>
+        <button
+          onClick={() => window.location.reload()}
+          className="rounded-md border border-border px-4 py-2 text-sm text-foreground hover:bg-accent"
+        >
+          Retry
+        </button>
       </div>
     );
   }

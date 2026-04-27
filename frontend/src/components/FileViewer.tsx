@@ -120,6 +120,34 @@ function renderMarkdownContent(text: string): string {
     .replace(/^### (.+)$/gm, '<h3 class="text-sm font-semibold mt-3 mb-1">$1</h3>')
     .replace(/^## (.+)$/gm, '<h2 class="text-base font-semibold mt-4 mb-2">$1</h2>')
     .replace(/^# (.+)$/gm, '<h1 class="text-lg font-bold mt-4 mb-2">$1</h1>')
+    // B-26 fix: Render markdown links with a strict allow-list on href schemes.
+    // Only https?:// links are rendered as anchors. Any other scheme
+    // (javascript:, data:, vbscript:, file:, etc.) is rendered as plain text
+    // to prevent XSS via crafted markdown files produced by an agent.
+    // This mirrors the href guard in Chat.tsx renderMarkdownImpl (BUG-R2-14).
+    .replace(
+      /\[([^\]]{1,300})\]\(([^)]{1,2000})\)/g,
+      (_match, linkText: string, rawHref: string) => {
+        // Decode HTML entities that were introduced in Step 1 to recover the
+        // original URL, then re-validate the scheme.
+        const href = rawHref
+          .replace(/&amp;/g, "&")
+          .replace(/&lt;/g, "<")
+          .replace(/&gt;/g, ">")
+          .replace(/&quot;/g, '"')
+          .replace(/&#39;/g, "'");
+        // Reject anything that is not a safe http(s) URL.
+        if (!/^https?:\/\//i.test(href)) {
+          // Return just the visible text — no hyperlink.
+          return linkText;
+        }
+        // Re-encode the href for safe inclusion in the attribute value.
+        const safeHref = href
+          .replace(/&/g, "&amp;")
+          .replace(/"/g, "&quot;");
+        return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer" class="text-blue-400 underline">${linkText}</a>`;
+      },
+    )
     .replace(/\n/g, "<br />");
 
   // Step 4: Restore code blocks after all transforms are complete

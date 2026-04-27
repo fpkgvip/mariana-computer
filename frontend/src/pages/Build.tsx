@@ -49,7 +49,7 @@ const FIRST_PROMPT_FLAG = "deft.firstPromptSubmitted.v1";
 const TERMINAL_STATES = new Set(["done", "completed", "failed", "stopped", "cancelled", "error"]);
 
 export default function Build() {
-  const { user, loading: authLoading } = useAuth();
+  const { user, loading: authLoading, refreshUser } = useAuth();
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   const taskIdParam = params.get("task");
@@ -66,6 +66,36 @@ export default function Build() {
     next.delete("prompt");
     setParams(next, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // B-29 fix: Detect Stripe success redirect (?checkout=success) on mount.
+  // After checkout Stripe redirects back here; the webhook fires asynchronously
+  // (2-10 s later). Show a success toast and poll refetchBalance/refreshUser so
+  // the credit balance updates without requiring a manual reload.
+  useEffect(() => {
+    if (params.get("checkout") !== "success") return;
+
+    // Clear the param immediately to prevent re-triggers on navigation.
+    setParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete("checkout");
+      return next;
+    }, { replace: true });
+
+    toast.success("Payment received", {
+      description: "Credits are updating — this may take a few seconds.",
+    });
+
+    // Poll refetchBalance + refreshUser up to 3 times with 3 s intervals.
+    let attempts = 0;
+    const poll = () => {
+      attempts++;
+      refetchBalance();
+      refreshUser().catch((e) => console.warn("[Build] post-checkout refreshUser failed:", e));
+      if (attempts < 3) setTimeout(poll, 3000);
+    };
+    setTimeout(poll, 3000);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally runs once on mount
   }, []);
 
   const [activeTaskId, setActiveTaskId] = useState<string | null>(taskIdParam);

@@ -314,14 +314,16 @@ async def test_concurrent_refund_grant_serialized(db, user_id):
     # Spend nothing, but do inject a state where there's 100 credit.
 
     uid = uuid.UUID(user_id)
+    refund_ref = f"evt-conc-{uuid.uuid4().hex[:12]}"
+    grant_ref = f"grant-conc-{uuid.uuid4().hex[:12]}"
 
     async def do_refund():
         conn2 = await asyncpg.connect(_dsn())
         try:
             import json
             row = await conn2.fetchrow(
-                "SELECT public.refund_credits($1, 1000, 'stripe_event', 'evt-conc-001') AS r",
-                uid
+                "SELECT public.refund_credits($1, 1000, 'stripe_event', $2) AS r",
+                uid, refund_ref,
             )
             return json.loads(row["r"])
         finally:
@@ -332,8 +334,8 @@ async def test_concurrent_refund_grant_serialized(db, user_id):
         try:
             import json
             row = await conn3.fetchrow(
-                "SELECT public.grant_credits($1, 1000, 'topup', 'test', 'grant-conc-001') AS r",
-                uid
+                "SELECT public.grant_credits($1, 1000, 'topup', 'test', $2) AS r",
+                uid, grant_ref,
             )
             return json.loads(row["r"])
         finally:

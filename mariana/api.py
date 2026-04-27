@@ -4635,19 +4635,46 @@ _UPLOAD_MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
 _UPLOAD_MAX_FILES_PER_INVESTIGATION: int = 5
 # SEC-E3-R1-02: Per-target lock to serialize file-count-and-write, preventing
 # parallel requests from bypassing the file cap via TOCTOU race.
-_upload_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+# G-01: Strong-reference dict + bounded LRU eviction. WeakValueDictionary was
+# unsound here — locks held only by a dict key are immediately GC-eligible the
+# moment the holder's local variable goes out of scope across an await, which
+# allowed concurrent callers to receive disjoint Lock instances and bypass
+# mutual exclusion entirely. F-02 and the file-count cap depend on this lock.
+import collections
+_UPLOAD_LOCK_CACHE_MAX: int = 4096
+_upload_locks_lock: asyncio.Lock = asyncio.Lock()
+_upload_locks: "collections.OrderedDict[str, asyncio.Lock]" = collections.OrderedDict()
 
 
 def _get_upload_lock(target_id: str) -> asyncio.Lock:
     """Return a per-target asyncio.Lock for serializing upload file-count checks.
 
-    Uses a weak-value cache so one-off upload targets do not accumulate in a
-    process-long dictionary after their requests finish.
+    Uses a strong-reference LRU bounded at ``_UPLOAD_LOCK_CACHE_MAX`` entries.
+    Memory is negligible because asyncio.Lock objects are tiny. Eviction occurs
+    only when the cache is full and an evicted lock is unheld; held locks are
+    skipped during eviction to preserve correctness.
     """
     lock = _upload_locks.get(target_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _upload_locks[target_id] = lock
+    if lock is not None:
+        # touch for LRU ordering
+        try:
+            _upload_locks.move_to_end(target_id)
+        except KeyError:  # pragma: no cover - racing eviction
+            pass
+        return lock
+    lock = asyncio.Lock()
+    _upload_locks[target_id] = lock
+    # Bounded eviction: only evict UNHELD entries from the LRU end. If every
+    # entry up to ``_UPLOAD_LOCK_CACHE_MAX`` is held, allow temporary growth
+    # rather than break correctness.
+    if len(_upload_locks) > _UPLOAD_LOCK_CACHE_MAX:
+        for evict_key in list(_upload_locks.keys())[: max(1, len(_upload_locks) - _UPLOAD_LOCK_CACHE_MAX)]:
+            evict_lock = _upload_locks.get(evict_key)
+            if evict_lock is None:
+                continue
+            if evict_lock.locked():
+                continue
+            _upload_locks.pop(evict_key, None)
     return lock
 _UPLOAD_ALLOWED_EXTENSIONS: frozenset[str] = frozenset({
     ".pdf", ".txt", ".md", ".csv", ".json", ".html",

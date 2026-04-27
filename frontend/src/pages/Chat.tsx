@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { useAuth } from "@/contexts/AuthContext";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
   Send,
   AlertTriangle,
@@ -454,6 +454,37 @@ const INITIAL_QUALITY_TIER = "balanced";
 export default function Chat() {
   const { user, refreshUser, logout } = useAuth();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // B-29 fix: Detect Stripe success redirect (?checkout=success) on mount.
+  // After checkout Stripe redirects back here; the webhook fires asynchronously
+  // (2-10 s later). Show a success toast and poll refreshUser() so the credit
+  // balance updates without requiring a manual reload.
+  useEffect(() => {
+    if (searchParams.get("checkout") !== "success") return;
+
+    // Clear the param immediately so refreshes don't re-trigger the flow.
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete("checkout");
+      return next;
+    }, { replace: true });
+
+    toast.success("Payment received", {
+      description: "Credits are updating — this may take a few seconds.",
+    });
+
+    // Poll refreshUser up to 3 times with 3 s intervals to wait for the
+    // webhook to apply credits before giving up.
+    let attempts = 0;
+    const poll = () => {
+      attempts++;
+      refreshUser().catch((e) => console.warn("[Chat] post-checkout refreshUser failed:", e));
+      if (attempts < 3) setTimeout(poll, 3000);
+    };
+    setTimeout(poll, 3000);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally runs once on mount only
+  }, []);
 
   // Conversation state
   const [conversations, setConversations] = useState<Conversation[]>([]);

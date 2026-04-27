@@ -280,7 +280,14 @@ export function PreviewPane({ taskId, task, events, className }: PreviewPaneProp
                 key={iframeKey}
                 src={absoluteUrl}
                 title="Live preview"
-                sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups allow-downloads"
+                // B-27 fix: Remove allow-same-origin from sandbox.
+                // Combining allow-scripts + allow-same-origin for user-generated
+                // content on the same origin is equivalent to no sandbox — the
+                // iframe JS could access parent localStorage, cookies, and DOM.
+                // Without allow-same-origin the iframe runs in a unique opaque
+                // origin, preventing parent-frame access even if the agent
+                // generates malicious preview content.
+                sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads"
                 className={cn(
                   "h-full w-full bg-white",
                   viewport === "desktop" ? "rounded-md" : "rounded-[14px]",

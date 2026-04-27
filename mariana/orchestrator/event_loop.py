@@ -26,6 +26,7 @@ Architecture constraints enforced here
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 import json
 import traceback
 import uuid
@@ -96,10 +97,31 @@ logger = structlog.get_logger(__name__)
 _MAX_ITERATIONS: int = 500
 """Safety ceiling on the main loop to prevent infinite runaway loops."""
 
-# BUG-0037 fix: asyncio.Lock for metadata counter read-modify-write operations.
-# Prevents lost updates when concurrent coroutines increment _tribunal_run_counter
-# or _skeptic_run_counter simultaneously.
-_metadata_lock = asyncio.Lock()
+# B-24 fix: replace the single module-level asyncio.Lock with a per-task lock
+# dict so that concurrent investigations do not serialize on one another's
+# tribunal/skeptic counter updates.  The original BUG-0037 goal (preventing
+# lost updates inside a single task's read-modify-write) is preserved because
+# each task still serialises its own counter operations through its own lock.
+#
+# Key: task_id (str) → asyncio.Lock instance.
+# Lock objects are created on first access and removed when run() finishes.
+_metadata_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_metadata_lock(task_id: str) -> asyncio.Lock:
+    """Return the per-task metadata lock for *task_id*, creating it if absent."""
+    if task_id not in _metadata_locks:
+        _metadata_locks[task_id] = asyncio.Lock()
+    return _metadata_locks[task_id]
+
+
+def _cleanup_metadata_lock(task_id: str) -> None:
+    """Remove the per-task metadata lock for *task_id* to prevent dict growth.
+
+    Must be called from the ``finally`` block of :func:`run` after the task
+    completes or fails so the dict does not grow unboundedly in daemon mode.
+    """
+    _metadata_locks.pop(task_id, None)
 
 _STRONG_FINDINGS_CONFIDENCE: float = 0.75
 _STRONG_FINDINGS_MIN_COUNT: int = 3
@@ -937,6 +959,9 @@ async def run(
         # BUG-AUD-20 fix: evict this task's handoff-phase cache entry
         # so a subsequent run (e.g. retry) starts from a clean slate.
         _last_handoff_phase.pop(task.id, None)
+        # B-24 fix: remove per-task metadata lock to prevent unbounded dict
+        # growth in daemon mode where many tasks run over time.
+        _cleanup_metadata_lock(task.id)
 
 
 # ===========================================================================
@@ -2243,8 +2268,9 @@ async def handle_tribunal(
     # BUG-AUD-14 fix: bump a per-task run counter the instant this handler
     # fires so _trigger_for_tribunal can distinguish "handler never ran"
     # from a DB write race.
-    # BUG-0037 fix: wrap read-modify-write in asyncio.Lock to prevent lost updates.
-    async with _metadata_lock:
+    # B-24 fix: use per-task lock (keyed by task.id) instead of module-level
+    # _metadata_lock so concurrent tasks do not serialize on this counter update.
+    async with _get_metadata_lock(task.id):
         if task.metadata is None:
             task.metadata = {}
         task.metadata["_tribunal_run_counter"] = int(
@@ -2501,8 +2527,9 @@ async def handle_skeptic(
     # BUG-AUD-13 fix: bump a per-task run counter the instant this handler
     # fires so _trigger_for_skeptic can distinguish "handler never ran"
     # from a DB write race.
-    # BUG-0037 fix: wrap read-modify-write in asyncio.Lock to prevent lost updates.
-    async with _metadata_lock:
+    # B-24 fix: use per-task lock (keyed by task.id) instead of module-level
+    # _metadata_lock so concurrent tasks do not serialize on this counter update.
+    async with _get_metadata_lock(task.id):
         if task.metadata is None:
             task.metadata = {}
         task.metadata["_skeptic_run_counter"] = int(
@@ -3350,7 +3377,11 @@ async def _atomic_probe_credits(user_id: str, config: Any) -> str:
     refund_ok = False
     for _attempt in range(3):
         try:
-            await _rpc("add_credits", {"target_user_id": user_id, "amount": 1})
+            # B-22 fix: live DB signature is add_credits(p_user_id uuid, p_credits integer).
+            # Previous call used {"target_user_id": ..., "amount": 1} which caused
+            # Postgres 42883 (function not found) on every attempt, silently losing
+            # 1 credit per probe call.  Correct param names: p_user_id, p_credits.
+            await _rpc("add_credits", {"p_user_id": user_id, "p_credits": 1})
             refund_ok = True
             break
         except Exception:
