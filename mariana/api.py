@@ -2841,7 +2841,41 @@ async def start_investigation(
         if body.upload_session_uuid:
             session_uuid = _validate_upload_session_uuid(body.upload_session_uuid)
             pending_dir = Path(cfg.DATA_ROOT) / "uploads" / "pending" / session_uuid
-            if pending_dir.is_dir():
+            # F-02 fix: Hold the same per-session lock that the upload endpoint
+            # uses (api.py:4677) across the entire existence check + ownership
+            # check + atomic claim + file-move sequence.  This serializes
+            # concurrent POST /api/investigations calls that reference the same
+            # session and prevents the TOCTOU race where two callers both pass
+            # the is_dir() check and then race on the file moves.
+            async with _get_upload_lock(f"pending-{session_uuid}"):
+                if not pending_dir.is_dir():
+                    # The pending dir does not exist: either the session was
+                    # already consumed by a concurrent/previous request, or the
+                    # session UUID was never created.  Only treat as a conflict
+                    # (409) when the session was previously seen as existing;
+                    # however since we cannot distinguish those cases inside the
+                    # lock, we 409 to protect against silent double-submission.
+                    # Callers that pass a session UUID are expected to have
+                    # created it via the upload endpoint first.
+                    if reserved_credits > 0:
+                        _credits_to_refund = reserved_credits
+                        reserved_credits = 0
+                        try:
+                            await _supabase_add_credits(
+                                current_user["user_id"], _credits_to_refund, cfg
+                            )
+                        except Exception as _refund_err:  # noqa: BLE001
+                            logger.error(
+                                "refund_after_session_conflict_failed",
+                                user_id=current_user["user_id"],
+                                amount=_credits_to_refund,
+                                error=str(_refund_err),
+                            )
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Upload session not found or already consumed",
+                    )
+
                 # Verify the upload session belongs to this user
                 owner_meta = pending_dir / ".owner"
                 if owner_meta.exists():
@@ -2851,23 +2885,66 @@ async def start_investigation(
                             status_code=403,
                             detail="Upload session belongs to another user",
                         )
-                # BUG-R13-02: Store in files/{task_id} so listing/download endpoints find them
+
+                # F-02 fix: Atomically claim the session by renaming the
+                # pending directory to a unique claimed path.  os.rename is
+                # atomic on the same filesystem, so exactly one concurrent
+                # caller wins.  Any other caller that reaches this point
+                # after the rename will find pending_dir gone (caught by the
+                # is_dir() check above on the next lock acquisition).
+                claimed_dir = (
+                    Path(cfg.DATA_ROOT)
+                    / "uploads"
+                    / "claimed"
+                    / f"{session_uuid}-{task_id}"
+                )
+                claimed_dir.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.rename(str(pending_dir), str(claimed_dir))
+                except (FileNotFoundError, OSError) as _rename_err:
+                    # Extremely unlikely race (e.g. external deletion) —
+                    # treat the same way: refund and 409.
+                    logger.warning(
+                        "upload_session_already_consumed",
+                        session_uuid=session_uuid,
+                        task_id=task_id,
+                        error=str(_rename_err),
+                    )
+                    if reserved_credits > 0:
+                        _credits_to_refund = reserved_credits
+                        reserved_credits = 0
+                        try:
+                            await _supabase_add_credits(
+                                current_user["user_id"], _credits_to_refund, cfg
+                            )
+                        except Exception as _refund_err2:  # noqa: BLE001
+                            logger.error(
+                                "refund_after_session_conflict_failed",
+                                user_id=current_user["user_id"],
+                                amount=_credits_to_refund,
+                                error=str(_refund_err2),
+                            )
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Upload session already consumed",
+                    ) from _rename_err
+
+                # BUG-R13-02: Store in files/{task_id} so listing/download
+                # endpoints find them.  Move from claimed dir, not pending
+                # dir (which is now renamed).
                 task_upload_dir = Path(cfg.DATA_ROOT) / "files" / task_id
                 task_upload_dir.mkdir(parents=True, exist_ok=True)
                 import shutil
-                for f in pending_dir.iterdir():
+                for f in claimed_dir.iterdir():
                     if f.is_symlink():  # BUG-0008 fix: skip symlinks
                         continue
                     if f.is_file() and f.name != ".owner":
                         dest = task_upload_dir / f.name
                         shutil.move(str(f), str(dest))
                         uploaded_file_names.append(f.name)
-                # Clean up pending directory (remove .owner metadata then dir)
+                # Clean up claimed directory
                 try:
-                    owner_cleanup = pending_dir / ".owner"
-                    if owner_cleanup.exists():
-                        owner_cleanup.unlink()
-                    pending_dir.rmdir()
+                    shutil.rmtree(str(claimed_dir), ignore_errors=True)
                 except OSError:
                     pass
                 logger.info(
@@ -5544,6 +5621,32 @@ async def billing_portal(
 # Stripe webhook helpers
 # ---------------------------------------------------------------------------
 
+# F-04: Map Stripe subscription state → effective plan for profiles.plan.
+# Active/trialing/past_due → keep paid plan; anything else → 'free'.
+_ACTIVE_SUBSCRIPTION_STATUSES: frozenset[str] = frozenset(
+    {"active", "trialing", "past_due"}
+)
+
+
+def _effective_plan(subscription_status: str | None, subscription_plan_id: str | None) -> str:
+    """Derive the canonical profiles.plan value from Stripe subscription state.
+
+    Rules (F-04):
+    - status in {active, trialing, past_due} → use subscription_plan_id (the Deft plan slug)
+    - status in {canceled, unpaid, incomplete_expired, paused, None, unknown} → 'free'
+    - subscription_plan_id not in known plans → 'free' (safe default)
+
+    Note: past_due keeps the paid plan so users aren't punished during a
+    brief payment retry window.  Access is revoked only on explicit
+    cancel/delete.
+    """
+    if subscription_status in _ACTIVE_SUBSCRIPTION_STATUSES and subscription_plan_id:
+        # Only accept known Deft plan slugs; unrecognised values fall through to 'free'.
+        if subscription_plan_id in _PLAN_BY_ID:
+            return subscription_plan_id
+    return "free"
+
+
 
 async def _handle_checkout_completed(
     session_obj: dict[str, Any],
@@ -5605,6 +5708,8 @@ async def _handle_checkout_completed(
     if period_end:
         update_payload["subscription_current_period_end"] = period_end
     update_payload["subscription_status"] = "active"
+    # F-04: keep profiles.plan in sync with subscription state.
+    update_payload["plan"] = _effective_plan("active", plan_id)
 
     if update_payload and cfg.SUPABASE_URL and _supabase_api_key(cfg):
         await _supabase_patch_profile(user_id, update_payload, cfg)
@@ -5695,6 +5800,8 @@ async def _handle_invoice_paid(
         patch: dict[str, Any] = {
             "subscription_plan": plan["id"],
             "subscription_status": "active",
+            # F-04: keep profiles.plan in sync with subscription state.
+            "plan": _effective_plan("active", plan["id"]),
         }
         if period_end_iso:
             patch["subscription_current_period_end"] = period_end_iso
@@ -5854,7 +5961,21 @@ async def _handle_subscription_updated(
         return
 
     # Patch all profiles with this Stripe customer ID
-    update_payload: dict[str, Any] = {"subscription_status": status}
+    # F-04: extract subscription_plan from the event object so we can sync
+    # profiles.plan transactionally alongside subscription_status.
+    subscription_plan_id: str | None = None
+    items = (sub_obj.get("items") or {}).get("data") or []
+    if items:
+        price = (items[0].get("price") or {})
+        subscription_plan_id = price.get("id") or price.get("product")
+        # Prefer the plan slug from _PLAN_BY_PRICE_ID; fall back to the raw value.
+        if subscription_plan_id and subscription_plan_id in _PLAN_BY_PRICE_ID:
+            subscription_plan_id = _PLAN_BY_PRICE_ID[subscription_plan_id]["id"]
+    update_payload: dict[str, Any] = {
+        "subscription_status": status,
+        # F-04: keep profiles.plan in sync with subscription state.
+        "plan": _effective_plan(status, subscription_plan_id),
+    }
     period_end_ts = sub_obj.get("current_period_end")
     if period_end_ts:
         update_payload["subscription_current_period_end"] = datetime.fromtimestamp(
@@ -5892,7 +6013,14 @@ async def _handle_subscription_deleted(
 
     await _supabase_patch_profile_by_customer(
         stripe_customer_id,
-        {"subscription_status": "canceled"},
+        {
+            "subscription_status": "canceled",
+            # F-04: immediately downgrade plan to 'free' on subscription deletion.
+            # Grace-period note: we downgrade immediately on customer.subscription.deleted
+            # (the definitive cancel signal from Stripe) rather than waiting for
+            # current_period_end.  This is the cleanest, safest spec.
+            "plan": "free",
+        },
         cfg,
     )
     logger.info("subscription_canceled", stripe_customer_id=stripe_customer_id)

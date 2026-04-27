@@ -58,9 +58,9 @@ Every YAML finding appears under exactly one canonical.  Merge rules from the ta
 | B-45 | A5-01 sub: get_stripe_customer_id IDOR | — | — | (folded into B-01; listed for completeness) |
 | B-46 | A4-12 | P4 | frontend | AuthProvider loading spinner has no ARIA role — screen readers see nothing during auth init |
 | F-01 | Phase E | P1 | api | Public preview route /preview/{task_id}/{file_path} bypasses owner check — IDOR on user previews | **FIXED 2026-04-27** (HMAC preview tokens via cookie+query+header; manifest mints HttpOnly cookie scoped to /preview/{task_id}; 15 regression tests) |
-| F-02 | Phase E | P1 | cross | start_investigation does not hold pending-upload lock during file move — double-charge race on shared upload session |
-| F-03 | Phase E | P1 | cross | Refund/dispute clawback clamped to current balance — already-spent credits forgiven, no debt construct |
-| F-04 | Phase E | P1 | cross | Subscription downgrade/cancel updates subscription_plan only; profiles.plan (used for entitlement enforcement) is never updated |
+| F-02 | Phase E | P1 | cross | start_investigation does not hold pending-upload lock during file move — double-charge race on shared upload session | **FIXED 2026-04-27** (api.py: pending-{session_uuid} lock + atomic os.rename to claimed/, 409 + credit refund on conflict; 6 regression tests) |
+| F-03 | Phase E | P1 | cross | Refund/dispute clawback clamped to current balance — already-spent credits forgiven, no debt construct | **FIXED 2026-04-27** (mig 009: credit_clawbacks table + refund_credits records deficit + grant_credits/add_credits drain open clawbacks FIFO; 8 pytest + C08 contract; applied to live) |
+| F-04 | Phase E | P1 | cross | Subscription downgrade/cancel updates subscription_plan only; profiles.plan (used for entitlement enforcement) is never updated | **FIXED 2026-04-27** (mig 008: update_profile_by_stripe_customer syncs plan + reconcile pass; api.py webhooks include effective_plan; 9 regression tests; applied to live, 12 stale flagship profiles reconciled to free) |
 | F-05 | Phase E | P2 | cross | research_tasks owner stored in metadata JSONB only — deleting auth.users orphans tasks and descendants |
 | F-06 | Phase E | P3 | api | Intelligence endpoints return unbounded per-task datasets to the browser — no pagination/limits |
 
