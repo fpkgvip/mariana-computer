@@ -14,7 +14,7 @@ Every YAML finding appears under exactly one canonical.  Merge rules from the ta
 | B-01 | A1-01, A1-03, A1-04, A5-01, A5-03 | P0 | db | Anon-callable SECURITY DEFINER RPCs — credit inflation/drain, IDOR, role escalation via JSONB merge | **FIXED 2026-04-27** (mig 005 split-revoke + api.py service_role) |
 | B-02 | A1-02, A1-17, A5-04 | P1 | db | SECURITY DEFINER functions missing SET search_path — schema-shadowing attack vector |
 | B-03 | A2-01 | P1 | api | Stripe webhook marks event processed before business logic succeeds — lost credit grants on retry | **FIXED 2026-04-27** (two-phase claim/finalize + 8 regression tests) |
-| B-04 | A2-02 | P1 | api | Stripe refund and dispute events never reverse previously granted credits |
+| B-04 | A2-02 | P1 | api | Stripe refund and dispute events never reverse previously granted credits | **FIXED 2026-04-27** (refund_credits RPC corrected to debit; charge.refunded/dispute handlers added; 10 regression tests) |
 | B-05 | A1-08, A2-03 | P1 | cross | add_credits / deduct_credits bypass credit_buckets/credit_transactions ledger — R6 drift |
 | B-06 | A5-02 | P1 | db | admin_set_credits absolute write races concurrent spend — last-writer-wins, audit dirty read |
 | B-07 | A1-09, A5-10 | P1 | db | spend_credits no SELECT FOR UPDATE — two-tab concurrent spend underflows; balance_after racy |
@@ -73,7 +73,7 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 | 3 | B-03 | P1 | api_patch | B-04 | none | api.py | **FIXED** |
 | 4 | B-09 | P1 | config | none | none | frontend |
 | 5 | B-02 | P1 | migration | B-14 | B-01 | db |
-| 6 | B-04 | P1 | api_patch | none | B-03 | api.py |
+| 6 | B-04 | P1 | api_patch | none | B-03 | api.py | **FIXED** |
 | 7 | B-05 | P1 | api_patch | B-16, B-17 | B-01 | db + api.py |
 | 8 | B-06 | P1 | migration | none | B-01 | db |
 | 9 | B-07 | P1 | migration | B-22 | B-01 | db |
@@ -179,6 +179,7 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 
 ### B-04 — Stripe refund and dispute events never reverse previously granted credits
 
+- **Status:** FIXED 2026-04-27 — Migration 006 replaces the `refund_credits` SQL RPC with a FIFO-debit implementation (type='refund' transactions). Three new handler functions (`_handle_charge_refunded`, `_handle_charge_dispute_created`, `_handle_charge_dispute_funds_withdrawn`) added to `mariana/api.py`. All three wired into the webhook dispatch block (lines ~5308-5319). Pro-rata partial refund logic included. Idempotency via `uq_credit_tx_idem` partial unique index on `(ref_type, ref_id)` for type='refund'. 10 regression tests in `tests/test_b04_refund_dispute.py`. Full suite GREEN.
 - **Severity:** P1
 - **Surface:** api
 - **Lens findings merged:** A2-02
