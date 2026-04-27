@@ -6070,14 +6070,18 @@ async def admin_list_users(
     # Forward the caller's JWT so the RPC function can verify admin role.
     # BUG-API-030 / BUG-API-048: normalize the header so we never forward
     # whitespace-only or malformed values.
+    # Loop6 / B-01: use the service_role key as the API-gateway credential
+    # (the Authorization header still carries the caller's JWT, so the
+    # effective Postgres role is still 'authenticated' and auth.uid() is
+    # the caller; is_admin() gating inside the RPC still fires).
     auth_header = _normalize_bearer_auth_header(
         request.headers.get("authorization") or request.headers.get("Authorization")
     )
-    anon_key = cfg.SUPABASE_ANON_KEY or ""
+    api_key = _supabase_api_key(cfg) or ""
 
     url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/admin_list_profiles"
     headers = {
-        "apikey": anon_key,
+        "apikey": api_key,
         "Authorization": auth_header,
         "Content-Type": "application/json",
     }
@@ -6198,14 +6202,17 @@ async def admin_set_credits(
         raise HTTPException(status_code=503, detail="Supabase not configured")
 
     # BUG-API-030 / BUG-API-048: normalize auth header before forwarding.
+    # Loop6 / B-01: api_key uses service_role so the API-gateway accepts
+    # the request; the Authorization JWT still drives the Postgres role
+    # and auth.uid() inside admin_set_credits.
     auth_header = _normalize_bearer_auth_header(
         request.headers.get("authorization") or request.headers.get("Authorization")
     )
-    anon_key = cfg.SUPABASE_ANON_KEY or ""
+    api_key = _supabase_api_key(cfg) or ""
 
     url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/admin_set_credits"
     headers = {
-        "apikey": anon_key,
+        "apikey": api_key,
         "Authorization": auth_header,
         "Content-Type": "application/json",
     }
@@ -6260,12 +6267,13 @@ async def admin_stats(
     if cfg.SUPABASE_URL:
         try:
             # BUG-API-030 / BUG-API-048: normalize auth header before forwarding.
+            # Loop6 / B-01: api_key uses service_role; JWT still carries caller.
             auth_header = _normalize_bearer_auth_header(
                 request.headers.get("authorization") or request.headers.get("Authorization")
             )
-            anon_key = cfg.SUPABASE_ANON_KEY or ""
+            api_key = _supabase_api_key(cfg) or ""
             headers = {
-                "apikey": anon_key,
+                "apikey": api_key,
                 "Authorization": auth_header,
                 "Content-Type": "application/json",
             }
@@ -6335,12 +6343,23 @@ async def admin_stats(
 
 
 def _admin_supabase_headers(request: Request, cfg: AppConfig) -> dict[str, str]:
-    """Build headers for forwarding to Supabase PostgREST with caller JWT."""
+    """Build headers for forwarding to Supabase PostgREST with caller JWT.
+
+    Loop6 / B-01: The ``apikey`` header uses the service-role key (preferred)
+    as the API-gateway credential. The ``Authorization`` header still carries
+    the caller's user JWT, which is what PostgREST uses to resolve the
+    Postgres role (``authenticated``) and ``auth.uid()`` inside SECURITY
+    DEFINER functions. Using service_role as the gateway key avoids the
+    anon-key rate limits and lets admin RPCs function under the partial
+    revoke posture applied by migration 005 (anon+PUBLIC fully revoked
+    on admin-gated RPCs; authenticated retained because is_admin(auth.uid())
+    is enforced inline).
+    """
     auth_header = _normalize_bearer_auth_header(
         request.headers.get("authorization") or request.headers.get("Authorization")
     )
     return {
-        "apikey": cfg.SUPABASE_ANON_KEY or "",
+        "apikey": _supabase_api_key(cfg) or "",
         "Authorization": auth_header,
         "Content-Type": "application/json",
     }
