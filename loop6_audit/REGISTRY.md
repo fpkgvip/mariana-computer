@@ -20,7 +20,7 @@ Every YAML finding appears under exactly one canonical.  Merge rules from the ta
 | B-07 | A1-09, A5-10 | P1 | db | spend_credits no SELECT FOR UPDATE — two-tab concurrent spend underflows; balance_after racy |
 | B-08 | A4-02 | P1 | frontend | Navbar / BuyCredits show stale profiles.tokens — never auto-refreshes after spend or webhook |
 | B-09 | A4-03 | P1 | frontend | Full JWT access token exposed in SSE query string when stream-token mint fails or is absent |
-| B-10 | A4-04 | P1 | frontend | No Content-Security-Policy or any security header in vercel.json |
+| B-10 | A4-04 | P1 | frontend | No Content-Security-Policy or any security header in vercel.json | **FIXED 2026-04-27** (vercel.json headers + vitest contract) |
 | B-11 | A1-05 | P2 | db | admin_count_profiles / admin_list_profiles use inline auth.uid() check instead of is_admin + missing search_path |
 | B-12 | A1-06, A5-06 | P2 | db | admin_audit_insert publicly executable — anonymous / any-user forge or pollute audit log |
 | B-13 | A1-07, A5-07 | P2 | db | expire_credits callable by anon — DoS by repeated full-table credit sweep |
@@ -69,7 +69,7 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 | Order | Canonical | Severity | fix_type | blocks | blocked_by | applies_to |
 |-------|-----------|----------|----------|--------|------------|------------|
 | 1 | B-01 | P0 | migration | B-02, B-05, B-06, B-07, B-12, B-13, B-16, B-21 | none | db | **FIXED** |
-| 2 | B-10 | P1 | frontend | none | none | frontend |
+| 2 | B-10 | P1 | frontend | none | none | frontend | **FIXED** |
 | 3 | B-03 | P1 | api_patch | B-04 | none | api.py |
 | 4 | B-09 | P1 | config | none | none | frontend |
 | 5 | B-02 | P1 | migration | B-14 | B-01 | db |
@@ -280,6 +280,7 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 
 ### B-10 — No Content-Security-Policy or security headers in vercel.json
 
+- **Status:** FIXED 2026-04-27 — `frontend/vercel.json` now declares a strict `headers` block applied to every route: HSTS (2yr + preload), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy` denying camera/mic/geolocation/etc, `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-site`, and a tight `Content-Security-Policy` covering default/base/frame-ancestors/object/form-action/img/font/style/script/connect/frame/worker/manifest/media. CSP allows Stripe (js.stripe.com, hooks.stripe.com), Supabase (https + wss `*.supabase.co`), and the preview subdomain. `script-src` excludes `'unsafe-inline'` and `'unsafe-eval'`. Pinned by vitest contract `src/test/vercelHeaders.test.ts` (9 assertions). Full suite: 7 SQL contracts + 18 pytest + 24 vitest GREEN.
 - **Severity:** P1
 - **Surface:** frontend
 - **Lens findings merged:** A4-04
