@@ -3,6 +3,7 @@ import { AgentPlanCard, type AgentPlanStep } from "./AgentPlanCard";
 import { AgentProgress } from "./AgentProgress";
 import { TerminalOutput, type TerminalLine } from "./TerminalOutput";
 import { WorkspaceSidebar } from "./WorkspaceSidebar";
+import { mintAgentStreamToken } from "@/lib/streamAuth";
 
 interface AgentEvent {
   event_type: string;
@@ -51,6 +52,9 @@ export function AgentTaskView({
   const [startedAt, setStartedAt] = useState<number>(Date.now());
   const [elapsed, setElapsed] = useState<number>(0);
   const [workspaceRefreshTick, setWorkspaceRefreshTick] = useState<number>(0);
+  // B-09: track stream-token mint failure so we can surface a visible error
+  // instead of silently falling back to a raw JWT in the URL.
+  const [connectionError, setConnectionError] = useState<string | null>(null);
 
   const esRef = useRef<EventSource | null>(null);
   const lineCounter = useRef(0);
@@ -77,15 +81,13 @@ export function AgentTaskView({
     };
   }, [getToken]);
 
-  // SSE subscription (waits for token)
+  // SSE subscription (waits for bearer token, then mints a stream token).
+  // B-09: the full JWT must never appear in the SSE URL — mint a short-lived
+  // stream token first.  On failure, surface a visible error and stop; never
+  // downgrade to placing the raw JWT in the URL.
   useEffect(() => {
     if (!token) return;
-    const url = `${apiUrl}/api/agent/${encodeURIComponent(taskId)}/stream?token=${encodeURIComponent(
-      token,
-    )}`;
-    const es = new EventSource(url);
-    esRef.current = es;
-    setStartedAt(Date.now());
+    let cancelled = false;
 
     const findStepIdx = (stepId: unknown): number => {
       if (typeof stepId !== "string") return -1;
@@ -218,21 +220,46 @@ export function AgentTaskView({
       }
     };
 
-    es.onmessage = (ev) => {
+    // Async IIFE: mint a stream token, then open EventSource.
+    // The `cancelled` flag prevents EventSource creation if the effect
+    // is cleaned up before the mint resolves (e.g. fast task-id change).
+    (async () => {
+      let streamToken: string;
       try {
-        const parsed = JSON.parse(ev.data);
-        handleEvent(parsed);
-      } catch {
-        // Ignore heartbeat / malformed frames silently.
+        streamToken = await mintAgentStreamToken(apiUrl, taskId, token);
+      } catch (_err) {
+        if (!cancelled) {
+          // B-09: do NOT fall back to JWT — surface a visible error instead.
+          setConnectionError("Connection failed — please refresh");
+        }
+        return;
       }
-    };
-    es.onerror = () => {
-      pushLine("error", "Stream disconnected. Retrying…");
-    };
+      if (cancelled) return;
+
+      const url = `${apiUrl}/api/agent/${encodeURIComponent(taskId)}/stream?token=${encodeURIComponent(streamToken)}`;
+      const es = new EventSource(url);
+      esRef.current = es;
+      setStartedAt(Date.now());
+
+      es.onmessage = (ev) => {
+        try {
+          const parsed = JSON.parse(ev.data);
+          handleEvent(parsed);
+        } catch {
+          // Ignore heartbeat / malformed frames silently.
+        }
+      };
+      es.onerror = () => {
+        pushLine("error", "Stream disconnected. Retrying…");
+      };
+    })();
 
     return () => {
-      es.close();
-      esRef.current = null;
+      cancelled = true;
+      if (esRef.current) {
+        esRef.current.close();
+        esRef.current = null;
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [taskId, apiUrl, token]);
@@ -259,6 +286,20 @@ export function AgentTaskView({
   };
 
   const totalSteps = useMemo(() => steps.length, [steps]);
+
+  // B-09: show a hard error when stream-token mint fails rather than
+  // silently falling back to placing the JWT in the SSE URL.
+  if (connectionError) {
+    return (
+      <div
+        className="mt-3 rounded border border-red-700 bg-red-950 px-4 py-3 text-sm text-red-300"
+        role="alert"
+        data-testid="connection-error"
+      >
+        {connectionError}
+      </div>
+    );
+  }
 
   return (
     <div className="mt-3 grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-4">

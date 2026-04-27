@@ -37,6 +37,7 @@ import FileViewer, { FileCard, type FileAttachment } from "@/components/FileView
 import FileUpload, { type UploadedFile } from "@/components/FileUpload";
 import ResearchFlowchart from "@/components/ResearchFlowchart";
 import { AgentTaskView } from "@/components/agent/AgentTaskView";
+import { mintInvestigationStreamToken } from "@/lib/streamAuth";
 // BUG-FE-137 fix: Use a styled AlertDialog instead of native window.confirm()
 // for delete confirmations. Native confirm() blocks the JS main thread, cannot
 // be styled, and is inconsistent across browsers.
@@ -1644,35 +1645,27 @@ export default function Chat() {
       const myGeneration = switchGenerationRef.current;
 
       connectedTaskIdRef.current = taskId;
-      // SEC-E3-R1-01: Mint a short-lived stream token instead of exposing
-      // the full JWT in the SSE query string. The stream token is HMAC-signed,
-      // bound to this specific task, and expires in 2 minutes.
-      let streamToken = token; // Fallback to JWT if mint fails
+      // B-09: Mint a short-lived stream token instead of exposing the full
+      // Supabase JWT in the SSE query string.  On failure, surface an error
+      // and abort — never fall back to placing the raw JWT in the URL.
+      let streamToken: string;
       try {
-        const res = await fetch(`${API_URL}/api/investigations/${taskId}/stream-token`, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        // P1-FIX-21 / P1-FIX-22: After every await, verify the component is still
-        // mounted AND the switch generation is still current. If either changed,
-        // do NOT create an EventSource — it would leak past cleanup / duplicate.
+        streamToken = await mintInvestigationStreamToken(API_URL, taskId, token);
+      } catch (_err) {
+        // B-09: Do NOT fall back to JWT-in-URL. Surface a visible error.
+        // P1-FIX-21 / P1-FIX-22: Re-check mounted/generation after await.
         if (!mountedRef.current || switchGenerationRef.current !== myGeneration) {
           return;
         }
-        if (res.ok) {
-          const data = await res.json();
-          // P1-FIX-21 / P1-FIX-22: Re-check after the second await (json parse).
-          if (!mountedRef.current || switchGenerationRef.current !== myGeneration) {
-            return;
-          }
-          streamToken = data.stream_token;
-        }
-      } catch {
-        // Fallback: use JWT directly (backward compat with older backends)
-        // P1-FIX-21 / P1-FIX-22: Even in the catch path we may have awaited — re-check.
-        if (!mountedRef.current || switchGenerationRef.current !== myGeneration) {
-          return;
-        }
+        toast.error("Connection failed — please refresh");
+        return;
+      }
+
+      // P1-FIX-21 / P1-FIX-22: After the async mint, verify the component is
+      // still mounted AND the switch generation is still current. If either
+      // changed, do NOT create an EventSource — it would leak or duplicate.
+      if (!mountedRef.current || switchGenerationRef.current !== myGeneration) {
+        return;
       }
 
       // BUG-FE-C3 fix: After async stream-token mint, check if the user has
@@ -1690,11 +1683,9 @@ export default function Chat() {
       // FE-HIGH-01: EventSource API does not support custom headers, so the
       // stream token must be passed via query string. Mitigations in place:
       //   1. Stream token is HMAC-signed, scoped to this task, expires in 2 min
-      //   2. Full JWT is only used as fallback if stream-token mint fails
-      //   3. Server should avoid logging query strings containing tokens
-      // A future improvement would be to use fetch() + ReadableStream for SSE
-      // to support Authorization headers, but that requires a polyfill for
-      // EventSource reconnection semantics.
+      //   2. Server avoids logging query strings containing tokens
+      // TODO B-09-FOLLOWUP: use fetch()+ReadableStream for Authorization-header
+      // SSE support without a polyfill for reconnection semantics.
       const url = `${API_URL}/api/investigations/${taskId}/logs?token=${encodeURIComponent(streamToken)}`;
 
       try {

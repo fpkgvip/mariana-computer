@@ -28,7 +28,7 @@ import uuid
 from typing import Any, AsyncIterator
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -191,11 +191,24 @@ async def _enqueue_agent_task(redis: Any, task_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def make_routes(*, get_current_user, get_db, get_redis, get_stream_user) -> APIRouter:
+def make_routes(
+    *,
+    get_current_user,
+    get_db,
+    get_redis,
+    get_stream_user,
+    mint_stream_token=None,
+    verify_stream_token=None,
+) -> APIRouter:
     """Build the agent APIRouter with auth/db dependencies injected.
 
     The api.py module calls this once during import and does
     ``app.include_router(result)``.
+
+    ``mint_stream_token(user_id, task_id) -> str`` and
+    ``verify_stream_token(token, task_id) -> str`` are optional.  When
+    provided, the SSE endpoint uses a short-lived stream token instead of
+    the full JWT (B-09 fix).
     """
     r = APIRouter(prefix="/api", tags=["Agent"])
 
@@ -540,11 +553,61 @@ def make_routes(*, get_current_user, get_db, get_redis, get_stream_user) -> APIR
             })
         return {"events": out, "next_after_id": out[-1]["id"] if out else after_id}
 
+    # -- POST /api/agent/{task_id}/stream-token (B-09) --------------------
+    # Mint a short-lived HMAC-signed stream token so the SSE client never
+    # places the full Supabase JWT in the URL query string.
+    @r.post("/agent/{task_id}/stream-token")
+    async def mint_agent_stream_token(
+        task_id: str,
+        current_user: dict = Depends(get_current_user),
+    ) -> dict:
+        """Issue a short-lived stream token for the agent SSE endpoint.
+
+        B-09: the SSE EventSource URL must never contain the raw Supabase JWT.
+        Clients call this first, then pass the returned token as ?token=.
+        Returns 501 if the server has no mint_stream_token implementation,
+        which the client treats as a permanent error (no JWT fallback).
+        """
+        if mint_stream_token is None:
+            raise HTTPException(
+                status_code=501,
+                detail="stream-token mint not configured on this server",
+            )
+        db = get_db()
+        task = await _load_agent_task(db, task_id)
+        if task is None:
+            raise HTTPException(404, f"agent task {task_id} not found")
+        if task.user_id != current_user["user_id"]:
+            raise HTTPException(403, "not your task")
+        token = mint_stream_token(current_user["user_id"], task_id)
+        return {"stream_token": token, "expires_in_seconds": 120}
+
+    # B-09: Build a stream-token-aware authenticator for the SSE endpoint.
+    # When verify_stream_token is provided, a ?token= param is treated as a
+    # signed stream token (not a raw JWT).  Falls back to get_stream_user
+    # (Bearer header or raw JWT) only when verify_stream_token is absent.
+    # TODO B-09-FOLLOWUP: remove the raw-JWT fallback path once all clients
+    # use the stream-token mint flow.
+    async def _authenticate_sse(
+        task_id: str,
+        authorization: str | None = Header(None),
+        token: str | None = Query(None),
+    ) -> dict:
+        """Authenticate agent SSE requests — prefer stream token over raw JWT."""
+        if token and verify_stream_token is not None:
+            # Fast path: validate the short-lived HMAC-signed stream token.
+            # HTTPException propagates automatically on invalid/expired token.
+            user_id = verify_stream_token(token, task_id)
+            return {"user_id": user_id}
+        # Fallback: raw JWT in Authorization header (or legacy ?token= JWT).
+        # This path will be removed in B-09-FOLLOWUP once all callers mint.
+        return await get_stream_user(authorization=authorization, token=token)  # type: ignore[call-arg]
+
     # -- GET /api/agent/{task_id}/stream (SSE) --------------------------
     @r.get("/agent/{task_id}/stream")
     async def stream_agent_events(
         task_id: str,
-        current_user: dict = Depends(get_stream_user),  # supports ?token= or Bearer
+        current_user: dict = Depends(_authenticate_sse),
     ) -> StreamingResponse:
         db = get_db()
         task = await _load_agent_task(db, task_id)

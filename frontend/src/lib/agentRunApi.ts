@@ -5,6 +5,7 @@
  */
 import { api } from "@/lib/api";
 import { supabase } from "@/lib/supabase";
+import { mintAgentStreamToken } from "@/lib/streamAuth";
 import type { ModelTier } from "@/lib/agentApi";
 
 export interface AgentStartParams {
@@ -133,14 +134,23 @@ export function previewAbsoluteUrl(relUrl: string): string {
 /**
  * Open an EventSource for the agent's SSE stream.
  *
- * EventSource doesn't support custom headers, so we attach the access token
- * as a `?token=` query param — backend's `get_stream_user` accepts both.
+ * B-09: mints a short-lived stream token first so the full Supabase JWT
+ * never appears in the SSE URL (and therefore never lands in nginx/CDN
+ * access logs, browser history, or Referer headers).
+ *
+ * Throws an error if authentication fails — never falls back to placing
+ * the raw JWT in the URL.
+ *
+ * TODO B-09-FOLLOWUP: replace EventSource with fetch()+ReadableStream so
+ * the token can travel in an Authorization header instead of ?token=.
  */
 export async function openAgentStream(taskId: string): Promise<EventSource> {
   const { data } = await supabase.auth.getSession();
-  const token = data.session?.access_token;
-  if (!token) throw new Error("Not authenticated");
+  const bearerJwt = data.session?.access_token;
+  if (!bearerJwt) throw new Error("Not authenticated");
   const apiBase = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
-  const url = `${apiBase}/api/agent/${encodeURIComponent(taskId)}/stream?token=${encodeURIComponent(token)}`;
+  // Mint short-lived stream token — throws on failure (B-09: no JWT fallback).
+  const streamToken = await mintAgentStreamToken(apiBase, taskId, bearerJwt);
+  const url = `${apiBase}/api/agent/${encodeURIComponent(taskId)}/stream?token=${encodeURIComponent(streamToken)}`;
   return new EventSource(url);
 }
