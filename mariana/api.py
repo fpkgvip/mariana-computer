@@ -5256,11 +5256,16 @@ async def stripe_webhook(request: Request) -> JSONResponse:
     if not event_id:
         raise HTTPException(status_code=400, detail="Webhook event missing id")
 
-    # BUG-C1-08 fix: If idempotency check fails due to DB error, return 500
-    # so Stripe retries later (instead of silently processing and risking
-    # double-crediting if idempotency INSERT never committed).
+    # B-03 fix: two-phase idempotency.  We claim the event in 'pending' state
+    # *before* running the handler.  Only after the handler returns
+    # successfully do we mark the event 'completed'.  If the handler raises,
+    # the row stays 'pending' so the next Stripe retry will re-execute the
+    # handler instead of being silently skipped as a duplicate.  All grant
+    # paths are independently idempotent on ``ref_id = event_id`` via the
+    # ``uq_credit_tx_idem`` partial unique index, so re-execution cannot
+    # double-credit.
     try:
-        recorded = await _record_webhook_event_once(event_id, event_type)
+        claim = await _claim_webhook_event(event_id, event_type)
     except Exception as exc:  # noqa: BLE001
         log.error("stripe_idempotency_check_failed", error=str(exc))
         return JSONResponse(
@@ -5268,11 +5273,11 @@ async def stripe_webhook(request: Request) -> JSONResponse:
             content={"status": "idempotency_error", "error": str(exc)},
         )
 
-    if not recorded:
+    if claim == _WebhookClaim.DUPLICATE:
         log.info("stripe_webhook_replay_ignored")
         return JSONResponse(content={"status": "duplicate", "event_id": event_id})
 
-    log.info("stripe_webhook_received")
+    log.info("stripe_webhook_received", claim=claim)
 
     try:
         if event_type == "checkout.session.completed":
@@ -5298,22 +5303,40 @@ async def stripe_webhook(request: Request) -> JSONResponse:
         else:
             log.info("stripe_webhook_unhandled_event")
 
-    except HTTPException:
+    except HTTPException as exc:
         # BUG-C1-09 fix: Let 503 from _supabase_add_credits propagate as
-        # 500 so Stripe retries when the credit RPC is down.
+        # 500 so Stripe retries when the credit RPC is down.  B-03: do NOT
+        # finalize the event — leave it 'pending' so the retry re-runs.
         log.error("stripe_webhook_handler_failed_retriable")
+        await _record_webhook_event_failure(event_id, f"http_{exc.status_code}: {exc.detail}")
         return JSONResponse(
             status_code=500,
             content={"status": "handler_error_retriable"},
         )
     except Exception as exc:  # noqa: BLE001
         log.error("stripe_webhook_handler_failed", error=str(exc), exc_info=True)
-        # BUG-API-019 fix: Return 500 so Stripe retries.  Idempotency guard
-        # (_record_webhook_event_once) prevents double-processing on retry.
-        # Returning 200 on handler errors silently lost credits.
+        # B-03 fix: Return 500 so Stripe retries.  The event row stays
+        # 'pending' so ``_claim_webhook_event`` returns RETRY next time,
+        # re-running the handler.  Per-grant idempotency guards prevent
+        # double-credit.
+        await _record_webhook_event_failure(event_id, str(exc))
         return JSONResponse(
             status_code=500,
             content={"status": "handler_error", "error": str(exc)},
+        )
+
+    # Handler succeeded — finalize the idempotency row.
+    try:
+        await _finalize_webhook_event(event_id)
+    except Exception as exc:  # noqa: BLE001
+        # The handler already mutated state (granted credits, etc.) but we
+        # failed to mark the event 'completed'.  Return 500 so Stripe retries;
+        # on the next attempt the claim will return RETRY and the handler
+        # will run again — protected by per-grant ``ref_id`` idempotency.
+        log.error("stripe_webhook_finalize_failed", error=str(exc))
+        return JSONResponse(
+            status_code=500,
+            content={"status": "finalize_error", "error": str(exc)},
         )
 
     return JSONResponse(content={"status": "ok"})
@@ -5987,28 +6010,131 @@ async def _supabase_deduct_credits(
     return "error"
 
 
-async def _record_webhook_event_once(event_id: str, event_type: str) -> bool:
-    """Record a Stripe webhook event idempotently.
+# Sentinel returned by ``_claim_webhook_event`` to indicate the disposition of
+# the claim attempt.  Using a small enum keeps the call-sites readable without
+# pulling in a heavier type elsewhere.
+class _WebhookClaim:
+    NEW = "new"            # First time seen; caller must run the handler.
+    RETRY = "retry"        # Previously crashed mid-handler; caller must run again.
+    DUPLICATE = "duplicate"  # Already completed successfully; caller must skip.
 
-    Returns ``True`` when this is the first time the event ID is seen and the
-    handler should proceed, or ``False`` when the event is a replay.
 
-    BUG-API-041: DB failures here propagate to the caller (``stripe_webhook``)
-    where they are translated into 500 so Stripe retries. The ``INSERT 0 1``
-    /``INSERT 0 0`` parsing pattern is well-defined for asyncpg. No action
-    needed beyond the existing implementation.
+async def _claim_webhook_event(event_id: str, event_type: str) -> str:
+    """B-03 two-phase claim: atomically reserve a webhook event for handling.
+
+    Returns one of ``_WebhookClaim.{NEW, RETRY, DUPLICATE}``.
+
+    Semantics:
+      - NEW       — First INSERT; caller proceeds and must call ``_finalize_webhook_event`` on success.
+      - RETRY     — An earlier handler invocation crashed (status='pending');
+                     caller proceeds and must call ``_finalize_webhook_event`` on success.
+                     ``attempts`` is incremented for observability.
+      - DUPLICATE — Already completed successfully (status='completed');
+                     caller short-circuits and returns 200 to Stripe.
+
+    The single round-trip uses ``INSERT ... ON CONFLICT DO UPDATE`` so the
+    transition from pending→pending+1 happens atomically with the lookup.
+    The ``RETURNING`` clause yields the *post-write* row state along with the
+    pre-existing status (captured via the EXCLUDED ↔ stripe_webhook_events
+    join in a subquery) so we can disambiguate NEW vs RETRY vs DUPLICATE.
+
+    DB failures propagate to the caller (``stripe_webhook``) where they are
+    translated into HTTP 500 so Stripe retries.
     """
     db = _get_db()
-    result = await db.execute(
+    # The CTE captures the pre-update status so we can return it alongside the
+    # upserted row.  When the row didn't exist, prior_status is NULL.
+    row = await db.fetchrow(
         """
-        INSERT INTO stripe_webhook_events (event_id, event_type, processed_at)
-        VALUES ($1, $2, NOW())
-        ON CONFLICT (event_id) DO NOTHING
+        WITH prior AS (
+            SELECT status FROM stripe_webhook_events WHERE event_id = $1
+        ),
+        upserted AS (
+            INSERT INTO stripe_webhook_events
+                (event_id, event_type, status, attempts, received_at, last_attempt_at, processed_at)
+            VALUES ($1, $2, 'pending', 1, NOW(), NOW(), NOW())
+            ON CONFLICT (event_id) DO UPDATE
+                SET attempts        = stripe_webhook_events.attempts + 1,
+                    last_attempt_at = NOW(),
+                    -- Do not overwrite event_type or completed status.
+                    event_type      = stripe_webhook_events.event_type
+                WHERE stripe_webhook_events.status = 'pending'
+            RETURNING status
+        )
+        SELECT (SELECT status FROM prior)     AS prior_status,
+               (SELECT status FROM upserted)  AS post_status
         """,
         event_id,
         event_type,
     )
-    return result.split()[-1] == "1"
+    prior_status = row["prior_status"] if row is not None else None
+    post_status = row["post_status"] if row is not None else None
+
+    if prior_status is None:
+        # No prior row — this is a brand-new event.  upserted produced one row.
+        return _WebhookClaim.NEW
+    if prior_status == "completed":
+        # A successful run already happened.  upserted's WHERE clause filtered
+        # the UPDATE out, so post_status is NULL.  Stripe replay; skip.
+        return _WebhookClaim.DUPLICATE
+    # prior_status == 'pending' — the handler crashed before finalising.
+    # The UPDATE matched (post_status='pending') and bumped attempts; rerun.
+    assert post_status == "pending", post_status
+    return _WebhookClaim.RETRY
+
+
+async def _finalize_webhook_event(event_id: str) -> None:
+    """B-03 second phase: mark a webhook event as fully processed.
+
+    Called only after the business-logic handler returns successfully.  If
+    this UPDATE itself fails the caller surfaces 500 to Stripe; on the next
+    retry ``_claim_webhook_event`` returns RETRY (status is still 'pending'),
+    so the handler runs again.  This is acceptable because every grant path
+    is itself idempotent on ``ref_id=event_id`` via the
+    ``uq_credit_tx_idem`` partial unique index.
+    """
+    db = _get_db()
+    await db.execute(
+        """
+        UPDATE stripe_webhook_events
+           SET status        = 'completed',
+               completed_at  = NOW(),
+               processed_at  = NOW(),
+               last_error    = NULL
+         WHERE event_id = $1
+        """,
+        event_id,
+    )
+
+
+async def _record_webhook_event_failure(event_id: str, error: str) -> None:
+    """Record the most recent failure reason without finalising the event.
+
+    The event remains ``status='pending'`` so Stripe's retry cycle can
+    reattempt it.  Errors here are swallowed — if even the failure-recording
+    UPDATE fails, the original handler error has already been logged.
+    """
+    try:
+        db = _get_db()
+        await db.execute(
+            """
+            UPDATE stripe_webhook_events
+               SET last_error      = LEFT($2, 4000),
+                   last_attempt_at = NOW()
+             WHERE event_id = $1
+            """,
+            event_id,
+            error,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("stripe_webhook_failure_record_failed", event_id=event_id)
+
+
+# Backwards-compat shim — some tests and callers reference the old name.
+# Returns True for both NEW and RETRY (i.e. "caller should proceed").
+async def _record_webhook_event_once(event_id: str, event_type: str) -> bool:
+    claim = await _claim_webhook_event(event_id, event_type)
+    return claim != _WebhookClaim.DUPLICATE
 
 
 async def _get_stripe_customer_id(

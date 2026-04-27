@@ -302,13 +302,65 @@ CREATE TABLE IF NOT EXISTS evaluation_results (
 CREATE INDEX IF NOT EXISTS idx_evaluation_results_task_id ON evaluation_results(task_id);
 CREATE INDEX IF NOT EXISTS idx_evaluation_results_branch_id ON evaluation_results(branch_id);
 
+-- B-03 fix: two-phase idempotency.  status='pending' is written before the
+-- handler runs; status='completed' only after the handler succeeds.  A retry
+-- of an event that is still 'pending' is allowed to re-attempt; a retry of a
+-- 'completed' event short-circuits as a true replay.  Existing deployments
+-- are upgraded by the ALTER TABLE block below.
 CREATE TABLE IF NOT EXISTS stripe_webhook_events (
-    event_id     TEXT        PRIMARY KEY,
-    event_type   TEXT        NOT NULL,
-    processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    event_id        TEXT        PRIMARY KEY,
+    event_type      TEXT        NOT NULL,
+    status          TEXT        NOT NULL DEFAULT 'completed'
+        CHECK (status IN ('pending', 'completed')),
+    attempts        INT         NOT NULL DEFAULT 1,
+    received_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at    TIMESTAMPTZ,
+    last_error      TEXT,
+    -- Kept for backwards compatibility with older deploys that read this column.
+    processed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Idempotent upgrade for pre-B-03 deployments where this table already
+-- existed without the two-phase columns.  Each statement is safe on a fresh
+-- create as well thanks to IF NOT EXISTS.
+DO $migrate_stripe_webhook_events$
+BEGIN
+    BEGIN
+        ALTER TABLE stripe_webhook_events ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'completed';
+    EXCEPTION WHEN duplicate_column THEN NULL;
+    END;
+    BEGIN
+        ALTER TABLE stripe_webhook_events ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 1;
+    EXCEPTION WHEN duplicate_column THEN NULL;
+    END;
+    BEGIN
+        ALTER TABLE stripe_webhook_events ADD COLUMN IF NOT EXISTS received_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    EXCEPTION WHEN duplicate_column THEN NULL;
+    END;
+    BEGIN
+        ALTER TABLE stripe_webhook_events ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    EXCEPTION WHEN duplicate_column THEN NULL;
+    END;
+    BEGIN
+        ALTER TABLE stripe_webhook_events ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+    EXCEPTION WHEN duplicate_column THEN NULL;
+    END;
+    BEGIN
+        ALTER TABLE stripe_webhook_events ADD COLUMN IF NOT EXISTS last_error TEXT;
+    EXCEPTION WHEN duplicate_column THEN NULL;
+    END;
+    BEGIN
+        ALTER TABLE stripe_webhook_events DROP CONSTRAINT IF EXISTS stripe_webhook_events_status_check;
+        ALTER TABLE stripe_webhook_events ADD CONSTRAINT stripe_webhook_events_status_check
+            CHECK (status IN ('pending', 'completed'));
+    EXCEPTION WHEN others THEN NULL;
+    END;
+END;
+$migrate_stripe_webhook_events$;
+
 CREATE INDEX IF NOT EXISTS idx_stripe_webhook_events_processed_at ON stripe_webhook_events(processed_at);
+CREATE INDEX IF NOT EXISTS idx_stripe_webhook_events_status ON stripe_webhook_events(status) WHERE status = 'pending';
 
 CREATE TABLE IF NOT EXISTS graph_nodes (
     id TEXT PRIMARY KEY,

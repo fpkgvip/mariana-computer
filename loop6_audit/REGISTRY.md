@@ -13,7 +13,7 @@ Every YAML finding appears under exactly one canonical.  Merge rules from the ta
 |-----------|----------------|----------|---------|-------|
 | B-01 | A1-01, A1-03, A1-04, A5-01, A5-03 | P0 | db | Anon-callable SECURITY DEFINER RPCs — credit inflation/drain, IDOR, role escalation via JSONB merge | **FIXED 2026-04-27** (mig 005 split-revoke + api.py service_role) |
 | B-02 | A1-02, A1-17, A5-04 | P1 | db | SECURITY DEFINER functions missing SET search_path — schema-shadowing attack vector |
-| B-03 | A2-01 | P1 | api | Stripe webhook marks event processed before business logic succeeds — lost credit grants on retry |
+| B-03 | A2-01 | P1 | api | Stripe webhook marks event processed before business logic succeeds — lost credit grants on retry | **FIXED 2026-04-27** (two-phase claim/finalize + 8 regression tests) |
 | B-04 | A2-02 | P1 | api | Stripe refund and dispute events never reverse previously granted credits |
 | B-05 | A1-08, A2-03 | P1 | cross | add_credits / deduct_credits bypass credit_buckets/credit_transactions ledger — R6 drift |
 | B-06 | A5-02 | P1 | db | admin_set_credits absolute write races concurrent spend — last-writer-wins, audit dirty read |
@@ -70,7 +70,7 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 |-------|-----------|----------|----------|--------|------------|------------|
 | 1 | B-01 | P0 | migration | B-02, B-05, B-06, B-07, B-12, B-13, B-16, B-21 | none | db | **FIXED** |
 | 2 | B-10 | P1 | frontend | none | none | frontend | **FIXED** |
-| 3 | B-03 | P1 | api_patch | B-04 | none | api.py |
+| 3 | B-03 | P1 | api_patch | B-04 | none | api.py | **FIXED** |
 | 4 | B-09 | P1 | config | none | none | frontend |
 | 5 | B-02 | P1 | migration | B-14 | B-01 | db |
 | 6 | B-04 | P1 | api_patch | none | B-03 | api.py |
@@ -161,6 +161,7 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 
 ### B-03 — Stripe webhook marks event processed before business logic succeeds
 
+- **Status:** FIXED 2026-04-27 — schema upgrade in `mariana/data/db.py`: `stripe_webhook_events` now carries `status` (pending|completed), `attempts`, `received_at`, `last_attempt_at`, `completed_at`, `last_error` columns (idempotent ALTER block for existing deployments). Replaced single-shot `_record_webhook_event_once` with two-phase `_claim_webhook_event` (NEW|RETRY|DUPLICATE) + `_finalize_webhook_event`. Webhook handler claims pending before business logic, finalizes only after handler returns; on raise, row stays pending and Stripe retries trigger RETRY claim. Per-grant idempotency via `uq_credit_tx_idem` (`ref_id=event_id`) prevents double-credit on retry. Backwards-compat shim retains old `_record_webhook_event_once`. New regression suite `tests/test_b03_webhook_two_phase.py` (8 tests covering NEW/RETRY/DUPLICATE/finalize-fail). Full suite: 7 SQL contracts + 66 pytest + 24 vitest GREEN.
 - **Severity:** P1
 - **Surface:** api
 - **Lens findings merged:** A2-01
