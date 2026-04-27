@@ -294,7 +294,9 @@ async def test_full_refund_reverses_full_grant():
     assert body["p_user_id"] == user_id
     assert body["p_credits"] == original_credits  # full reversal
     assert body["p_ref_type"] == "stripe_event"
-    assert body["p_ref_id"] == "evt_ref_full_1"
+    # I-02 fix: ref_id is now the stable reversal_key, not event_id.
+    # charge.refunded with no dispute uses "charge:<id>:reversal".
+    assert body["p_ref_id"] == "charge:ch_1:reversal"
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +341,8 @@ async def test_partial_refund_reverses_pro_rata():
     assert len(rpc_calls) == 1
     body = rpc_calls[0]["json"]
     assert body["p_credits"] == expected_debited
-    assert body["p_ref_id"] == "evt_ref_partial_1"
+    # I-02 fix: ref_id is now the stable reversal_key.
+    assert body["p_ref_id"] == "charge:ch_2:reversal"
 
 
 # ---------------------------------------------------------------------------
@@ -414,7 +417,9 @@ async def test_dispute_funds_withdrawn_reverses_grant():
     body = rpc_calls[0]["json"]
     assert body["p_user_id"] == user_id
     assert body["p_credits"] == original_credits
-    assert body["p_ref_id"] == "evt_disp_fw_1"
+    # I-02 fix: ref_id is now the stable reversal_key.
+    # dispute event with dispute_id=dp_1 uses "dispute:dp_1".
+    assert body["p_ref_id"] == "dispute:dp_1"
 
 
 # ---------------------------------------------------------------------------

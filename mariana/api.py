@@ -6321,6 +6321,22 @@ async def _lookup_grant_tx_for_payment_intent(
         return None
     return rows[0]
 
+def _compute_reversal_key(
+    charge_obj: dict[str, Any],
+    dispute_obj: dict[str, Any] | None,
+) -> str:
+    """Return the stable business key for this reversal.
+
+    Uses 'dispute:<dispute_id>' when a dispute object with an id is present;
+    falls back to 'charge:<charge_id>:reversal' for plain charge.refunded events.
+    Stable across all event types for the same underlying dispute or refund.
+    """
+    if dispute_obj and dispute_obj.get("id"):
+        return f"dispute:{dispute_obj['id']}"
+    charge_id = charge_obj.get("id") or ""
+    return f"charge:{charge_id}:reversal"
+
+
 async def _record_dispute_reversal_or_skip(
     charge_obj: dict[str, Any],
     dispute_obj: dict[str, Any] | None,
@@ -6346,13 +6362,7 @@ async def _record_dispute_reversal_or_skip(
     if not cfg.SUPABASE_URL or not api_key:
         return False
 
-    dispute_id: str | None = None
-    if dispute_obj and dispute_obj.get("id"):
-        dispute_id = dispute_obj["id"]
-        reversal_key = f"dispute:{dispute_id}"
-    else:
-        charge_id = charge_obj.get("id") or ""
-        reversal_key = f"charge:{charge_id}:reversal"
+    reversal_key = _compute_reversal_key(charge_obj, dispute_obj)
 
     headers = {
         "apikey": api_key,
@@ -6407,13 +6417,8 @@ async def _insert_dispute_reversal(
     if not cfg.SUPABASE_URL or not api_key:
         return
 
-    dispute_id: str | None = None
-    if dispute_obj and dispute_obj.get("id"):
-        dispute_id = dispute_obj["id"]
-        reversal_key = f"dispute:{dispute_id}"
-    else:
-        charge_id = charge_obj.get("id") or ""
-        reversal_key = f"charge:{charge_id}:reversal"
+    reversal_key = _compute_reversal_key(charge_obj, dispute_obj)
+    dispute_id: str | None = dispute_obj.get("id") if dispute_obj else None
 
     headers = {
         "apikey": api_key,
@@ -6486,6 +6491,12 @@ async def _reverse_credits_for_charge(
     amount_total: int = int(charge_obj.get("amount") or 0)
     amount_refunded: int = int(charge_obj.get("amount_refunded") or charge_obj.get("amount") or 0)
 
+    # I-02 fix: compute the stable reversal_key once before any check or RPC call.
+    # This key is identical across all event types for the same dispute/refund,
+    # so refund_credits idempotency on (type='refund', ref_type, ref_id=reversal_key)
+    # collapses concurrent dispute.created + dispute.funds_withdrawn server-side.
+    reversal_key = _compute_reversal_key(charge_obj, dispute_obj)
+
     # H-02: dedup check before computing/executing the reversal.
     already_done = await _record_dispute_reversal_or_skip(
         charge_obj=charge_obj,
@@ -6527,13 +6538,17 @@ async def _reverse_credits_for_charge(
         raise HTTPException(status_code=503, detail="Credit ledger unavailable")
 
     try:
+        # I-02 fix: key idempotency on stable reversal_key (not event_id).
+        # Both dispute.created (evt_A) and dispute.funds_withdrawn (evt_B) for the
+        # same dispute map to the same reversal_key, so if both bypass the SELECT
+        # short-circuit, refund_credits collapses the second call server-side.
         result = await _refund_rpc(
             supabase_url=cfg.SUPABASE_URL,
             service_key=api_key,
             user_id=user_id,
             credits=credits_to_debit,
             ref_type="stripe_event",
-            ref_id=event_id,
+            ref_id=reversal_key,
         )
     except LedgerError as exc:
         logger.error(
