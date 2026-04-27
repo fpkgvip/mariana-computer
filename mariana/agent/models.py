@@ -139,7 +139,7 @@ class AgentTask(BaseModel):
     budget_usd: float = 5.0
     spent_usd: float = 0.0
 
-    # M-01 fix: credit reservation accounting.
+    # M-01 fix: credit reservation accounting (persisted by N-01).
     # ``reserved_credits`` is the up-front Supabase deduction made by
     # ``POST /api/agent`` (canonical 100 credits/USD).  The runtime settles
     # this in :func:`mariana.agent.loop._settle_agent_credits` once the task
@@ -147,10 +147,11 @@ class AgentTask(BaseModel):
     # or deducting the overrun via ``deduct_credits``.  ``credits_settled``
     # makes settlement idempotent: any subsequent call observes the flag and
     # short-circuits, so a retried orchestrator pass cannot double-charge or
-    # double-refund.  Neither field is persisted to Postgres in this
-    # release; they live on the in-memory task instance for the duration of
-    # one orchestrator run, which is the only window in which settlement
-    # runs.
+    # double-refund.  Both fields are persisted to ``agent_tasks`` (see
+    # ``mariana/agent/schema.sql``) so the queue-consumer reload path
+    # (``mariana/main.py``) preserves them across worker restarts and
+    # requeues — without persistence the worker would always observe
+    # ``reserved_credits=0`` and skip settlement entirely.
     reserved_credits: int = 0
     credits_settled: bool = False
 

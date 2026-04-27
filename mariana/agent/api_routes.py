@@ -79,11 +79,15 @@ async def _insert_agent_task(db: Any, task: AgentTask) -> None:
     payload = task.model_dump(mode="json")
     async with db.acquire() as conn:
         await conn.execute(
+            # N-01: ``reserved_credits`` and ``credits_settled`` MUST be in
+            # this INSERT — otherwise the queue consumer reload path drops
+            # them and ``_settle_agent_credits`` becomes a noop.
             """
             INSERT INTO agent_tasks (
                 id, user_id, conversation_id, goal, user_instructions,
                 state, selected_model, steps, artifacts,
                 max_duration_hours, budget_usd, spent_usd,
+                reserved_credits, credits_settled,
                 max_fix_attempts_per_step, max_replans, replan_count, total_failures,
                 final_answer, stop_requested, error,
                 created_at, updated_at
@@ -91,9 +95,10 @@ async def _insert_agent_task(db: Any, task: AgentTask) -> None:
                 $1, $2, $3, $4, $5,
                 $6, $7, $8::jsonb, $9::jsonb,
                 $10, $11, $12,
-                $13, $14, $15, $16,
-                $17, $18, $19,
-                $20, $21
+                $13, $14,
+                $15, $16, $17, $18,
+                $19, $20, $21,
+                $22, $23
             )
             """,
             task.id,
@@ -108,6 +113,8 @@ async def _insert_agent_task(db: Any, task: AgentTask) -> None:
             task.max_duration_hours,
             task.budget_usd,
             task.spent_usd,
+            task.reserved_credits,
+            task.credits_settled,
             task.max_fix_attempts_per_step,
             task.max_replans,
             task.replan_count,
@@ -129,10 +136,14 @@ async def _load_agent_task(db: Any, task_id: str) -> AgentTask | None:
         return None
     async with db.acquire() as conn:
         row = await conn.fetchrow(
+            # N-01: include reserved_credits / credits_settled so the worker
+            # reload path (mariana/main.py queue consumer) can settle credits
+            # at terminal state instead of silently falling back to defaults.
             """
             SELECT id, user_id, conversation_id, goal, user_instructions,
                    state, selected_model, steps, artifacts,
                    max_duration_hours, budget_usd, spent_usd,
+                   reserved_credits, credits_settled,
                    max_fix_attempts_per_step, max_replans, replan_count, total_failures,
                    final_answer, stop_requested, error,
                    created_at, updated_at
@@ -164,6 +175,10 @@ async def _load_agent_task(db: Any, task_id: str) -> AgentTask | None:
         "max_duration_hours": float(row["max_duration_hours"]),
         "budget_usd": float(row["budget_usd"]),
         "spent_usd": float(row["spent_usd"]),
+        # N-01: settlement metadata must round-trip from Postgres so the
+        # queue-consumer worker can refund / extra-deduct correctly.
+        "reserved_credits": int(row["reserved_credits"]),
+        "credits_settled": bool(row["credits_settled"]),
         "max_fix_attempts_per_step": int(row["max_fix_attempts_per_step"]),
         "max_replans": int(row["max_replans"]),
         "replan_count": int(row["replan_count"]),

@@ -83,11 +83,18 @@ async def _persist_task(db: Any, task: AgentTask) -> None:
     payload = task.model_dump(mode="json")
     async with db.acquire() as conn:
         await conn.execute(
+            # N-01: ``reserved_credits`` and ``credits_settled`` are part of
+            # the agent_tasks row in this release.  They MUST appear in both
+            # the INSERT and the ON CONFLICT SET clause, otherwise the
+            # ``finally:`` settlement (which writes credits_settled=True
+            # before this UPSERT runs) is dropped on disk and a requeue
+            # would re-settle.
             """
             INSERT INTO agent_tasks (
                 id, user_id, conversation_id, goal, user_instructions,
                 state, selected_model, steps, artifacts,
                 max_duration_hours, budget_usd, spent_usd,
+                reserved_credits, credits_settled,
                 max_fix_attempts_per_step, max_replans, replan_count, total_failures,
                 final_answer, stop_requested, error,
                 created_at, updated_at
@@ -95,15 +102,18 @@ async def _persist_task(db: Any, task: AgentTask) -> None:
                 $1, $2, $3, $4, $5,
                 $6, $7, $8::jsonb, $9::jsonb,
                 $10, $11, $12,
-                $13, $14, $15, $16,
-                $17, $18, $19,
-                $20, $21
+                $13, $14,
+                $15, $16, $17, $18,
+                $19, $20, $21,
+                $22, $23
             )
             ON CONFLICT (id) DO UPDATE SET
                 state = EXCLUDED.state,
                 steps = EXCLUDED.steps,
                 artifacts = EXCLUDED.artifacts,
                 spent_usd = EXCLUDED.spent_usd,
+                reserved_credits = EXCLUDED.reserved_credits,
+                credits_settled = EXCLUDED.credits_settled,
                 replan_count = EXCLUDED.replan_count,
                 total_failures = EXCLUDED.total_failures,
                 final_answer = EXCLUDED.final_answer,
@@ -123,6 +133,8 @@ async def _persist_task(db: Any, task: AgentTask) -> None:
             task.max_duration_hours,
             task.budget_usd,
             task.spent_usd,
+            task.reserved_credits,
+            task.credits_settled,
             task.max_fix_attempts_per_step,
             task.max_replans,
             task.replan_count,
