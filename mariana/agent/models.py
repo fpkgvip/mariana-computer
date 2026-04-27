@@ -29,6 +29,11 @@ class AgentState(str, Enum):
     DONE = "done"
     FAILED = "failed"
     HALTED = "halted"
+    # O-02: terminal state for tasks cancelled before any worker spend.
+    # Distinct from HALTED (which is what the worker uses when it observes a
+    # mid-run stop_requested) so the lifecycle log can tell "never ran" apart
+    # from "ran and was stopped". Both are terminal and trigger settlement.
+    CANCELLED = "cancelled"
 
 
 class StepStatus(str, Enum):

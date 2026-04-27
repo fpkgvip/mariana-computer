@@ -87,6 +87,19 @@ export function deriveStudioStage(
 }
 
 /**
+ * Canonical floor for the up-front credit reservation made by
+ * ``POST /api/agent``. The backend reserves
+ * ``max(CREDITS_MIN_RESERVATION, int(budget_usd*100))`` and the Pydantic
+ * ``AgentStartRequest.budget_usd`` field enforces ``ge=1.0`` so direct-API
+ * callers cannot bypass the floor either. The PreflightCard clamps its
+ * ceiling slider/input to this minimum so the UI never displays a sub-floor
+ * ceiling that would silently over-reserve at start time.
+ *
+ * 100 credits == $1.00 under the canonical 1 credit = $0.01 conversion.
+ */
+export const CREDITS_MIN_RESERVATION = 100;
+
+/**
  * Convenience: integer credit count from the dollar-denominated task fields.
  * 1 credit == $0.01.
  */

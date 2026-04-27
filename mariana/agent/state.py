@@ -13,8 +13,12 @@ from mariana.agent.models import AgentState
 
 
 # Allowed transitions.  Anything not in this set is rejected.
+#
+# O-02 adds AgentState.CANCELLED as a terminal state reachable from any
+# pre-execution state via the stop endpoint's in-transaction transition.
 _TRANSITIONS: dict[AgentState, frozenset[AgentState]] = {
-    AgentState.PLAN:    frozenset({AgentState.EXECUTE, AgentState.FAILED, AgentState.HALTED}),
+    AgentState.PLAN:    frozenset({AgentState.EXECUTE, AgentState.FAILED,
+                                   AgentState.HALTED, AgentState.CANCELLED}),
     AgentState.EXECUTE: frozenset({AgentState.TEST, AgentState.FIX, AgentState.REPLAN,
                                    AgentState.DELIVER, AgentState.FAILED, AgentState.HALTED,
                                    AgentState.EXECUTE}),
@@ -27,12 +31,15 @@ _TRANSITIONS: dict[AgentState, frozenset[AgentState]] = {
     AgentState.DONE:    frozenset(),
     AgentState.FAILED:  frozenset(),
     AgentState.HALTED:  frozenset(),
+    AgentState.CANCELLED: frozenset(),
 }
 
 
 # States the loop considers terminal — execution stops when we hit one.
+# O-02: CANCELLED joins the existing trio so settlement runs on the cancel
+# path the same way it does on DONE / FAILED / HALTED.
 TERMINAL_STATES: frozenset[AgentState] = frozenset({
-    AgentState.DONE, AgentState.FAILED, AgentState.HALTED,
+    AgentState.DONE, AgentState.FAILED, AgentState.HALTED, AgentState.CANCELLED,
 })
 
 

@@ -41,6 +41,7 @@ import {
 import { ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { track } from "@/lib/analytics";
+import { CREDITS_MIN_RESERVATION } from "@/components/deft/studio/stage";
 
 interface PreflightCardProps {
   prompt: string;
@@ -146,11 +147,18 @@ export function PreflightCard({
   const ceilingBelowMin = quote && !unlimited ? ceiling < quote.credits_min : false;
   const ceilingDollars = (ceiling / 100).toFixed(2);
 
-  const ceilingFloor = quote ? Math.max(quote.credits_max * 2, 100) : 100;
-  const ceilingMin = quote ? Math.max(1, Math.floor(quote.credits_min * 0.5)) : 1;
+  // O-01: clamp the ceiling minimum to CREDITS_MIN_RESERVATION so the UI never
+  // exposes a sub-floor value. Backend reserves max(CREDITS_MIN_RESERVATION,
+  // int(budget_usd*100)); a sub-floor ceiling would either trigger a false
+  // 402 rejection (when the user's balance sits between the displayed value
+  // and the actual floor) or silently over-reserve up to the floor.
+  const ceilingFloor = quote ? Math.max(quote.credits_max * 2, CREDITS_MIN_RESERVATION) : CREDITS_MIN_RESERVATION;
+  const ceilingMin = quote
+    ? Math.max(CREDITS_MIN_RESERVATION, Math.max(1, Math.floor(quote.credits_min * 0.5)))
+    : CREDITS_MIN_RESERVATION;
   const ceilingMax = quote
     ? Math.max(ceilingFloor, balance > 0 ? balance : ceilingFloor)
-    : Math.max(100, balance);
+    : Math.max(CREDITS_MIN_RESERVATION, balance);
   const effectiveCeilingMax = Math.max(ceilingMin, ceilingMax);
 
   const canStart = Boolean(quote) && !insufficient && !ceilingBelowMin && !starting && !loading;
@@ -258,6 +266,9 @@ export function PreflightCard({
           <div className="mb-1.5 flex items-baseline justify-between text-xs">
             <label htmlFor={ceilingInputId} className="tracking-wide text-muted-foreground">
               Credit ceiling
+              <span className="ml-1.5 text-[10px] text-muted-foreground/80">
+                Minimum reservation {CREDITS_MIN_RESERVATION} credits
+              </span>
             </label>
             <span className="font-mono text-sm text-foreground">
               <input
@@ -270,7 +281,12 @@ export function PreflightCard({
                 onChange={(e) => {
                   const n = Number(e.target.value);
                   if (Number.isFinite(n)) {
-                    setCeiling(n);
+                    // O-01: hard-clamp typed values to the canonical floor.
+                    const clamped = Math.max(
+                      CREDITS_MIN_RESERVATION,
+                      Math.max(ceilingMin, Math.min(n, effectiveCeilingMax)),
+                    );
+                    setCeiling(clamped);
                     setCeilingTouched(true);
                   }
                 }}

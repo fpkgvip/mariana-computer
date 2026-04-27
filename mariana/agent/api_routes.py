@@ -49,7 +49,13 @@ class AgentStartRequest(BaseModel):
     user_instructions: str | None = Field(default=None, max_length=8_000)
     conversation_id: str | None = None
     selected_model: str = "claude-opus-4-7"
-    budget_usd: float = Field(default=5.0, ge=0.1, le=100.0)
+    # O-01 defense in depth: the canonical platform floor for an agent run is
+    # 100 credits == $1.00 (100 credits/USD).  The backend reserves
+    # ``max(100, int(budget_usd*100))`` regardless, so any sub-$1 budget
+    # either silently over-reserves up to the floor or trips a false 402.
+    # Reject the call here so direct-API callers (those bypassing the
+    # PreflightCard UI) get a clear validation error instead.
+    budget_usd: float = Field(default=5.0, ge=1.0, le=100.0)
     max_duration_hours: float = Field(default=2.0, ge=0.1, le=24.0)
     # F4 Vault: optional ephemeral env injection.  The frontend decrypts
     # vaulted secrets locally and sends only the names that the prompt
@@ -706,7 +712,10 @@ def make_routes(
                     if idle_ticks % 6 == 0:
                         latest = await _load_agent_task(db, task_id)
                         if latest and latest.state in (
-                            AgentState.DONE, AgentState.FAILED, AgentState.HALTED,
+                            AgentState.DONE,
+                            AgentState.FAILED,
+                            AgentState.HALTED,
+                            AgentState.CANCELLED,
                         ):
                             yield _sse_msg("eof", {"final_state": latest.state.value})
                             break
@@ -725,7 +734,10 @@ def make_routes(
                         evt_type = obj.get("event_type", "message")
                         yield _sse_msg(evt_type, obj)
                         if evt_type in ("delivered", "halted") or obj.get("state") in (
-                            AgentState.DONE.value, AgentState.FAILED.value, AgentState.HALTED.value,
+                            AgentState.DONE.value,
+                            AgentState.FAILED.value,
+                            AgentState.HALTED.value,
+                            AgentState.CANCELLED.value,
                         ):
                             yield _sse_msg("eof", {"final_state": obj.get("state")})
                             return
@@ -746,6 +758,16 @@ def make_routes(
         task_id: str,
         current_user: dict = Depends(get_current_user),
     ) -> StopResponse:
+        """Stop a task.
+
+        O-02: pre-execution tasks (PLAN with no spend) are transitioned to
+        ``AgentState.CANCELLED`` and settled in the same transaction so the
+        reservation refunds immediately.  Already-running tasks (anything
+        past PLAN with spend, or any non-terminal post-PLAN state) keep the
+        existing behaviour: ``stop_requested=TRUE`` only, and the worker
+        terminalises + settles in its ``finally:`` block.  Already-terminal
+        or already-settled tasks are a no-op for idempotency.
+        """
         db = get_db()
         task = await _load_agent_task(db, task_id)
         if task is None:
@@ -753,11 +775,53 @@ def make_routes(
         if task.user_id != current_user["user_id"]:
             raise HTTPException(403, "not your task")
 
+        # Lock the row, decide pre-vs-post-execution, transition + settle
+        # for the pre-execution case.  Late imports avoid the circular
+        # dependency between ``mariana.api`` and the agent loop.
+        from mariana.agent.loop import _persist_task, _settle_agent_credits  # noqa: PLC0415
+        from mariana.agent.state import is_terminal  # noqa: PLC0415
+
         async with db.acquire() as conn:
-            await conn.execute(
-                "UPDATE agent_tasks SET stop_requested = TRUE, updated_at = now() WHERE id = $1",
-                task_id,
-            )
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT state, spent_usd, credits_settled, stop_requested "
+                    "FROM agent_tasks WHERE id = $1 FOR UPDATE",
+                    task_id,
+                )
+                if row is None:
+                    raise HTTPException(404, f"agent task {task_id} not found")
+                cur_state_raw = row["state"]
+                cur_spent = float(row["spent_usd"] or 0.0)
+                already_settled = bool(row["credits_settled"])
+                try:
+                    cur_state = AgentState(cur_state_raw)
+                except ValueError:
+                    cur_state = AgentState.PLAN
+
+                # Idempotent: terminal/settled rows just confirm the request.
+                if is_terminal(cur_state) and already_settled:
+                    return StopResponse(
+                        task_id=task_id,
+                        stopped=True,
+                        message="already terminal",
+                    )
+
+                # Pre-execution = PLAN with no recorded spend.  This is the
+                # narrow window the O-02 fix targets: a task sitting in the
+                # Redis queue or just-started by the worker before the
+                # planner has charged anything.  In that window we can
+                # safely terminalise + settle in this same transaction.
+                pre_execution = (
+                    cur_state == AgentState.PLAN
+                    and cur_spent <= 0.0
+                    and not already_settled
+                )
+                await conn.execute(
+                    "UPDATE agent_tasks SET stop_requested = TRUE, updated_at = now() "
+                    "WHERE id = $1",
+                    task_id,
+                )
+
         redis = None
         try:
             redis = get_redis()
@@ -768,6 +832,40 @@ def make_routes(
                 await redis.set(f"agent:{task_id}:stop", "1", ex=3600)
             except Exception:
                 pass
+
+        if pre_execution:
+            # Reload the freshly-locked task object, transition it to
+            # CANCELLED, settle credits inline, and persist the terminal
+            # row.  Settlement is idempotent via ``credits_settled`` so a
+            # racing worker that subsequently picks up the task will not
+            # double-refund.
+            terminal_task = await _load_agent_task(db, task_id)
+            if terminal_task is not None and not is_terminal(terminal_task.state):
+                terminal_task.state = AgentState.CANCELLED
+                terminal_task.stop_requested = True
+                if terminal_task.error is None:
+                    terminal_task.error = "stop_requested"
+                try:
+                    await _settle_agent_credits(terminal_task)
+                except Exception as exc:  # noqa: BLE001 — defensive
+                    logger.warning(
+                        "agent_stop_settle_failed",
+                        task_id=task_id,
+                        error=str(exc),
+                    )
+                try:
+                    await _persist_task(db, terminal_task)
+                except Exception as exc:  # noqa: BLE001 — defensive
+                    logger.warning(
+                        "agent_stop_persist_failed",
+                        task_id=task_id,
+                        error=str(exc),
+                    )
+            return StopResponse(
+                task_id=task_id,
+                stopped=True,
+                message="cancelled before execution",
+            )
         return StopResponse(task_id=task_id, stopped=True, message="stop requested")
 
     # -- GET /api/agent/{task_id}/artifacts --------------------------------

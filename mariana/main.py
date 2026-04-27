@@ -755,8 +755,15 @@ async def _run_agent_queue_daemon(db: Any, redis_client: Any) -> None:
     try:
         async with db.acquire() as conn:
             stuck = await conn.fetch(
+                # O-02: ``stop_requested = FALSE`` excludes cancelled-but-non-
+                # terminal legacy rows.  After the O-02 fix, the stop endpoint
+                # finalises queued/pending tasks in-transaction (transitioning
+                # to CANCELLED + settling), so this state should not exist on
+                # fresh data.  The filter is belt-and-suspenders for rows
+                # written by older versions of the stop path.
                 "SELECT id, state FROM agent_tasks "
                 "WHERE state NOT IN ('done', 'failed', 'halted', 'cancelled', 'stopped') "
+                "AND stop_requested = FALSE "
                 "AND updated_at < NOW() - INTERVAL '60 seconds' "
                 "ORDER BY created_at ASC LIMIT 500"
             )

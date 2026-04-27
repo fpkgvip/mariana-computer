@@ -172,7 +172,8 @@ async def test_reserve_canonical_100_per_usd():
         f"expected 500 credits for $5 budget under canonical 100c/USD; got {credits_arg}"
     )
 
-    # And $0.50 budget reserves max(100, 50) = 100 (the floor wins).
+    # And the $1.00 floor budget reserves exactly 100 credits (canonical
+    # floor enforced by both Pydantic ge=1.0 and the backend max(100, ...)).
     deduct_mock.reset_mock()
     with patch.object(api_mod, "_supabase_deduct_credits", deduct_mock), \
          patch.object(api_mod, "_supabase_add_credits", AsyncMock()), \
@@ -182,17 +183,17 @@ async def test_reserve_canonical_100_per_usd():
 
         endpoint = await _start_route()
         await endpoint(
-            body=AgentStartRequest(goal="cheap task", budget_usd=0.5),
+            body=AgentStartRequest(goal="cheap task", budget_usd=1.0),
             current_user={"user_id": "user-m01"},
         )
 
     _, credits_arg2, _ = deduct_mock.await_args.args
-    assert credits_arg2 == 100, f"expected floor of 100 for $0.50 budget; got {credits_arg2}"
+    assert credits_arg2 == 100, f"expected floor of 100 for $1.00 budget; got {credits_arg2}"
 
 
 @pytest.mark.asyncio
 async def test_reserve_floor_at_100():
-    """A $0.10 budget must still reserve 100 (the floor)."""
+    """A $1.00 budget (the floor enforced by Pydantic ge=1.0) reserves 100."""
     from mariana.agent.api_routes import AgentStartRequest
 
     deduct_mock = AsyncMock(return_value="ok")
@@ -205,7 +206,7 @@ async def test_reserve_floor_at_100():
 
         endpoint = await _start_route()
         await endpoint(
-            body=AgentStartRequest(goal="tiny", budget_usd=0.1),
+            body=AgentStartRequest(goal="tiny", budget_usd=1.0),
             current_user={"user_id": "user-m01"},
         )
 

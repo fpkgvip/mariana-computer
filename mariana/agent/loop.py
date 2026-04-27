@@ -760,6 +760,21 @@ async def run_agent_task(
         await _persist_task(db, task)
         await _emit(db, redis, task, "state_change",
                     payload={"from": "init", "to": task.state.value})
+
+        # O-02: bail BEFORE invoking the planner if a stop has already been
+        # requested.  The stop endpoint finalises pre-execution tasks itself,
+        # but a race or a recovered legacy row may still arrive here with
+        # ``stop_requested=TRUE``.  Without this gate the planner would run,
+        # ``spent_usd`` would tick up, and the user would pay for a cancelled
+        # task. ``HALTED`` (not CANCELLED) keeps the existing transition map
+        # legal from PLAN and signals "the worker honoured the stop".
+        if await _check_stop_requested(redis, task):
+            task.error = "stop_requested"
+            await _emit(db, redis, task, "halted",
+                        payload={"reason": "stop_requested_pre_plan"})
+            await _transition(db, redis, task, AgentState.HALTED)
+            return task
+
         try:
             steps, cost = await planner.build_initial_plan(task)
         except Exception as exc:
