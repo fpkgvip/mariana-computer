@@ -18,7 +18,7 @@ Every YAML finding appears under exactly one canonical.  Merge rules from the ta
 | B-05 | A1-08, A2-03 | P1 | cross | add_credits / deduct_credits bypass credit_buckets/credit_transactions ledger — R6 drift |
 | B-06 | A5-02 | P1 | db | admin_set_credits absolute write races concurrent spend — last-writer-wins, audit dirty read |
 | B-07 | A1-09, A5-10 | P1 | db | spend_credits no SELECT FOR UPDATE — two-tab concurrent spend underflows; balance_after racy |
-| B-08 | A4-02 | P1 | frontend | Navbar / BuyCredits show stale profiles.tokens — never auto-refreshes after spend or webhook |
+| B-08 | A4-02 | P1 | frontend | Navbar / BuyCredits show stale profiles.tokens — never auto-refreshes after spend or webhook | **FIXED 2026-04-27** (Navbar.tsx + BuyCredits.tsx use useCredits() hook; hook extended with focus/visibilitychange/30s poll; 7 vitest tests added) |
 | B-09 | A4-03 | P1 | frontend | Full JWT access token exposed in SSE query string when stream-token mint fails or is absent |
 | B-10 | A4-04 | P1 | frontend | No Content-Security-Policy or any security header in vercel.json | **FIXED 2026-04-27** (vercel.json headers + vitest contract) |
 | B-11 | A1-05 | P2 | db | admin_count_profiles / admin_list_profiles use inline auth.uid() check instead of is_admin + missing search_path |
@@ -77,7 +77,7 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 | 7 | B-05 | P1 | api_patch | B-16, B-17 | B-01 | db + api.py |
 | 8 | B-06 | P1 | migration | none | B-01 | db |
 | 9 | B-07 | P1 | migration | B-22 | B-01 | db |
-| 10 | B-08 | P1 | frontend_patch | none | none | frontend |
+| 10 | B-08 | P1 | frontend_patch | none | none | frontend | **FIXED** |
 | 11 | B-11 | P2 | migration | none | none | db |
 | 12 | B-12 | P2 | migration | none | B-01 | db |
 | 13 | B-13 | P2 | migration | none | B-01 | db |
@@ -249,6 +249,7 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 
 ### B-08 — Navbar / BuyCredits display stale profiles.tokens
 
+- **Status:** FIXED 2026-04-27 — Replaced `user.tokens` in `Navbar.tsx` (lines 126, 203) and `BuyCredits.tsx` (line 47) with `useCredits()` hook output. Extended `useCredits.ts` to subscribe to `window focus`, `document visibilitychange`, and `deft:credits-changed` events, and to poll every 30 s as a backstop. Added 7 vitest tests in `src/__tests__/b08-useCredits.test.tsx` covering mount fetch, custom event, focus refresh, visibilitychange refresh, poll interval, and two component render assertions.
 - **Severity:** P1
 - **Surface:** frontend
 - **Lens findings merged:** A4-02

@@ -2,6 +2,9 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useState, useEffect, useRef } from "react";
 import { Menu, X, User, LogOut, CreditCard, Settings, ShieldCheck, Inbox, KeyRound, LayoutDashboard } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
+// B-08: useCredits provides live balance that refreshes after spend/webhook.
+// Replaces stale user.tokens from AuthContext which was set once on session sync.
+import { useCredits } from "@/hooks/useCredits";
 import { BRAND } from "@/lib/brand";
 
 const navLinks = [
@@ -14,6 +17,8 @@ export function Navbar() {
   const location = useLocation();
   const navigate = useNavigate();
   const { user, logout } = useAuth();
+  // B-08: live balance — auto-refreshes on focus, visibilitychange, deft:credits-changed, and poll.
+  const { balance: liveBalance } = useCredits();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [scrolled, setScrolled] = useState(false);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
@@ -123,7 +128,7 @@ export function Navbar() {
                   <div className="mx-4 my-1 border-t border-border" />
                   <div className="px-4 py-2">
                     <p className="text-xs text-muted-foreground/60">
-                      {user.tokens.toLocaleString()} credits
+                      {liveBalance.toLocaleString()} credits
                     </p>
                   </div>
                   <button
@@ -200,7 +205,7 @@ export function Navbar() {
                 )}
                 <div className="my-1 border-t border-border" />
                 <p className="text-xs text-muted-foreground/60">
-                  {user.name} · {user.tokens.toLocaleString()} credits
+                  {user.name} · {liveBalance.toLocaleString()} credits
                 </p>
                 <button
                   onClick={handleLogout}

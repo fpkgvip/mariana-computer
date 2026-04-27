@@ -4,6 +4,9 @@ import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
 import { ScrollReveal } from "@/components/ScrollReveal";
 import { useAuth } from "@/contexts/AuthContext";
+// B-08: useCredits provides live balance that refreshes after spend/webhook.
+// Replaces stale user.tokens from AuthContext which was set once on session sync.
+import { useCredits } from "@/hooks/useCredits";
 import { Mail } from "lucide-react";
 
 /**
@@ -17,6 +20,8 @@ import { Mail } from "lucide-react";
  */
 export default function BuyCredits() {
   const { user } = useAuth();
+  // B-08: live balance — auto-refreshes on focus, visibilitychange, deft:credits-changed, and poll.
+  const { balance: liveBalance } = useCredits();
   const navigate = useNavigate();
 
   // BUG-R1-10: Add a 500ms grace period before redirecting, matching Chat.tsx.
@@ -44,7 +49,7 @@ export default function BuyCredits() {
             <p className="mt-2 text-sm text-muted-foreground">
               Current balance:{" "}
               <span className="font-medium text-foreground">
-                {user.tokens.toLocaleString()} credits
+                {liveBalance.toLocaleString()} credits
               </span>
             </p>
           </ScrollReveal>
