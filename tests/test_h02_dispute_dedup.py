@@ -187,8 +187,67 @@ async def test_dispute_created_then_funds_withdrawn_same_dispute_only_one_revers
                 return _grant_lookup_resp()
             return _FakeResp(200, [])
 
-    client1 = _StatefulClient()
-    client2 = _StatefulClient()
+    # Use a shared state client that correctly simulates DB state across two calls.
+    # The client tracks inserted reversal rows and answers GET queries from that state.
+    class _SharedStateClient:
+        """Simulates a single DB that persists inserted rows across multiple
+        AsyncClient contexts (one per event handler call)."""
+
+        # Shared class-level state between client1 and client2 instances
+        _inserted_reversals: list[dict] = []
+
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+        async def post(self, url: str, json=None, headers=None):
+            self.calls.append({"method": "POST", "url": url, "json": json})
+            if "stripe_dispute_reversals" in url and json:
+                _SharedStateClient._inserted_reversals.append(json)
+                return _FakeResp(201, {})
+            if "rpc/refund_credits" in url:
+                return _refund_rpc_resp()
+            return _FakeResp(200, {})
+
+        async def get(self, url: str, params=None, headers=None):
+            self.calls.append({"method": "GET", "url": url, "params": params})
+            if "stripe_payment_grants" in url:
+                return _grant_lookup_resp()
+            if "stripe_dispute_reversals" in url:
+                params = params or {}
+                charge_id_filter = params.get("charge_id", "") if isinstance(params, dict) else ""
+                reversal_key_filter = ""
+                if "reversal_key=eq." in url:
+                    reversal_key_filter = url.split("reversal_key=eq.")[1].split("&")[0]
+
+                if charge_id_filter.startswith("eq."):
+                    cid = charge_id_filter[3:]
+                    rows = [
+                        r for r in _SharedStateClient._inserted_reversals
+                        if r.get("charge_id") == cid
+                    ]
+                    return _FakeResp(200, [{"credits": r.get("credits", 0)} for r in rows])
+
+                if reversal_key_filter:
+                    key = reversal_key_filter.lstrip("eq.")
+                    for row in _SharedStateClient._inserted_reversals:
+                        if row.get("reversal_key") == key:
+                            return _FakeResp(200, [row])
+                    return _FakeResp(200, [])
+
+                return _FakeResp(200, [])
+            return _FakeResp(200, [])
+
+    # Reset shared state before test
+    _SharedStateClient._inserted_reversals = []
+
+    client1 = _SharedStateClient()
+    client2 = _SharedStateClient()
 
     # First call: dispute.created — should process
     with patch.object(httpx, "AsyncClient", return_value=client1):
@@ -418,7 +477,9 @@ async def test_reversal_key_formatting_dispute_vs_no_dispute_paths():
     )
     inserted_keys.clear()
 
-    # Test 2: charge.refunded → reversal_key uses charge id
+    # Test 2: charge.refunded → reversal_key uses per-event id (J-01 fix)
+    # Key format changed from 'charge:<id>:reversal' to 'refund_event:<event_id>'
+    # so sequential partial refunds on the same charge each get their own dedup row.
     with patch.object(httpx, "AsyncClient", return_value=_KeyCapturingClient()):
         await mod._handle_charge_refunded(
             {"id": "ch_6", "payment_intent": "pi_6", "amount": 1000, "amount_refunded": 1000},
@@ -426,6 +487,6 @@ async def test_reversal_key_formatting_dispute_vs_no_dispute_paths():
             event_id="evt_ref_5",
         )
 
-    assert "charge:ch_6:reversal" in inserted_keys, (
-        f"charge refund key should be 'charge:ch_6:reversal', got: {inserted_keys}"
+    assert "refund_event:evt_ref_5" in inserted_keys, (
+        f"charge refund key should be 'refund_event:evt_ref_5' (J-01 fix), got: {inserted_keys}"
     )
