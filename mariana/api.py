@@ -6139,10 +6139,15 @@ async def _grant_credits_for_event(
         # Surface as 500 so Stripe retries via the outer handler
         raise HTTPException(status_code=503, detail="Credit grant failed") from exc
 
-    # H-01: persist pi_id mapping so refund/dispute handlers can look up the
-    # exact grant by payment_intent_id rather than falling back globally.
-    grant_status = result.get("status") if isinstance(result, dict) else None
-    if pi_id and grant_status != "duplicate":
+    # H-01 / L-01: persist pi_id mapping so refund/dispute handlers can look
+    # up the exact grant by payment_intent_id rather than falling back
+    # globally. L-01: always attempt the insert when pi_id is provided, even
+    # when grant_credits returned 'duplicate' — a prior delivery may have
+    # granted credits but failed the mapping write, and Stripe-retry of the
+    # same event must heal the missing row. The Prefer:
+    # resolution=ignore-duplicates,return=minimal header makes repeats safe
+    # (existing rows collapse to a 2xx with empty body).
+    if pi_id:
         pg_url = f"{cfg.SUPABASE_URL}/rest/v1/stripe_payment_grants"
         pg_headers = {
             "apikey": api_key,
@@ -6163,17 +6168,39 @@ async def _grant_credits_for_event(
         # compute pro-rata for partial-amount disputes.
         if charge_amount is not None and int(charge_amount) > 0:
             pg_payload["charge_amount"] = int(charge_amount)
+        # L-01: the mapping insert is part of the webhook correctness
+        # boundary, not a best-effort side-write. On any failure (transport
+        # exception or non-2xx response) we raise 503 so Stripe retries the
+        # event. Without the mapping row, later refund/dispute events would
+        # silently skip reversal — money leak.
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(pg_url, json=pg_payload, headers=pg_headers)
+                pg_resp = await client.post(pg_url, json=pg_payload, headers=pg_headers)
         except Exception as exc:  # noqa: BLE001
-            # Non-fatal: log and continue. The grant itself succeeded; the
-            # mapping row can be repaired manually if needed.
+            logger.error(
+                "stripe_payment_grants_insert_transport_error",
+                pi_id=pi_id,
+                user_id=user_id,
+                ref_id=ref_id,
+                error=str(exc),
+            )
+            raise HTTPException(
+                status_code=503, detail="Credit grant mapping failed"
+            ) from exc
+        if pg_resp.status_code not in {200, 201, 204}:
+            # Log status + body so on-call can diagnose. Body may be JSON or
+            # plain text; .text is always safe.
+            body_text = getattr(pg_resp, "text", "") or ""
             logger.error(
                 "stripe_payment_grants_insert_failed",
                 pi_id=pi_id,
                 user_id=user_id,
-                error=str(exc),
+                ref_id=ref_id,
+                status=pg_resp.status_code,
+                body=body_text[:500],
+            )
+            raise HTTPException(
+                status_code=503, detail="Credit grant mapping failed"
             )
 
 

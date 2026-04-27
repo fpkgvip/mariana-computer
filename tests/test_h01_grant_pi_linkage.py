@@ -10,7 +10,7 @@ Test inventory (>=6):
   1.  grant_with_pi_id_inserts_stripe_payment_grants_row
   2.  lookup_returns_none_when_stripe_payment_grants_empty
   3.  refund_for_user_a_pi_resolves_user_a_not_user_b
-  4.  duplicate_grant_status_skips_stripe_payment_grants_insert
+  4.  duplicate_grant_status_still_attempts_stripe_payment_grants_insert (L-01)
   5.  grant_with_no_pi_id_runs_without_error
   6.  lookup_returns_correct_fields_from_stripe_payment_grants
 """
@@ -283,15 +283,20 @@ async def test_refund_for_user_a_pi_resolves_user_a_not_user_b():
 
 
 # ---------------------------------------------------------------------------
-# 4. Duplicate grant status does NOT insert into stripe_payment_grants.
+# 4. Duplicate grant status MUST still attempt stripe_payment_grants insert.
+#    L-01: a prior delivery may have granted credits but failed the mapping
+#    write; Stripe-retry of the same event must heal the missing row. The
+#    Prefer: resolution=ignore-duplicates,return=minimal header makes a
+#    repeat insert against an already-present row a safe no-op.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_duplicate_grant_status_skips_stripe_payment_grants_insert():
-    """When grant_credits RPC returns status='duplicate', the event was already
-    processed. In that case, we must NOT insert into stripe_payment_grants
-    (the mapping already exists from the first attempt)."""
+async def test_duplicate_grant_status_still_attempts_stripe_payment_grants_insert():
+    """L-01: When grant_credits RPC returns status='duplicate', we must STILL
+    attempt the stripe_payment_grants insert so a prior failed mapping write
+    can heal on retry. The ignore-duplicates Prefer header collapses repeats.
+    """
     cfg = _cfg()
 
     dup_rpc_resp = _FakeResp(200, {"status": "duplicate", "transaction_id": "tx-existing"})
@@ -319,8 +324,9 @@ async def test_duplicate_grant_status_skips_stripe_payment_grants_insert():
         c for c in client.calls
         if c["method"] == "POST" and "stripe_payment_grants" in c["url"]
     ]
-    assert len(insert_calls) == 0, (
-        "stripe_payment_grants insert must be skipped when grant RPC returns 'duplicate'"
+    assert len(insert_calls) == 1, (
+        "L-01: stripe_payment_grants insert must be attempted even on duplicate "
+        "grant so a missing mapping row can heal on Stripe retry"
     )
 
 
