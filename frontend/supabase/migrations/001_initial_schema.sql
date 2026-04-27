@@ -1,3 +1,21 @@
+-- ============================================================
+-- 001_initial_schema.sql — NestD initial schema
+-- ============================================================
+-- DRIFT NOTICE (B-36 / A1-16, 2026-04-28):
+-- This file contains initial DDL that has been superseded by later migrations:
+--
+--   1. "Users can update own profile" policy (line ~60): superseded by
+--      004_loop5_idempotency_and_rls.sql which DROPs this weak policy and
+--      replaces it with profiles_owner_update_safe (strict WITH CHECK).
+--
+--   2. investigations.ticker / investigations.hypothesis are defined NOT NULL
+--      here; migration 20260416092124 (make_ticker_hypothesis_nullable) made
+--      them NULLABLE. The live schema has nullable columns.
+--
+-- scripts/build_local_baseline_v2.sh now drops the stale policy after
+-- applying this file (see B-36 fix). Do not remove the DROP there.
+-- ============================================================
+
 -- Profiles table (extends Supabase auth.users)
 CREATE TABLE IF NOT EXISTS public.profiles (
   id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,

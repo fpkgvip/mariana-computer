@@ -208,6 +208,13 @@ class AppConfig:
     STRIPE_SECRET_KEY: str = ""
     STRIPE_PUBLISHABLE_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
+    # B-30: dual-secret support for zero-downtime webhook secret rotation.
+    # STRIPE_WEBHOOK_SECRET_PRIMARY is the active secret; STRIPE_WEBHOOK_SECRET_PREVIOUS
+    # is the prior secret kept alive during the overlap window so in-flight events
+    # signed with the old key are not dropped.  When both are set, PRIMARY is tried
+    # first; a PREVIOUS match is accepted but logged as a warning.
+    STRIPE_WEBHOOK_SECRET_PRIMARY: str = ""
+    STRIPE_WEBHOOK_SECRET_PREVIOUS: str = ""
 
     # ------------------------------------------------------------------
     # Supabase — used by backend for REST API calls (webhooks, admin)
@@ -368,6 +375,9 @@ def load_config(env_file: str | Path | None = None) -> AppConfig:
         STRIPE_SECRET_KEY=_str("STRIPE_SECRET_KEY", ""),
         STRIPE_PUBLISHABLE_KEY=_str("STRIPE_PUBLISHABLE_KEY", ""),
         STRIPE_WEBHOOK_SECRET=_str("STRIPE_WEBHOOK_SECRET", ""),
+        # B-30: dual-secret rotation support
+        STRIPE_WEBHOOK_SECRET_PRIMARY=_str("STRIPE_WEBHOOK_SECRET_PRIMARY", ""),
+        STRIPE_WEBHOOK_SECRET_PREVIOUS=_str("STRIPE_WEBHOOK_SECRET_PREVIOUS", ""),
         # Supabase
         SUPABASE_URL=_str("SUPABASE_URL", ""),
         SUPABASE_ANON_KEY=_str("SUPABASE_ANON_KEY", ""),

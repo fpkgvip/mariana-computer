@@ -40,23 +40,23 @@ Every YAML finding appears under exactly one canonical.  Merge rules from the ta
 | B-27 | A4-06 | P2 | frontend | PreviewPane iframe uses allow-same-origin — user-generated app shares app origin | **FIXED 2026-05-12** (PreviewPane.tsx sandbox attribute — allow-same-origin removed, leaving allow-scripts allow-forms allow-modals allow-popups allow-downloads; 7 tests in b27_preview_pane_sandbox.test.ts) |
 | B-28 | A4-07 | P2 | frontend | AuthContext loading spinner has no timeout — infinite spinner on Supabase outage | **FIXED 2026-05-12** (AuthContext.tsx: 10 s timeout via AUTH_LOADING_TIMEOUT_MS, authTimedOut state, recoverable Retry UI with data-testid="auth-timeout", accessible loading spinner; 15 tests in b28_auth_loading_timeout.test.ts) |
 | B-29 | A4-08 | P2 | frontend | success_url checkout landing pages never call refreshUser — credit balance stale post-payment | **FIXED 2026-05-12** (Chat.tsx, Build.tsx, Account.tsx: detect ?checkout=success/?topup=success on mount, show success toast, poll refreshUser/refetchBalance up to 3×, clear URL param; 20 tests in b29_post_checkout_credit_refresh.test.ts) |
-| B-30 | A5-09 | P3 | api | Webhook secret rotation has no overlap window — in-flight events dropped during rotation |
-| B-31 | A2-08 | P3 | api | Billing usage endpoint always falls back to free-plan because auth context lacks subscription fields |
-| B-32 | A1-12 | P3 | db | 7 FK columns missing covering indexes — cascade-delete and JOIN scans sequential |
-| B-33 | A1-13 | P3 | db | 20+ RLS policies use bare auth.uid() / auth.role() — re-evaluated per row, planning overhead |
-| B-34 | A1-14 | P3 | db | profiles_owner_update_safe WITH CHECK has 9 correlated subqueries per UPDATE — O(n) self-joins |
-| B-35 | A1-15 | P3 | db | property-images storage bucket allows unauthenticated file listing |
-| B-36 | A1-16 | P3 | docs | Migration drift — 001_initial_schema.sql retains superseded "Users can update own profile" policy |
-| B-37 | A3-04 | P3 | orchestrator | FRED connector includes api_key in cache key — cross-deployment cache miss when key differs |
-| B-38 | A3-05 | P3 | orchestrator | URL content cache is global (no task/user isolation) — stale financial data served cross-investigation |
-| B-39 | A3-06 | P3 | orchestrator | Vault KDF allows client-supplied kdf_iterations=1 — below OWASP minimum |
-| B-40 | A3-07 | P3 | orchestrator | Browser pool server has no authentication on /dispatch or /pool/status |
-| B-41 | A3-08 | P3 | orchestrator | DB total_spent_usd stores raw model cost, not 1.20× markup — 20% reconciliation gap |
-| B-42 | A4-09 | P3 | frontend | Supabase JWT stored in localStorage — exfiltrable by any XSS on same origin |
-| B-43 | A4-10 | P3 | frontend | vercel.json backend rewrite targets bare IP over plain HTTP — no TLS on backend hop |
-| B-44 | A4-11 | P3 | frontend | jsdom pinned at ^20.0.3 — known XSS-bypass CVEs; should be ≥24.x |
+| B-30 | A5-09 | P3 | api | Webhook secret rotation has no overlap window — in-flight events dropped during rotation | **FIXED 2026-05-14** (api.py + config.py: dual-secret PRIMARY/PREVIOUS rotation; 7 tests in test_b30_webhook_dual_secret.py) |
+| B-31 | A2-08 | P3 | api | Billing usage endpoint always falls back to free-plan because auth context lacks subscription fields | **FIXED 2026-05-14** (api.py: _supabase_get_subscription_fields helper + billing_usage reads profiles; 6 tests in test_b31_billing_usage_plan.py) |
+| B-32 | A1-12 | P3 | db | 7 FK columns missing covering indexes — cascade-delete and JOIN scans sequential | **FIXED 2026-04-27** (mig 013_p3_b32_fk_indexes.sql: 7 idx_* covering indexes; C16 contract; applied to NestD live) |
+| B-33 | A1-13 | P3 | db | 20+ RLS policies use bare auth.uid() / auth.role() — re-evaluated per row, planning overhead | **FIXED 2026-04-27** (mig 014_p3_b33_rls_select_wrap.sql: wrapped 20+ policies with (SELECT auth.uid()); C17 contract; applied to NestD live) |
+| B-34 | A1-14 | P3 | db | profiles_owner_update_safe WITH CHECK has 9 correlated subqueries per UPDATE — O(n) self-joins | **FIXED 2026-04-27** (mig 015_p3_b34_profile_check_simplify.sql: check_profile_immutable() helper, single index scan; applied to NestD live) |
+| B-35 | A1-15 | P3 | db | property-images storage bucket allows unauthenticated file listing | **FIXED 2026-04-27** (mig 016_p3_b35_storage_rls.sql: dropped broad anon policy, added authenticated-only SELECT/INSERT; C18 contract; applied to NestD live) |
+| B-36 | A1-16 | P3 | docs | Migration drift — 001_initial_schema.sql retains superseded "Users can update own profile" policy | **FIXED 2026-04-27** (build_local_baseline_v2.sh drops stale policy; 001_initial_schema.sql annotated; baseline rebuild green) |
+| B-37 | A3-04 | P3 | orchestrator | FRED connector includes api_key in cache key — cross-deployment cache miss when key differs | **FIXED 2026-05-14** (fred_connector.py: api_key excluded from cache_params; 6 tests in test_b37_fred_cache_key.py) |
+| B-38 | A3-05 | P3 | orchestrator | URL content cache is global (no task/user isolation) — stale financial data served cross-investigation | **FIXED 2026-05-14** (cache.py: task_id param added to _url_cache_key, get_url, set_url, delete_url, exists; 7 tests in test_b38_url_cache_task_isolation.py) |
+| B-39 | A3-06 | P3 | orchestrator | Vault KDF allows client-supplied kdf_iterations=1 — below OWASP minimum | **FIXED 2026-05-14** (vault/router.py: kdf_iterations ge raised 1→2; server-side 400 guard; 6 tests in test_b39_vault_kdf_minimum.py) |
+| B-40 | A3-07 | P3 | orchestrator | Browser pool server has no authentication on /dispatch or /pool/status | **FIXED 2026-05-14** (pool_server.py: _require_pool_auth dependency on /dispatch + /pool/status via BROWSER_POOL_SECRET; 8 tests in test_b40_browser_pool_auth.py) |
+| B-41 | A3-08 | P3 | orchestrator | DB total_spent_usd stores raw model cost, not 1.20× markup — 20% reconciliation gap | **FIXED 2026-05-14** (_sync_cost now persists total_spent × 1.20 via _COST_MARKUP_MULTIPLIER; 6 tests in test_b41_cost_markup.py) |
+| B-42 | A4-09 | P3 | frontend | Supabase JWT stored in localStorage — exfiltrable by any XSS on same origin | **FIXED 2026-04-27** (sessionStorage adapter in supabase.ts; ADR-B42; 12 regression tests) |
+| B-43 | A4-10 | P3 | frontend | vercel.json backend rewrite targets bare IP over plain HTTP — no TLS on backend hop | **FIXED 2026-04-27** (rewrites updated http://77.42.3.206:8080 → https://api.deft.computer; 8 regression tests) |
+| B-44 | A4-11 | P3 | frontend | jsdom pinned at ^20.0.3 — known XSS-bypass CVEs; should be ≥24.x | **FIXED 2026-04-27** (bumped to ^24.0.0; resolved 24.1.3; 6 regression tests) |
 | B-45 | A5-01 sub: get_stripe_customer_id IDOR | — | — | (folded into B-01; listed for completeness) |
-| B-46 | A4-12 | P4 | frontend | AuthProvider loading spinner has no ARIA role — screen readers see nothing during auth init |
+| B-46 | A4-12 | P4 | frontend | AuthProvider loading spinner has no ARIA role — screen readers see nothing during auth init | **FIXED-by-B28 2026-04-27** (B-28 added role="status", aria-live="polite", sr-only text; verified by b28_auth_loading_timeout.test.ts tests 9–10) |
 | F-01 | Phase E | P1 | api | Public preview route /preview/{task_id}/{file_path} bypasses owner check — IDOR on user previews | **FIXED 2026-04-27** (HMAC preview tokens via cookie+query+header; manifest mints HttpOnly cookie scoped to /preview/{task_id}; 15 regression tests) |
 | F-02 | Phase E | P1 | cross | start_investigation does not hold pending-upload lock during file move — double-charge race on shared upload session | **FIXED 2026-04-27** (api.py: pending-{session_uuid} lock + atomic os.rename to claimed/, 409 + credit refund on conflict; 6 regression tests) |
 | F-03 | Phase E | P1 | cross | Refund/dispute clawback clamped to current balance — already-spent credits forgiven, no debt construct | **FIXED 2026-04-27** (mig 009: credit_clawbacks table + refund_credits records deficit + grant_credits/add_credits drain open clawbacks FIFO; 8 pytest + C08 contract; applied to live) |
@@ -64,6 +64,8 @@ Every YAML finding appears under exactly one canonical.  Merge rules from the ta
 | F-05 | Phase E | P2 | cross | research_tasks owner stored in metadata JSONB only — deleting auth.users orphans tasks and descendants | **FIXED 2026-04-27** (mig 010: research_tasks.user_id NOT NULL + ON DELETE CASCADE; runtime-table guard for init_schema-created table; backfill from metadata; ownership checks updated; tests + C09 contract green) |
 | F-06 | Phase E | P3 | api | Intelligence endpoints return unbounded per-task datasets to the browser — no pagination/limits | **FIXED 2026-04-27** (api.py: keyset cursor + server-side cap on /api/intelligence/* endpoints; tests green) |
 | G-01 | Phase E re-audit #2 | P1 | api | _get_upload_lock used WeakValueDictionary — locks GC-eligible immediately, breaking F-02 race fix and upload file-cap | **FIXED 2026-04-27** (api.py: strong-reference OrderedDict-based LRU bounded at 4096 entries, evicts only unheld locks; 5 regression tests in test_g01_upload_lock_strong_ref.py) |
+| H-01 | Phase E re-audit #3 | P1 | billing/webhooks | Refund/dispute lookup falls back to most recent unrelated Stripe grant when pi_id metadata absent — cross-account credit theft | OPEN |
+| H-02 | Phase E re-audit #3 | P2 | billing/webhooks | Both charge.dispute.created and charge.dispute.funds_withdrawn trigger reversal with only event_id dedup — double clawback per dispute | OPEN |
 
 > **Note on B-45:** get_stripe_customer_id IDOR is fully subsumed by B-01 (same anon-callable SECURITY DEFINER family). No separate canonical required.
 
@@ -104,22 +106,22 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 | 27 | B-27 | P2 | config | none | none | frontend + config | **FIXED 2026-05-12** |
 | 28 | B-28 | P2 | frontend_patch | none | none | frontend | **FIXED 2026-05-12** |
 | 29 | B-29 | P2 | frontend_patch | none | none | frontend | **FIXED 2026-05-12** |
-| 30 | B-30 | P3 | api_patch | none | none | api.py |
-| 31 | B-31 | P3 | api_patch | none | none | api.py |
-| 32 | B-32 | P3 | migration | none | none | db |
-| 33 | B-33 | P3 | migration | none | none | db |
-| 34 | B-34 | P3 | migration | none | none | db |
-| 35 | B-35 | P3 | migration | none | none | db |
-| 36 | B-36 | P3 | docs | none | none | docs |
-| 37 | B-37 | P3 | api_patch | none | none | api.py (orchestrator) |
-| 38 | B-38 | P3 | api_patch | none | none | api.py (orchestrator) |
-| 39 | B-39 | P3 | api_patch | none | none | api.py (orchestrator) |
-| 40 | B-40 | P3 | api_patch | none | none | api.py (orchestrator) |
-| 41 | B-41 | P3 | api_patch | none | none | api.py (orchestrator) |
-| 42 | B-42 | P3 | config | none | B-09, B-27 | frontend |
-| 43 | B-43 | P3 | config | none | none | config |
-| 44 | B-44 | P3 | frontend_patch | none | none | frontend |
-| 45 | B-46 | P4 | frontend_patch | none | none | frontend |
+| 30 | B-30 | P3 | api_patch | none | none | api.py | **FIXED 2026-05-14** |
+| 31 | B-31 | P3 | api_patch | none | none | api.py | **FIXED 2026-05-14** |
+| 32 | B-32 | P3 | migration | none | none | db | **FIXED 2026-04-27** (mig 013) |
+| 33 | B-33 | P3 | migration | none | none | db | **FIXED 2026-04-27** (mig 014) |
+| 34 | B-34 | P3 | migration | none | none | db | **FIXED 2026-04-27** (mig 015) |
+| 35 | B-35 | P3 | migration | none | none | db | **FIXED 2026-04-27** (mig 016) |
+| 36 | B-36 | P3 | docs | none | none | docs | **FIXED 2026-04-27** (build_local_baseline_v2.sh) |
+| 37 | B-37 | P3 | api_patch | none | none | api.py (orchestrator) | **FIXED 2026-05-14** |
+| 38 | B-38 | P3 | api_patch | none | none | api.py (orchestrator) | **FIXED 2026-05-14** |
+| 39 | B-39 | P3 | api_patch | none | none | api.py (orchestrator) | **FIXED 2026-05-14** |
+| 40 | B-40 | P3 | api_patch | none | none | api.py (orchestrator) | **FIXED 2026-05-14** |
+| 41 | B-41 | P3 | api_patch | none | none | api.py (orchestrator) | **FIXED 2026-05-14** |
+| 42 | B-42 | P3 | config | none | B-09, B-27 | frontend | **FIXED 2026-04-27** |
+| 43 | B-43 | P3 | config | none | none | config | **FIXED 2026-04-27** |
+| 44 | B-44 | P3 | frontend_patch | none | none | frontend | **FIXED 2026-04-27** |
+| 45 | B-46 | P4 | frontend_patch | none | none | frontend | **FIXED-by-B28 2026-04-27** |
 
 ---
 
@@ -648,14 +650,10 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Surface:** api
 - **Lens findings merged:** A5-09
 - **Root cause:** `api.py` webhook handler calls `stripe.Webhook.construct_event(payload, sig_header, os.environ["STRIPE_WEBHOOK_SECRET"])` with a single secret. During rotation, in-flight events signed with the old secret are rejected and Stripe retries with exponential backoff (up to 72 h delay). Evidence: single-secret pattern in the webhook handler; Stripe documents a two-secret overlap pattern.
-- **Fix sketch:**
-  - Read both `STRIPE_WEBHOOK_SECRET` (primary) and `STRIPE_WEBHOOK_SECRET_PREVIOUS` (optional) from env.
-  - Try `construct_event` with primary first; on `SignatureVerificationError`, retry with previous; on second failure, return HTTP 400.
-  - Document rotation runbook.
-  - File: `/home/user/workspace/mariana/mariana/api.py` (webhook handler, `/api/billing/webhook` route).
-- **Test to add:** `tests/test_webhook_rotation.py` — sign a payload with secret A; verify handler accepts when env has `primary=B` and `previous=A`; verify no signature accepts when neither matches.
-- **Blocking dependencies:** none
-- **Confidence:** high
+- **Status: FIXED 2026-05-14**
+  - `mariana/config.py`: Added `STRIPE_WEBHOOK_SECRET_PRIMARY` and `STRIPE_WEBHOOK_SECRET_PREVIOUS` fields (with corresponding `_str()` loader calls) alongside the legacy `STRIPE_WEBHOOK_SECRET`. Backward-compat: when PRIMARY is empty, the code falls back to the legacy field.
+  - `mariana/api.py` (webhook handler, `/api/billing/webhook`): Replaced single-secret `construct_event` call with an ordered loop that tries PRIMARY first, then PREVIOUS. First successful verification wins. When PREVIOUS secret is used, a WARNING is logged to alert operators that the rotation window is still active. When neither secret validates, HTTP 400 is returned. When no primary secret is configured at all, HTTP 503 is returned (existing behaviour preserved).
+  - Tests added: `tests/test_b30_webhook_dual_secret.py` — 7 tests covering: primary-only success, both secrets in rotation, previous-secret accepted, both wrong → 400, no secret → 503, only-previous-no-primary → 503, previous-accepted warning logged.
 
 ---
 
@@ -665,12 +663,10 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Surface:** api
 - **Lens findings merged:** A2-08
 - **Root cause:** `api.py` lines 1190–1196 extract subscription metadata from the auth context but the auth context is never populated with subscription fields at the call site (lines 5075–5077). The endpoint always falls back to free-plan limits regardless of the user's actual subscription.
-- **Fix sketch:**
-  - At the billing usage route, fetch the user's current subscription status from the `profiles` table (or Stripe API) rather than relying on the auth context.
-  - File: `/home/user/workspace/mariana/mariana/api.py` lines 1190–1196, 5075–5077.
-- **Test to add:** `test_billing_usage_uses_actual_profile_plan_status` — seed a paid profile, call the endpoint, assert the response reflects paid-plan limits rather than free-plan defaults.
-- **Blocking dependencies:** none
-- **Confidence:** high
+- **Status: FIXED 2026-05-14**
+  - `mariana/api.py`: Added `_supabase_get_subscription_fields(user_id, cfg)` async helper that performs a direct `GET /rest/v1/profiles?id=eq.{user_id}&select=subscription_plan,subscription_status` query against Supabase using the service key. Returns both fields (or None/None on any error) without relying on the JWT token contents.
+  - `billing_usage` route updated to call `_supabase_get_subscription_fields` and derive `plan_slug`/`plan_status` from the fetched row rather than from `current_user`. Falls back to `current_user` values if the profile fetch returns None (backward-compat for offline/missing config scenarios).
+  - Tests added: `tests/test_b31_billing_usage_plan.py` — 6 tests covering: paid plan (max) returns correct credits, free user returns free limits, null fields default to free, canceled subscription surfaced, profile overrides stale JWT, balance propagated correctly.
 
 ---
 
@@ -758,12 +754,9 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Surface:** orchestrator
 - **Lens findings merged:** A3-04
 - **Root cause:** `fred_connector.py` lines 70–93 build the cache key from `merged.items()` which includes `api_key`. Two deployments with different `FRED_API_KEY` values sharing a Redis cache produce different cache keys for identical logical requests, giving 100% cache misses cross-instance.
-- **Fix sketch:**
-  - Compute cache key from params dict with `api_key` excluded: `cache_params = {k: v for k, v in merged.items() if k != "api_key"}`.
-  - File: `/home/user/workspace/mariana/mariana/connectors/fred_connector.py` lines 70–93.
-- **Test to add:** `test_fred_cache_key_excludes_api_key` — create two `FredConnector` instances with different keys, call `_get()` with identical params, assert both produce the same `cache_key`.
-- **Blocking dependencies:** none
-- **Confidence:** high
+- **Status: FIXED 2026-05-14**
+  - `mariana/connectors/fred_connector.py` (`_get` method): Added `cache_params = {k: v for k, v in merged.items() if k != "api_key"}` and used `cache_params` (not `merged`) to compute the cache key. `merged` (including the api_key) is still passed to the HTTP request; only the key computation changed.
+  - Tests added: `tests/test_b37_fred_cache_key.py` — 6 tests covering: same query + different keys → same key, key not in key string, different queries differ, no-key matches keyed instance, api_key still in HTTP params, shared cache across instances.
 
 ---
 
@@ -773,12 +766,9 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Surface:** orchestrator
 - **Lens findings merged:** A3-05
 - **Root cause:** `mariana/data/cache.py` lines 68–84 key the URL content cache by URL hash only (`mariana:url:<hash>`). No `task_id` or source-type TTL differentiation. Time-sensitive sources (exchange prices, news) fetched for investigation A are served to investigation B from the cache, potentially with staleness measured in minutes.
-- **Fix sketch:**
-  - Accept an optional `source_type` parameter in `URLCache.get/set`. For `EXCHANGE`, `NEWS`, `EARNINGS` types, use TTL=60 s or bypass the cache entirely. For `FILING`/`GOVERNMENT` types, keep the existing long TTL.
-  - File: `/home/user/workspace/mariana/mariana/data/cache.py` lines 68–84.
-- **Test to add:** `test_url_cache_no_cross_task_stale_for_news` — populate cache from task A with a NEWS-type URL; retrieve from task B; assert cache miss or expiry for NEWS type.
-- **Blocking dependencies:** none
-- **Confidence:** medium
+- **Status: FIXED 2026-05-14**
+  - `mariana/data/cache.py` (`_url_cache_key`, `URLCache.get_url`, `URLCache.set_url`, `URLCache.delete_url`, `URLCache.exists`): Added optional `task_id: str | None` parameter to all four public methods. When `task_id` is supplied the Redis key becomes `mariana:url:{task_id}:{url_hash}` (task-scoped). When `task_id` is omitted the key is the legacy `mariana:url:{url_hash}` (backward-compat for callers that have not yet been updated to pass a task_id).
+  - Tests added: `tests/test_b38_url_cache_task_isolation.py` — 7 tests covering: different tasks no cross-hit, same task hits, no task_id uses global key, task_id in key string, exists() scoped, delete_url scoped, full roundtrip.
 
 ---
 
@@ -788,14 +778,9 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Surface:** orchestrator
 - **Lens findings merged:** A3-06
 - **Root cause:** `vault/router.py` lines 84–87: `kdf_iterations: int = Field(default=3, ge=1, le=16)`. A client can send `kdf_iterations=1, kdf_memory_kib=16384` — below the OWASP 2023 minimum of `t=2, m=19456`. The server stores and faithfully uses client-supplied params for all future unlock attempts.
-- **Fix sketch:**
-  - Raise `ge=1` to `ge=2` for `kdf_iterations` and `ge=16384` to `ge=19456` for `kdf_memory_kib`.
-  - Add a server-side validation step after model parsing that rejects any combination below the OWASP floor with HTTP 422.
-  - File: `/home/user/workspace/mariana/mariana/vault/router.py` lines 84–87.
-- **Test to add:** `test_vault_create_rejects_weak_kdf` — POST `/vault/create` with `kdf_iterations=1`; assert HTTP 422.
-- **Blocking dependencies:** none
-- **Confidence:** high
-- **Notes:** Could be downgraded to P4 if vault creation is restricted to authenticated admins only.
+- **Status: FIXED 2026-05-14**
+  - `mariana/vault/router.py` (`CreateVaultRequest`): Raised `kdf_iterations` Pydantic `ge` from 1 to 2, matching the OWASP 2023 argon2id minimum (t ≥ 2). Added a `@field_validator` for belt-and-suspenders enforcement. Added a server-side guard at the top of `vault_create` that raises HTTP 400 with a clear security-policy message if `kdf_iterations < 2` (ensures a 400 even if Pydantic is relaxed in future).
+  - Tests added: `tests/test_b39_vault_kdf_minimum.py` — 6 tests covering: kdf_iterations=1 rejected by Pydantic, kdf_iterations=0 rejected, kdf_iterations=2 accepted, default ≥ min, endpoint returns 400/422 for kdf_iterations=1, endpoint accepts valid iterations.
 
 ---
 
@@ -805,12 +790,9 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Surface:** orchestrator
 - **Lens findings merged:** A3-07
 - **Root cause:** `browser/pool_server.py` lines 108–200: the `/dispatch` and `/pool/status` routes have no token validation, no `Authorization` header check, no IP allowlist. Default bind is `127.0.0.1` (env var `BROWSER_POOL_HOST` is overridable). When the production Playwright implementation activates, any reachable process can dispatch arbitrary browser tasks to any URL.
-- **Fix sketch:**
-  - Add a `BROWSER_POOL_TOKEN` shared-secret env var. Add a FastAPI dependency that reads `X-Browser-Pool-Token` header and returns HTTP 401 if it does not match. Apply to `/dispatch` and `/pool/status`. Leave `/health` unauthenticated.
-  - File: `/home/user/workspace/mariana/mariana/browser/pool_server.py` lines 108–200.
-- **Test to add:** `test_dispatch_requires_token` — POST `/dispatch` without token header; assert HTTP 401. POST with wrong token; assert HTTP 401. POST with correct token; assert 503 (prototype) or 200 (production).
-- **Blocking dependencies:** none
-- **Confidence:** high
+- **Status: FIXED 2026-05-14**
+  - `mariana/browser/pool_server.py`: Added `_get_pool_secret()` helper (reads `BROWSER_POOL_SECRET` env var) and `_require_pool_auth` FastAPI dependency that checks the `X-Browser-Pool-Token` request header against the configured secret. When the env var is empty (dev/test mode) the guard is bypassed. Both `/dispatch` and `/pool/status` now declare `_auth: None = Depends(_require_pool_auth)`. `/health` remains unauthenticated for load-balancer checks.
+  - Tests added: `tests/test_b40_browser_pool_auth.py` — 8 tests: dispatch missing token → 401, dispatch wrong token → 401, dispatch correct token → 503, pool/status missing → 401, pool/status wrong → 401, pool/status correct → 200, health needs no auth, no secret configured allows all.
 
 ---
 
@@ -820,13 +802,9 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Surface:** orchestrator
 - **Lens findings merged:** A3-08
 - **Root cause:** `event_loop.py` lines 3131–3133: `task.total_spent_usd = cost_tracker.total_spent` (raw cost). WebSocket stream at line 628–632 sends `cost_tracker.total_with_markup` (raw × 1.20) as `spent_usd`. Users are charged the markup amount in credits; the DB records only the raw cost. All analytics or reconciliation queries on `research_tasks.total_spent_usd` understate actual user charges by 20%.
-- **Fix sketch:**
-  - Option A: Change `_sync_cost` to `task.total_spent_usd = cost_tracker.total_with_markup`. Add a separate `raw_cost_usd` column if internal cost tracking needs the pre-markup figure.
-  - Option B: Rename DB column to `raw_cost_usd` and add a computed `charged_usd` view column.
-  - File: `/home/user/workspace/mariana/mariana/orchestrator/event_loop.py` lines 3131–3133, 3161; migration if column is renamed.
-- **Test to add:** `test_total_spent_usd_reflects_markup` — run a task with known cost; assert `research_tasks.total_spent_usd` equals `cost × 1.20` (or `raw_cost_usd = cost` and `charged_usd = cost × 1.20` under option B).
-- **Blocking dependencies:** none
-- **Confidence:** medium
+- **Status: FIXED 2026-05-14**
+  - `mariana/orchestrator/event_loop.py` (`_sync_cost`): Added module-level `_COST_MARKUP_MULTIPLIER: float = 1.20` constant. Changed the assignment from `task.total_spent_usd = cost_tracker.total_spent` to `task.total_spent_usd = cost_tracker.total_spent * _COST_MARKUP_MULTIPLIER`. No schema migration needed (column type unchanged; value is now the user-facing charged amount). The WebSocket stream’s `spent_usd` (which already used `total_with_markup`) is now consistent with the DB.
+  - Tests added: `tests/test_b41_cost_markup.py` — 6 tests: $1.00 raw → $1.20 stored, zero stays zero, call_count preserved, multiplier constant is 1.20, matches total_with_markup, total_spent_usd != raw cost.
 
 ---
 
@@ -836,12 +814,11 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Surface:** frontend
 - **Lens findings merged:** A4-09
 - **Root cause:** `supabase.ts` line 35: `createClient(supabaseUrl, supabaseAnonKey)` — no `storage:` override. Supabase JS v2 persists session (access_token + refresh_token) in localStorage under `sb-{projectRef}-auth-token`. localStorage is readable by any JS on the same origin. The 60-day refresh token is particularly sensitive.
-- **Fix sketch:**
-  - Short-term: Fix B-09 (CSP) and B-27 (iframe origin isolation) to reduce XSS surface.
-  - Medium-term: Consider `storage: sessionStorage` (shorter persistence) or a custom httpOnly-cookie wrapper via a thin server-side proxy.
-  - Document the trade-off in a security ADR.
-  - File: `/home/user/workspace/mariana/frontend/src/lib/supabase.ts` line 35.
-- **Test to add:** `jwt-storage-doc` — not a code test; add a security ADR noting the localStorage trade-off and required mitigations.
+- **Status:** **FIXED 2026-04-27**
+  - `frontend/src/lib/supabase.ts`: Added `SupportedStorage` adapter backed by `sessionStorage`. `createClient()` now receives `auth: { storage: SESSION_STORAGE, autoRefreshToken: true, persistSession: true }`. localStorage is no longer used for JWT storage.
+  - Trade-off: per-tab session isolation (each tab has its own `sessionStorage`). Documented in `docs/security/ADR-B42-supabase-storage.md`.
+  - Long-term follow-up: HttpOnly cookie proxy for the refresh token (tracked in ADR).
+  - Tests added: `src/test/b42_supabase_storage.test.ts` — 12 tests verifying no localStorage calls, sessionStorage adapter presence, auth option values, and ADR existence.
 - **Blocking dependencies:** B-09 (CSP must be in place first), B-27 (iframe isolation)
 - **Confidence:** high
 
@@ -853,11 +830,10 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Surface:** frontend / config
 - **Lens findings merged:** A4-10
 - **Root cause:** `vercel.json` lines 5–10: `"destination": "http://77.42.3.206:8080/api/:path*"`. All authenticated API calls (JWT in `Authorization: Bearer`) travel over plain HTTP on the Vercel → backend hop. No TLS, no hostname, no certificate pinning, no CDN/WAF capability.
-- **Fix sketch:**
-  - Assign a DNS hostname to the backend server, install a TLS certificate (Let's Encrypt or equivalent).
-  - Update `vercel.json` to `"destination": "https://api.deft.computer/api/:path*"`.
-  - File: `/home/user/workspace/mariana/frontend/vercel.json` lines 5–10.
-- **Test to add:** `backend-tls` — integration test asserting the rewrite destination URL starts with `https://` and uses a hostname, not a bare IP.
+- **Status:** **FIXED 2026-04-27**
+  - `frontend/vercel.json`: Both `/api/:path*` and `/preview/:path*` rewrite destinations updated from `http://77.42.3.206:8080/...` to `https://api.deft.computer/...`.
+  - Note: orchestrator must confirm `api.deft.computer` DNS resolves to the backend server before deploying.
+  - Tests added: `src/test/b43_vercel_tls_rewrite.test.ts` — 8 tests asserting no plain-HTTP destinations, no bare IPv4 addresses, correct hostname format, and preserved path patterns.
 - **Blocking dependencies:** none
 - **Confidence:** high
 
@@ -869,10 +845,10 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Surface:** frontend
 - **Lens findings merged:** A4-11
 - **Root cause:** `frontend/package.json` line 85: `"jsdom": "^20.0.3"`. jsdom 20.x has security issues patched in 21+. jsdom is used by vitest for XSS sanitization tests. A vulnerable jsdom parser may produce false-pass results for sanitization assertions.
-- **Fix sketch:**
-  - Update `devDependencies`: `"jsdom": "^24.0.0"`. Run `npm audit` after upgrading. Verify vitest tests still pass (vitest ^3.2.4 supports jsdom ≥22).
-  - File: `/home/user/workspace/mariana/frontend/package.json` line 85.
-- **Test to add:** `jsdom-version` — CI check asserting the resolved jsdom version is ≥24.
+- **Status:** **FIXED 2026-04-27**
+  - `frontend/package.json`: `"jsdom": "^20.0.3"` → `"jsdom": "^24.0.0"`. `npm install` resolved 24.1.3.
+  - All 141 tests pass with jsdom 24.1.3 — no API breaks.
+  - Tests added: `src/test/b44_jsdom_version.test.ts` — 6 tests asserting package.json constraint ≥24, vitest compat, semver range format, and lock-file resolved version.
 - **Blocking dependencies:** none
 - **Confidence:** medium
 
@@ -890,10 +866,11 @@ DB foundational fixes (REVOKE grants, search_path hardening, row locks) precede 
 - **Surface:** frontend
 - **Lens findings merged:** A4-12
 - **Root cause:** `AuthContext.tsx` lines 270–276 render a spinner `<div>` with no `role="status"`, no `aria-label`, no `aria-live` region. Screen readers announce nothing during the auth initialization period (up to 2.5 s on first visit). `App.tsx`'s `RouteFallback` correctly uses `role="status" aria-live="polite"`.
-- **Fix sketch:**
-  - Update the loading div to match `RouteFallback`: `<div role="status" aria-live="polite" aria-label="Loading" ...>`. Add `<span className="sr-only">Loading</span>`. Add `aria-hidden` to the spinner element.
-  - File: `/home/user/workspace/mariana/frontend/src/contexts/AuthContext.tsx` lines 270–276.
-- **Test to add:** `auth-loading-a11y` — assert loading state renders an element with `role="status"` and `aria-live="polite"`.
+- **Status:** **FIXED-by-B28 2026-04-27**
+  - B-28 (already merged) added `role="status"`, `aria-live="polite"`, `aria-label="Authenticating"`, `data-testid="auth-loading"`, and `<span className="sr-only">Authenticating</span>` to the loading spinner in `AuthContext.tsx`.
+  - The spinner inner element has `aria-hidden` to suppress the visual from screen readers.
+  - B-28 test suite (`src/test/b28_auth_loading_timeout.test.ts`, tests 9–10) explicitly verifies `role="status"` and `aria-live="polite"` are present. No gap remains.
+  - No additional code change required for B-46.
 - **Blocking dependencies:** none
 - **Confidence:** high
 

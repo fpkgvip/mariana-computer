@@ -32,11 +32,48 @@ from datetime import datetime, timezone
 
 import structlog
 import uvicorn
-from fastapi import FastAPI, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 logger = structlog.get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# B-40: shared-secret authentication for /dispatch and /pool/status
+# ---------------------------------------------------------------------------
+
+# The orchestrator and pool server share BROWSER_POOL_SECRET at deploy time.
+# /health remains unauthenticated for load balancer liveness checks.
+
+
+def _get_pool_secret() -> str:
+    """Return the configured BROWSER_POOL_SECRET (may be empty in dev)."""
+    return os.getenv("BROWSER_POOL_SECRET", "")
+
+
+async def _require_pool_auth(
+    x_browser_pool_token: str | None = Header(default=None),
+) -> None:
+    """FastAPI dependency that enforces the BROWSER_POOL_SECRET header check.
+
+    Returns immediately when BROWSER_POOL_SECRET is not configured (dev mode).
+    In production, rejects any request that does not supply the correct
+    X-Browser-Pool-Token header value.
+    """
+    secret = _get_pool_secret()
+    if not secret:
+        # Secret not configured — allow all (development / test).
+        return
+    if x_browser_pool_token != secret:
+        logger.warning(
+            "browser_pool_auth_rejected",
+            reason="missing or incorrect X-Browser-Pool-Token header",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or incorrect X-Browser-Pool-Token header",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Request / response models
@@ -147,7 +184,10 @@ async def health() -> JSONResponse:
         "The orchestrator should fall back to the HTTP connectors for data retrieval."
     ),
 )
-async def dispatch_task(task: BrowserTask) -> DispatchResponse:
+async def dispatch_task(
+    task: BrowserTask,
+    _auth: None = Depends(_require_pool_auth),  # B-40: shared-secret auth
+) -> DispatchResponse:
     """
     Return HTTP 503 for every dispatch request — the browser pool is not active.
 
@@ -181,7 +221,9 @@ async def dispatch_task(task: BrowserTask) -> DispatchResponse:
     summary="Pool status",
     description="Returns detailed pool metrics for monitoring dashboards.",
 )
-async def pool_status() -> JSONResponse:
+async def pool_status(
+    _auth: None = Depends(_require_pool_auth),  # B-40: shared-secret auth
+) -> JSONResponse:
     """
     Return detailed pool metrics.
 

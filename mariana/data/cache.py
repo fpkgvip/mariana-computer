@@ -77,7 +77,11 @@ def _sanitize_key_component(value: str) -> str:
     return _SAFE_KEY_RE.sub("", value)
 
 
-def _url_cache_key(url_hash: str) -> str:
+def _url_cache_key(url_hash: str, task_id: str | None = None) -> str:
+    # B-38 fix: include task_id in the key when provided so that different
+    # investigations cannot share stale cached content for time-sensitive sources.
+    if task_id:
+        return f"{_URL_CACHE_PREFIX}{_sanitize_key_component(task_id)}:{_sanitize_key_component(url_hash)}"
     return f"{_URL_CACHE_PREFIX}{_sanitize_key_component(url_hash)}"
 
 
@@ -114,18 +118,26 @@ class URLCache:
     # Public API
     # ------------------------------------------------------------------
 
-    async def get_url(self, url_hash: str) -> dict[str, Any] | None:
+    async def get_url(
+        self,
+        url_hash: str,
+        task_id: str | None = None,
+    ) -> dict[str, Any] | None:
         """
         Retrieve cached content for a URL hash.
 
         Args:
             url_hash: SHA-256 hex digest of the canonical URL.
+            task_id:  Optional investigation ID.  When supplied the cache key
+                      is scoped to this task so two investigations do not share
+                      content (B-38 fix).
 
         Returns:
             The cached payload dict (keys: ``content``, ``metadata``,
             ``cached_at``, ``expires_at``), or *None* on a cache miss.
         """
-        raw: str | None = await self._redis.get(_url_cache_key(url_hash))  # BUG-NEW-16 fix: decode_responses=True returns str, not bytes
+        key = _url_cache_key(url_hash, task_id)
+        raw: str | None = await self._redis.get(key)  # BUG-NEW-16 fix: decode_responses=True returns str, not bytes
         if raw is None:
             logger.debug("URL cache miss url_hash=%s", url_hash)
             return None
@@ -136,7 +148,7 @@ class URLCache:
                 "Corrupt cache entry for url_hash=%s — deleting",
                 url_hash,
             )
-            await self._redis.delete(_url_cache_key(url_hash))
+            await self._redis.delete(key)
             return None
         logger.debug("URL cache hit url_hash=%s", url_hash)
         return payload
@@ -148,6 +160,7 @@ class URLCache:
         source_type: SourceType | None = None,
         metadata: dict[str, Any] | None = None,
         ttl: int | None = None,
+        task_id: str | None = None,
     ) -> None:
         """
         Store page content in the cache.
@@ -158,6 +171,8 @@ class URLCache:
             source_type: Source provenance; used to select the appropriate TTL.
             metadata:    Arbitrary key/value metadata to store alongside content.
             ttl:         Explicit TTL in seconds; overrides source-type selection.
+            task_id:     Optional investigation ID for per-task key isolation
+                         (B-38 fix).
         """
         effective_ttl: int
         if ttl is not None:
@@ -174,8 +189,9 @@ class URLCache:
             "cached_at": now,
             "expires_at": now + effective_ttl,
         }
+        key = _url_cache_key(url_hash, task_id)
         await self._redis.setex(
-            _url_cache_key(url_hash),
+            key,
             effective_ttl,
             json.dumps(payload),
         )
@@ -186,14 +202,14 @@ class URLCache:
             source_type,
         )
 
-    async def delete_url(self, url_hash: str) -> None:
+    async def delete_url(self, url_hash: str, task_id: str | None = None) -> None:
         """Explicitly evict a cached URL entry."""
-        await self._redis.delete(_url_cache_key(url_hash))
+        await self._redis.delete(_url_cache_key(url_hash, task_id))
         logger.debug("URL cache deleted url_hash=%s", url_hash)
 
-    async def exists(self, url_hash: str) -> bool:
+    async def exists(self, url_hash: str, task_id: str | None = None) -> bool:
         """Return True if a (non-expired) entry exists for the given URL hash."""
-        result: int = await self._redis.exists(_url_cache_key(url_hash))
+        result: int = await self._redis.exists(_url_cache_key(url_hash, task_id))
         return result > 0
 
 

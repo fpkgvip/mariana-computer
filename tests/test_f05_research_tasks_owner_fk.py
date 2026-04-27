@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS research_tasks (
     dont_kill_branches BOOLEAN DEFAULT FALSE,
     user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE
 );
+CREATE INDEX IF NOT EXISTS idx_research_tasks_user_id ON research_tasks(user_id);
 
 CREATE TABLE IF NOT EXISTS hypotheses (
     id TEXT PRIMARY KEY,

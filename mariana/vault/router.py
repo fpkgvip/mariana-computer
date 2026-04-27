@@ -82,9 +82,27 @@ class CreateVaultRequest(BaseModel):
     verifier_blob: str = Field(..., min_length=1)
 
     # Optional KDF tuning (defaults match m=64MiB/t=3/p=4)
+    # B-39 fix: raise kdf_iterations lower bound from ge=1 to ge=2 to match
+    # the OWASP 2023 argon2id minimum (t ≥ 2).  ge=1 allowed a client to
+    # create a vault with deliberately weak KDF parameters that are trivially
+    # brute-forced offline.
     kdf_memory_kib: int = Field(default=65536, ge=16384, le=1048576)
-    kdf_iterations: int = Field(default=3, ge=1, le=16)
+    kdf_iterations: int = Field(default=3, ge=2, le=16)
     kdf_parallelism: int = Field(default=4, ge=1, le=16)
+
+    # B-39: server-side minimum enforcement (belt-and-suspenders over Pydantic).
+    _KDF_ITERATIONS_MIN: int = 2  # OWASP 2023 argon2id minimum t parameter
+
+    @field_validator("kdf_iterations")
+    @classmethod
+    def _kdf_iterations_min(cls, v: int) -> int:
+        """B-39: reject any iteration count below the OWASP argon2id floor."""
+        if v < 2:
+            raise ValueError(
+                f"kdf_iterations must be \u2265 2 (OWASP 2023 argon2id minimum); "
+                f"got {v}"
+            )
+        return v
 
 
 class VaultResponse(BaseModel):
@@ -187,6 +205,18 @@ def build_vault_router(
         body: CreateVaultRequest,
         current_user: dict = Depends(get_current_user),
     ):
+        # B-39: belt-and-suspenders server-side minimum check.
+        # Pydantic ge=2 already rejects kdf_iterations < 2 with 422, but we
+        # also check here to surface a clear 400 with a security-policy message.
+        if body.kdf_iterations < 2:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "kdf_iterations must be \u2265 2 (OWASP 2023 argon2id minimum). "
+                    "Values below the minimum are rejected server-side regardless "
+                    "of client-supplied parameters."
+                ),
+            )
         try:
             kw = dict(
                 passphrase_salt=_b64decode_strict(body.passphrase_salt, expected_min=16, expected_max=16, label="passphrase_salt"),

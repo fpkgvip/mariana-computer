@@ -3147,6 +3147,13 @@ async def _build_session_data(
     )
 
 
+# B-41: Markup multiplier applied when persisting cost so that the DB column
+# total_spent_usd reflects the amount the user is actually charged, not the
+# raw model cost.  The frontend WebSocket already uses total_with_markup
+# (raw × 1.20); this constant keeps the two in sync.
+_COST_MARKUP_MULTIPLIER: float = 1.20
+
+
 def _sync_cost(task: ResearchTask, cost_tracker: CostTracker) -> None:
     """Sync live cost-tracker totals into the task model before persistence.
 
@@ -3154,8 +3161,14 @@ def _sync_cost(task: ResearchTask, cost_tracker: CostTracker) -> None:
     ``cost_tracker.total_spent``, causing the DB to always record 0.0.
     ``task.ai_call_counter`` is also synced from the tracker's call_count
     so both fields reflect the latest values at every checkpoint.
+
+    B-41 fix: persist total_spent_usd as raw_cost × _COST_MARKUP_MULTIPLIER
+    so the DB column matches the user-facing charge (1.20× markup) rather
+    than the internal raw model cost.  Operators and analytics queries reading
+    total_spent_usd will now see the charged amount, eliminating the 20%
+    reconciliation gap between DB records and credit-ledger deductions.
     """
-    task.total_spent_usd = cost_tracker.total_spent
+    task.total_spent_usd = cost_tracker.total_spent * _COST_MARKUP_MULTIPLIER
     task.ai_call_counter = cost_tracker.call_count
 
 

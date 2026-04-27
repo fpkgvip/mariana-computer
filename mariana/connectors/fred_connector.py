@@ -90,7 +90,12 @@ class FredConnector(BaseConnector):
         """
         url = f"{_BASE_URL}{path}"
         merged = self._base_params(params)
-        cache_key = self._cache_key("fred", url, str(sorted(merged.items())))
+        # B-37 fix: exclude api_key from the cache key so that two deployments
+        # sharing a Redis instance but using different FRED_API_KEY values
+        # produce the same cache key for identical logical queries.
+        # The actual HTTP request still uses `merged` (which includes the key).
+        cache_params = {k: v for k, v in merged.items() if k != "api_key"}
+        cache_key = self._cache_key("fred", url, str(sorted(cache_params.items())))
 
         cached = await self._cache_get(cache_key)
         if cached is not None:

@@ -1,4 +1,5 @@
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+// B-42 fix: Import SupportedStorage type for the sessionStorage adapter.
+import { createClient, type SupabaseClient, type SupportedStorage } from "@supabase/supabase-js";
 
 // BUG-028: Avoid unsafe `as string` casts — preserve the true type (string | undefined)
 // so TypeScript can enforce the guards below instead of lying to the compiler.
@@ -32,7 +33,37 @@ function getClient(): SupabaseClient {
       supabaseConfigError ?? "Supabase client is not configured.",
     );
   }
-  _client = createClient(supabaseUrl, supabaseAnonKey);
+  // B-42 fix: Use sessionStorage instead of the default localStorage so that
+  // the Supabase JWT (access_token + refresh_token) is not persisted across
+  // browser tabs/sessions.  localStorage is readable by any JS on the same
+  // origin; sessionStorage narrows the XSS exfiltration window to the current
+  // tab and clears automatically when the tab closes.
+  //
+  // Trade-off: each new tab requires a fresh sign-in (or Supabase's built-in
+  // refresh-token rotation will re-hydrate the session via the tab's own
+  // sessionStorage after the first load if the user has a valid refresh token
+  // in that tab).  This is a deliberate UX trade-off accepted to reduce the
+  // 60-day refresh-token exfiltration surface documented in A4-09.
+  //
+  // If per-tab session isolation proves too disruptive, the alternative is
+  // memory-only storage (see the commented MEMORY_STORAGE below) which loses
+  // the session on any navigation but gives the smallest possible attack surface.
+  // See ADR in docs/security/ADR-B42-supabase-storage.md for full rationale.
+  const SESSION_STORAGE: SupportedStorage = {
+    getItem: (key: string) => sessionStorage.getItem(key),
+    setItem: (key: string, value: string) => sessionStorage.setItem(key, value),
+    removeItem: (key: string) => sessionStorage.removeItem(key),
+  };
+  _client = createClient(supabaseUrl, supabaseAnonKey, {
+    auth: {
+      storage: SESSION_STORAGE,
+      // Keep auto-refresh enabled so the access token is silently refreshed
+      // within the tab lifetime.
+      autoRefreshToken: true,
+      // Persist session within this tab so page reloads do not log the user out.
+      persistSession: true,
+    },
+  });
   return _client;
 }
 

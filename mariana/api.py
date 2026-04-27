@@ -5440,12 +5440,12 @@ async def billing_usage(
             logger.warning("billing_usage_balance_lookup_failed", user_id=user_id, error=str(exc))
             balance = None
 
-    # Fetch plan details. Resolve from JWT claims when available, else
-    # default to "free". We intentionally return plan details instead of
-    # just the slug so the frontend can render the usage meter without a
-    # second API call.
-    plan_slug = (current_user.get("subscription_plan") or "free").lower()
-    plan_status = current_user.get("subscription_status") or "none"
+    # B-31 fix: the JWT auth context only carries user_id + role; subscription
+    # fields live in profiles.  Fetch them directly so billing_usage reflects
+    # the current plan rather than always falling back to "free".
+    sub_fields = await _supabase_get_subscription_fields(user_id, cfg)
+    plan_slug = (sub_fields.get("subscription_plan") or current_user.get("subscription_plan") or "free").lower()
+    plan_status = sub_fields.get("subscription_status") or current_user.get("subscription_status") or "none"
     matched = next((p for p in _PLANS if p["id"] == plan_slug), None)
     # If user has no active plan, synthesize a "free" tier so the UI has
     # something to render. Free tier has limited credits to encourage upgrade.
@@ -5601,23 +5601,44 @@ async def stripe_webhook(request: Request) -> JSONResponse:
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
 
-    # BUG-S2-06 fix: Reject webhooks entirely when STRIPE_WEBHOOK_SECRET is
-    # not configured, instead of silently accepting unverified payloads.
-    # An attacker could forge webhook events to credit arbitrary accounts.
-    if not cfg.STRIPE_WEBHOOK_SECRET:
+    # B-30 / BUG-S2-06: Reject webhooks when no secret is configured.
+    # Support dual-secret rotation via STRIPE_WEBHOOK_SECRET_PRIMARY +
+    # STRIPE_WEBHOOK_SECRET_PREVIOUS so in-flight events are not dropped
+    # during a key rotation.  Fall back to the legacy STRIPE_WEBHOOK_SECRET
+    # when the PRIMARY/PREVIOUS env vars are absent (backward-compat).
+    _primary_secret = cfg.STRIPE_WEBHOOK_SECRET_PRIMARY or cfg.STRIPE_WEBHOOK_SECRET
+    _previous_secret = cfg.STRIPE_WEBHOOK_SECRET_PREVIOUS
+    if not _primary_secret:
         logger.error("stripe_webhook_secret_not_configured")
         raise HTTPException(status_code=503, detail="Webhook signature verification not configured")
 
-    try:
-        event = _stripe.Webhook.construct_event(
-            payload, sig_header, cfg.STRIPE_WEBHOOK_SECRET
+    event = None
+    _used_previous_secret = False
+    # Try primary first; on failure try the previous secret (rotation overlap window).
+    for _secret, _is_previous in ((_primary_secret, False), (_previous_secret, True)):
+        if not _secret:
+            continue
+        try:
+            event = _stripe.Webhook.construct_event(payload, sig_header, _secret)
+            _used_previous_secret = _is_previous
+            break  # first successful verification wins
+        except _stripe.SignatureVerificationError:
+            continue  # try next secret
+        except Exception as exc:  # noqa: BLE001
+            logger.error("stripe_webhook_parse_failed", error=str(exc))
+            raise HTTPException(status_code=400, detail="Webhook parse error") from exc
+
+    if event is None:
+        logger.warning("stripe_webhook_signature_invalid")
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+    if _used_previous_secret:
+        # Log at WARNING level so operators know the rotation window is still active.
+        logger.warning(
+            "stripe_webhook_accepted_via_previous_secret",
+            detail="Webhook verified with the previous (rotating-out) secret — "
+                   "update Stripe dashboard to use the new secret.",
         )
-    except _stripe.SignatureVerificationError as exc:
-        logger.warning("stripe_webhook_signature_invalid", error=str(exc))
-        raise HTTPException(status_code=400, detail="Invalid webhook signature") from exc
-    except Exception as exc:  # noqa: BLE001
-        logger.error("stripe_webhook_parse_failed", error=str(exc))
-        raise HTTPException(status_code=400, detail="Webhook parse error") from exc
 
     event_id: str | None = event.get("id")
     event_type: str | None = event.get("type")  # BUG-API-029: use .get() to avoid KeyError on malformed webhooks
@@ -6620,6 +6641,53 @@ async def _supabase_get_user_tokens(
         if result is None:
             return None
         return int(result)
+
+
+async def _supabase_get_subscription_fields(
+    user_id: str,
+    cfg: AppConfig,
+) -> dict[str, str | None]:
+    """Fetch subscription_plan and subscription_status from profiles table.
+
+    B-31 fix: the auth token only carries user_id + role; subscription fields
+    live in profiles and must be fetched separately so billing_usage can return
+    plan-accurate limits rather than always defaulting to free.
+
+    Returns a dict with keys 'subscription_plan' and 'subscription_status'
+    (values are strings or None).  Returns both as None on any error.
+    """
+    api_key = _supabase_api_key(cfg)
+    empty: dict[str, str | None] = {"subscription_plan": None, "subscription_status": None}
+    if not cfg.SUPABASE_URL or not api_key:
+        return empty
+    url = f"{cfg.SUPABASE_URL}/rest/v1/profiles"
+    params = {
+        "id": f"eq.{user_id}",
+        "select": "subscription_plan,subscription_status",
+        "limit": "1",
+    }
+    headers = {"apikey": api_key, "Authorization": f"Bearer {api_key}"}
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url, params=params, headers=headers)
+    except httpx.HTTPError as exc:  # noqa: BLE001
+        logger.warning("supabase_get_subscription_fields_network_error", user_id=user_id, error=str(exc))
+        return empty
+    if resp.status_code != 200:
+        logger.warning(
+            "supabase_get_subscription_fields_failed",
+            user_id=user_id,
+            status=resp.status_code,
+        )
+        return empty
+    rows: list[dict[str, Any]] = resp.json() or []
+    if not rows:
+        return empty
+    row = rows[0]
+    return {
+        "subscription_plan": row.get("subscription_plan"),
+        "subscription_status": row.get("subscription_status"),
+    }
 
 
 async def _supabase_deduct_credits(
