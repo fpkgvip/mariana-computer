@@ -846,7 +846,10 @@ def make_routes(
                 if terminal_task.error is None:
                     terminal_task.error = "stop_requested"
                 try:
-                    await _settle_agent_credits(terminal_task)
+                    # R-01: pass db so the agent_settlements claim row is
+                    # written atomically.  A racing worker finally call
+                    # observing the same DB will short-circuit on conflict.
+                    await _settle_agent_credits(terminal_task, db=db)
                 except Exception as exc:  # noqa: BLE001 — defensive
                     logger.warning(
                         "agent_stop_settle_failed",

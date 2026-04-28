@@ -361,7 +361,63 @@ def _budget_exceeded(task: AgentTask, started_at: float) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
-async def _settle_agent_credits(task: AgentTask) -> None:
+async def _claim_settlement(
+    db: Any,
+    *,
+    task_id: str,
+    user_id: str,
+    reserved_credits: int,
+    final_credits: int,
+    delta_credits: int,
+    ref_id: str,
+) -> bool:
+    """Atomically claim the right to settle this task.
+
+    Inserts a row into ``agent_settlements`` with ``ON CONFLICT (task_id) DO
+    NOTHING RETURNING task_id``.  Returns ``True`` if this caller won the
+    claim (insert landed) and may proceed to issue the ledger RPC, ``False``
+    if a previous caller already owns settlement and we must short-circuit.
+
+    R-01: this is the canonical idempotency primitive.  It is robust to a
+    failed in-memory flag, a racing stop-endpoint vs worker-finally, or any
+    transient DB read error elsewhere — the row-level INSERT is atomic and
+    a duplicate insert is rejected by the primary key constraint without
+    raising.
+    """
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO agent_settlements (
+                task_id, user_id, reserved_credits, final_credits,
+                delta_credits, ref_id
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (task_id) DO NOTHING
+            RETURNING task_id
+            """,
+            task_id,
+            user_id,
+            reserved_credits,
+            final_credits,
+            delta_credits,
+            ref_id,
+        )
+    return row is not None
+
+
+async def _mark_settlement_completed(db: Any, task_id: str) -> None:
+    """Stamp ``completed_at`` on the claim row after a successful RPC.
+
+    Idempotent — a second call is a no-op via the ``IS NULL`` filter.
+    """
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_settlements SET completed_at = now() "
+            "WHERE task_id = $1 AND completed_at IS NULL",
+            task_id,
+        )
+
+
+async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
     """Reconcile reserved credits against actual ``spent_usd`` at task end.
 
     Mirrors the research-task settlement in ``mariana/main.py:_deduct_user_credits``.
@@ -376,11 +432,25 @@ async def _settle_agent_credits(task: AgentTask) -> None:
     * ``delta < 0``  → reservation exceeded actual cost → refund the unused
       portion via the ``add_credits`` RPC.
 
-    The function always sets ``credits_settled = True`` once it has attempted
-    a reconciliation, even if the RPC call returned a non-2xx status — this
-    is what makes the helper safe to call from a retried orchestrator pass
-    without double-charging or double-refunding.  Errors are logged with
-    ``agent_credits_settle_*`` keys for ops-time investigation.
+    R-01: when ``db`` is provided, settlement idempotency is enforced by an
+    atomic INSERT...ON CONFLICT DO NOTHING into ``agent_settlements`` BEFORE
+    any ledger RPC fires.  A second caller (typical race: stop endpoint +
+    worker finally) observes the existing claim row and short-circuits
+    without minting a duplicate refund — even if the in-memory
+    ``credits_settled`` flag is False (stale snapshot) or the Q-01 finally
+    fetchrow guard raised.  When ``db`` is omitted (legacy unit-test
+    callers), the function falls back to the older in-memory flag-based
+    idempotency.
+
+    The function always sets ``credits_settled = True`` once it has
+    attempted a reconciliation, even if the RPC call returned a non-2xx
+    status — this is what makes the helper safe to call from a retried
+    orchestrator pass without double-charging or double-refunding, and what
+    keeps the Q-01 CAS guard willing to accept the trailing
+    ``_persist_task``.  Errors are logged with ``agent_credits_settle_*``
+    keys for ops-time investigation.  The ``agent_settlements`` row
+    additionally records ``completed_at`` on RPC success and stays
+    uncompleted on RPC failure for offline reconciliation.
 
     Late imports avoid the api.py ↔ agent.loop circular import.
     """
@@ -410,9 +480,63 @@ async def _settle_agent_credits(task: AgentTask) -> None:
 
     final_tokens = int(task.spent_usd * 100)
     delta = final_tokens - task.reserved_credits
+    ref_id = f"agent_settle:{task.id}"
+
+    # R-01: claim row first.  If a prior caller already won the claim, we
+    # short-circuit before issuing any RPC.  The claim records the
+    # delta_credits we computed so an offline reconciler can spot a stale
+    # snapshot writing nonsense.
+    if db is not None:
+        try:
+            won = await _claim_settlement(
+                db,
+                task_id=task.id,
+                user_id=task.user_id,
+                reserved_credits=task.reserved_credits,
+                final_credits=final_tokens,
+                delta_credits=delta,
+                ref_id=ref_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — defensive
+            # If the claim INSERT itself errored, fail closed: do NOT issue
+            # a ledger RPC.  Mark in-memory settled so the trailing
+            # _persist_task can still land via the Q-01 CAS path; the
+            # absence of a claim row signals "unsettled" to operators.
+            task.credits_settled = True
+            logger.error(
+                "agent_credits_settle_claim_error",
+                task_id=task.id,
+                user_id=task.user_id,
+                reserved=task.reserved_credits,
+                error=str(exc),
+            )
+            return
+        if not won:
+            # Another writer has already claimed settlement for this task.
+            # The claim row + ref_id at the ledger provide defense-in-depth;
+            # we must NOT call the RPC.
+            task.credits_settled = True
+            logger.info(
+                "agent_settlement_already_claimed",
+                task_id=task.id,
+                user_id=task.user_id,
+                reserved=task.reserved_credits,
+                final_tokens=final_tokens,
+                delta=delta,
+            )
+            return
 
     if delta == 0:
         task.credits_settled = True
+        if db is not None:
+            try:
+                await _mark_settlement_completed(db, task.id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent_settlement_mark_completed_failed",
+                    task_id=task.id,
+                    error=str(exc),
+                )
         logger.info(
             "agent_credits_settle_noop",
             task_id=task.id,
@@ -429,6 +553,7 @@ async def _settle_agent_credits(task: AgentTask) -> None:
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    rpc_succeeded = False
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             if delta > 0:
@@ -436,14 +561,20 @@ async def _settle_agent_credits(task: AgentTask) -> None:
                 rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/deduct_credits"
                 resp = await client.post(
                     rpc_url,
-                    json={"target_user_id": task.user_id, "amount": delta},
+                    json={
+                        "target_user_id": task.user_id,
+                        "amount": delta,
+                        "ref_id": ref_id,
+                    },
                     headers=headers,
                 )
                 # Set the flag regardless of HTTP outcome so a retry of the
                 # finally block can't double-charge.  A logged failure here
-                # is reconciled offline.
+                # is reconciled offline via the agent_settlements partial
+                # index on completed_at IS NULL.
                 task.credits_settled = True
                 if resp.status_code in (200, 204):
+                    rpc_succeeded = True
                     logger.info(
                         "agent_credits_settle_extra_deduct_ok",
                         task_id=task.id,
@@ -462,40 +593,45 @@ async def _settle_agent_credits(task: AgentTask) -> None:
                         extra=delta,
                         status=resp.status_code,
                     )
-                return
-
-            # delta < 0 → refund unused reservation.
-            refund = abs(delta)
-            rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/add_credits"
-            resp = await client.post(
-                rpc_url,
-                json={"p_user_id": task.user_id, "p_credits": refund},
-                headers=headers,
-            )
-            task.credits_settled = True
-            if resp.status_code in (200, 204):
-                logger.info(
-                    "agent_credits_settle_refund_ok",
-                    task_id=task.id,
-                    user_id=task.user_id,
-                    reserved=task.reserved_credits,
-                    final_tokens=final_tokens,
-                    refunded=refund,
-                )
             else:
-                logger.error(
-                    "agent_credits_settle_refund_failed",
-                    task_id=task.id,
-                    user_id=task.user_id,
-                    reserved=task.reserved_credits,
-                    final_tokens=final_tokens,
-                    refund=refund,
-                    status=resp.status_code,
+                # delta < 0 → refund unused reservation.
+                refund = abs(delta)
+                rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/add_credits"
+                resp = await client.post(
+                    rpc_url,
+                    json={
+                        "p_user_id": task.user_id,
+                        "p_credits": refund,
+                        "ref_id": ref_id,
+                    },
+                    headers=headers,
                 )
+                task.credits_settled = True
+                if resp.status_code in (200, 204):
+                    rpc_succeeded = True
+                    logger.info(
+                        "agent_credits_settle_refund_ok",
+                        task_id=task.id,
+                        user_id=task.user_id,
+                        reserved=task.reserved_credits,
+                        final_tokens=final_tokens,
+                        refunded=refund,
+                    )
+                else:
+                    logger.error(
+                        "agent_credits_settle_refund_failed",
+                        task_id=task.id,
+                        user_id=task.user_id,
+                        reserved=task.reserved_credits,
+                        final_tokens=final_tokens,
+                        refund=refund,
+                        status=resp.status_code,
+                    )
     except Exception as exc:  # noqa: BLE001
         # Defensive: never let a settlement error bubble out of the finally
         # block in run_task.  Mark settled so we don't loop on a permanently
-        # broken Supabase config.
+        # broken Supabase config.  The agent_settlements row remains with
+        # completed_at IS NULL — operator reconciliation surface.
         task.credits_settled = True
         logger.error(
             "agent_credits_settle_exception",
@@ -504,6 +640,16 @@ async def _settle_agent_credits(task: AgentTask) -> None:
             reserved=task.reserved_credits,
             error=str(exc),
         )
+
+    if db is not None and rpc_succeeded:
+        try:
+            await _mark_settlement_completed(db, task.id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "agent_settlement_mark_completed_failed",
+                task_id=task.id,
+                error=str(exc),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1038,72 +1184,65 @@ async def run_agent_task(
         return task
     finally:
         if is_terminal(task.state):
-            # M-01: settle reserved credits BEFORE the final persist so the
-            # ``credits_settled`` flag (and any post-settlement state) lands
-            # in the same UPSERT.  Wrapped in try/except so a settlement
-            # error never crashes the finally block.
+            # R-01: settlement is now self-idempotent at the DB level via
+            # the ``agent_settlements`` claim row.  A duplicate call (from a
+            # racing stop endpoint, a retried worker, or a stale snapshot)
+            # short-circuits before any ledger RPC fires.  That makes the
+            # elaborate Q-01 finally pre-check (re-read credits_settled and
+            # skip on True) redundant for refund correctness; we keep a
+            # tiny optional fast-path that skips the helper call entirely
+            # when we already know the row is settled, but its failure is
+            # no longer dangerous — the claim-row INSERT will catch a
+            # double settle attempt regardless.
             #
-            # P-01: defense-in-depth — re-read ``credits_settled`` from DB
-            # right before settlement.  If another writer (typically the
-            # stop endpoint) has already finalized this task while we were
-            # running, our in-memory ``task.credits_settled`` may still be
-            # False from the stale snapshot, but the DB row already shows
-            # the refund happened.  Calling ``_settle_agent_credits`` again
-            # would issue a SECOND ``add_credits`` RPC — the exact
-            # double-refund the P-01 fix prevents.
+            # Q-01 CAS still protects the trailing _persist_task from
+            # clobbering finalized state, so we always attempt the persist
+            # too — the CAS guard quietly rejects writes that would
+            # un-finalize the row.
             already_settled_in_db = False
-            db_terminal_state: str | None = None
             try:
                 async with db.acquire() as conn:
-                    final_row = await conn.fetchrow(
-                        "SELECT credits_settled, state FROM agent_tasks "
+                    fast_row = await conn.fetchrow(
+                        "SELECT credits_settled FROM agent_tasks "
                         "WHERE id = $1",
                         task.id,
                     )
-                if final_row is not None:
-                    # asyncpg returns a real Python bool here; use ``is True``
-                    # rather than ``bool(...)`` so a mocked DB in tests can't
-                    # accidentally short-circuit the settlement.
-                    already_settled_in_db = (
-                        final_row["credits_settled"] is True
-                    )
-                    db_terminal_state = final_row["state"]
-            except Exception:  # noqa: BLE001 — defensive
+                if fast_row is not None and fast_row["credits_settled"] is True:
+                    already_settled_in_db = True
+            except Exception:  # noqa: BLE001
+                # The fast-path read failed.  This used to be the R-01
+                # double-refund vector — fail-open into a stale settle.
+                # It is no longer dangerous because
+                # ``_settle_agent_credits`` will claim via
+                # ``agent_settlements`` ON CONFLICT DO NOTHING and
+                # short-circuit if a winner already exists.
                 logger.exception(
-                    "agent_finally_settle_check_failed", task_id=task.id
+                    "agent_finally_fast_path_read_failed", task_id=task.id
                 )
-            if already_settled_in_db:
-                # Q-01 + P-01: another writer (typically the stop endpoint)
-                # has already finalized this row.  Skip BOTH the
-                # ``_settle_agent_credits`` call (P-01: avoid double-refund)
-                # AND the trailing ``_persist_task`` (Q-01: avoid even an
-                # idempotent self-write that could race with another
-                # writer landing between our re-read and our write, and to
-                # avoid leaking the worker's stale ``state`` /
-                # ``spent_usd`` into the canonical DB row).
-                logger.info(
-                    "agent_finally_settle_skipped_already_settled",
-                    task_id=task.id,
-                    db_state=db_terminal_state,
-                    in_memory_state=task.state.value,
-                )
-            else:
+
+            if not already_settled_in_db:
                 try:
-                    await _settle_agent_credits(task)
+                    await _settle_agent_credits(task, db=db)
                 except Exception as _settle_exc:  # noqa: BLE001
                     logger.error(
                         "agent_credits_settle_finally_error",
                         task_id=task.id,
                         error=str(_settle_exc),
                     )
-                try:
-                    # CAS guard inside _persist_task will quietly reject
-                    # this if another writer's finalization is more recent.
-                    await _persist_task(db, task)
-                except Exception:
-                    logger.exception(
-                        "agent_finally_persist_failed", task_id=task.id
-                    )
+            else:
+                logger.info(
+                    "agent_finally_settle_fast_path_skip",
+                    task_id=task.id,
+                )
+
+            try:
+                # CAS guard inside _persist_task will quietly reject this
+                # if another writer's finalization is more recent (Q-01).
+                await _persist_task(db, task)
+            except Exception:
+                logger.exception(
+                    "agent_finally_persist_failed", task_id=task.id
+                )
         # Drop the per-task vault context AND the Redis blob.  This is the
         # only place plaintext can persist server-side, so we delete it as
         # soon as the loop exits regardless of state.

@@ -69,3 +69,25 @@ CREATE TABLE IF NOT EXISTS agent_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_events_task_id ON agent_events(task_id, id);
+
+-- R-01: DB-atomic settlement claim row.  Each agent_task can be settled at
+-- most once; the (task_id) primary key plus INSERT...ON CONFLICT DO NOTHING
+-- enforces this regardless of process-local in-memory flags or any race
+-- between the stop endpoint, the worker's finally block, and a stale
+-- requeue.  A successful Supabase add_credits/deduct_credits RPC stamps
+-- ``completed_at``; if the RPC failed the row remains uncompleted but the
+-- claim is locked, so a retry cannot mint a duplicate refund.  Operators
+-- can reconcile uncompleted rows offline via the partial index below.
+CREATE TABLE IF NOT EXISTS agent_settlements (
+    task_id           UUID PRIMARY KEY REFERENCES agent_tasks(id) ON DELETE CASCADE,
+    user_id           TEXT NOT NULL,
+    reserved_credits  BIGINT NOT NULL,
+    final_credits     BIGINT NOT NULL,
+    delta_credits     BIGINT NOT NULL,
+    ref_id            TEXT NOT NULL,
+    claimed_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at      TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_settlements_completed
+    ON agent_settlements(completed_at) WHERE completed_at IS NULL;
