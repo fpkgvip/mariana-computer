@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useEffect, useId, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
@@ -135,6 +135,25 @@ function CreateSkillModal({
   const [systemPrompt, setSystemPrompt] = useState("");
   const [keywords, setKeywords] = useState("");
   const [saving, setSaving] = useState(false);
+  // Stable ids for aria-labelledby + every form label → input pairing.
+  // useId is React 18’s SSR-safe primitive; we keep one base id and derive
+  // suffixed ids per field below so axe/screen-reader navigation is clean.
+  const titleId = useId();
+  const nameId = useId();
+  const descId = useId();
+  const promptId = useId();
+  const keywordsId = useId();
+
+  // Escape closes the modal. Mounted only when the modal is open so we
+  // don’t intercept Escape elsewhere on the page.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
 
   if (!open) return null;
 
@@ -192,22 +211,42 @@ function CreateSkillModal({
 
   return (
     <>
-      <div className="fixed inset-0 z-50 bg-black/50" onClick={onClose} />
-      <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div
+        className="fixed inset-0 z-50 bg-black/50"
+        onClick={onClose}
+        aria-hidden="true"
+      />
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      >
         <div className="w-full max-w-lg rounded-lg border border-border bg-card p-6 shadow-xl">
           <div className="flex items-center justify-between mb-4">
-            <h3 className="text-base font-semibold text-foreground">
+            <h3 id={titleId} className="text-base font-semibold text-foreground">
               Create Custom Skill
             </h3>
-            <button onClick={onClose} className="text-muted-foreground hover:text-foreground">
-              <X size={16} />
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close dialog"
+              className="rounded-md text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-card"
+            >
+              <X size={16} aria-hidden="true" />
             </button>
           </div>
 
           <div className="space-y-4">
             <div>
-              <label className="block text-xs font-medium text-muted-foreground mb-1">Name</label>
+              <label
+                htmlFor={nameId}
+                className="block text-xs font-medium text-muted-foreground mb-1"
+              >
+                Name
+              </label>
               <input
+                id={nameId}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-primary focus:outline-none"
@@ -215,8 +254,14 @@ function CreateSkillModal({
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-muted-foreground mb-1">Description</label>
+              <label
+                htmlFor={descId}
+                className="block text-xs font-medium text-muted-foreground mb-1"
+              >
+                Description
+              </label>
               <input
+                id={descId}
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-primary focus:outline-none"
@@ -224,22 +269,30 @@ function CreateSkillModal({
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-muted-foreground mb-1">
+              <label
+                htmlFor={promptId}
+                className="block text-xs font-medium text-muted-foreground mb-1"
+              >
                 System Prompt <span className="text-muted-foreground/50">(optional)</span>
               </label>
               <textarea
+                id={promptId}
                 value={systemPrompt}
                 onChange={(e) => setSystemPrompt(e.target.value)}
                 rows={3}
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-primary focus:outline-none resize-none"
-                placeholder="Instructions for Deft when this skill is active..."
+                placeholder="Instructions for Deft when this skill is active…"
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-muted-foreground mb-1">
+              <label
+                htmlFor={keywordsId}
+                className="block text-xs font-medium text-muted-foreground mb-1"
+              >
                 Trigger Keywords <span className="text-muted-foreground/50">(comma-separated)</span>
               </label>
               <input
+                id={keywordsId}
                 value={keywords}
                 onChange={(e) => setKeywords(e.target.value)}
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-primary focus:outline-none"
@@ -250,17 +303,23 @@ function CreateSkillModal({
 
           <div className="mt-6 flex justify-end gap-2">
             <button
+              type="button"
               onClick={onClose}
-              className="rounded-md border border-border px-3 py-1.5 text-xs text-foreground hover:bg-secondary transition-colors"
+              className="rounded-md border border-border px-3 py-1.5 text-xs text-foreground transition-colors hover:bg-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-card"
             >
               Cancel
             </button>
             <button
+              type="button"
               onClick={handleCreate}
               disabled={saving || !name.trim()}
-              className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
+              className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-card"
             >
-              {saving ? <Loader2 size={12} className="animate-spin" /> : "Create Skill"}
+              {saving ? (
+                <Loader2 size={12} className="animate-spin" aria-hidden="true" />
+              ) : (
+                "Create Skill"
+              )}
             </button>
           </div>
         </div>

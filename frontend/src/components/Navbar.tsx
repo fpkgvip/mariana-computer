@@ -161,16 +161,20 @@ export function Navbar() {
 
         {/* Mobile toggle */}
         <button
+          type="button"
           onClick={() => setMobileOpen(!mobileOpen)}
-          className="text-foreground md:hidden"
-          aria-label="Toggle menu"
+          className="rounded-md text-foreground transition-colors md:hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+          aria-label={mobileOpen ? "Close menu" : "Open menu"}
+          aria-expanded={mobileOpen}
+          aria-controls="navbar-mobile-menu"
         >
-          {mobileOpen ? <X size={20} /> : <Menu size={20} />}
+          {mobileOpen ? <X size={20} aria-hidden="true" /> : <Menu size={20} aria-hidden="true" />}
         </button>
       </div>
 
       {/* Mobile menu */}
       <div
+        id="navbar-mobile-menu"
         className={`overflow-hidden transition-all duration-300 md:hidden ${
           mobileOpen ? "max-h-[28rem] border-t border-border" : "max-h-0"
         }`}
