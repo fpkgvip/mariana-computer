@@ -109,17 +109,37 @@ def _valid_user_id(uid: str) -> bool:
 def _safe_workspace_path(user_id: str, rel_path: str) -> pathlib.Path:
     """Return absolute path under WORKSPACE_ROOT/{user_id}, refusing traversal."""
     if not _valid_user_id(user_id):
-        raise HTTPException(400, f"invalid user_id: {user_id!r}")
+        log.warning(
+            "sandbox_invalid_user_id",
+            extra={"reason": "invalid_user_id", "user_id": user_id},
+        )
+        raise HTTPException(400, "invalid path")
     rel = rel_path.lstrip("/").replace("\\", "/")
     if not rel:
-        raise HTTPException(400, "empty path")
+        log.warning(
+            "sandbox_empty_path",
+            extra={"reason": "empty_path", "user_id": user_id},
+        )
+        raise HTTPException(400, "invalid path")
     # Reject absolute paths, traversal, null bytes
     if "\x00" in rel or ".." in rel.split("/"):
-        raise HTTPException(400, f"invalid path: {rel_path!r}")
+        log.warning(
+            "sandbox_path_traversal",
+            extra={"reason": "path_traversal", "user_id": user_id, "rel_path": rel_path},
+        )
+        raise HTTPException(400, "invalid path")
     # Every component must match the whitelist (tight but permissive enough).
     for comp in rel.split("/"):
         if comp in ("", ".") or not _PATH_COMPONENT_RE.match(comp):
-            raise HTTPException(400, f"invalid path component: {comp!r}")
+            log.warning(
+                "sandbox_invalid_path_component",
+                extra={
+                    "reason": "invalid_path_component",
+                    "user_id": user_id,
+                    "component": comp,
+                },
+            )
+            raise HTTPException(400, "invalid path")
     user_root = (WORKSPACE_ROOT / user_id).resolve()
     user_root.mkdir(parents=True, exist_ok=True)
     # Ensure ownership is correct every time (cheap, idempotent).
@@ -130,7 +150,15 @@ def _safe_workspace_path(user_id: str, rel_path: str) -> pathlib.Path:
     try:
         candidate.relative_to(user_root)
     except ValueError as exc:
-        raise HTTPException(400, f"path escapes workspace: {rel_path!r}") from exc
+        log.warning(
+            "sandbox_path_escape",
+            extra={
+                "reason": "path_escape",
+                "user_id": user_id,
+                "rel_path": rel_path,
+            },
+        )
+        raise HTTPException(400, "invalid path") from exc
     return candidate
 
 
@@ -664,10 +692,24 @@ class FsDeleteRequest(BaseModel):
 async def fs_read(req: FsReadRequest) -> dict[str, Any]:
     p = _safe_workspace_path(req.user_id, req.path)
     if not p.is_file():
-        raise HTTPException(404, f"not a file: {req.path}")
+        log.info(
+            "sandbox_fs_read_not_a_file",
+            extra={"reason": "not_a_file", "user_id": req.user_id, "path": req.path},
+        )
+        raise HTTPException(404, "invalid request")
     size = p.stat().st_size
     if size > req.max_bytes:
-        raise HTTPException(413, f"file too large: {size} > {req.max_bytes}")
+        log.info(
+            "sandbox_fs_read_too_large",
+            extra={
+                "reason": "file_too_large",
+                "user_id": req.user_id,
+                "path": req.path,
+                "size": size,
+                "max_bytes": req.max_bytes,
+            },
+        )
+        raise HTTPException(413, "invalid request")
     raw = p.read_bytes()
     if req.binary:
         return {"path": req.path, "size": size, "binary": True,
@@ -685,13 +727,25 @@ async def fs_read(req: FsReadRequest) -> dict[str, Any]:
 async def fs_write(req: FsWriteRequest) -> dict[str, Any]:
     p = _safe_workspace_path(req.user_id, req.path)
     if p.exists() and not req.overwrite:
-        raise HTTPException(409, f"file exists: {req.path}")
+        log.info(
+            "sandbox_fs_write_exists",
+            extra={"reason": "file_exists", "user_id": req.user_id, "path": req.path},
+        )
+        raise HTTPException(409, "invalid request")
     p.parent.mkdir(parents=True, exist_ok=True)
     if req.binary:
         try:
             data = base64.b64decode(req.content, validate=True)
         except Exception as exc:
-            raise HTTPException(400, f"invalid base64: {exc}") from exc
+            log.warning(
+                "sandbox_fs_write_invalid_base64",
+                extra={
+                    "reason": "invalid_base64",
+                    "user_id": req.user_id,
+                    "detail": str(exc),
+                },
+            )
+            raise HTTPException(400, "invalid request") from exc
         p.write_bytes(data)
     else:
         p.write_text(req.content, encoding="utf-8")
@@ -704,7 +758,11 @@ async def fs_write(req: FsWriteRequest) -> dict[str, Any]:
 async def fs_list(req: FsListRequest) -> dict[str, Any]:
     user_root = (WORKSPACE_ROOT / req.user_id).resolve()
     if not _valid_user_id(req.user_id):
-        raise HTTPException(400, f"invalid user_id: {req.user_id}")
+        log.warning(
+            "sandbox_fs_list_invalid_user_id",
+            extra={"reason": "invalid_user_id", "user_id": req.user_id},
+        )
+        raise HTTPException(400, "invalid request")
     user_root.mkdir(parents=True, exist_ok=True)
     base = user_root if not req.path else _safe_workspace_path(req.user_id, req.path)
     if base.is_file():
@@ -731,12 +789,24 @@ async def fs_list(req: FsListRequest) -> dict[str, Any]:
 async def fs_delete(req: FsDeleteRequest) -> dict[str, Any]:
     p = _safe_workspace_path(req.user_id, req.path)
     if not p.exists():
-        raise HTTPException(404, f"not found: {req.path}")
+        log.info(
+            "sandbox_fs_delete_not_found",
+            extra={"reason": "not_found", "user_id": req.user_id, "path": req.path},
+        )
+        raise HTTPException(404, "operation failed")
     if p.is_dir():
         try:
             p.rmdir()
         except OSError as exc:
-            raise HTTPException(400, f"directory not empty: {exc}") from exc
+            log.exception(
+                "sandbox_fs_delete_rmdir_failed",
+                extra={
+                    "reason": "rmdir_failed",
+                    "user_id": req.user_id,
+                    "path": req.path,
+                },
+            )
+            raise HTTPException(400, "operation failed") from exc
     else:
         p.unlink()
     return {"path": req.path, "deleted": True}
