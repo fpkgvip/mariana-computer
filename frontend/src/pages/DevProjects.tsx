@@ -78,14 +78,9 @@ const MOCK_TASKS: ProjectRowData[] = [
 ];
 
 export default function DevProjects() {
-  if (!import.meta.env.DEV) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-background text-foreground">
-        <p className="text-sm text-muted-foreground">Dev preview disabled in production.</p>
-      </div>
-    );
-  }
-
+  // Hooks must run unconditionally on every render (rules-of-hooks).
+  // The DEV-only gate below only suppresses the rendered JSX.
+  const isDev = import.meta.env.DEV;
   const [params, setParams] = useSearchParams();
   const mode = (params.get("mode") as Mode | null) ?? "default";
 
@@ -122,6 +117,14 @@ export default function DevProjects() {
     ],
     [],
   );
+
+  if (!isDev) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background text-foreground">
+        <p className="text-sm text-muted-foreground">Dev preview disabled in production.</p>
+      </div>
+    );
+  }
 
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">

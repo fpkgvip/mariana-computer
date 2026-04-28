@@ -130,17 +130,15 @@ jobs:
 
   # -------------------------------------------------------------------
   # Frontend lint — eslint via the existing ``npm run lint`` script.
-  # Marked advisory (continue-on-error: true) because the repo currently
-  # carries 13 pre-existing react-hooks errors that pre-date this CI
-  # setup; flipping the gate to required would block all PRs until
-  # those are remediated separately.  The job still surfaces new
-  # regressions so reviewers can see lint deltas in the run summary.
+  # Required gate: the 13 pre-existing react-hooks errors flagged at
+  # CI rollout were remediated in the same Phase D follow-up that
+  # promoted this job from advisory to required.  New PRs that
+  # reintroduce a hooks-rule violation fail closed.
   # -------------------------------------------------------------------
   frontend-lint:
-    name: Frontend lint (eslint, advisory)
+    name: Frontend lint (eslint)
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true
 
     defaults:
       run:

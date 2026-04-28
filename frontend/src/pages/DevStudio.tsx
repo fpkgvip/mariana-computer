@@ -7,7 +7,7 @@
  *
  * Use ?mode=idle | live | empty to switch states.
  */
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Navbar } from "@/components/Navbar";
 import { Coins, Plus, Search } from "lucide-react";
@@ -82,23 +82,21 @@ const MOCK_EVENTS: AgentEvent[] = [
 ] as any[];
 
 export default function DevStudio() {
-  if (!import.meta.env.DEV) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-background text-foreground">
-        <p className="text-sm text-muted-foreground">Dev preview disabled in production.</p>
-      </div>
-    );
-  }
-
+  // Hooks must run unconditionally on every render (rules-of-hooks).
+  // The DEV-only gate below only suppresses the rendered JSX.
+  const isDev = import.meta.env.DEV;
   const [params, setParams] = useSearchParams();
   const mode = (params.get("mode") as Mode | null) ?? "idle";
   const [draftPrompt, setDraftPrompt] = useState("");
 
-  const goto = (m: Mode) => {
-    const next = new URLSearchParams(params);
-    next.set("mode", m);
-    setParams(next, { replace: true });
-  };
+  const goto = useCallback(
+    (m: Mode) => {
+      const next = new URLSearchParams(params);
+      next.set("mode", m);
+      setParams(next, { replace: true });
+    },
+    [params, setParams],
+  );
 
   const noopStart = async (_p: { tier: ModelTier; ceiling: number; quote: QuoteResponse }) => {
     void _p;
@@ -132,7 +130,7 @@ export default function DevStudio() {
       title: "",
       stage: "idle" as const,
     };
-  }, [mode]);
+  }, [mode, goto]);
 
   const doneTask: AgentTaskState = useMemo(
     () => ({
@@ -147,6 +145,14 @@ export default function DevStudio() {
     }),
     [],
   );
+
+  if (!isDev) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background text-foreground">
+        <p className="text-sm text-muted-foreground">Dev preview disabled in production.</p>
+      </div>
+    );
+  }
 
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">

@@ -24,7 +24,7 @@ a second push to the same PR cancels the in-flight run.
 |-----|-----------|----------------|
 | `backend-tests` | yes | pytest against postgres:16 + redis:7 service containers, with the full schema baseline pre-applied. Baseline 406 passing / 13 skipped / 0 failed. |
 | `frontend-tests` | yes | vitest against `frontend/`. Baseline 144 passing. |
-| `frontend-lint` | advisory | eslint via `npm run lint`. Marked `continue-on-error: true` because the repo currently carries 13 pre-existing react-hooks errors that pre-date this CI setup. The job still surfaces new lint regressions in the run summary; once the existing errors are remediated, flip the gate to required by removing `continue-on-error`. |
+| `frontend-lint` | yes | eslint via `npm run lint`. The 13 pre-existing react-hooks errors flagged at CI rollout were remediated in the same Phase D follow-up that promoted this job from advisory to required. |
 | `frontend-typecheck` | yes | `npx tsc --noEmit -p tsconfig.json`. Currently passes clean. |
 | `frontend-build` | yes | `npm run build` (vite production bundle). |
 | `sql-lint` | yes | `.github/scripts/check_migration_pairs.sh` — every forward migration `NNN_*.sql` (revision >= 004) must have a paired `NNN_revert.sql` (or `NNN_<name>_revert.sql`). Y-02 convention. |
