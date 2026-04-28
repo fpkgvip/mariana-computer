@@ -834,6 +834,57 @@ async def _run_agent_queue_daemon(db: Any, redis_client: Any) -> None:
     logger.info("agent_queue_stopped")
 
 
+# ---------------------------------------------------------------------------
+# S-03: agent_settlements reconciler loop
+# ---------------------------------------------------------------------------
+
+_SETTLEMENT_RECONCILE_INTERVAL_S = int(
+    os.getenv("AGENT_SETTLEMENT_RECONCILE_INTERVAL_S", "60")
+)
+_SETTLEMENT_RECONCILE_MAX_AGE_S = int(
+    os.getenv("AGENT_SETTLEMENT_RECONCILE_MAX_AGE_S", "300")
+)
+_SETTLEMENT_RECONCILE_BATCH_SIZE = int(
+    os.getenv("AGENT_SETTLEMENT_RECONCILE_BATCH_SIZE", "50")
+)
+
+
+async def _run_settlement_reconciler_loop(db: Any) -> None:
+    """Periodically run :func:`reconcile_pending_settlements` so any
+    ``agent_settlements`` claim with ``completed_at IS NULL`` older than
+    ``AGENT_SETTLEMENT_RECONCILE_MAX_AGE_S`` (default 5 min) gets retried.
+
+    Runs on a fixed cadence regardless of whether the previous iteration
+    found work; the underlying SELECT is cheap because of the partial
+    index on ``completed_at IS NULL``.
+    """
+    from mariana.agent.settlement_reconciler import (  # noqa: PLC0415
+        reconcile_pending_settlements,
+    )
+
+    logger.info(
+        "settlement_reconciler_start",
+        interval_s=_SETTLEMENT_RECONCILE_INTERVAL_S,
+        max_age_s=_SETTLEMENT_RECONCILE_MAX_AGE_S,
+        batch_size=_SETTLEMENT_RECONCILE_BATCH_SIZE,
+    )
+    while True:
+        try:
+            await reconcile_pending_settlements(
+                db,
+                max_age_seconds=_SETTLEMENT_RECONCILE_MAX_AGE_S,
+                batch_size=_SETTLEMENT_RECONCILE_BATCH_SIZE,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "settlement_reconciler_iteration_failed",
+                error=str(exc),
+            )
+        await asyncio.sleep(_SETTLEMENT_RECONCILE_INTERVAL_S)
+
+
 async def _run_daemon(config: Config, db: Any, redis_client: Any) -> None:
     """
     Poll an inbox directory for ``.task.json`` files and run investigations.
@@ -1221,8 +1272,12 @@ async def _async_main() -> int:  # noqa: PLR0912  (many branches by design)
                 _run_agent_queue_daemon(db=db, redis_client=redis_client),
                 name="agent-queue",
             )
+            settlement_reconciler_task = asyncio.create_task(
+                _run_settlement_reconciler_loop(db=db),
+                name="settlement-reconciler",
+            )
             done, pending = await asyncio.wait(
-                {research_task, agent_task},
+                {research_task, agent_task, settlement_reconciler_task},
                 return_when=asyncio.FIRST_EXCEPTION,
             )
             for p in pending:

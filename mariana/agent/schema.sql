@@ -78,16 +78,41 @@ CREATE INDEX IF NOT EXISTS idx_agent_events_task_id ON agent_events(task_id, id)
 -- ``completed_at``; if the RPC failed the row remains uncompleted but the
 -- claim is locked, so a retry cannot mint a duplicate refund.  Operators
 -- can reconcile uncompleted rows offline via the partial index below.
+-- S-04: ON DELETE RESTRICT keeps settlement history immutable across task
+-- UUID reuse (admin tooling, fixture reset, B-tree rebuild).  Operators
+-- must explicitly drop the agent_settlements row before deleting the task.
+-- S-02: CHECK (>= 0) on the credit columns is defense-in-depth against a
+-- future caller persisting negative values.  delta_credits stays signed
+-- (deliberately positive for overruns and negative for refunds).
 CREATE TABLE IF NOT EXISTS agent_settlements (
-    task_id           UUID PRIMARY KEY REFERENCES agent_tasks(id) ON DELETE CASCADE,
+    task_id           UUID PRIMARY KEY REFERENCES agent_tasks(id) ON DELETE RESTRICT,
     user_id           TEXT NOT NULL,
-    reserved_credits  BIGINT NOT NULL,
-    final_credits     BIGINT NOT NULL,
+    reserved_credits  BIGINT NOT NULL CHECK (reserved_credits >= 0),
+    final_credits     BIGINT NOT NULL CHECK (final_credits >= 0),
     delta_credits     BIGINT NOT NULL,
     ref_id            TEXT NOT NULL,
     claimed_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at      TIMESTAMPTZ
 );
+
+-- S-02 / S-04: idempotent backfill for already-existing deployments where
+-- the table was created with the older constraint set.  Drop-then-add
+-- under IF EXISTS so a fresh database is unaffected.
+ALTER TABLE agent_settlements
+    DROP CONSTRAINT IF EXISTS agent_settlements_reserved_credits_check;
+ALTER TABLE agent_settlements
+    ADD CONSTRAINT agent_settlements_reserved_credits_check
+        CHECK (reserved_credits >= 0);
+ALTER TABLE agent_settlements
+    DROP CONSTRAINT IF EXISTS agent_settlements_final_credits_check;
+ALTER TABLE agent_settlements
+    ADD CONSTRAINT agent_settlements_final_credits_check
+        CHECK (final_credits >= 0);
+ALTER TABLE agent_settlements
+    DROP CONSTRAINT IF EXISTS agent_settlements_task_id_fkey;
+ALTER TABLE agent_settlements
+    ADD CONSTRAINT agent_settlements_task_id_fkey
+        FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE RESTRICT;
 
 CREATE INDEX IF NOT EXISTS idx_agent_settlements_completed
     ON agent_settlements(completed_at) WHERE completed_at IS NULL;

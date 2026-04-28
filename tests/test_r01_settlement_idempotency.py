@@ -302,7 +302,15 @@ async def test_r01_finally_fetch_failure_does_not_double_refund():
 async def test_r01_settlement_table_records_outcome():
     """After successful settle, the claim row has completed_at NOT NULL,
     delta_credits, ref_id.  After RPC failure, completed_at IS NULL but the
-    row still locks the claim."""
+    row still locks the claim.
+
+    S-01 contract update (2026-04-28): on RPC failure, ``credits_settled``
+    now stays False so the S-03 reconciler can retry the same code path.
+    The R-01-original assertion that ``credits_settled is True`` after a
+    500 was the root cause of S-01: it permanently stranded uncompleted
+    claims by short-circuiting every retry on the in-memory flag.
+    Updated to assert ``credits_settled is False`` per the S-01 fix
+    (loop.py: only set the flag together with the completed_at stamp)."""
     import httpx  # noqa: PLC0415
 
     from mariana import api as api_mod  # noqa: PLC0415
@@ -362,9 +370,11 @@ async def test_r01_settlement_table_records_outcome():
         assert row_fail["completed_at"] is None, (
             "completed_at must remain NULL when the RPC did not succeed"
         )
-        # The in-memory flag must still be True so the CAS guard accepts
-        # the trailing _persist_task and a retry doesn't re-mint credits.
-        assert fail_task.credits_settled is True
+        # S-01 fix: on RPC failure, credits_settled MUST stay False so the
+        # reconciler (S-03) can retry the settlement.  The DB-level claim
+        # row + ref_id is the canonical idempotency anchor; the in-memory
+        # flag is a co-witness that only flips together with completed_at.
+        assert fail_task.credits_settled is False
     finally:
         await pool.close()
 

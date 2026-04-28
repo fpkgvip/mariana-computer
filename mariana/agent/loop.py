@@ -432,25 +432,22 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
     * ``delta < 0``  → reservation exceeded actual cost → refund the unused
       portion via the ``add_credits`` RPC.
 
-    R-01: when ``db`` is provided, settlement idempotency is enforced by an
-    atomic INSERT...ON CONFLICT DO NOTHING into ``agent_settlements`` BEFORE
-    any ledger RPC fires.  A second caller (typical race: stop endpoint +
-    worker finally) observes the existing claim row and short-circuits
-    without minting a duplicate refund — even if the in-memory
-    ``credits_settled`` flag is False (stale snapshot) or the Q-01 finally
-    fetchrow guard raised.  When ``db`` is omitted (legacy unit-test
-    callers), the function falls back to the older in-memory flag-based
-    idempotency.
+    S-01: the RPC payloads must match the live PostgREST function signatures
+    exactly — ``add_credits(p_user_id uuid, p_credits integer)`` and
+    ``deduct_credits(target_user_id uuid, amount integer)``.  An earlier
+    revision sent an extra ``ref_id`` JSON key and PostgREST rejected every
+    call with PGRST202 / HTTP 404, silently leaking refunds.  The ``ref_id``
+    string is still computed and used as the ``agent_settlements`` claim-row
+    idempotency key — it just must not be sent to PostgREST.
 
-    The function always sets ``credits_settled = True`` once it has
-    attempted a reconciliation, even if the RPC call returned a non-2xx
-    status — this is what makes the helper safe to call from a retried
-    orchestrator pass without double-charging or double-refunding, and what
-    keeps the Q-01 CAS guard willing to accept the trailing
-    ``_persist_task``.  Errors are logged with ``agent_credits_settle_*``
-    keys for ops-time investigation.  The ``agent_settlements`` row
-    additionally records ``completed_at`` on RPC success and stays
-    uncompleted on RPC failure for offline reconciliation.
+    S-01 retry contract: an existing claim row is the canonical idempotency
+    anchor.  We look it up FIRST.  If it exists with ``completed_at IS NOT
+    NULL`` we are already settled — flip the in-memory flag and return.
+    If it exists with ``completed_at IS NULL`` we retry the RPC.  If absent,
+    we insert it (race-safe via ON CONFLICT DO NOTHING) and then issue the
+    RPC.  ``task.credits_settled`` only flips to True on RPC 2xx OR
+    pre-completed claim — RPC failure leaves the row in flight for the
+    background reconciler (S-03).
 
     Late imports avoid the api.py ↔ agent.loop circular import.
     """
@@ -482,51 +479,100 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
     delta = final_tokens - task.reserved_credits
     ref_id = f"agent_settle:{task.id}"
 
-    # R-01: claim row first.  If a prior caller already won the claim, we
-    # short-circuit before issuing any RPC.  The claim records the
-    # delta_credits we computed so an offline reconciler can spot a stale
-    # snapshot writing nonsense.
+    # S-01: existing-claim lookup is the entry point.  This replaces the
+    # prior "insert then short-circuit on lost-race" pattern, which
+    # mistakenly conflated "another writer claimed" with "already settled"
+    # and stranded uncompleted claims after RPC failures.
+    existing_claim: Any = None
     if db is not None:
         try:
-            won = await _claim_settlement(
-                db,
-                task_id=task.id,
-                user_id=task.user_id,
-                reserved_credits=task.reserved_credits,
-                final_credits=final_tokens,
-                delta_credits=delta,
-                ref_id=ref_id,
-            )
+            async with db.acquire() as conn:
+                existing_claim = await conn.fetchrow(
+                    "SELECT delta_credits, completed_at "
+                    "FROM agent_settlements WHERE task_id = $1",
+                    task.id,
+                )
         except Exception as exc:  # noqa: BLE001 — defensive
-            # If the claim INSERT itself errored, fail closed: do NOT issue
-            # a ledger RPC.  Mark in-memory settled so the trailing
-            # _persist_task can still land via the Q-01 CAS path; the
-            # absence of a claim row signals "unsettled" to operators.
-            task.credits_settled = True
+            # Read failure: do not issue any RPC blindly.  Leave
+            # credits_settled as-is so the next pass / reconciler retries.
             logger.error(
-                "agent_credits_settle_claim_error",
+                "agent_credits_settle_claim_lookup_failed",
                 task_id=task.id,
-                user_id=task.user_id,
-                reserved=task.reserved_credits,
                 error=str(exc),
             )
             return
-        if not won:
-            # Another writer has already claimed settlement for this task.
-            # The claim row + ref_id at the ledger provide defense-in-depth;
-            # we must NOT call the RPC.
+
+        if existing_claim is not None and existing_claim["completed_at"] is not None:
+            # Already settled — set the in-memory flag and short-circuit.
             task.credits_settled = True
             logger.info(
-                "agent_settlement_already_claimed",
+                "agent_credits_settle_already_completed",
                 task_id=task.id,
                 user_id=task.user_id,
-                reserved=task.reserved_credits,
-                final_tokens=final_tokens,
-                delta=delta,
             )
             return
 
+        if existing_claim is None:
+            # First-time claim.  Use the same INSERT...ON CONFLICT DO NOTHING
+            # idempotency the R-01 fix introduced; if we lose the race to
+            # another writer we re-fetch and decide based on completed_at.
+            try:
+                won = await _claim_settlement(
+                    db,
+                    task_id=task.id,
+                    user_id=task.user_id,
+                    reserved_credits=task.reserved_credits,
+                    final_credits=final_tokens,
+                    delta_credits=delta,
+                    ref_id=ref_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.error(
+                    "agent_credits_settle_claim_error",
+                    task_id=task.id,
+                    user_id=task.user_id,
+                    reserved=task.reserved_credits,
+                    error=str(exc),
+                )
+                return
+            if not won:
+                # Lost the race — re-fetch and treat as a retry against the
+                # row another caller just inserted.
+                try:
+                    async with db.acquire() as conn:
+                        existing_claim = await conn.fetchrow(
+                            "SELECT delta_credits, completed_at "
+                            "FROM agent_settlements WHERE task_id = $1",
+                            task.id,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "agent_credits_settle_claim_refetch_failed",
+                        task_id=task.id,
+                        error=str(exc),
+                    )
+                    return
+                if existing_claim is not None and existing_claim["completed_at"] is not None:
+                    task.credits_settled = True
+                    logger.info(
+                        "agent_credits_settle_already_completed_after_race",
+                        task_id=task.id,
+                    )
+                    return
+                # Race winner is still working — exit gracefully.  Either
+                # they will succeed or the reconciler picks the row up.
+                logger.info(
+                    "agent_credits_settle_claim_lost",
+                    task_id=task.id,
+                    user_id=task.user_id,
+                )
+                return
+        # else: existing_claim with completed_at IS NULL → fall through to retry RPC.
+
     if delta == 0:
+        # No RPC needed.  Stamp completed_at inline so the reconciler doesn't
+        # pick this up.  When db is None (legacy unit tests), just flip the
+        # in-memory flag.
         task.credits_settled = True
         if db is not None:
             try:
@@ -558,21 +604,17 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
         async with httpx.AsyncClient(timeout=10.0) as client:
             if delta > 0:
                 # User spent more than reserved → take the overrun.
+                # S-01: payload keys MUST match the live function signature
+                # ``deduct_credits(target_user_id uuid, amount integer)``.
                 rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/deduct_credits"
                 resp = await client.post(
                     rpc_url,
                     json={
                         "target_user_id": task.user_id,
                         "amount": delta,
-                        "ref_id": ref_id,
                     },
                     headers=headers,
                 )
-                # Set the flag regardless of HTTP outcome so a retry of the
-                # finally block can't double-charge.  A logged failure here
-                # is reconciled offline via the agent_settlements partial
-                # index on completed_at IS NULL.
-                task.credits_settled = True
                 if resp.status_code in (200, 204):
                     rpc_succeeded = True
                     logger.info(
@@ -592,9 +634,12 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
                         final_tokens=final_tokens,
                         extra=delta,
                         status=resp.status_code,
+                        body=getattr(resp, "text", "")[:500],
                     )
             else:
                 # delta < 0 → refund unused reservation.
+                # S-01: payload keys MUST match
+                # ``add_credits(p_user_id uuid, p_credits integer)``.
                 refund = abs(delta)
                 rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/add_credits"
                 resp = await client.post(
@@ -602,11 +647,9 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
                     json={
                         "p_user_id": task.user_id,
                         "p_credits": refund,
-                        "ref_id": ref_id,
                     },
                     headers=headers,
                 )
-                task.credits_settled = True
                 if resp.status_code in (200, 204):
                     rpc_succeeded = True
                     logger.info(
@@ -626,13 +669,13 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
                         final_tokens=final_tokens,
                         refund=refund,
                         status=resp.status_code,
+                        body=getattr(resp, "text", "")[:500],
                     )
     except Exception as exc:  # noqa: BLE001
         # Defensive: never let a settlement error bubble out of the finally
-        # block in run_task.  Mark settled so we don't loop on a permanently
-        # broken Supabase config.  The agent_settlements row remains with
-        # completed_at IS NULL — operator reconciliation surface.
-        task.credits_settled = True
+        # block in run_task.  S-01: leave credits_settled False so the
+        # reconciler retries; the claim row stays with completed_at IS NULL
+        # which is the reconciler's pick-up signal.
         logger.error(
             "agent_credits_settle_exception",
             task_id=task.id,
@@ -641,15 +684,19 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
             error=str(exc),
         )
 
-    if db is not None and rpc_succeeded:
-        try:
-            await _mark_settlement_completed(db, task.id)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "agent_settlement_mark_completed_failed",
-                task_id=task.id,
-                error=str(exc),
-            )
+    # S-01: the in-memory flag and the completed_at stamp move TOGETHER on
+    # RPC success.  On failure both stay unset and the reconciler retries.
+    if rpc_succeeded:
+        task.credits_settled = True
+        if db is not None:
+            try:
+                await _mark_settlement_completed(db, task.id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent_settlement_mark_completed_failed",
+                    task_id=task.id,
+                    error=str(exc),
+                )
 
 
 # ---------------------------------------------------------------------------
