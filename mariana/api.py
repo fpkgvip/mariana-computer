@@ -137,7 +137,6 @@ _VERSION = "0.1.0"
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID", "")
 
 
-_ADMIN_ROLE_CACHE: dict[str, tuple[float, bool]] = {}
 # B-20 fix: Positive caching dropped entirely — stale positive decisions after
 # role revocation allowed revoked admins to keep calling admin endpoints for up
 # to 30 s.  Negative results (non-admin) are still cached briefly (5 s) to
@@ -145,6 +144,74 @@ _ADMIN_ROLE_CACHE: dict[str, tuple[float, bool]] = {}
 # a fresh DB check on every request.  This is the lowest-risk fix: only
 # negative-cache entries use the TTL; positive-cache entries are never stored.
 _ADMIN_ROLE_CACHE_NEGATIVE_TTL = 5.0  # seconds — safe to cache negatives
+# CC-30 fix: bound the cache size so an attacker who can make authenticated
+# requests with many distinct random ``user_id`` values cannot grow this dict
+# indefinitely.  10_000 entries x ~80 bytes ≈ 800 kB ceiling.  When at
+# capacity, the oldest insertion is evicted (FIFO via OrderedDict).  TTL is
+# still applied on read so an entry older than the negative TTL returns None.
+_ADMIN_ROLE_CACHE_MAX_ENTRIES = 10_000
+
+
+class _BoundedTTLCache:
+    """Hand-rolled bounded TTL cache for ``_ADMIN_ROLE_CACHE``.
+
+    Mirrors the dict subset previously used by :func:`_is_admin_user` and
+    :func:`_clear_admin_cache`: ``get(key)`` returns the cached
+    ``(inserted_at, value)`` tuple or ``None``; ``__setitem__`` inserts /
+    refreshes; ``pop(key, default)`` removes; ``clear()`` empties the cache
+    (used by tests).  TTL is enforced inside ``get``: an entry older than
+    ``ttl`` is evicted and ``None`` returned.  Eviction on overflow is FIFO
+    (insertion order) via ``OrderedDict``.
+    """
+
+    __slots__ = ("_max", "_ttl", "_data")
+
+    def __init__(self, maxsize: int, ttl: float) -> None:
+        from collections import OrderedDict
+
+        self._max = maxsize
+        self._ttl = ttl
+        self._data: OrderedDict[str, tuple[float, bool]] = OrderedDict()
+
+    def get(self, key: str) -> tuple[float, bool] | None:
+        entry = self._data.get(key)
+        if entry is None:
+            return None
+        inserted_at, _ = entry
+        import time as _time
+
+        if _time.time() - inserted_at >= self._ttl:
+            # Expired — evict and report miss so the caller refreshes.
+            self._data.pop(key, None)
+            return None
+        return entry
+
+    def __setitem__(self, key: str, value: tuple[float, bool]) -> None:
+        # Refresh insertion order so a re-set bumps the entry.
+        if key in self._data:
+            self._data.move_to_end(key, last=True)
+        self._data[key] = value
+        # FIFO eviction when over capacity.
+        while len(self._data) > self._max:
+            self._data.popitem(last=False)
+
+    def pop(self, key: str, default=None):
+        return self._data.pop(key, default)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
+
+
+_ADMIN_ROLE_CACHE: _BoundedTTLCache = _BoundedTTLCache(
+    maxsize=_ADMIN_ROLE_CACHE_MAX_ENTRIES,
+    ttl=_ADMIN_ROLE_CACHE_NEGATIVE_TTL,
+)
 
 
 def _clear_admin_cache(user_id: str) -> None:
