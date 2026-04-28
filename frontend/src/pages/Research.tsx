@@ -1,7 +1,8 @@
 import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
 import { ScrollReveal } from "@/components/ScrollReveal";
-import { ArrowRight } from "lucide-react";
+import { EmptyState } from "@/components/deft/states";
+import { ArrowRight, Search } from "lucide-react";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 
@@ -261,9 +262,23 @@ export default function Research() {
         </div>
 
         {filtered.length === 0 && (
-          <p className="py-12 text-center text-muted-foreground">
-            No examples in this category yet.
-          </p>
+          <div className="mt-10">
+            <EmptyState
+              filtered
+              icon={<Search size={20} aria-hidden="true" />}
+              title="No examples in this category"
+              description="Try another category, or describe what you have in mind — Deft will plan and run it from a fresh prompt."
+              action={
+                <button
+                  type="button"
+                  onClick={() => setActiveCat("All")}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                >
+                  Show all examples
+                </button>
+              }
+            />
+          </div>
         )}
 
         {/* CTA */}

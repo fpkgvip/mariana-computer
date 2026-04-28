@@ -91,10 +91,10 @@ export default function Login() {
         <div className="flex flex-1 items-center">
           <div className="w-full max-w-sm">
             <h1 className="text-[32px] font-semibold leading-[1.1] tracking-[-0.02em] text-foreground">
-              Welcome back.
+              Pick up where {BRAND.name} left off.
             </h1>
             <p className="mt-2.5 text-[14.5px] leading-[1.55] text-muted-foreground">
-              Pick up where {BRAND.name} left off — your apps, runs, and vault are waiting.
+              Your apps, runs, and vault are waiting.
             </p>
 
             <form onSubmit={handleSubmit} className="mt-9 space-y-4">
