@@ -123,7 +123,7 @@ export default function Product() {
           </h2>
           <p className="mt-5 max-w-xl text-[16px] leading-[1.7] text-muted-foreground">
             You describe what you need. Deft picks the right approach —
-            whether that's a ten-second lookup or a multi-hour build.
+            whether that's a ten-second lookup or a multi-hour run.
           </p>
         </ScrollReveal>
         <div className="mt-14 grid gap-6 sm:grid-cols-3">
