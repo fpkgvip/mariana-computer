@@ -78,6 +78,22 @@ async def reconcile_pending_settlements(
       propagates so the caller's ``except Exception`` log loop can
       tag the iteration as failed.
     """
+    # CC-05: defensive clamp.  ``batch_size`` is fed straight into PG's
+    # ``LIMIT $2``; PG rejects negative LIMIT with
+    # ``InvalidRowCountInLimitClauseError``.  A single bad operator env value
+    # (e.g. ``AGENT_SETTLEMENT_RECONCILE_BATCH_SIZE=-1``) would otherwise
+    # brick this daemon forever — the outer loop catches, logs, sleeps, and
+    # retries the same broken value.  ``main._parse_reconcile_batch_size``
+    # already clamps at parse time; this is the function-entry guard for
+    # callers that bypass the env helper (tests, future internal callers).
+    if batch_size <= 0:
+        logger.debug(
+            "settlement_reconciler_batch_size_clamped",
+            requested=batch_size,
+            clamped=1,
+        )
+        batch_size = 1
+
     # Atomically claim the candidate rows by bumping ``claimed_at`` to now()
     # in a single UPDATE...RETURNING.  Concurrent reconcilers see disjoint
     # candidate sets because the WHERE clause filters by

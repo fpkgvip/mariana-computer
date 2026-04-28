@@ -47,6 +47,21 @@ async def reconcile_pending_research_settlements(
         propagates so the caller's loop log can tag the iteration as
         failed.
     """
+    # CC-05: defensive clamp.  ``batch_size`` flows into PG's ``LIMIT $2``;
+    # PG rejects negative LIMIT with ``InvalidRowCountInLimitClauseError``.
+    # A single bad env value would otherwise brick this daemon forever
+    # (outer loop catches, logs, sleeps, retries the same broken value).
+    # ``main._parse_reconcile_batch_size`` already clamps at parse time;
+    # this is the function-entry guard for callers that bypass the env
+    # helper (tests, future internal callers).
+    if batch_size <= 0:
+        logger.debug(
+            "research_settlement_reconciler_batch_size_clamped",
+            requested=batch_size,
+            clamped=1,
+        )
+        batch_size = 1
+
     # CC-02: candidate selection MUST be a materialised CTE rather than an
     # inline ``WHERE task_id IN (SELECT ... LIMIT $2 ...)``.  PostgreSQL is
     # free to inline the IN-subquery as a semi-join, in which case the

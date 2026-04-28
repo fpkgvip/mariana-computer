@@ -1177,8 +1177,63 @@ _SETTLEMENT_RECONCILE_INTERVAL_S = int(
 _SETTLEMENT_RECONCILE_MAX_AGE_S = int(
     os.getenv("AGENT_SETTLEMENT_RECONCILE_MAX_AGE_S", "300")
 )
-_SETTLEMENT_RECONCILE_BATCH_SIZE = int(
-    os.getenv("AGENT_SETTLEMENT_RECONCILE_BATCH_SIZE", "50")
+
+
+def _parse_reconcile_batch_size(env_var: str, default: int) -> int:
+    """CC-05: parse a reconciler ``batch_size`` env var with safe clamping.
+
+    Contract:
+      * If ``env_var`` is unset, return ``default`` (one info log).
+      * If ``env_var`` parses to int, return ``max(1, value)`` so 0 / negative
+        are coerced to 1.  PostgreSQL rejects ``LIMIT < 0`` with
+        ``InvalidRowCountInLimitClauseError``; one bad env value would
+        otherwise brick the daemon loop forever (every iteration raises
+        before claiming rows, the outer ``except`` logs+sleeps+retries).
+      * If ``env_var`` is set but does not parse, log a warning and return
+        ``default`` — fail safe rather than crash the daemon launcher.
+      * Always emit one ``settlement_reconciler_batch_size_resolved`` info log
+        on startup so operators can see what value the daemon picked up.
+    """
+    raw = os.getenv(env_var)
+    if raw is None:
+        logger.info(
+            "settlement_reconciler_batch_size_resolved",
+            env_var=env_var,
+            raw=None,
+            value=default,
+            source="default",
+        )
+        return default
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "settlement_reconciler_batch_size_unparseable",
+            env_var=env_var,
+            raw=raw,
+            fallback=default,
+        )
+        logger.info(
+            "settlement_reconciler_batch_size_resolved",
+            env_var=env_var,
+            raw=raw,
+            value=default,
+            source="unparseable_fallback",
+        )
+        return default
+    clamped = max(1, parsed)
+    logger.info(
+        "settlement_reconciler_batch_size_resolved",
+        env_var=env_var,
+        raw=raw,
+        value=clamped,
+        source="clamped" if clamped != parsed else "parsed",
+    )
+    return clamped
+
+
+_SETTLEMENT_RECONCILE_BATCH_SIZE = _parse_reconcile_batch_size(
+    "AGENT_SETTLEMENT_RECONCILE_BATCH_SIZE", 50
 )
 
 
