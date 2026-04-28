@@ -1,0 +1,12 @@
+2026-04-28 01:17:08 [info     ] agent_routes_registered        route_count=13
+2026-04-28 01:17:08 [info     ] billing_routes_registered      route_count=3
+2026-04-28 01:17:09 [info     ] vault_routes_registered        route_count=7
+2026-04-28 01:17:09 [warning  ] preview_routes_registration_failed error=[Errno 13] Permission denied: '/var/lib/deft'
+2026-04-28 01:17:09 [info     ] agent_credits_settle_refund_ok final_tokens=30 refunded=470 reserved=500 task_id=bbe232bb-b7fd-4dfb-a3ec-a350104d31f3 user_id=user-fe95704d
+2026-04-28 01:17:09 [warning  ] agent_settlement_mark_completed_failed error=db write failed after rpc task_id=bbe232bb-b7fd-4dfb-a3ec-a350104d31f3
+after settle calls 1 None True
+2026-04-28 01:17:09 [info     ] settlement_reconciler_batch    count=1 max_age_seconds=300
+2026-04-28 01:17:09 [info     ] agent_credits_settle_refund_ok final_tokens=30 refunded=470 reserved=500 task_id=bbe232bb-b7fd-4dfb-a3ec-a350104d31f3 user_id=user-fe95704d
+after reconcile calls 2
+completed_at after reconcile 2026-04-28 01:17:09.280152+00:00
+[{'url': 'https://supabase.test/rest/v1/rpc/add_credits', 'json': {'p_user_id': 'user-fe95704d', 'p_credits': 470}}, {'url': 'https://supabase.test/rest/v1/rpc/add_credits', 'json': {'p_user_id': 'user-fe95704d', 'p_credits': 470}}]
