@@ -418,31 +418,53 @@ async def _claim_research_settlement(
     final_credits: int,
     delta_credits: int,
     ref_id: str,
-) -> bool:
+) -> str:
     """Atomically claim the right to settle this research task.
 
-    Y-01: mirrors the agent-side ``_claim_settlement`` (R-01).  Returns True
-    iff the INSERT landed (this caller owns settlement) and False if a
-    previous caller already owns it (short-circuit).
+    Y-01: mirrors the agent-side ``_claim_settlement`` (R-01).
+    AA-01: returns a 3-state string so the caller can distinguish the
+    parent-row-gone case from a normal lost-race:
+
+      ``"won"``    — INSERT landed, this caller owns settlement.
+      ``"lost"``   — INSERT no-op'd via ``ON CONFLICT DO NOTHING``;
+                     another caller already owns the claim.
+      ``"orphan"`` — FK violation because the parent ``research_tasks``
+                     row was deleted (typically by the user-driven
+                     ``DELETE /api/investigations/{task_id}`` between
+                     this daemon picking up the kill signal and reaching
+                     settlement).  Caller must fall through to the
+                     keyed ledger RPC directly so the user's reservation
+                     refund still lands.
+
+    Other DB errors propagate to the caller.
     """
-    async with db.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO research_settlements (
-                task_id, user_id, reserved_credits, final_credits,
-                delta_credits, ref_id
-            ) VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (task_id) DO NOTHING
-            RETURNING task_id
-            """,
-            task_id,
-            user_id,
-            reserved_credits,
-            final_credits,
-            delta_credits,
-            ref_id,
-        )
-    return row is not None
+    import asyncpg as _asyncpg  # noqa: PLC0415
+
+    try:
+        async with db.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO research_settlements (
+                    task_id, user_id, reserved_credits, final_credits,
+                    delta_credits, ref_id
+                ) VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (task_id) DO NOTHING
+                RETURNING task_id
+                """,
+                task_id,
+                user_id,
+                reserved_credits,
+                final_credits,
+                delta_credits,
+                ref_id,
+            )
+    except _asyncpg.exceptions.ForeignKeyViolationError:
+        # AA-01: parent ``research_tasks`` row is gone — the user
+        # cascaded the investigation away during the daemon's settlement
+        # window.  Caller must still issue the keyed ledger RPC so the
+        # reservation refund (or overrun debit) actually lands.
+        return "orphan"
+    return "won" if row is not None else "lost"
 
 
 async def _mark_research_ledger_applied(db: Any, task_id: str) -> None:
@@ -578,7 +600,7 @@ async def _deduct_user_credits(
 
         if existing is None:
             try:
-                won = await _claim_research_settlement(
+                claim_state = await _claim_research_settlement(
                     db,
                     task_id=task_id,
                     user_id=user_id,
@@ -595,7 +617,7 @@ async def _deduct_user_credits(
                     error=str(exc),
                 )
                 return
-            if not won:
+            if claim_state == "lost":
                 # Lost the race; another caller is settling.  Re-fetch
                 # and exit gracefully — they will succeed or the
                 # reconciler picks up the row.
@@ -605,11 +627,44 @@ async def _deduct_user_credits(
                     task_id=task_id,
                 )
                 return
+            if claim_state == "orphan":
+                # AA-01: parent research_tasks row was deleted while the
+                # daemon was still mid-settle (user clicked DELETE on a
+                # RUNNING task).  No claim row was inserted (FK
+                # violation).  We MUST still issue the keyed ledger RPC
+                # so the reservation refund / overrun debit lands —
+                # otherwise the user's reservation is silently lost.
+                # The keyed ``(ref_type, ref_id=task_id)`` is dedupliced
+                # by the live ``credit_transactions`` UNIQUE constraint
+                # so a subsequent daemon retry returns ``status='duplicate'``
+                # rather than minting a second mutation.  The marker
+                # UPDATEs at the end of the RPC branch are skipped via
+                # the ``orphan_parent`` flag because there is no claim
+                # row to attach them to.
+                logger.warning(
+                    "credit_settlement_orphan_parent",
+                    user_id=user_id,
+                    task_id=task_id,
+                    reserved_credits=reserved_credits,
+                    final_tokens=final_tokens,
+                    delta_tokens=delta_tokens,
+                )
+                orphan_parent = True
+            else:
+                orphan_parent = False
+        else:
+            orphan_parent = False
+    else:
+        # No db / task_id — legacy CLI path; treat as orphan-style for
+        # marker-skip purposes (there is no row to mark anyway).
+        orphan_parent = False
 
     if delta_tokens == 0:
         # No RPC needed.  Stamp completed_at inline so the reconciler
-        # does not pick this up.
-        if task_id and db is not None:
+        # does not pick this up.  AA-01: skip the marker UPDATE on the
+        # orphan-parent path — there is no research_settlements row to
+        # mark.
+        if task_id and db is not None and not orphan_parent:
             try:
                 await _mark_research_settlement_completed(db, task_id)
             except Exception as exc:  # noqa: BLE001
@@ -729,7 +784,13 @@ async def _deduct_user_credits(
     #    that the ledger mutation already happened even if step 2 fails.
     # 2. Stamp ``completed_at`` (and re-stamp ``ledger_applied_at`` via
     #    COALESCE) and flip ``research_tasks.credits_settled``.
-    if rpc_succeeded and task_id and db is not None:
+    # AA-01: skip both UPDATEs on the orphan-parent path — there is no
+    # research_settlements row (FK was violated) and no
+    # research_tasks row (user deleted the parent).  The keyed ledger
+    # mutation has already landed via the idempotent RPC; a successful
+    # ``status='duplicate'`` on a future retry is the canonical
+    # idempotency anchor.
+    if rpc_succeeded and task_id and db is not None and not orphan_parent:
         try:
             await _mark_research_ledger_applied(db, task_id)
         except Exception as exc:  # noqa: BLE001
@@ -750,6 +811,15 @@ async def _deduct_user_credits(
                 error=str(exc),
             )
             return
+    elif rpc_succeeded and orphan_parent:
+        logger.info(
+            "credit_settlement_orphan_refund_ok",
+            user_id=user_id,
+            task_id=task_id,
+            reserved_credits=reserved_credits,
+            final_tokens=final_tokens,
+            delta_tokens=delta_tokens,
+        )
 
 
 async def _run_single(
