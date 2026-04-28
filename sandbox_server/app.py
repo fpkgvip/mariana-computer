@@ -81,14 +81,67 @@ WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 
 # Per-execution caps
 DEFAULT_WALL_TIMEOUT_SEC = 60
-MAX_WALL_TIMEOUT_SEC = 1800           # 30 minutes
-DEFAULT_MEM_MB = 1024                 # 1 GB RAM
-MAX_MEM_MB = 4096                     # 4 GB RAM (some data tasks need it)
+MAX_WALL_TIMEOUT_SEC = 1800  # 30 minutes
+DEFAULT_MEM_MB = 1024  # 1 GB RAM
+MAX_MEM_MB = 4096  # 4 GB RAM (some data tasks need it)
 DEFAULT_CPU_SEC = 60
 MAX_CPU_SEC = 1800
-MAX_STDOUT_BYTES = 2 * 1024 * 1024    # 2 MB — truncated if exceeded
+MAX_STDOUT_BYTES = 2 * 1024 * 1024  # 2 MB — truncated if exceeded
 MAX_STDERR_BYTES = 512 * 1024
-MAX_CODE_BYTES = 1 * 1024 * 1024      # 1 MB source file
+MAX_CODE_BYTES = 1 * 1024 * 1024  # 1 MB source file
+
+# CC-28 fix: per-workspace disk quota.  A malicious or runaway plan can fill
+# the host filesystem by writing arbitrary amounts to its workspace.  Enforce
+# a stable ``workspace_full`` HTTP 507 (Insufficient Storage) before every
+# write op (``/fs/write``, ``/exec``).  Default 2 GiB, overridable via env.
+_MAX_WORKSPACE_BYTES = int(
+    os.environ.get("SANDBOX_MAX_WORKSPACE_BYTES", str(2 * 1024 * 1024 * 1024))
+)
+_WORKSPACE_SIZE_TTL_SEC = 5.0
+# (path_str -> (timestamp, size_bytes))
+_WORKSPACE_SIZE_CACHE: dict[str, tuple[float, int]] = {}
+
+
+def _workspace_size_bytes(workspace_root: pathlib.Path) -> int:
+    """Return total bytes used under ``workspace_root``.
+
+    Cached for ~5 seconds per workspace path to avoid hammering the FS with
+    a recursive ``stat`` on every write request.  Missing-file races are
+    swallowed (best-effort accounting).
+    """
+    key = str(workspace_root)
+    now = time.monotonic()
+    cached = _WORKSPACE_SIZE_CACHE.get(key)
+    if cached is not None and (now - cached[0]) < _WORKSPACE_SIZE_TTL_SEC:
+        return cached[1]
+    total = 0
+    try:
+        for f in workspace_root.rglob("*"):
+            try:
+                if f.is_file():
+                    total += f.stat().st_size
+            except (FileNotFoundError, PermissionError):
+                continue
+    except FileNotFoundError:
+        total = 0
+    _WORKSPACE_SIZE_CACHE[key] = (now, total)
+    return total
+
+
+def _enforce_workspace_quota(workspace_root: pathlib.Path) -> None:
+    """Raise HTTP 507 ``workspace_full`` if the workspace is over quota."""
+    size = _workspace_size_bytes(workspace_root)
+    if size > _MAX_WORKSPACE_BYTES:
+        log.warning(
+            "workspace_full",
+            extra={
+                "workspace": str(workspace_root),
+                "size": size,
+                "max": _MAX_WORKSPACE_BYTES,
+            },
+        )
+        raise HTTPException(status_code=507, detail="workspace_full")
+
 
 SANDBOX_UID = 1000
 SANDBOX_GID = 100  # `users` group
@@ -125,7 +178,11 @@ def _safe_workspace_path(user_id: str, rel_path: str) -> pathlib.Path:
     if "\x00" in rel or ".." in rel.split("/"):
         log.warning(
             "sandbox_path_traversal",
-            extra={"reason": "path_traversal", "user_id": user_id, "rel_path": rel_path},
+            extra={
+                "reason": "path_traversal",
+                "user_id": user_id,
+                "rel_path": rel_path,
+            },
         )
         raise HTTPException(400, "invalid path")
     # Every component must match the whitelist (tight but permissive enough).
@@ -169,7 +226,7 @@ def _safe_workspace_path(user_id: str, rel_path: str) -> pathlib.Path:
 app = FastAPI(
     title="Mariana Sandbox",
     version="1.0.0",
-    docs_url=None,       # no public docs; internal only
+    docs_url=None,  # no public docs; internal only
     redoc_url=None,
     openapi_url=None,
 )
@@ -282,7 +339,9 @@ def _preexec(mem_mb: int, cpu_sec: int) -> Callable[[], None]:
     return _inner
 
 
-def _pick_runner(language: Language, src_path: pathlib.Path) -> tuple[list[str], str | None]:
+def _pick_runner(
+    language: Language, src_path: pathlib.Path
+) -> tuple[list[str], str | None]:
     """Map language to (argv, optional compile step marker)."""
     if language == "python":
         return (["python3", "-I", "-u", str(src_path)], None)
@@ -365,19 +424,26 @@ async def _run_subprocess(
             os.killpg(proc.pid, signal.SIGKILL)
         # Drain what we have.
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=5.0
+            )
         except asyncio.TimeoutError:
             stdout_bytes, stderr_bytes = b"", b""
         rc = -9
     elapsed_ms = int((time.monotonic() - start) * 1000)
     log.info(
         "exec finished argv=%s rc=%s timed_out=%s elapsed_ms=%s",
-        argv[0], rc, timed_out, elapsed_ms,
+        argv[0],
+        rc,
+        timed_out,
+        elapsed_ms,
     )
     return stdout_bytes, stderr_bytes, rc, timed_out, killed, elapsed_ms
 
 
-async def _compile_rust(src_path: pathlib.Path, *, wall_timeout_sec: int) -> tuple[pathlib.Path | None, str]:
+async def _compile_rust(
+    src_path: pathlib.Path, *, wall_timeout_sec: int
+) -> tuple[pathlib.Path | None, str]:
     """Compile Rust source with rustc.  Returns (binary_path or None, stderr).
 
     v3.6: the sandbox rootfs is read-only, so rustup's default behaviour of
@@ -387,7 +453,12 @@ async def _compile_rust(src_path: pathlib.Path, *, wall_timeout_sec: int) -> tup
     """
     binary_path = src_path.with_suffix("")
     proc = await asyncio.create_subprocess_exec(
-        "rustc", "-O", "--edition=2021", "-o", str(binary_path), str(src_path),
+        "rustc",
+        "-O",
+        "--edition=2021",
+        "-o",
+        str(binary_path),
+        str(src_path),
         cwd=str(src_path.parent),
         env={
             "PATH": "/usr/local/cargo/bin:/usr/bin:/bin",
@@ -402,7 +473,9 @@ async def _compile_rust(src_path: pathlib.Path, *, wall_timeout_sec: int) -> tup
         close_fds=True,
     )
     try:
-        _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=wall_timeout_sec)
+        _, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=wall_timeout_sec
+        )
     except asyncio.TimeoutError:
         with suppress(ProcessLookupError, PermissionError):
             os.killpg(proc.pid, signal.SIGKILL)
@@ -415,7 +488,7 @@ async def _compile_rust(src_path: pathlib.Path, *, wall_timeout_sec: int) -> tup
 def _truncate(raw: bytes, limit: int) -> tuple[str, bool]:
     if len(raw) <= limit:
         return raw.decode("utf-8", "replace"), False
-    head = raw[: limit]
+    head = raw[:limit]
     return head.decode("utf-8", "replace") + f"\n\n…[truncated at {limit} bytes]", True
 
 
@@ -481,7 +554,9 @@ def _collect_artifacts(
         rand = secrets.token_hex(3)
         dest_dir = user_workspace / "_runs" / f"{ts}_{rand}"
         files = [p for p in run_dir.rglob("*") if p.is_file()]
-        interesting = [p for p in files if p.name not in skip_names and not p.name.endswith(".pyc")]
+        interesting = [
+            p for p in files if p.name not in skip_names and not p.name.endswith(".pyc")
+        ]
         if interesting:
             dest_dir.mkdir(parents=True, exist_ok=True)
             for src in interesting:
@@ -502,12 +577,14 @@ def _collect_artifacts(
                     if wp in seen_paths:
                         continue
                     seen_paths.add(wp)
-                    artifacts.append({
-                        "name": str(rel),
-                        "workspace_path": wp,
-                        "size": size,
-                        "sha256": digest,
-                    })
+                    artifacts.append(
+                        {
+                            "name": str(rel),
+                            "workspace_path": wp,
+                            "size": size,
+                            "sha256": digest,
+                        }
+                    )
                 except Exception as exc:  # noqa: BLE001
                     log.warning("artifact copy failed name=%s err=%s", src.name, exc)
 
@@ -541,12 +618,14 @@ def _collect_artifacts(
             if rel in seen_paths:
                 continue
             seen_paths.add(rel)
-            artifacts.append({
-                "name": pathlib.PurePosixPath(rel).name,
-                "workspace_path": rel,
-                "size": size,
-                "sha256": digest,
-            })
+            artifacts.append(
+                {
+                    "name": pathlib.PurePosixPath(rel).name,
+                    "workspace_path": rel,
+                    "size": size,
+                    "sha256": digest,
+                }
+            )
     return artifacts
 
 
@@ -560,6 +639,10 @@ async def exec_code(req: ExecRequest) -> dict[str, Any]:
     user_workspace.mkdir(parents=True, exist_ok=True)
     with suppress(PermissionError):
         os.chown(user_workspace, SANDBOX_UID, SANDBOX_GID)
+
+    # CC-28: enforce per-workspace disk quota before any write.  ``/exec``
+    # writes the source file plus whatever the user code produces.
+    _enforce_workspace_quota(user_workspace)
 
     # Resolve cwd (must stay in the workspace).  Empty → workspace root.
     if req.cwd:
@@ -595,7 +678,9 @@ async def exec_code(req: ExecRequest) -> dict[str, Any]:
         # Rust requires a compile step.
         if req.language == "rust":
             compile_start = time.monotonic()
-            binary_path, rust_stderr = await _compile_rust(src_path, wall_timeout_sec=min(wall, 120))
+            binary_path, rust_stderr = await _compile_rust(
+                src_path, wall_timeout_sec=min(wall, 120)
+            )
             compile_ms = int((time.monotonic() - compile_start) * 1000)
             if binary_path is None:
                 return {
@@ -616,7 +701,7 @@ async def exec_code(req: ExecRequest) -> dict[str, Any]:
 
         stdout, stderr, rc, timed_out, killed, duration_ms = await _run_subprocess(
             argv,
-            cwd=run_dir,             # run in the ephemeral dir so writes to ./ don't pollute workspace
+            cwd=run_dir,  # run in the ephemeral dir so writes to ./ don't pollute workspace
             env=req.env,
             stdin=req.stdin.encode("utf-8"),
             wall_timeout_sec=wall,
@@ -678,7 +763,7 @@ class FsWriteRequest(BaseModel):
 
 class FsListRequest(BaseModel):
     user_id: str
-    path: str = ""           # relative to workspace root ("" = root)
+    path: str = ""  # relative to workspace root ("" = root)
     recursive: bool = True
     max_entries: int = Field(default=1000, ge=1, le=10_000)
 
@@ -712,20 +797,34 @@ async def fs_read(req: FsReadRequest) -> dict[str, Any]:
         raise HTTPException(413, "invalid request")
     raw = p.read_bytes()
     if req.binary:
-        return {"path": req.path, "size": size, "binary": True,
-                "content_b64": base64.b64encode(raw).decode("ascii")}
+        return {
+            "path": req.path,
+            "size": size,
+            "binary": True,
+            "content_b64": base64.b64encode(raw).decode("ascii"),
+        }
     try:
-        return {"path": req.path, "size": size, "binary": False,
-                "content": raw.decode("utf-8")}
+        return {
+            "path": req.path,
+            "size": size,
+            "binary": False,
+            "content": raw.decode("utf-8"),
+        }
     except UnicodeDecodeError:
-        return {"path": req.path, "size": size, "binary": True,
-                "content_b64": base64.b64encode(raw).decode("ascii"),
-                "decoded_as_binary": True}
+        return {
+            "path": req.path,
+            "size": size,
+            "binary": True,
+            "content_b64": base64.b64encode(raw).decode("ascii"),
+            "decoded_as_binary": True,
+        }
 
 
 @app.post("/fs/write")
 async def fs_write(req: FsWriteRequest) -> dict[str, Any]:
     p = _safe_workspace_path(req.user_id, req.path)
+    # CC-28: enforce per-workspace disk quota before any write.
+    _enforce_workspace_quota((WORKSPACE_ROOT / req.user_id).resolve())
     if p.exists() and not req.overwrite:
         log.info(
             "sandbox_fs_write_exists",
@@ -751,7 +850,11 @@ async def fs_write(req: FsWriteRequest) -> dict[str, Any]:
         p.write_text(req.content, encoding="utf-8")
     with suppress(PermissionError):
         os.chown(p, SANDBOX_UID, SANDBOX_GID)
-    return {"path": req.path, "size": p.stat().st_size, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+    return {
+        "path": req.path,
+        "size": p.stat().st_size,
+        "sha256": hashlib.sha256(p.read_bytes()).hexdigest(),
+    }
 
 
 @app.post("/fs/list")
@@ -776,13 +879,19 @@ async def fs_list(req: FsListRequest) -> dict[str, Any]:
             st = entry.stat()
         except FileNotFoundError:
             continue
-        entries.append({
-            "path": str(entry.relative_to(user_root)),
-            "type": "dir" if entry.is_dir() else "file",
-            "size": st.st_size if entry.is_file() else 0,
-            "mtime": int(st.st_mtime),
-        })
-    return {"root": req.path or "/", "entries": entries, "truncated": len(entries) >= req.max_entries}
+        entries.append(
+            {
+                "path": str(entry.relative_to(user_root)),
+                "type": "dir" if entry.is_dir() else "file",
+                "size": st.st_size if entry.is_file() else 0,
+                "mtime": int(st.st_mtime),
+            }
+        )
+    return {
+        "root": req.path or "/",
+        "entries": entries,
+        "truncated": len(entries) >= req.max_entries,
+    }
 
 
 @app.post("/fs/delete")
