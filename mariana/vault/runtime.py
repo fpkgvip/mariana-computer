@@ -29,6 +29,60 @@ from typing import Any, Callable, Mapping
 
 from mariana.vault.redaction import build_redactor
 
+
+# ---------------------------------------------------------------------------
+# U-03 fix — Redis transport policy + fail-closed exceptions
+# ---------------------------------------------------------------------------
+
+
+class VaultUnavailableError(RuntimeError):
+    """Raised when a task that REQUESTED secrets cannot durably store /
+    retrieve them through the vault Redis backing store.
+
+    Callers (API task-creation handler, agent worker pre-tool gate) must
+    surface this as a fail-closed error: a 503 to the API client, or a
+    task abort with ``error`` set before any tool execution.  Never
+    swallow this — the whole point of U-03 is that we refuse to run a
+    task that asked for secrets when those secrets cannot be honoured.
+    """
+
+
+# Hosts that may safely use plaintext ``redis://`` — local dev, CI, and
+# the docker-compose service name baked into our default Compose stack
+# (see ``mariana/config.py:124``).  Mirrors the policy in
+# ``mariana/data/cache.py:421-433`` (M-05 fix) so vault and cache cannot
+# diverge.
+_LOCAL_REDIS_HOST_TOKENS: tuple[str, ...] = (
+    "://localhost",
+    "://127.",
+    "://[::1]",
+    "://redis:",  # docker-compose service name
+    "://redis/",  # docker-compose service name, no port
+)
+
+
+def _validate_redis_url_for_vault(url: str | None) -> None:
+    """Enforce ``rediss://`` (TLS) for any non-loopback Redis URL.
+
+    Mirrors ``mariana.data.cache._connect_redis`` (M-05 fix).  Vault
+    secrets are at least as sensitive as cached investigation data, so
+    the same transport policy applies: local hosts may use plaintext
+    ``redis://`` for developer convenience; everything else MUST use
+    ``rediss://``.
+
+    A ``None`` / empty URL is treated as "local" (no remote transport
+    will happen) and does not raise.
+    """
+    if not url:
+        return
+    u = url.lower().strip()
+    is_local = any(tok in u for tok in _LOCAL_REDIS_HOST_TOKENS)
+    if not is_local and u.startswith("redis://"):
+        raise ValueError(
+            "Remote Redis URLs must use rediss:// (TLS) for vault env transport; "
+            f"got {url!r}"
+        )
+
 # Hard caps mirror the frontend grammar so server is the second line of defence.
 _MAX_VAULT_ENV_ENTRIES = 50
 _MAX_VAULT_VALUE_LEN = 16_384
@@ -95,34 +149,102 @@ _NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 # ---------------------------------------------------------------------------
 
 
-async def store_vault_env(redis: Any, task_id: str, env: Mapping[str, str], *, ttl_seconds: int) -> None:
+async def store_vault_env(
+    redis: Any,
+    task_id: str,
+    env: Mapping[str, str],
+    *,
+    ttl_seconds: int,
+    redis_url: str | None = None,
+) -> None:
     """Persist a task's vault_env to Redis with a bounded TTL.
 
-    Silently no-ops if Redis is unavailable so a degraded test env still
-    accepts agent runs (without secret injection).
+    U-03 fix: when ``env`` is non-empty (i.e. the user explicitly
+    requested per-task secrets) we **fail closed** on any Redis error —
+    raising :class:`VaultUnavailableError` so the API can return 503 and
+    the task is never enqueued without its secrets.  When ``env`` is
+    empty there is nothing to store and the function is a true no-op,
+    preserving backwards compatibility with tasks that don't need a
+    vault.
+
+    If ``redis_url`` is supplied, it is validated against the
+    rediss://-required policy before any IO is attempted.
     """
-    if redis is None or not env:
+    if not env:
+        # Nothing to store — never touch Redis (back-compat: a task
+        # without vault_env should not need Redis at all).
         return
+    # Validate transport BEFORE any IO so we fail loud at task-creation
+    # time rather than after a half-finished write.
+    _validate_redis_url_for_vault(redis_url)
+    if redis is None:
+        # The caller asked for vault storage but no client is configured.
+        # That is a fail-closed condition.
+        raise VaultUnavailableError(
+            f"vault_env requested for task {task_id} but no Redis client is configured"
+        )
     ttl = max(_MIN_TTL_SECONDS, int(ttl_seconds))
     key = REDIS_KEY_FMT.format(task_id=task_id)
     payload = json.dumps(dict(env))
     try:
         await redis.set(key, payload, ex=ttl)
-    except Exception:
-        # Defensive — never crash an agent start because of redis hiccup.
-        pass
+    except Exception as exc:
+        # U-03 fix: do NOT swallow.  Surface as VaultUnavailableError so
+        # the route handler can return 503 and the task is rejected
+        # before enqueue.
+        raise VaultUnavailableError(
+            f"vault_env store failed for task {task_id}: {exc}"
+        ) from exc
 
 
-async def fetch_vault_env(redis: Any, task_id: str) -> dict[str, str]:
-    """Read back the persisted env, returning ``{}`` on miss."""
+async def fetch_vault_env(
+    redis: Any,
+    task_id: str,
+    *,
+    requires_vault: bool = False,
+    redis_url: str | None = None,
+) -> dict[str, str]:
+    """Read back the persisted env.
+
+    U-03 fix: when ``requires_vault`` is True (i.e. the task was
+    created with a non-empty ``vault_env`` and depends on secret
+    injection to behave correctly), any Redis error OR a missing /
+    empty payload raises :class:`VaultUnavailableError` so the agent
+    worker fails the task BEFORE invoking any tool.  Returning ``{}``
+    in that case would silently strip the user's secrets and let the
+    task run as if they had been honoured — exactly the behaviour the
+    bug fix exists to prevent.
+
+    For ``requires_vault=False`` the legacy semantics are preserved:
+    return ``{}`` on miss/error.  This is the path tasks without a
+    vault take (zero new Redis dependency).
+    """
+    if requires_vault:
+        _validate_redis_url_for_vault(redis_url)
     if redis is None:
+        if requires_vault:
+            raise VaultUnavailableError(
+                f"vault_env required for task {task_id} but no Redis client is configured"
+            )
         return {}
     key = REDIS_KEY_FMT.format(task_id=task_id)
     try:
         raw = await redis.get(key)
-    except Exception:
+    except Exception as exc:
+        if requires_vault:
+            raise VaultUnavailableError(
+                f"vault_env fetch failed for task {task_id}: {exc}"
+            ) from exc
         return {}
     if not raw:
+        if requires_vault:
+            # The task asked for secrets but Redis has nothing for it
+            # (evicted by TTL, evicted by maxmemory, never written
+            # because of an earlier silent store_vault_env loss, etc.).
+            # Fail closed.
+            raise VaultUnavailableError(
+                f"vault_env missing for task {task_id} that required vault"
+            )
         return {}
     if isinstance(raw, (bytes, bytearray)):
         raw = raw.decode("utf-8", errors="replace")
@@ -234,4 +356,6 @@ __all__ = [
     "redact_payload",
     "TaskContextHandle",
     "REDIS_KEY_FMT",
+    "VaultUnavailableError",
+    "_validate_redis_url_for_vault",
 ]

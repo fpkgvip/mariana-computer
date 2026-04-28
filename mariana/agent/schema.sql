@@ -40,6 +40,12 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
     stop_requested           BOOLEAN NOT NULL DEFAULT FALSE,
     error                    TEXT,
 
+    -- U-03 fix: marks tasks that submitted a non-empty ``vault_env`` so
+    -- the worker can fail-closed if the secret payload cannot be
+    -- retrieved from Redis at fetch time.  Default FALSE so existing
+    -- tasks (and tasks without a vault) carry no new Redis dependency.
+    requires_vault           BOOLEAN NOT NULL DEFAULT FALSE,
+
     created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at               TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -50,6 +56,8 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
 -- original M-01 fix.  Safe to run repeatedly and on fresh databases alike.
 ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS reserved_credits BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS credits_settled BOOLEAN NOT NULL DEFAULT FALSE;
+-- U-03 fix: idempotent backfill for already-existing deployments.
+ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS requires_vault BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_user_id ON agent_tasks(user_id);
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_state ON agent_tasks(state);

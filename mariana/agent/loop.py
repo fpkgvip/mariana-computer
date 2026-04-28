@@ -41,6 +41,7 @@ from mariana.agent.models import (
 )
 from mariana.agent.state import assert_transition, is_terminal
 from mariana.vault.runtime import (
+    VaultUnavailableError,
     clear_vault_env,
     fetch_vault_env,
     get_redactor,
@@ -1140,10 +1141,65 @@ async def run_agent_task(
     # redactor into the current async context.  Every dispatcher.exec_code
     # call will see these as real env vars; every event payload + step
     # result will be auto-redacted before it leaves the process.
+    #
+    # U-03 fix: when the task was created with a non-empty ``vault_env``
+    # (``task.requires_vault`` is True), the fetch is fail-closed.  If
+    # Redis is down, the payload was evicted, or the URL is plaintext
+    # for a remote host, we record an error on the task and skip
+    # straight to FAILED — BEFORE any tool is invoked, so we never run
+    # tools with the user's secrets silently stripped.
     vault_env: dict[str, str] = {}
+    # Resolve REDIS_URL for transport policy enforcement.  Tolerant of
+    # missing config (tests).
+    _vault_redis_url: str | None = None
     try:
-        vault_env = await fetch_vault_env(redis, task.id)
+        # Late import: mariana.api owns the singleton config; avoids
+        # circular import at module load.
+        from mariana.api import _get_config as _get_cfg_loop  # noqa: PLC0415
+        _vault_redis_url = getattr(_get_cfg_loop(), "REDIS_URL", None)
+    except Exception:
+        _vault_redis_url = None
+    requires_vault = bool(getattr(task, "requires_vault", False))
+    try:
+        vault_env = await fetch_vault_env(
+            redis,
+            task.id,
+            requires_vault=requires_vault,
+            redis_url=_vault_redis_url,
+        )
+    except VaultUnavailableError as exc:
+        # Fail-closed BEFORE any tool execution.  Mark the task FAILED
+        # with a clear error and return without running anything.
+        log.error("vault_env_unavailable_fail_closed", task_id=task.id, error=str(exc))
+        task.error = f"Vault unavailable: {exc}"
+        task.state = AgentState.FAILED
+        try:
+            await _persist_task(db, task)
+        except Exception:
+            pass
+        return task
+    except ValueError as exc:
+        # Transport policy violation (e.g. plaintext redis:// to a
+        # remote host).  Same fail-closed surface.
+        log.error("vault_env_redis_url_policy_violation", task_id=task.id, error=str(exc))
+        task.error = f"Vault transport policy violation: {exc}"
+        task.state = AgentState.FAILED
+        try:
+            await _persist_task(db, task)
+        except Exception:
+            pass
+        return task
     except Exception as exc:  # pragma: no cover
+        # Non-vault tasks: legacy soft-fail behaviour preserved.
+        if requires_vault:
+            log.error("vault_env_unexpected_error_fail_closed", task_id=task.id, error=str(exc))
+            task.error = f"Vault unavailable: {exc}"
+            task.state = AgentState.FAILED
+            try:
+                await _persist_task(db, task)
+            except Exception:
+                pass
+            return task
         logger.warning("vault_env_fetch_failed", task_id=task.id, error=str(exc))
     ctx_handle = set_task_context(vault_env)
     if vault_env:

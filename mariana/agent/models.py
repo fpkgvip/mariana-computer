@@ -179,6 +179,16 @@ class AgentTask(BaseModel):
     stop_requested: bool = False
     error: str | None = None
 
+    # U-03 fix: True when the user submitted a non-empty ``vault_env``
+    # alongside this task.  The agent loop reads this BEFORE invoking
+    # any tool: if True and the per-task secrets cannot be retrieved
+    # from Redis (transport down, payload missing/evicted, etc.) the
+    # task fails closed via :class:`mariana.vault.runtime.VaultUnavailableError`
+    # instead of running with empty env (which would silently strip
+    # the user's secrets).  Default False keeps the no-vault path free
+    # of any Redis dependency.
+    requires_vault: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Event emitted on the SSE channel

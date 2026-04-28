@@ -81,6 +81,20 @@ class StopResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _row_get_bool(row: Any, key: str, *, default: bool = False) -> bool:
+    """Defensive accessor for asyncpg.Record / dict-like rows.
+
+    Older deployments may not have the ``requires_vault`` column yet
+    (the ALTER TABLE IF NOT EXISTS in schema.sql backfills on startup,
+    but tests may load rows from a freshly-created table that did /
+    didn't include the column).  Falls back to ``default``.
+    """
+    try:
+        return bool(row[key])
+    except (KeyError, TypeError, IndexError):
+        return default
+
+
 async def _insert_agent_task(db: Any, task: AgentTask) -> None:
     payload = task.model_dump(mode="json")
     async with db.acquire() as conn:
@@ -96,6 +110,7 @@ async def _insert_agent_task(db: Any, task: AgentTask) -> None:
                 reserved_credits, credits_settled,
                 max_fix_attempts_per_step, max_replans, replan_count, total_failures,
                 final_answer, stop_requested, error,
+                requires_vault,
                 created_at, updated_at
             ) VALUES (
                 $1, $2, $3, $4, $5,
@@ -104,7 +119,8 @@ async def _insert_agent_task(db: Any, task: AgentTask) -> None:
                 $13, $14,
                 $15, $16, $17, $18,
                 $19, $20, $21,
-                $22, $23
+                $22,
+                $23, $24
             )
             """,
             task.id,
@@ -128,6 +144,7 @@ async def _insert_agent_task(db: Any, task: AgentTask) -> None:
             task.final_answer,
             task.stop_requested,
             task.error,
+            task.requires_vault,
             task.created_at,
             task.updated_at,
         )
@@ -152,6 +169,7 @@ async def _load_agent_task(db: Any, task_id: str) -> AgentTask | None:
                    reserved_credits, credits_settled,
                    max_fix_attempts_per_step, max_replans, replan_count, total_failures,
                    final_answer, stop_requested, error,
+                   COALESCE(requires_vault, FALSE) AS requires_vault,
                    created_at, updated_at
             FROM agent_tasks
             WHERE id = $1
@@ -192,6 +210,10 @@ async def _load_agent_task(db: Any, task_id: str) -> AgentTask | None:
         "final_answer": row["final_answer"],
         "stop_requested": bool(row["stop_requested"]),
         "error": row["error"],
+        # U-03: requires_vault round-trips so the worker can fail-closed
+        # if the per-task secrets cannot be retrieved at fetch time.
+        # Tolerate older rows / missing column with a default of False.
+        "requires_vault": _row_get_bool(row, "requires_vault", default=False),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -413,6 +435,7 @@ def make_routes(
         from mariana.vault.runtime import (  # noqa: PLC0415
             validate_vault_env,
             store_vault_env,
+            VaultUnavailableError,
         )
         try:
             vault_env_validated = validate_vault_env(body.vault_env or {})
@@ -482,6 +505,10 @@ def make_routes(
             # can settle it (refund unused, deduct overage) at terminal
             # state.  ``credits_settled`` defaults to False on a fresh task.
             reserved_credits=reserved_credits,
+            # U-03: persist the fact that this task was started with a
+            # non-empty vault_env so the worker can fail-closed if the
+            # per-task secrets cannot be retrieved at fetch time.
+            requires_vault=bool(vault_env_validated),
         )
 
         # Refund-on-DB-failure guard: if the INSERT blows up, credits are
@@ -523,12 +550,83 @@ def make_routes(
         # buffer so the loop can read it on first cold start.  We do this
         # BEFORE enqueueing so the consumer never picks up a task whose
         # secrets aren't yet in place.
+        #
+        # U-03 fix: when the user explicitly requested vault_env, store
+        # is fail-closed.  ``store_vault_env`` raises
+        # :class:`VaultUnavailableError` on Redis error / missing client;
+        # we surface that as 503 and leave the task DB row in PLAN with
+        # ``error`` set so the user can see why it never started.  We
+        # also pass the configured REDIS_URL so the rediss://-required
+        # transport policy is enforced before any IO.
         if vault_env_validated:
             ttl_seconds = int(body.max_duration_hours * 3600) + 300
+            # Resolve REDIS_URL via the same get_config helper used
+            # everywhere else; tolerate import-time wiring quirks.
+            _redis_url: str | None = None
             try:
-                await store_vault_env(redis, task_id, vault_env_validated, ttl_seconds=ttl_seconds)
-            except Exception as exc:
-                logger.warning("vault_env_store_failed", task_id=task_id, error=str(exc))
+                from mariana.api import _get_config as _get_cfg_for_vault  # noqa: PLC0415
+                _cfg_for_vault = _get_cfg_for_vault()
+                _redis_url = getattr(_cfg_for_vault, "REDIS_URL", None)
+            except Exception:
+                _redis_url = None
+            try:
+                await store_vault_env(
+                    redis,
+                    task_id,
+                    vault_env_validated,
+                    ttl_seconds=ttl_seconds,
+                    redis_url=_redis_url,
+                )
+            except (VaultUnavailableError, ValueError) as exc:
+                # U-03 fail-closed: refuse the task, refund the
+                # reservation, mark the row, and 503.  Distinguish:
+                #   ValueError  → transport policy violation (URL)
+                #   VaultUnavailableError → Redis not reachable / not configured
+                is_policy = isinstance(exc, ValueError)
+                logger.error(
+                    "vault_env_redis_url_policy_violation" if is_policy else "vault_env_store_failed_fail_closed",
+                    task_id=task_id,
+                    error=str(exc),
+                )
+                # Refund the reservation so the user is not charged for
+                # a task that never started.
+                if reserved_credits > 0:
+                    try:
+                        from mariana.api import (  # noqa: PLC0415
+                            _get_config as _get_cfg3,
+                            _supabase_add_credits as _refund3,
+                        )
+                        await _refund3(current_user["user_id"], reserved_credits, _get_cfg3())
+                        logger.info(
+                            "agent_credits_refunded_on_vault_failure",
+                            user_id=current_user["user_id"],
+                            amount=reserved_credits,
+                        )
+                    except Exception as refund_exc:  # pragma: no cover
+                        logger.error(
+                            "agent_credits_refund_failed_after_vault_failure",
+                            user_id=current_user["user_id"],
+                            amount=reserved_credits,
+                            error=str(refund_exc),
+                        )
+                # Mark the task so any later GET shows why it never ran.
+                try:
+                    async with db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE agent_tasks SET state='failed', error=$2, updated_at=NOW() WHERE id=$1",
+                            task_id,
+                            ("vault transport policy violation: " if is_policy else "vault unavailable: ") + str(exc),
+                        )
+                except Exception:
+                    pass
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Vault transport policy violation; refusing to store secrets"
+                        if is_policy else
+                        "Vault storage unavailable; cannot honour requested secrets"
+                    ),
+                ) from exc
 
         try:
             if redis is not None:

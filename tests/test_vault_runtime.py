@@ -205,9 +205,16 @@ def test_fetch_vault_env_filters_invalid_names():
 
 
 def test_store_vault_env_no_redis_is_noop():
+    """Empty vault on a None redis is a no-op (no client needed).
+
+    U-03 fix: when env is *non-empty* + redis is None we fail closed
+    (covered in tests/test_u03_vault_redis_safety.py).  This test pins
+    the back-compat path: an empty env never touches Redis.
+    """
     async def _go():
-        # Should not raise.
-        await store_vault_env(None, "t", {"K": "v"}, ttl_seconds=600)
+        # Empty env on None redis: no-op, no raise.
+        await store_vault_env(None, "t", {}, ttl_seconds=600)
+        # Fetch with the legacy (requires_vault=False default) returns {}.
         out = await fetch_vault_env(None, "t")
         assert out == {}
 
