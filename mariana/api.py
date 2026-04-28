@@ -5345,9 +5345,15 @@ async def upload_investigation_files(
                     break
                 size += len(chunk)
                 if size > _UPLOAD_MAX_FILE_SIZE:
+                    # CC-32: do not echo the user-supplied filename in 400
+                    # details; log it for operator diagnostics instead.
+                    logger.info(
+                        "filename_rejected",
+                        extra={"filename": filename, "reason": "file_too_large"},
+                    )
                     raise HTTPException(
                         status_code=400,
-                        detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024 * 1024)}MB limit",
+                        detail=f"File exceeds {_UPLOAD_MAX_FILE_SIZE // (1024 * 1024)}MB limit",
                     )
                 chunks.append(chunk)
             content = b"".join(chunks)
@@ -5356,15 +5362,20 @@ async def upload_investigation_files(
             # then reject dotfiles and traversal names.
             safe_name = os.path.basename(re.sub(r"[^\w\-.]", "_", filename))
             if not safe_name or safe_name.startswith(".") or safe_name in (".", ".."):
-                raise HTTPException(
-                    status_code=400, detail=f"Invalid filename: {filename!r}"
+                # CC-32: log the rejected filename; surface a generic detail.
+                logger.info(
+                    "filename_rejected",
+                    extra={"filename": filename, "reason": "invalid_shape"},
                 )
+                raise HTTPException(status_code=400, detail="invalid filename")
             dest = upload_dir / safe_name
             # Ensure resolved path is within the upload directory
             if not str(dest.resolve()).startswith(str(upload_dir.resolve())):
-                raise HTTPException(
-                    status_code=400, detail=f"Invalid filename: {filename!r}"
+                logger.info(
+                    "filename_rejected",
+                    extra={"filename": filename, "reason": "path_escape"},
                 )
+                raise HTTPException(status_code=400, detail="invalid filename")
             # BUG-0034 fix: append counter suffix on duplicate filenames
             if dest.exists():
                 stem = Path(safe_name).stem
@@ -5378,9 +5389,11 @@ async def upload_investigation_files(
             # BUG-0008 fix: reject symlinks after write (race-safe check)
             if dest.is_symlink():
                 dest.unlink()
-                raise HTTPException(
-                    status_code=400, detail=f"Symlinks are not allowed: {safe_name!r}"
+                logger.info(
+                    "filename_rejected",
+                    extra={"filename": safe_name, "reason": "symlink_after_write"},
                 )
+                raise HTTPException(status_code=400, detail="symlinks are not allowed")
 
             uploaded.append(
                 UploadedFileInfo(
@@ -5504,9 +5517,15 @@ async def upload_pending_files(
                     break
                 size += len(chunk)
                 if size > _UPLOAD_MAX_FILE_SIZE:
+                    # CC-32: do not echo the user-supplied filename in 400
+                    # details; log it for operator diagnostics instead.
+                    logger.info(
+                        "filename_rejected",
+                        extra={"filename": filename, "reason": "file_too_large"},
+                    )
                     raise HTTPException(
                         status_code=400,
-                        detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024 * 1024)}MB limit",
+                        detail=f"File exceeds {_UPLOAD_MAX_FILE_SIZE // (1024 * 1024)}MB limit",
                     )
                 chunks.append(chunk)
             content = b"".join(chunks)
@@ -5514,14 +5533,19 @@ async def upload_pending_files(
             # P1-FIX-46b: Same path-traversal protection as upload_investigation_files
             safe_name = os.path.basename(re.sub(r"[^\w\-.]", "_", filename))
             if not safe_name or safe_name.startswith(".") or safe_name in (".", ".."):
-                raise HTTPException(
-                    status_code=400, detail=f"Invalid filename: {filename!r}"
+                # CC-32: log the rejected filename; surface a generic detail.
+                logger.info(
+                    "filename_rejected",
+                    extra={"filename": filename, "reason": "invalid_shape"},
                 )
+                raise HTTPException(status_code=400, detail="invalid filename")
             dest = pending_dir / safe_name
             if not str(dest.resolve()).startswith(str(pending_dir.resolve())):
-                raise HTTPException(
-                    status_code=400, detail=f"Invalid filename: {filename!r}"
+                logger.info(
+                    "filename_rejected",
+                    extra={"filename": filename, "reason": "path_escape"},
                 )
+                raise HTTPException(status_code=400, detail="invalid filename")
             # BUG-0034 fix: append counter suffix on duplicate filenames
             if dest.exists():
                 stem = Path(safe_name).stem
@@ -5535,9 +5559,11 @@ async def upload_pending_files(
             # BUG-0008 fix: reject symlinks after write (race-safe check)
             if dest.is_symlink():
                 dest.unlink()
-                raise HTTPException(
-                    status_code=400, detail=f"Symlinks are not allowed: {safe_name!r}"
+                logger.info(
+                    "filename_rejected",
+                    extra={"filename": safe_name, "reason": "symlink_after_write"},
                 )
+                raise HTTPException(status_code=400, detail="symlinks are not allowed")
 
             uploaded.append(
                 UploadedFileInfo(
