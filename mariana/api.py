@@ -3617,6 +3617,15 @@ async def delete_investigation(
         "findings",
         "branches",
         "hypotheses",
+        # Z-01: settlement claim row (Y-01 added FK to research_tasks
+        # with ON DELETE RESTRICT).  Must be cleared before the parent
+        # DELETE or the user-driven investigation delete fails with a
+        # ForeignKeyViolationError.  Settlement history is moot once the
+        # user hard-deletes the investigation; a daemon mid-settle
+        # observing the row gone after RPC succeeds is safe because the
+        # ledger primitives are idempotent on (ref_type, ref_id) and
+        # the marker UPDATE silently no-ops when the row is missing.
+        "research_settlements",
     ]
     for table in cascade_tables:
         try:
