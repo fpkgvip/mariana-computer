@@ -77,18 +77,52 @@ _STEP_STDERR_TAIL = 4000
 # ---------------------------------------------------------------------------
 
 
-async def _persist_task(db: Any, task: AgentTask) -> None:
-    """Write the full task JSON back to Postgres.  Idempotent UPSERT."""
+# P-01: terminal states whose presence in DB plus credits_settled=TRUE means
+# the row has been *finalized* by some writer (typically the stop endpoint's
+# inline pre-execution cancel + settle path).  A stale snapshot from a
+# worker that loaded the row BEFORE finalization must NOT be allowed to
+# clobber it back to a non-terminal / non-settled state via _persist_task's
+# UPSERT.  See tests/test_p01_stale_worker_race.py.
+_TERMINAL_STATE_VALUES: tuple[str, ...] = (
+    "done", "failed", "halted", "cancelled",
+)
+
+
+async def _persist_task(db: Any, task: AgentTask) -> bool:
+    """Write the full task JSON back to Postgres.  Guarded UPSERT.
+
+    P-01: the ON CONFLICT UPDATE branch carries a compare-and-swap WHERE
+    clause that REJECTS any UPDATE which would un-finalize a row that has
+    already been settled by another writer.  Concretely: if the existing DB
+    row has ``credits_settled=TRUE`` AND ``state`` in (done/failed/halted/
+    cancelled), and the incoming snapshot wants to set
+    ``credits_settled=FALSE``, the UPDATE is silently skipped — the legitimate
+    finalization stays intact and the stale worker's later finally-block
+    settlement check will see ``credits_settled=TRUE`` and short-circuit.
+
+    Returns ``True`` if the row was inserted or updated, ``False`` if the
+    UPDATE branch was rejected by the CAS guard.  Callers that care about
+    finalization may use the return value to abort gracefully; legacy callers
+    can ignore it.
+    """
     task.updated_at = datetime.now(tz=timezone.utc)
     payload = task.model_dump(mode="json")
     async with db.acquire() as conn:
-        await conn.execute(
+        # asyncpg's ``execute`` returns the libpq command tag, e.g.
+        # ``"INSERT 0 1"``, ``"UPDATE 1"``, or ``"UPDATE 0"`` when the
+        # WHERE filtered out the conflict-update row.  We parse it to
+        # produce the bool return.
+        cmd_tag = await conn.execute(
             # N-01: ``reserved_credits`` and ``credits_settled`` are part of
             # the agent_tasks row in this release.  They MUST appear in both
             # the INSERT and the ON CONFLICT SET clause, otherwise the
             # ``finally:`` settlement (which writes credits_settled=True
             # before this UPSERT runs) is dropped on disk and a requeue
             # would re-settle.
+            #
+            # P-01: the WHERE on the ON CONFLICT branch refuses to write
+            # when the existing row is already finalized and the incoming
+            # row would un-finalize it (stale-worker race double-refund).
             """
             INSERT INTO agent_tasks (
                 id, user_id, conversation_id, goal, user_instructions,
@@ -120,6 +154,11 @@ async def _persist_task(db: Any, task: AgentTask) -> None:
                 stop_requested = EXCLUDED.stop_requested,
                 error = EXCLUDED.error,
                 updated_at = EXCLUDED.updated_at
+            WHERE NOT (
+                agent_tasks.credits_settled = TRUE
+                AND agent_tasks.state IN ('done','failed','halted','cancelled')
+                AND EXCLUDED.credits_settled = FALSE
+            )
             """,
             task.id,
             task.user_id,
@@ -145,6 +184,30 @@ async def _persist_task(db: Any, task: AgentTask) -> None:
             task.created_at,
             task.updated_at,
         )
+
+    # cmd_tag formats:
+    #   "INSERT 0 1"      -> first insert; the row landed.
+    #   "INSERT 0 0"      -> conflict matched and ON CONFLICT updated AND
+    #                         passed the CAS WHERE; ON CONFLICT in PG
+    #                         actually reports as "INSERT 0 1" too even when
+    #                         updating, but the WHERE skip path reports
+    #                         "INSERT 0 0".  We treat 0 as blocked.
+    affected = 1
+    try:
+        parts = (cmd_tag or "").split()
+        if parts and parts[0] in ("INSERT", "UPDATE") and parts[-1].isdigit():
+            affected = int(parts[-1])
+    except Exception:  # pragma: no cover — defensive parse fallback.
+        affected = 1
+    if affected == 0:
+        logger.warning(
+            "agent_persist_task_blocked",
+            task_id=task.id,
+            snapshot_state=task.state.value,
+            snapshot_credits_settled=task.credits_settled,
+        )
+        return False
+    return True
 
 
 async def _record_event(db: Any, redis: Any, task_id: str, event: AgentEvent) -> None:
@@ -756,6 +819,50 @@ async def run_agent_task(
         log.info("vault_env_installed", count=len(vault_env), names=sorted(vault_env.keys()))
 
     try:
+        # ---- P-01 pre-flight: re-validate the DB row before any work -----
+        # The queue worker loaded ``task`` via a plain SELECT in
+        # ``_load_agent_task`` (no FOR UPDATE / no version check).  If the
+        # user hit Stop in the window between that load and us, the stop
+        # endpoint may already have locked + settled the row.  Without this
+        # gate, the next ``_persist_task`` would clobber the finalized
+        # row back to our stale snapshot, and our ``finally:`` would issue
+        # a SECOND ``_settle_agent_credits`` — double refund / minted
+        # credits.  Returning here is safe: the in-memory task state is
+        # not advanced, so ``is_terminal(task.state)`` stays False and
+        # the finally block does not re-settle.
+        try:
+            async with db.acquire() as conn:
+                fresh_row = await conn.fetchrow(
+                    "SELECT state, credits_settled FROM agent_tasks WHERE id = $1",
+                    task.id,
+                )
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.warning(
+                "agent_run_task_prevalidate_failed",
+                task_id=task.id,
+                error=str(exc),
+            )
+            fresh_row = None
+        if fresh_row is None:
+            logger.warning("agent_run_task_missing_row", task_id=task.id)
+            return task
+        fresh_state = fresh_row["state"]
+        # ``is True`` (not ``bool(...)``) so a test passing a MagicMock for db
+        # cannot accidentally trip the early-abort path — only a real DB row
+        # with a literal True will do.
+        fresh_settled = fresh_row["credits_settled"] is True
+        if fresh_settled and fresh_state in _TERMINAL_STATE_VALUES:
+            logger.info(
+                "agent_run_task_already_finalized",
+                task_id=task.id,
+                fresh_state=fresh_state,
+            )
+            # Do nothing — another writer has already finalized this row.
+            # We deliberately do NOT mutate ``task.state`` so that the
+            # ``finally:`` ``is_terminal(task.state)`` check stays False
+            # and ``_settle_agent_credits`` is not called a second time.
+            return task
+
         # ---- PLAN --------------------------------------------------------
         await _persist_task(db, task)
         await _emit(db, redis, task, "state_change",
@@ -915,18 +1022,60 @@ async def run_agent_task(
             # ``credits_settled`` flag (and any post-settlement state) lands
             # in the same UPSERT.  Wrapped in try/except so a settlement
             # error never crashes the finally block.
+            #
+            # P-01: defense-in-depth — re-read ``credits_settled`` from DB
+            # right before settlement.  If another writer (typically the
+            # stop endpoint) has already finalized this task while we were
+            # running, our in-memory ``task.credits_settled`` may still be
+            # False from the stale snapshot, but the DB row already shows
+            # the refund happened.  Calling ``_settle_agent_credits`` again
+            # would issue a SECOND ``add_credits`` RPC — the exact
+            # double-refund the P-01 fix prevents.
+            already_settled_in_db = False
             try:
-                await _settle_agent_credits(task)
-            except Exception as _settle_exc:  # noqa: BLE001
-                logger.error(
-                    "agent_credits_settle_finally_error",
-                    task_id=task.id,
-                    error=str(_settle_exc),
+                async with db.acquire() as conn:
+                    final_row = await conn.fetchrow(
+                        "SELECT credits_settled FROM agent_tasks WHERE id = $1",
+                        task.id,
+                    )
+                if final_row is not None:
+                    # asyncpg returns a real Python bool here; use ``is True``
+                    # rather than ``bool(...)`` so a mocked DB in tests can't
+                    # accidentally short-circuit the settlement.
+                    already_settled_in_db = (
+                        final_row["credits_settled"] is True
+                    )
+            except Exception:  # noqa: BLE001 — defensive
+                logger.exception(
+                    "agent_finally_settle_check_failed", task_id=task.id
                 )
+            if already_settled_in_db:
+                # Reflect the canonical DB truth on the in-memory object so
+                # ``_settle_agent_credits`` short-circuits even if called
+                # again, and so the subsequent ``_persist_task`` does not
+                # re-flip the flag to False via the stale snapshot.
+                task.credits_settled = True
+                logger.info(
+                    "agent_finally_settle_skipped_already_settled",
+                    task_id=task.id,
+                )
+            else:
+                try:
+                    await _settle_agent_credits(task)
+                except Exception as _settle_exc:  # noqa: BLE001
+                    logger.error(
+                        "agent_credits_settle_finally_error",
+                        task_id=task.id,
+                        error=str(_settle_exc),
+                    )
             try:
+                # The CAS guard inside _persist_task will quietly reject
+                # this if another writer's finalization is more recent.
                 await _persist_task(db, task)
             except Exception:
-                pass
+                logger.exception(
+                    "agent_finally_persist_failed", task_id=task.id
+                )
         # Drop the per-task vault context AND the Redis blob.  This is the
         # only place plaintext can persist server-side, so we delete it as
         # soon as the loop exits regardless of state.
