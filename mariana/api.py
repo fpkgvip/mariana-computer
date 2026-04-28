@@ -56,7 +56,17 @@ import asyncpg
 import httpx
 import structlog
 import stripe as _stripe
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -76,8 +86,16 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from mariana.config import AppConfig, load_config
-from mariana.data.db import create_pool, init_schema, insert_research_task as _db_insert_research_task
-from mariana.data.models import ResearchTask as _ResearchTask, TaskStatus as _TaskStatus, State as _State
+from mariana.data.db import (
+    create_pool,
+    init_schema,
+    insert_research_task as _db_insert_research_task,
+)
+from mariana.data.models import (
+    ResearchTask as _ResearchTask,
+    TaskStatus as _TaskStatus,
+    State as _State,
+)
 from mariana.util.redis_url import make_redis_client
 
 logger = structlog.get_logger(__name__)
@@ -160,6 +178,7 @@ def _is_admin_user(user_id: str) -> bool:
 
     # Check negative-result cache only (positive decisions bypass cache).
     import time as _time
+
     now = _time.time()
     cached = _ADMIN_ROLE_CACHE.get(user_id)
     if cached is not None:
@@ -174,6 +193,7 @@ def _is_admin_user(user_id: str) -> bool:
         cfg = _get_config()
         if cfg.SUPABASE_URL and cfg.SUPABASE_ANON_KEY:
             import httpx as _httpx  # noqa: PLC0415
+
             # Use SECURITY DEFINER RPC is_admin(user_id uuid) which reads
             # profiles.role='admin' irrespective of RLS.
             url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/is_admin"
@@ -201,16 +221,19 @@ def _is_admin_user(user_id: str) -> bool:
         _ADMIN_ROLE_CACHE.pop(user_id, None)
     return is_admin
 
+
 # BUG-API-024: Allow-list of valid task status values. Clients that pass
 # anything outside this set receive a 400 instead of an empty result.
-_VALID_TASK_STATUSES: frozenset[str] = frozenset({
-    "PENDING",
-    "RUNNING",
-    "COMPLETED",
-    "FAILED",
-    "HALTED",
-    "CANCELLED",
-})
+_VALID_TASK_STATUSES: frozenset[str] = frozenset(
+    {
+        "PENDING",
+        "RUNNING",
+        "COMPLETED",
+        "FAILED",
+        "HALTED",
+        "CANCELLED",
+    }
+)
 
 
 def _normalize_bearer_auth_header(raw: str | None) -> str:
@@ -252,6 +275,7 @@ def _normalize_bearer_auth_header(raw: str | None) -> str:
             detail="Sign-in failed. Try again, or contact support if this keeps happening.",
         )
     return f"Bearer {token}"
+
 
 # ---------------------------------------------------------------------------
 # Module-level singletons (populated during lifespan startup)
@@ -301,7 +325,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _stripe.api_key = _config.STRIPE_SECRET_KEY
         log.info("stripe_configured")
     else:
-        log.warning("stripe_not_configured", message="STRIPE_SECRET_KEY is unset; billing endpoints will error")
+        log.warning(
+            "stripe_not_configured",
+            message="STRIPE_SECRET_KEY is unset; billing endpoints will error",
+        )
 
     # ── Database ────────────────────────────────────────────────────────────
     try:
@@ -316,8 +343,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.error("db_pool_failed", error=str(exc))
         _db_pool = None
         # BUG-054: Clarify degraded mode for operators
-        log.info("api_running_degraded_mode", missing="database",
-                 message="API started without database; most endpoints will return 503")
+        log.info(
+            "api_running_degraded_mode",
+            missing="database",
+            message="API started without database; most endpoints will return 503",
+        )
 
     # ── Redis ───────────────────────────────────────────────────────────────
     try:
@@ -419,6 +449,7 @@ if _redis_rate_limit_url:
 else:
     # Per-process fallback — warn at import time so it surfaces in logs.
     import warnings as _warnings
+
     _warnings.warn(
         "B-21: REDIS_URL not configured — rate limiter is per-process only. "
         "With multiple workers each worker gets an independent counter; "
@@ -431,9 +462,15 @@ else:
 # CC-16: Startup assertions — fail-closed if slowapi or its storage URI
 # validation somehow ended up in an inconsistent state. These guard against
 # a future refactor accidentally re-introducing a noop fallback.
-assert _slowapi is not None, "CC-16: slowapi module reference is None — refusing to start without a real rate limiter"
-assert isinstance(limiter, Limiter), "CC-16: limiter is not a real slowapi.Limiter — refusing to start"
-assert _RATE_LIMIT_STORAGE_VALIDATED, "CC-16: rate-limit storage URI was not validated by _load_rate_limit_storage_uri()"
+assert _slowapi is not None, (
+    "CC-16: slowapi module reference is None — refusing to start without a real rate limiter"
+)
+assert isinstance(limiter, Limiter), (
+    "CC-16: limiter is not a real slowapi.Limiter — refusing to start"
+)
+assert _RATE_LIMIT_STORAGE_VALIDATED, (
+    "CC-16: rate-limit storage URI was not validated by _load_rate_limit_storage_uri()"
+)
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -452,6 +489,7 @@ _DEFAULT_DEV_CORS_ORIGINS = [
 # Preserve the old name for backwards compatibility with external imports.
 _DEFAULT_CORS_ORIGINS = _DEFAULT_PROD_CORS_ORIGINS + _DEFAULT_DEV_CORS_ORIGINS
 
+
 def _is_dev_environment() -> bool:
     """Return True when we should allow localhost-style CORS origins.
 
@@ -464,6 +502,7 @@ def _is_dev_environment() -> bool:
         return True
     debug = os.environ.get("DEBUG", "").lower()
     return debug in {"1", "true", "yes", "on"}
+
 
 def _get_cors_origins() -> list[str]:
     """Return CORS allowed origins from env var, falling back to defaults.
@@ -484,6 +523,7 @@ def _get_cors_origins() -> list[str]:
     if _is_dev_environment():
         return list(_DEFAULT_PROD_CORS_ORIGINS) + list(_DEFAULT_DEV_CORS_ORIGINS)
     return list(_DEFAULT_PROD_CORS_ORIGINS)
+
 
 # BUG-0022 fix: Use explicit allow_origins list with allow_credentials=True.
 # The CORS spec forbids allow_credentials=True with wildcard origin/methods/headers.
@@ -550,12 +590,16 @@ _rate_limit_store: dict[str, deque] = defaultdict(deque)
 
 # Auth endpoints get stricter limits to slow credential stuffing
 _AUTH_PATH_PREFIXES = ("/api/auth/", "/auth/")
-_AUTH_RATE_LIMIT = 20       # requests per window
-_DEFAULT_RATE_LIMIT = 60    # requests per window
-_RATE_LIMIT_WINDOW = 60     # seconds
+_AUTH_RATE_LIMIT = 20  # requests per window
+_DEFAULT_RATE_LIMIT = 60  # requests per window
+_RATE_LIMIT_WINDOW = 60  # seconds
 
 
-def _check_rate_limit(key: str, max_requests: int = _DEFAULT_RATE_LIMIT, window_seconds: int = _RATE_LIMIT_WINDOW) -> bool:
+def _check_rate_limit(
+    key: str,
+    max_requests: int = _DEFAULT_RATE_LIMIT,
+    window_seconds: int = _RATE_LIMIT_WINDOW,
+) -> bool:
     """Return True if the request is within rate limits, False if exceeded."""
     now = time.monotonic()
     dq = _rate_limit_store[key]
@@ -596,7 +640,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if not _check_rate_limit(key, max_requests=max_req):
             return JSONResponse(
                 status_code=429,
-                content={"detail": "Rate limit exceeded. Please retry after a short wait."},
+                content={
+                    "detail": "Rate limit exceeded. Please retry after a short wait."
+                },
             )
 
         return await call_next(request)
@@ -613,14 +659,19 @@ app.add_middleware(RateLimitMiddleware)
 def _get_db() -> asyncpg.Pool:
     """Return the live DB pool or raise 503 if unavailable."""
     if _db_pool is None:
-        raise HTTPException(status_code=503, detail="Our database is offline. Try again in a moment.")
+        raise HTTPException(
+            status_code=503, detail="Our database is offline. Try again in a moment."
+        )
     return _db_pool
 
 
 def _get_config() -> AppConfig:
     """Return the loaded config or raise 503 if startup failed."""
     if _config is None:
-        raise HTTPException(status_code=503, detail="The service is starting up. Try again in a few seconds.")
+        raise HTTPException(
+            status_code=503,
+            detail="The service is starting up. Try again in a few seconds.",
+        )
     return _config
 
 
@@ -635,7 +686,9 @@ def _get_config() -> AppConfig:
 _REQUEST_DICT_MAX_BYTES = 32 * 1024  # 32 KB
 
 
-def _validate_dict_size(value: dict | None, *, max_bytes: int = _REQUEST_DICT_MAX_BYTES) -> dict | None:
+def _validate_dict_size(
+    value: dict | None, *, max_bytes: int = _REQUEST_DICT_MAX_BYTES
+) -> dict | None:
     """Reject dicts whose JSON serialization exceeds ``max_bytes``.
 
     Returns the dict unchanged on success. Raises ``ValueError`` (which
@@ -678,8 +731,10 @@ class ConfigResponse(BaseModel):
 
 # ── Conversation models ─────────────────────────────────────────────────────
 
+
 class ConversationSummary(BaseModel):
     """A conversation summary for the sidebar list."""
+
     id: str
     title: str
     created_at: str
@@ -692,6 +747,7 @@ class ConversationListResponse(BaseModel):
 
 class ConversationMessageOut(BaseModel):
     """A single persisted message."""
+
     id: str
     role: str
     content: str
@@ -743,9 +799,14 @@ class SaveMessageResponse(BaseModel):
 
 # ── Investigation models ───────────────────────────────────────────────────
 
+
 class StartInvestigationRequest(BaseModel):
-    topic: str = Field(..., min_length=1, max_length=4096, description="Research topic or question")
-    conversation_id: str | None = Field(None, description="Conversation to link this investigation to")
+    topic: str = Field(
+        ..., min_length=1, max_length=4096, description="Research topic or question"
+    )
+    conversation_id: str | None = Field(
+        None, description="Conversation to link this investigation to"
+    )
     # All below are now optional — AI determines them if not provided
 
     @field_validator("topic")
@@ -763,28 +824,56 @@ class StartInvestigationRequest(BaseModel):
         return trimmed
 
     budget_usd: float | None = Field(
-        None, gt=0.0, le=10000.0, description="Budget ceiling in USD (AI-determined if omitted)"
+        None,
+        gt=0.0,
+        le=10000.0,
+        description="Budget ceiling in USD (AI-determined if omitted)",
     )
     duration_hours: float | None = Field(
         None, gt=0.0, description="Max duration in hours (AI-determined if omitted)"
     )
-    plan_approved: bool = Field(False, description="Whether user has approved the research plan")
-    upload_session_uuid: str | None = Field(
-        None, description="Session UUID from pre-submission file uploads (from POST /api/upload)",
+    plan_approved: bool = Field(
+        False, description="Whether user has approved the research plan"
     )
-    quality_tier: str | None = Field(None, description="Model quality: maximum, high, balanced, economy")
-    user_flow_instructions: str | None = Field(None, max_length=8192, description="User's custom instructions for how AI should conduct research")
-    continuous_mode: bool = Field(False, description="If true, run in continuous loop until user manually stops")
-    dont_kill_branches: bool = Field(False, description="If true, never auto-kill branches regardless of score")
-    force_report_on_halt: bool = Field(False, description="If true, generate report instead of halting on critical failures")
-    skip_skeptic: bool = Field(False, description="If true, skip the skeptic quality gate")
-    skip_tribunal: bool = Field(False, description="If true, skip the adversarial tribunal review")
-    user_directives: dict | None = Field(None, description="Freeform user directives dict for custom flow control")
-    tier: str | None = Field(None, description="Override tier: instant, quick, standard, deep. If omitted, auto-classified.")
+    upload_session_uuid: str | None = Field(
+        None,
+        description="Session UUID from pre-submission file uploads (from POST /api/upload)",
+    )
+    quality_tier: str | None = Field(
+        None, description="Model quality: maximum, high, balanced, economy"
+    )
+    user_flow_instructions: str | None = Field(
+        None,
+        max_length=8192,
+        description="User's custom instructions for how AI should conduct research",
+    )
+    continuous_mode: bool = Field(
+        False, description="If true, run in continuous loop until user manually stops"
+    )
+    dont_kill_branches: bool = Field(
+        False, description="If true, never auto-kill branches regardless of score"
+    )
+    force_report_on_halt: bool = Field(
+        False,
+        description="If true, generate report instead of halting on critical failures",
+    )
+    skip_skeptic: bool = Field(
+        False, description="If true, skip the skeptic quality gate"
+    )
+    skip_tribunal: bool = Field(
+        False, description="If true, skip the adversarial tribunal review"
+    )
+    user_directives: dict | None = Field(
+        None, description="Freeform user directives dict for custom flow control"
+    )
+    tier: str | None = Field(
+        None,
+        description="Override tier: instant, quick, standard, deep. If omitted, auto-classified.",
+    )
     selected_model: str | None = Field(
         None,
         description="Orchestrator model ID chosen by the user (e.g. 'claude-opus-4-7'). "
-                    "Maps to a quality_tier internally.  Takes precedence over quality_tier if both set.",
+        "Maps to a quality_tier internally.  Takes precedence over quality_tier if both set.",
     )
 
     @field_validator("user_directives")
@@ -810,6 +899,7 @@ class ClassifyRequest(BaseModel):
 
 class ArchitectureHypothesis(BaseModel):
     """Lightweight hypothesis for the research architecture preview."""
+
     statement: str
     priority: int = Field(ge=1, le=10)
     test_strategy: str
@@ -817,6 +907,7 @@ class ArchitectureHypothesis(BaseModel):
 
 class ArchitecturePhase(BaseModel):
     """A single phase in the research flow."""
+
     name: str
     description: str
     depends_on: list[str] = Field(default_factory=list)
@@ -827,6 +918,7 @@ class ResearchArchitecturePlan(BaseModel):
     response so the user can preview the investigation structure before
     approving.  This is NOT the same as the full ResearchArchitectureOutput
     generated by the orchestrator — it is a preview only."""
+
     hypotheses: list[ArchitectureHypothesis]
     data_sources: list[str]
     research_phases: list[ArchitecturePhase]
@@ -877,8 +969,12 @@ class ClassifyResponse(BaseModel):
     plan_summary: str  # Brief description of what Mariana will do
     requires_approval: bool  # False for instant, True for standard/deep
     quality_tier: str = "balanced"
-    is_conversational: bool = False  # True for greetings/casual messages — use /api/chat/respond instead
-    research_architecture: ResearchArchitecturePlan | None = None  # Present for standard/deep tiers
+    is_conversational: bool = (
+        False  # True for greetings/casual messages — use /api/chat/respond instead
+    )
+    research_architecture: ResearchArchitecturePlan | None = (
+        None  # Present for standard/deep tiers
+    )
     orchestrator_models: list[dict[str, str]] = Field(
         default_factory=lambda: ORCHESTRATOR_MODELS,
         description="Available orchestrator model choices for the user to select",
@@ -887,18 +983,24 @@ class ClassifyResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     """Request body for the /api/chat/respond endpoint."""
+
     message: str = Field(..., min_length=1, max_length=8192)
     conversation_id: str | None = None
 
 
 class ChatResponse(BaseModel):
     """Smart reply: either a conversational response, a research launch, or an agent task."""
+
     reply: str
     action: str = "chat"  # "chat" = just reply, "research" = launch investigation, "computer" = agent task
-    mode: str = "chat"    # "chat" | "research" | "computer" — same signal as action, kept for legacy clients
-    research_topic: str | None = None  # refined topic for investigation (when action=research)
+    mode: str = "chat"  # "chat" | "research" | "computer" — same signal as action, kept for legacy clients
+    research_topic: str | None = (
+        None  # refined topic for investigation (when action=research)
+    )
     tier: str | None = None  # suggested tier (when action=research)
-    user_instructions: str | None = None  # extracted user methodology / custom instructions (when action=research)
+    user_instructions: str | None = (
+        None  # extracted user methodology / custom instructions (when action=research)
+    )
     agent_goal: str | None = None  # refined goal when action=computer
 
 
@@ -1040,7 +1142,9 @@ class PlanInfo(BaseModel):
 class CreateCheckoutRequest(BaseModel):
     """Request body for POST /api/billing/create-checkout."""
 
-    plan_id: str = Field(..., description="Plan ID (researcher | professional | enterprise)")
+    plan_id: str = Field(
+        ..., description="Plan ID (researcher | professional | enterprise)"
+    )
     success_url: str = Field(..., description="Redirect URL after successful checkout")
     cancel_url: str = Field(..., description="Redirect URL if checkout is cancelled")
 
@@ -1084,8 +1188,12 @@ class AdminSetCreditsRequest(BaseModel):
     but remains ≥ 0 when ``delta=False`` (setting an absolute balance).
     """
 
-    credits: int = Field(..., description="New absolute credits balance, or delta when delta=True")
-    delta: bool = Field(False, description="If True, treat credits as a delta to add/subtract")
+    credits: int = Field(
+        ..., description="New absolute credits balance, or delta when delta=True"
+    )
+    delta: bool = Field(
+        False, description="If True, treat credits as a delta to add/subtract"
+    )
 
     @model_validator(mode="after")
     def _validate_credits_sign(self) -> "AdminSetCreditsRequest":
@@ -1241,7 +1349,10 @@ async def _authenticate_supabase_token(token: str) -> dict[str, str]:
     """
     cfg = _get_config()
     if not cfg.SUPABASE_URL:
-        raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again shortly.")
+        raise HTTPException(
+            status_code=503,
+            detail="Sign-in is temporarily unavailable. Try again shortly.",
+        )
 
     headers = {"Authorization": f"Bearer {token}"}
     if cfg.SUPABASE_ANON_KEY:
@@ -1252,21 +1363,31 @@ async def _authenticate_supabase_token(token: str) -> dict[str, str]:
             resp = await client.get(f"{cfg.SUPABASE_URL}/auth/v1/user", headers=headers)
     except httpx.HTTPError as exc:
         logger.warning("supabase_auth_unreachable", error=str(exc))
-        raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again shortly.") from exc
+        raise HTTPException(
+            status_code=503,
+            detail="Sign-in is temporarily unavailable. Try again shortly.",
+        ) from exc
 
     if resp.status_code != 200:
         logger.warning("supabase_auth_rejected_token", status=resp.status_code)
-        raise HTTPException(status_code=401, detail="Your session is invalid. Sign in again.")
+        raise HTTPException(
+            status_code=401, detail="Your session is invalid. Sign in again."
+        )
 
     try:
         payload = resp.json()
     except ValueError as exc:
         logger.error("supabase_auth_invalid_json", error=str(exc))
-        raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again shortly.") from exc
+        raise HTTPException(
+            status_code=503,
+            detail="Sign-in is temporarily unavailable. Try again shortly.",
+        ) from exc
 
     user_id: str | None = payload.get("id") or payload.get("sub")
     if not user_id:
-        raise HTTPException(status_code=401, detail="Your session is malformed. Sign in again.")
+        raise HTTPException(
+            status_code=401, detail="Your session is malformed. Sign in again."
+        )
 
     app_metadata = payload.get("app_metadata") or {}
     role: str = payload.get("role") or app_metadata.get("role") or "authenticated"
@@ -1331,7 +1452,9 @@ async def _require_investigation_owner(
     fk_user_id = str(row["user_id"]) if row["user_id"] is not None else None
     if fk_user_id is not None:
         if fk_user_id != current_user["user_id"]:
-            raise HTTPException(status_code=403, detail="You do not own this investigation")
+            raise HTTPException(
+                status_code=403, detail="You do not own this investigation"
+            )
         return current_user
 
     # Fallback: metadata-based check for legacy rows where user_id column is NULL.
@@ -1402,7 +1525,9 @@ def _mint_stream_token(user_id: str, task_id: str) -> str:
     """
     exp = int(time.time()) + _STREAM_TOKEN_TTL_SECONDS
     payload = f"{user_id}|{task_id}|{exp}"
-    sig = hmac.new(_get_stream_token_secret(), payload.encode(), hashlib.sha256).hexdigest()
+    sig = hmac.new(
+        _get_stream_token_secret(), payload.encode(), hashlib.sha256
+    ).hexdigest()
     return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
 
 
@@ -1415,7 +1540,9 @@ def _mint_preview_token(user_id: str, task_id: str) -> str:
     """
     exp = int(time.time()) + _PREVIEW_TOKEN_TTL_SECONDS
     payload = f"preview|{user_id}|{task_id}|{exp}"
-    sig = hmac.new(_get_stream_token_secret(), payload.encode(), hashlib.sha256).hexdigest()
+    sig = hmac.new(
+        _get_stream_token_secret(), payload.encode(), hashlib.sha256
+    ).hexdigest()
     return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
 
 
@@ -1434,7 +1561,9 @@ def _verify_preview_token(token: str, task_id: str) -> str | None:
         if scope != "preview":
             return None
         payload = f"{scope}|{user_id}|{tok_task_id}|{exp_str}"
-        expected_sig = hmac.new(_get_stream_token_secret(), payload.encode(), hashlib.sha256).hexdigest()
+        expected_sig = hmac.new(
+            _get_stream_token_secret(), payload.encode(), hashlib.sha256
+        ).hexdigest()
         if not hmac.compare_digest(sig, expected_sig):
             return None
         if tok_task_id != task_id:
@@ -1459,7 +1588,9 @@ def _verify_stream_token(token: str, task_id: str) -> str:
         user_id, tok_task_id, exp_str, sig = parts
         # Verify HMAC
         payload = f"{user_id}|{tok_task_id}|{exp_str}"
-        expected_sig = hmac.new(_get_stream_token_secret(), payload.encode(), hashlib.sha256).hexdigest()
+        expected_sig = hmac.new(
+            _get_stream_token_secret(), payload.encode(), hashlib.sha256
+        ).hexdigest()
         if not hmac.compare_digest(sig, expected_sig):
             raise ValueError("bad signature")
         # Verify task_id matches
@@ -1500,7 +1631,9 @@ async def _require_investigation_owner_header_or_query(
     fk_user_id = str(row["user_id"]) if row["user_id"] is not None else None
     if fk_user_id is not None:
         if fk_user_id != current_user["user_id"]:
-            raise HTTPException(status_code=403, detail="You do not own this investigation")
+            raise HTTPException(
+                status_code=403, detail="You do not own this investigation"
+            )
         return current_user
 
     metadata = row.get("metadata") or {}
@@ -1546,7 +1679,9 @@ async def _authenticate_stream_token_or_header(
         user = await _authenticate_supabase_token(raw_token)
         # Verify ownership
         db = _get_db()
-        row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
+        row = await db.fetchrow(
+            "SELECT metadata FROM research_tasks WHERE id = $1", task_id
+        )
         if row is None:
             logger.info("task_not_found", task_id=task_id)
             raise HTTPException(status_code=404, detail="task not found")
@@ -1561,10 +1696,11 @@ async def _authenticate_stream_token_or_header(
                 except (json.JSONDecodeError, TypeError):
                     metadata = {}
             if metadata.get("user_id") != user["user_id"]:
-                raise HTTPException(status_code=403, detail="You do not own this investigation")
+                raise HTTPException(
+                    status_code=403, detail="You do not own this investigation"
+                )
         return user
     raise HTTPException(status_code=401, detail="Sign in to continue.")
-
 
 
 async def _require_admin(
@@ -1614,7 +1750,7 @@ try:
     _billing_router = _build_billing_router(
         get_current_user=_get_current_user,
         get_supabase_url=lambda: _get_config().SUPABASE_URL,
-        get_service_key=lambda: (_supabase_api_key(_get_config()) or ""),
+        get_service_key=lambda: _supabase_api_key(_get_config()) or "",
     )
     app.include_router(_billing_router)
     logger.info("billing_routes_registered", route_count=len(_billing_router.routes))
@@ -1631,7 +1767,7 @@ try:
     _vault_router = _build_vault_router(
         get_current_user=_get_current_user,
         get_supabase_url=lambda: _get_config().SUPABASE_URL,
-        get_service_key=lambda: (_supabase_api_key(_get_config()) or ""),
+        get_service_key=lambda: _supabase_api_key(_get_config()) or "",
     )
     app.include_router(_vault_router)
     logger.info("vault_routes_registered", route_count=len(_vault_router.routes))
@@ -1652,7 +1788,9 @@ try:
     from fastapi import Path as _FPath  # noqa: PLC0415
     from fastapi.responses import FileResponse as _FileResponse  # noqa: PLC0415
 
-    _PREVIEW_ROOT_PATH = _PathPv(os.environ.get("DEFT_PREVIEW_ROOT", "/var/lib/deft/preview"))
+    _PREVIEW_ROOT_PATH = _PathPv(
+        os.environ.get("DEFT_PREVIEW_ROOT", "/var/lib/deft/preview")
+    )
     _PREVIEW_ROOT_PATH.mkdir(parents=True, exist_ok=True)
     # CC-10: anchor with \Z, not $.  Python's $ matches before a trailing \n,
     # so a poisoned task_id like "abc\n" would slip through this gate and be
@@ -1732,6 +1870,7 @@ try:
         # Redirect /preview/<id> -> /preview/<id>/index.html so iframe paths
         # resolve correctly relative to the entry document.
         from fastapi.responses import RedirectResponse  # noqa: PLC0415
+
         if not _SAFE_PREVIEW_TASK.match(task_id):
             raise HTTPException(404, "preview not found")
         await _enforce_preview_owner(request, task_id)
@@ -1814,7 +1953,9 @@ try:
             preview_token = _mint_preview_token(user_id or owner or "", task_id)
             _set_preview_cookie(response, task_id, preview_token)
         except Exception as cookie_err:  # pragma: no cover — cookie best-effort
-            logger.warning("preview_cookie_set_failed", task_id=task_id, error=str(cookie_err))
+            logger.warning(
+                "preview_cookie_set_failed", task_id=task_id, error=str(cookie_err)
+            )
         rel_url = f"/preview/{task_id}/{manifest.get('entry') or 'index.html'}"
         return {
             "task_id": task_id,
@@ -1899,7 +2040,9 @@ _TOPUPS: list[dict[str, Any]] = [
         "name": "Starter top-up",
         "price_usd": 10.0,
         "credits": 1_000,
-        "stripe_price_id": os.environ.get("STRIPE_PRICE_TOPUP_STARTER", "price_topup_starter"),
+        "stripe_price_id": os.environ.get(
+            "STRIPE_PRICE_TOPUP_STARTER", "price_topup_starter"
+        ),
     },
     {
         "id": "topup_pro",
@@ -1920,16 +2063,18 @@ _TOPUPS: list[dict[str, Any]] = [
 _PLAN_BY_ID: dict[str, dict[str, Any]] = {p["id"]: p for p in _PLANS}
 _PLAN_BY_PRICE_ID: dict[str, dict[str, Any]] = {p["stripe_price_id"]: p for p in _PLANS}
 _TOPUP_BY_ID: dict[str, dict[str, Any]] = {t["id"]: t for t in _TOPUPS}
-_TOPUP_BY_PRICE_ID: dict[str, dict[str, Any]] = {t["stripe_price_id"]: t for t in _TOPUPS}
+_TOPUP_BY_PRICE_ID: dict[str, dict[str, Any]] = {
+    t["stripe_price_id"]: t for t in _TOPUPS
+}
 
 #: Tier-to-credit cost mapping used by the classification heuristic.
 #: At $0.01/credit, these map to: instant=$0.10, standard=$5, deep=$20.
 #: Minimum budgets: standard=$5, deep=$20 per the architecture spec.
 _TIER_CREDITS: dict[str, int] = {
     "instant": 5,
-    "quick": 20,       # ~$0.20 budget, ~30s, single search
-    "standard": 100,   # ~$1.00 budget, 3-5 min, moderate analysis
-    "deep": 500,       # ~$5.00 budget, 15-45 min, exhaustive research
+    "quick": 20,  # ~$0.20 budget, ~30s, single search
+    "standard": 100,  # ~$1.00 budget, 3-5 min, moderate analysis
+    "deep": 500,  # ~$5.00 budget, 15-45 min, exhaustive research
 }
 
 #: Credits-to-USD ratio (1 credit = $0.01 USD)
@@ -2129,7 +2274,9 @@ If they ask what you can do, explain you're an AI that can have normal conversat
     if body.conversation_id:
         try:
             hist_resp = await _supabase_rest(
-                cfg, "GET", "/conversation_messages",
+                cfg,
+                "GET",
+                "/conversation_messages",
                 params={
                     "conversation_id": f"eq.{body.conversation_id}",
                     "select": "role,content,type",
@@ -2144,7 +2291,11 @@ If they ask what you can do, explain you're an AI that can have normal conversat
                     content = m.get("content", "")
                     msg_type = m.get("type", "text")
                     # Only include text messages (skip status/system messages)
-                    if msg_type in ("text", None) and role in ("user", "assistant") and content.strip():
+                    if (
+                        msg_type in ("text", None)
+                        and role in ("user", "assistant")
+                        and content.strip()
+                    ):
                         history_messages.append({"role": role, "content": content})
         except Exception as hist_err:
             logger.warning("chat_history_fetch_error", error=str(hist_err))
@@ -2178,6 +2329,7 @@ If they ask what you can do, explain you're an AI that can have normal conversat
 
             # Parse the JSON response from the LLM
             import json as _json  # noqa: PLC0415
+
             # Strip markdown code fences if present
             if raw.startswith("```"):
                 raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
@@ -2247,7 +2399,9 @@ If they ask what you can do, explain you're an AI that can have normal conversat
 # targets a specific primary key (filtered via params) so the replay is
 # still idempotent — callers that issue bulk PATCH/DELETE should pass
 # ``allow_retry=False`` explicitly.
-_SUPABASE_RETRY_IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "PATCH", "DELETE", "PUT"})
+_SUPABASE_RETRY_IDEMPOTENT_METHODS = frozenset(
+    {"GET", "HEAD", "PATCH", "DELETE", "PUT"}
+)
 _SUPABASE_RETRY_MAX_ATTEMPTS = 3
 _SUPABASE_RETRY_BASE_DELAY = 0.25  # seconds; exponential 0.25, 0.5, 1.0
 _SUPABASE_RETRYABLE_STATUSES = frozenset({502, 503, 504})
@@ -2305,13 +2459,16 @@ async def _supabase_rest(
             allow_retry = True
         elif method_upper in ("PATCH", "DELETE", "PUT") and params:
             allow_retry = any(
-                isinstance(v, str) and v.startswith("eq.")
-                for v in params.values()
+                isinstance(v, str) and v.startswith("eq.") for v in params.values()
             )
         else:
             allow_retry = False
 
-    max_attempts = _SUPABASE_RETRY_MAX_ATTEMPTS if allow_retry and method_upper in _SUPABASE_RETRY_IDEMPOTENT_METHODS else 1
+    max_attempts = (
+        _SUPABASE_RETRY_MAX_ATTEMPTS
+        if allow_retry and method_upper in _SUPABASE_RETRY_IDEMPOTENT_METHODS
+        else 1
+    )
     last_exc: Exception | None = None
     async with httpx.AsyncClient(timeout=15.0) as client:
         for attempt in range(1, max_attempts + 1):
@@ -2319,7 +2476,11 @@ async def _supabase_rest(
                 resp = await client.request(
                     method_upper, url, json=json, params=params, headers=headers
                 )
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
+            except (
+                httpx.ConnectError,
+                httpx.ReadTimeout,
+                httpx.RemoteProtocolError,
+            ) as exc:
                 last_exc = exc
                 if attempt >= max_attempts:
                     logger.warning(
@@ -2342,7 +2503,10 @@ async def _supabase_rest(
                 await asyncio.sleep(delay)
                 continue
 
-            if resp.status_code in _SUPABASE_RETRYABLE_STATUSES and attempt < max_attempts:
+            if (
+                resp.status_code in _SUPABASE_RETRYABLE_STATUSES
+                and attempt < max_attempts
+            ):
                 delay = _SUPABASE_RETRY_BASE_DELAY * (2 ** (attempt - 1))
                 logger.info(
                     "supabase_rest_retry_status",
@@ -2398,13 +2562,16 @@ async def _supabase_rest_system(
             allow_retry = True
         elif method_upper in ("PATCH", "DELETE", "PUT") and params:
             allow_retry = any(
-                isinstance(v, str) and v.startswith("eq.")
-                for v in params.values()
+                isinstance(v, str) and v.startswith("eq.") for v in params.values()
             )
         else:
             allow_retry = False
 
-    max_attempts = _SUPABASE_RETRY_MAX_ATTEMPTS if allow_retry and method_upper in _SUPABASE_RETRY_IDEMPOTENT_METHODS else 1
+    max_attempts = (
+        _SUPABASE_RETRY_MAX_ATTEMPTS
+        if allow_retry and method_upper in _SUPABASE_RETRY_IDEMPOTENT_METHODS
+        else 1
+    )
     last_exc: Exception | None = None
     async with httpx.AsyncClient(timeout=15.0) as client:
         for attempt in range(1, max_attempts + 1):
@@ -2412,7 +2579,11 @@ async def _supabase_rest_system(
                 resp = await client.request(
                     method_upper, url, json=json, params=params, headers=headers
                 )
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
+            except (
+                httpx.ConnectError,
+                httpx.ReadTimeout,
+                httpx.RemoteProtocolError,
+            ) as exc:
                 last_exc = exc
                 if attempt >= max_attempts:
                     raise
@@ -2420,7 +2591,10 @@ async def _supabase_rest_system(
                 await asyncio.sleep(delay)
                 continue
 
-            if resp.status_code in _SUPABASE_RETRYABLE_STATUSES and attempt < max_attempts:
+            if (
+                resp.status_code in _SUPABASE_RETRYABLE_STATUSES
+                and attempt < max_attempts
+            ):
                 delay = _SUPABASE_RETRY_BASE_DELAY * (2 ** (attempt - 1))
                 await asyncio.sleep(delay)
                 continue
@@ -2444,12 +2618,22 @@ async def create_conversation(
 ) -> CreateConversationResponse:
     cfg = _get_config()
     user_id = current_user["user_id"]
-    user_token = authorization.split(" ", 1)[1].strip() if authorization and authorization.startswith("Bearer ") else None
+    user_token = (
+        authorization.split(" ", 1)[1].strip()
+        if authorization and authorization.startswith("Bearer ")
+        else None
+    )
     row = {"user_id": user_id, "title": body.title.strip() or "New conversation"}
-    resp = await _supabase_rest(cfg, "POST", "/conversations", json=row, user_token=user_token)
+    resp = await _supabase_rest(
+        cfg, "POST", "/conversations", json=row, user_token=user_token
+    )
     if resp.status_code not in (200, 201):
-        logger.error("create_conversation_failed", status=resp.status_code, body=resp.text)
-        raise HTTPException(status_code=500, detail="Could not start a new conversation. Try again.")
+        logger.error(
+            "create_conversation_failed", status=resp.status_code, body=resp.text
+        )
+        raise HTTPException(
+            status_code=500, detail="Could not start a new conversation. Try again."
+        )
     data = resp.json()
     created = data[0] if isinstance(data, list) else data
     return CreateConversationResponse(id=created["id"], title=created["title"])
@@ -2467,9 +2651,15 @@ async def list_conversations(
 ) -> ConversationListResponse:
     cfg = _get_config()
     user_id = current_user["user_id"]
-    user_token = authorization.split(" ", 1)[1].strip() if authorization and authorization.startswith("Bearer ") else None
+    user_token = (
+        authorization.split(" ", 1)[1].strip()
+        if authorization and authorization.startswith("Bearer ")
+        else None
+    )
     resp = await _supabase_rest(
-        cfg, "GET", "/conversations",
+        cfg,
+        "GET",
+        "/conversations",
         params={
             "user_id": f"eq.{user_id}",
             "select": "id,title,created_at,updated_at",
@@ -2479,8 +2669,12 @@ async def list_conversations(
         user_token=user_token,
     )
     if resp.status_code != 200:
-        logger.error("list_conversations_failed", status=resp.status_code, body=resp.text)
-        raise HTTPException(status_code=500, detail="Could not load your conversations. Try again.")
+        logger.error(
+            "list_conversations_failed", status=resp.status_code, body=resp.text
+        )
+        raise HTTPException(
+            status_code=500, detail="Could not load your conversations. Try again."
+        )
     rows = resp.json()
     items = [
         ConversationSummary(
@@ -2513,11 +2707,17 @@ async def get_conversation(
 
     cfg = _get_config()
     user_id = current_user["user_id"]
-    user_token = authorization.split(" ", 1)[1].strip() if authorization and authorization.startswith("Bearer ") else None
+    user_token = (
+        authorization.split(" ", 1)[1].strip()
+        if authorization and authorization.startswith("Bearer ")
+        else None
+    )
 
     # Fetch conversation (RLS ensures ownership)
     conv_resp = await _supabase_rest(
-        cfg, "GET", "/conversations",
+        cfg,
+        "GET",
+        "/conversations",
         params={
             "id": f"eq.{conversation_id}",
             "user_id": f"eq.{user_id}",
@@ -2527,7 +2727,9 @@ async def get_conversation(
         user_token=user_token,
     )
     if conv_resp.status_code != 200:
-        raise HTTPException(status_code=500, detail="Could not load this conversation. Try again.")
+        raise HTTPException(
+            status_code=500, detail="Could not load this conversation. Try again."
+        )
     convs = conv_resp.json()
     if not convs:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -2535,7 +2737,9 @@ async def get_conversation(
 
     # Fetch messages
     msg_resp = await _supabase_rest(
-        cfg, "GET", "/conversation_messages",
+        cfg,
+        "GET",
+        "/conversation_messages",
         params={
             "conversation_id": f"eq.{conversation_id}",
             "select": "id,role,content,type,metadata,created_at",
@@ -2573,18 +2777,24 @@ async def get_conversation(
                     have_created_at=bool(msg_created_at),
                 )
                 continue
-            msgs.append(ConversationMessageOut(
-                id=msg_id,
-                role=msg_role,
-                content=msg_content if isinstance(msg_content, str) else str(msg_content),
-                type=m.get("type") or "text",
-                metadata=raw_meta if isinstance(raw_meta, dict) else None,
-                created_at=msg_created_at,
-            ))
+            msgs.append(
+                ConversationMessageOut(
+                    id=msg_id,
+                    role=msg_role,
+                    content=msg_content
+                    if isinstance(msg_content, str)
+                    else str(msg_content),
+                    type=m.get("type") or "text",
+                    metadata=raw_meta if isinstance(raw_meta, dict) else None,
+                    created_at=msg_created_at,
+                )
+            )
 
     # Fetch linked investigation task_ids
     inv_resp = await _supabase_rest(
-        cfg, "GET", "/investigations",
+        cfg,
+        "GET",
+        "/investigations",
         params={
             "conversation_id": f"eq.{conversation_id}",
             "user_id": f"eq.{user_id}",
@@ -2623,15 +2833,27 @@ async def update_conversation(
         raise HTTPException(status_code=400, detail="Invalid conversation ID format")
     cfg = _get_config()
     user_id = current_user["user_id"]
-    user_token = authorization.split(" ", 1)[1].strip() if authorization and authorization.startswith("Bearer ") else None
+    user_token = (
+        authorization.split(" ", 1)[1].strip()
+        if authorization and authorization.startswith("Bearer ")
+        else None
+    )
     resp = await _supabase_rest(
-        cfg, "PATCH", "/conversations",
-        json={"title": body.title.strip(), "updated_at": datetime.now(tz=timezone.utc).isoformat()},
+        cfg,
+        "PATCH",
+        "/conversations",
+        json={
+            "title": body.title.strip(),
+            "updated_at": datetime.now(tz=timezone.utc).isoformat(),
+        },
         params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
         user_token=user_token,
     )
     if resp.status_code not in (200, 204):
-        raise HTTPException(status_code=500, detail="Could not save changes to this conversation. Try again.")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save changes to this conversation. Try again.",
+        )
     # BUG-0053b fix: check if any rows were actually affected
     try:
         affected = resp.json()
@@ -2658,15 +2880,23 @@ async def delete_conversation(
         raise HTTPException(status_code=400, detail="Invalid conversation ID format")
     cfg = _get_config()
     user_id = current_user["user_id"]
-    user_token = authorization.split(" ", 1)[1].strip() if authorization and authorization.startswith("Bearer ") else None
+    user_token = (
+        authorization.split(" ", 1)[1].strip()
+        if authorization and authorization.startswith("Bearer ")
+        else None
+    )
     # Cascade delete handles messages. Unlink investigations (SET NULL).
     resp = await _supabase_rest(
-        cfg, "DELETE", "/conversations",
+        cfg,
+        "DELETE",
+        "/conversations",
         params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
         user_token=user_token,
     )
     if resp.status_code not in (200, 204):
-        raise HTTPException(status_code=500, detail="Could not delete this conversation. Try again.")
+        raise HTTPException(
+            status_code=500, detail="Could not delete this conversation. Try again."
+        )
     # BUG-0053b fix: check if any rows were actually affected
     try:
         affected = resp.json()
@@ -2693,25 +2923,39 @@ async def save_message(
     to save user, assistant, and system messages as they happen."""
     cfg = _get_config()
     user_id = current_user["user_id"]
-    user_token = authorization.split(" ", 1)[1].strip() if authorization and authorization.startswith("Bearer ") else None
+    user_token = (
+        authorization.split(" ", 1)[1].strip()
+        if authorization and authorization.startswith("Bearer ")
+        else None
+    )
 
     # BUG-API-028: Validate conversation_id as a UUID to avoid confusing
     # PostgREST 400/500s when a client sends a malformed id.
     try:
         uuid.UUID(body.conversation_id)
     except (ValueError, AttributeError) as exc:
-        raise HTTPException(status_code=400, detail="Invalid conversation_id format") from exc
+        raise HTTPException(
+            status_code=400, detail="Invalid conversation_id format"
+        ) from exc
 
     # Verify conversation ownership first
     check = await _supabase_rest(
-        cfg, "GET", "/conversations",
-        params={"id": f"eq.{body.conversation_id}", "user_id": f"eq.{user_id}", "select": "id", "limit": "1"},
+        cfg,
+        "GET",
+        "/conversations",
+        params={
+            "id": f"eq.{body.conversation_id}",
+            "user_id": f"eq.{user_id}",
+            "select": "id",
+            "limit": "1",
+        },
         user_token=user_token,
     )
     if check.status_code != 200 or not check.json():
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     import json as _json  # noqa: PLC0415
+
     row = {
         "conversation_id": body.conversation_id,
         "role": body.role,
@@ -2719,10 +2963,14 @@ async def save_message(
         "type": body.type,
         "metadata": _json.dumps(body.metadata) if body.metadata else "{}",
     }
-    resp = await _supabase_rest(cfg, "POST", "/conversation_messages", json=row, user_token=user_token)
+    resp = await _supabase_rest(
+        cfg, "POST", "/conversation_messages", json=row, user_token=user_token
+    )
     if resp.status_code not in (200, 201):
         logger.error("save_message_failed", status=resp.status_code, body=resp.text)
-        raise HTTPException(status_code=500, detail="Could not save your message. Try again.")
+        raise HTTPException(
+            status_code=500, detail="Could not save your message. Try again."
+        )
 
     data = resp.json()
     created = data[0] if isinstance(data, list) else data
@@ -2735,8 +2983,14 @@ async def save_message(
         if title_candidate:
             # Only auto-title if current title is default
             conv_check = await _supabase_rest(
-                cfg, "GET", "/conversations",
-                params={"id": f"eq.{body.conversation_id}", "select": "title", "limit": "1"},
+                cfg,
+                "GET",
+                "/conversations",
+                params={
+                    "id": f"eq.{body.conversation_id}",
+                    "select": "title",
+                    "limit": "1",
+                },
                 user_token=user_token,
             )
             if conv_check.status_code == 200:
@@ -2744,7 +2998,9 @@ async def save_message(
                 if conv_data and conv_data[0].get("title") in ("New conversation", ""):
                     patch["title"] = title_candidate
     await _supabase_rest(
-        cfg, "PATCH", "/conversations",
+        cfg,
+        "PATCH",
+        "/conversations",
         json=patch,
         params={"id": f"eq.{body.conversation_id}"},
         user_token=user_token,
@@ -2782,7 +3038,9 @@ async def start_investigation(
     # ── BUG-D2-04 fix: Validate quality_tier before any processing ─────────
     # Previously an invalid value like "ultra" was silently accepted and
     # written to .task.json, only caught much later via a warning in session.py.
-    _VALID_QUALITY_TIERS: frozenset[str] = frozenset({"maximum", "high", "balanced", "economy"})
+    _VALID_QUALITY_TIERS: frozenset[str] = frozenset(
+        {"maximum", "high", "balanced", "economy"}
+    )
     if body.quality_tier and body.quality_tier not in _VALID_QUALITY_TIERS:
         raise HTTPException(
             status_code=400,
@@ -2793,9 +3051,7 @@ async def start_investigation(
         )
 
     # ── Map selected_model → quality_tier (takes precedence) ─────────────
-    _MODEL_TO_TIER: dict[str, str] = {
-        m["id"]: m["tier"] for m in ORCHESTRATOR_MODELS
-    }
+    _MODEL_TO_TIER: dict[str, str] = {m["id"]: m["tier"] for m in ORCHESTRATOR_MODELS}
     if body.selected_model and body.selected_model in _MODEL_TO_TIER:
         body.quality_tier = _MODEL_TO_TIER[body.selected_model]
 
@@ -2822,7 +3078,9 @@ async def start_investigation(
     )
     try:
         _plan_resp = await _supabase_rest(
-            cfg, "GET", "/profiles",
+            cfg,
+            "GET",
+            "/profiles",
             params={
                 "id": f"eq.{current_user['user_id']}",
                 "select": "plan",
@@ -2833,7 +3091,11 @@ async def start_investigation(
         if _plan_resp.status_code == 200:
             _plan_data = _plan_resp.json()
             if _plan_data:
-                user_plan = (_plan_data[0].get("plan") or "free") if isinstance(_plan_data, list) else (_plan_data.get("plan") or "free")
+                user_plan = (
+                    (_plan_data[0].get("plan") or "free")
+                    if isinstance(_plan_data, list)
+                    else (_plan_data.get("plan") or "free")
+                )
     except Exception:  # noqa: BLE001
         pass  # Default to "free" on lookup failure
 
@@ -2922,7 +3184,9 @@ async def start_investigation(
         # BUG-API-005: Three-state result. Distinguish insufficient-credits
         # (402) from transient RPC errors (503) so we never 402 a user whose
         # problem is actually service availability.
-        reserved = await _supabase_deduct_credits(current_user["user_id"], estimated_credits_needed, cfg)
+        reserved = await _supabase_deduct_credits(
+            current_user["user_id"], estimated_credits_needed, cfg
+        )
         if reserved == "insufficient":
             user_tokens = await _supabase_get_user_tokens(current_user["user_id"], cfg)
             available = user_tokens if user_tokens is not None else 0
@@ -3042,6 +3306,7 @@ async def start_investigation(
                 task_upload_dir = Path(cfg.DATA_ROOT) / "files" / task_id
                 task_upload_dir.mkdir(parents=True, exist_ok=True)
                 import shutil
+
                 for f in claimed_dir.iterdir():
                     if f.is_symlink():  # BUG-0008 fix: skip symlinks
                         continue
@@ -3068,9 +3333,8 @@ async def start_investigation(
         # BUG-0007 fix: admin-only QA-bypass flags are stripped for non-admin
         # users.  BUG-0006 fix: uses _is_admin_user() which handles empty
         # ADMIN_USER_ID safely.
-        _is_admin: bool = (
-            current_user.get("role") == "admin"
-            or _is_admin_user(str(current_user.get("user_id", "")))
+        _is_admin: bool = current_user.get("role") == "admin" or _is_admin_user(
+            str(current_user.get("user_id", ""))
         )
 
         task_payload: dict[str, Any] = {
@@ -3097,7 +3361,9 @@ async def start_investigation(
             # critical-review gates.  Only honour them when the submitting
             # user is an admin; non-admin submissions get them forced False.
             "dont_kill_branches": bool(body.dont_kill_branches) if _is_admin else False,
-            "force_report_on_halt": bool(body.force_report_on_halt) if _is_admin else False,
+            "force_report_on_halt": bool(body.force_report_on_halt)
+            if _is_admin
+            else False,
             "skip_skeptic": bool(body.skip_skeptic) if _is_admin else False,
             "skip_tribunal": bool(body.skip_tribunal) if _is_admin else False,
             "user_directives": body.user_directives or {},
@@ -3153,7 +3419,9 @@ async def start_investigation(
                 # Validate UUID shape before hitting PostgREST (avoids confusing 400s).
                 uuid.UUID(body.conversation_id)
                 ownership_resp = await _supabase_rest_system(
-                    cfg, "GET", "/conversations",
+                    cfg,
+                    "GET",
+                    "/conversations",
                     params={
                         "id": f"eq.{body.conversation_id}",
                         "user_id": f"eq.{current_user['user_id']}",
@@ -3183,12 +3451,16 @@ async def start_investigation(
             if conversation_owned:
                 try:
                     await _supabase_rest_system(
-                        cfg, "PATCH", "/investigations",
+                        cfg,
+                        "PATCH",
+                        "/investigations",
                         json={"conversation_id": body.conversation_id},
                         params={"task_id": f"eq.{task_id}"},
                     )
                 except Exception as link_err:  # noqa: BLE001
-                    logger.warning("investigation_conversation_link_failed", error=str(link_err))
+                    logger.warning(
+                        "investigation_conversation_link_failed", error=str(link_err)
+                    )
             else:
                 logger.warning(
                     "investigation_conversation_link_rejected",
@@ -3201,7 +3473,9 @@ async def start_investigation(
         # never masks the original HTTPException the user was about to see.
         if reserved_credits > 0:
             try:
-                await _supabase_add_credits(current_user["user_id"], reserved_credits, cfg)
+                await _supabase_add_credits(
+                    current_user["user_id"], reserved_credits, cfg
+                )
             except Exception as refund_err:  # noqa: BLE001
                 logger.error(
                     "refund_after_http_exception_failed",
@@ -3213,7 +3487,9 @@ async def start_investigation(
     except OSError as exc:
         if reserved_credits > 0:
             try:
-                await _supabase_add_credits(current_user["user_id"], reserved_credits, cfg)
+                await _supabase_add_credits(
+                    current_user["user_id"], reserved_credits, cfg
+                )
             except Exception as refund_err:  # noqa: BLE001
                 logger.error(
                     "refund_after_oserror_failed",
@@ -3232,7 +3508,9 @@ async def start_investigation(
     except Exception:
         if reserved_credits > 0:
             try:
-                await _supabase_add_credits(current_user["user_id"], reserved_credits, cfg)
+                await _supabase_add_credits(
+                    current_user["user_id"], reserved_credits, cfg
+                )
             except Exception as refund_err:  # noqa: BLE001
                 logger.error(
                     "refund_after_unexpected_exception_failed",
@@ -3371,7 +3649,9 @@ async def get_investigation(
         fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
         if fk_uid is not None:
             if fk_uid != current_user["user_id"]:
-                raise HTTPException(status_code=403, detail="You do not own this investigation")
+                raise HTTPException(
+                    status_code=403, detail="You do not own this investigation"
+                )
         else:
             metadata = row.get("metadata") or {}
             if isinstance(metadata, str):
@@ -3381,7 +3661,9 @@ async def get_investigation(
                     metadata = {}
             task_user_id = metadata.get("user_id", "")
             if task_user_id != current_user["user_id"]:
-                raise HTTPException(status_code=403, detail="You do not own this investigation")
+                raise HTTPException(
+                    status_code=403, detail="You do not own this investigation"
+                )
     return _row_to_task_summary(row)
 
 
@@ -3426,7 +3708,9 @@ async def kill_investigation(
                     metadata = {}
             task_user_id = metadata.get("user_id", "")
         if task_user_id != current_user["user_id"]:
-            raise HTTPException(status_code=403, detail="You do not own this investigation")
+            raise HTTPException(
+                status_code=403, detail="You do not own this investigation"
+            )
 
     # BUG-021: Atomic conditional UPDATE to avoid race condition
     result = await db.execute(
@@ -3436,7 +3720,9 @@ async def kill_investigation(
     )
     rows_affected = int(result.split()[-1])
     if rows_affected == 0:
-        exists = await db.fetchval("SELECT 1 FROM research_tasks WHERE id = $1", task_id)
+        exists = await db.fetchval(
+            "SELECT 1 FROM research_tasks WHERE id = $1", task_id
+        )
         if not exists:
             logger.info("task_not_found", task_id=task_id)
             raise HTTPException(status_code=404, detail="task not found")
@@ -3496,7 +3782,9 @@ async def stop_investigation(
                     metadata = {}
             task_user_id = metadata.get("user_id", "")
         if task_user_id != current_user["user_id"]:
-            raise HTTPException(status_code=403, detail="You do not own this investigation")
+            raise HTTPException(
+                status_code=403, detail="You do not own this investigation"
+            )
 
     # BUG-API-011: Return 409 when task is already in a terminal state (matches kill_investigation behavior)
     current_status = row.get("status", "")
@@ -3525,7 +3813,10 @@ async def stop_investigation(
     )
 
     logger.info("task_stop_requested", task_id=task_id)
-    return KillTaskResponse(task_id=task_id, message="Stop signal sent; investigation will halt after current cycle")
+    return KillTaskResponse(
+        task_id=task_id,
+        message="Stop signal sent; investigation will halt after current cycle",
+    )
 
 
 @app.delete(
@@ -3568,7 +3859,9 @@ async def delete_investigation(
     # BUG-API-017 fix: Treat missing owner as admin-only. Previously, empty
     # user_id let anyone delete legacy tasks.
     if not _is_admin_user(user_id) and row_user_id != user_id:
-        raise HTTPException(status_code=403, detail="Not authorized to delete this investigation")
+        raise HTTPException(
+            status_code=403, detail="Not authorized to delete this investigation"
+        )
 
     # If still running, kill it first
     if row["status"] in ("RUNNING", "PENDING"):
@@ -3668,9 +3961,10 @@ async def list_branches(
 ) -> list[BranchSummary]:
     """List all research branches for a given investigation."""
     db = _get_db()
-    _ensure_task_exists(await db.fetchrow(
-        "SELECT id FROM research_tasks WHERE id = $1", task_id
-    ), task_id)
+    _ensure_task_exists(
+        await db.fetchrow("SELECT id FROM research_tasks WHERE id = $1", task_id),
+        task_id,
+    )
 
     rows = await db.fetch(
         """
@@ -3699,14 +3993,17 @@ async def list_branches(
 async def list_findings(
     task_id: str,
     limit: int = Query(50, ge=1, le=500, description="Max findings to return"),
-    evidence_type: str | None = Query(None, description="Filter by FOR / AGAINST / NEUTRAL"),
+    evidence_type: str | None = Query(
+        None, description="Filter by FOR / AGAINST / NEUTRAL"
+    ),
     _: dict[str, str] = Depends(_require_investigation_owner),
 ) -> list[FindingSummary]:
     """List findings (evidence items) collected for an investigation."""
     db = _get_db()
-    _ensure_task_exists(await db.fetchrow(
-        "SELECT id FROM research_tasks WHERE id = $1", task_id
-    ), task_id)
+    _ensure_task_exists(
+        await db.fetchrow("SELECT id FROM research_tasks WHERE id = $1", task_id),
+        task_id,
+    )
 
     if evidence_type:
         rows = await db.fetch(
@@ -3788,7 +4085,10 @@ async def get_cost_breakdown(
         task_id,
     )
     # BUG-API-044: model_used may be NULL — use "unknown" as key to avoid JSON serialization error
-    per_model = {(r["model_used"] or "unknown"): float(r["total_cost"] or 0.0) for r in model_rows}
+    per_model = {
+        (r["model_used"] or "unknown"): float(r["total_cost"] or 0.0)
+        for r in model_rows
+    }
 
     # Per-branch breakdown
     branch_rows = await db.fetch(
@@ -3804,10 +4104,13 @@ async def get_cost_breakdown(
     per_branch = {r["branch_id"]: float(r["total_cost"] or 0.0) for r in branch_rows}
 
     # Total AI call count
-    call_count: int = await db.fetchval(
-        "SELECT COUNT(*) FROM ai_sessions WHERE task_id = $1",
-        task_id,
-    ) or 0
+    call_count: int = (
+        await db.fetchval(
+            "SELECT COUNT(*) FROM ai_sessions WHERE task_id = $1",
+            task_id,
+        )
+        or 0
+    )
 
     budget_usd = float(task_row["budget_usd"])
     total_spent = float(task_row["total_spent_usd"] or 0.0)
@@ -4045,8 +4348,8 @@ async def upsert_investigation_graph(
                     """,
                     edge.id,
                     task_id,
-                    edge.source,      # D3 source → source_node
-                    edge.target,      # D3 target → target_node
+                    edge.source,  # D3 source → source_node
+                    edge.target,  # D3 target → target_node
                     edge.label,
                     json.dumps(edge.metadata),
                     edge.source_origin,  # provenance → source column
@@ -4109,7 +4412,9 @@ async def create_stream_token(
 async def stream_logs(
     request: Request,
     task_id: str,
-    format: str | None = Query(None, description="Set to 'legacy' for plain text events"),
+    format: str | None = Query(
+        None, description="Set to 'legacy' for plain text events"
+    ),
     auth_context: dict[str, str] = Depends(_authenticate_stream_token_or_header),
 ) -> EventSourceResponse:
     """
@@ -4152,15 +4457,29 @@ async def stream_logs(
                             "SELECT status, metadata FROM research_tasks WHERE id = $1",
                             task_id,
                         )
-                        if _replay_row is not None and _replay_row["status"] in ("COMPLETED", "FAILED", "HALTED"):
+                        if _replay_row is not None and _replay_row["status"] in (
+                            "COMPLETED",
+                            "FAILED",
+                            "HALTED",
+                        ):
                             _replay_meta = _replay_row.get("metadata") or {}
                             if isinstance(_replay_meta, str):
                                 _replay_meta = json.loads(_replay_meta)
                             _fast_answer = _replay_meta.get("fast_path_answer")
                             if _fast_answer:
-                                yield {"data": json.dumps({"type": "text", "content": _fast_answer}), "event": "log"}
+                                yield {
+                                    "data": json.dumps(
+                                        {"type": "text", "content": _fast_answer}
+                                    ),
+                                    "event": "log",
+                                }
                             yield {
-                                "data": json.dumps({"task_id": task_id, "final_status": _replay_row["status"]}),
+                                "data": json.dumps(
+                                    {
+                                        "task_id": task_id,
+                                        "final_status": _replay_row["status"],
+                                    }
+                                ),
                                 "event": "done",
                             }
                             _initial_replay_done = True
@@ -4172,7 +4491,10 @@ async def stream_logs(
                 while True:
                     if await request.is_disconnected():
                         break
-                    if time.monotonic() - last_auth_check >= auth_recheck_interval_seconds:
+                    if (
+                        time.monotonic() - last_auth_check
+                        >= auth_recheck_interval_seconds
+                    ):
                         # BUG-API-009: distinguish permanent auth failures (task
                         # deleted / revoked owner) from transient DB errors; on
                         # transient errors we log and retry on the next cycle
@@ -4180,12 +4502,22 @@ async def stream_logs(
                         try:
                             db = _get_db()
                             # F-05: include relational user_id column for ownership.
-                            row = await db.fetchrow("SELECT user_id, metadata FROM research_tasks WHERE id = $1", task_id)
+                            row = await db.fetchrow(
+                                "SELECT user_id, metadata FROM research_tasks WHERE id = $1",
+                                task_id,
+                            )
                             if row is None:
-                                yield {"data": json.dumps({"error": "task_deleted"}), "event": "error"}
+                                yield {
+                                    "data": json.dumps({"error": "task_deleted"}),
+                                    "event": "error",
+                                }
                                 break
                             if not _is_admin_user(_sse_user_id):
-                                fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
+                                fk_uid = (
+                                    str(row["user_id"])
+                                    if row["user_id"] is not None
+                                    else None
+                                )
                                 if fk_uid is not None:
                                     _owner_id = fk_uid
                                 else:
@@ -4197,7 +4529,12 @@ async def stream_logs(
                                             meta = {}
                                     _owner_id = meta.get("user_id", "")
                                 if _owner_id != _sse_user_id:
-                                    yield {"data": json.dumps({"error": "authentication_revoked"}), "event": "error"}
+                                    yield {
+                                        "data": json.dumps(
+                                            {"error": "authentication_revoked"}
+                                        ),
+                                        "event": "error",
+                                    }
                                     break
                         except HTTPException as exc:
                             # _get_db() raises HTTPException(503) when the pool is
@@ -4234,7 +4571,11 @@ async def stream_logs(
                         if use_legacy:
                             # Convert structured JSON events to plain text
                             try:
-                                evt = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
+                                evt = (
+                                    json.loads(raw_data)
+                                    if isinstance(raw_data, str)
+                                    else raw_data
+                                )
                                 if isinstance(evt, dict):
                                     evt_type = evt.get("type", "")
                                     if evt_type == "text":
@@ -4251,7 +4592,10 @@ async def stream_logs(
                     else:
                         # BUG-006: Use _db_pool directly to avoid HTTPException inside generator
                         if _db_pool is None:
-                            yield {"data": json.dumps({"error": "database_unavailable"}), "event": "error"}
+                            yield {
+                                "data": json.dumps({"error": "database_unavailable"}),
+                                "event": "error",
+                            }
                             break
                         # BUG-API-008: only poll the DB every ``db_poll_interval_seconds``
                         # to avoid hammering the pool with idle subscribers.
@@ -4263,10 +4607,17 @@ async def stream_logs(
                                 task_id,
                             )
                             if status_row is not None and status_row["status"] in (
-                                "COMPLETED", "FAILED", "HALTED"
+                                "COMPLETED",
+                                "FAILED",
+                                "HALTED",
                             ):
                                 yield {
-                                    "data": json.dumps({"task_id": task_id, "final_status": status_row["status"]}),
+                                    "data": json.dumps(
+                                        {
+                                            "task_id": task_id,
+                                            "final_status": status_row["status"],
+                                        }
+                                    ),
                                     "event": "done",
                                 }
                                 break
@@ -4279,7 +4630,10 @@ async def stream_logs(
             # ── DB fallback: poll task status changes ───────────────────
             # BUG-006: Use _db_pool directly to avoid HTTPException inside generator
             if _db_pool is None:
-                yield {"data": json.dumps({"error": "database_unavailable"}), "event": "error"}
+                yield {
+                    "data": json.dumps({"error": "database_unavailable"}),
+                    "event": "error",
+                }
                 return
             db = _db_pool
             last_state: str | None = None
@@ -4291,12 +4645,22 @@ async def stream_logs(
                     # are not silently masked; retry on the next cycle.
                     try:
                         # F-05: prefer relational user_id FK for auth re-check.
-                        row = await db.fetchrow("SELECT user_id, metadata FROM research_tasks WHERE id = $1", task_id)
+                        row = await db.fetchrow(
+                            "SELECT user_id, metadata FROM research_tasks WHERE id = $1",
+                            task_id,
+                        )
                         if row is None:
-                            yield {"data": json.dumps({"error": "task_deleted"}), "event": "error"}
+                            yield {
+                                "data": json.dumps({"error": "task_deleted"}),
+                                "event": "error",
+                            }
                             break
                         if not _is_admin_user(_sse_user_id):
-                            fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
+                            fk_uid = (
+                                str(row["user_id"])
+                                if row["user_id"] is not None
+                                else None
+                            )
                             if fk_uid is not None:
                                 _owner_id2 = fk_uid
                             else:
@@ -4308,7 +4672,12 @@ async def stream_logs(
                                         meta = {}
                                 _owner_id2 = meta.get("user_id", "")
                             if _owner_id2 != _sse_user_id:
-                                yield {"data": json.dumps({"error": "authentication_revoked"}), "event": "error"}
+                                yield {
+                                    "data": json.dumps(
+                                        {"error": "authentication_revoked"}
+                                    ),
+                                    "event": "error",
+                                }
                                 break
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
@@ -4334,25 +4703,29 @@ async def stream_logs(
                 if current_state != last_state:
                     last_state = current_state
                     yield {
-                        "data": json.dumps({
-                            "task_id": task_id,
-                            "status": row["status"],
-                            "state": current_state,
-                            "total_spent_usd": float(row["total_spent_usd"] or 0.0),
-                            "output_pdf_path": row.get("output_pdf_path"),
-                            "output_docx_path": row.get("output_docx_path"),
-                            "ts": datetime.now(tz=timezone.utc).isoformat(),
-                        }),
+                        "data": json.dumps(
+                            {
+                                "task_id": task_id,
+                                "status": row["status"],
+                                "state": current_state,
+                                "total_spent_usd": float(row["total_spent_usd"] or 0.0),
+                                "output_pdf_path": row.get("output_pdf_path"),
+                                "output_docx_path": row.get("output_docx_path"),
+                                "ts": datetime.now(tz=timezone.utc).isoformat(),
+                            }
+                        ),
                         "event": "state_change",
                     }
                 if row["status"] in ("COMPLETED", "FAILED", "HALTED"):
                     yield {
-                        "data": json.dumps({
-                            "task_id": task_id,
-                            "final_status": row["status"],
-                            "output_pdf_path": row.get("output_pdf_path"),
-                            "output_docx_path": row.get("output_docx_path"),
-                        }),
+                        "data": json.dumps(
+                            {
+                                "task_id": task_id,
+                                "final_status": row["status"],
+                                "output_pdf_path": row.get("output_pdf_path"),
+                                "output_docx_path": row.get("output_docx_path"),
+                            }
+                        ),
                         "event": "done",
                     }
                     break
@@ -4408,7 +4781,9 @@ async def download_report_pdf(
     # via a symlink that was planted by another process.
     cfg = _get_config()
     candidate = Path(pdf_path)
-    if candidate.is_symlink() or any(p.is_symlink() for p in candidate.parents if p.exists()):
+    if candidate.is_symlink() or any(
+        p.is_symlink() for p in candidate.parents if p.exists()
+    ):
         logger.warning("pdf_path_is_symlink", task_id=task_id, path=str(candidate))
         raise HTTPException(
             status_code=403,
@@ -4430,7 +4805,9 @@ async def download_report_pdf(
         )
     # BUG-0008 fix: reject symlinks in report download
     if resolved.is_symlink():
-        raise HTTPException(status_code=403, detail="Access denied: symlinks are not allowed")
+        raise HTTPException(
+            status_code=403, detail="Access denied: symlinks are not allowed"
+        )
 
     # BUG-API-047: `FileResponse` already emits a correctly-encoded
     # Content-Disposition header when ``filename`` is passed (it uses
@@ -4484,7 +4861,9 @@ async def download_report_docx(
     # the same comment in ``download_report_pdf`` above.
     cfg = _get_config()
     candidate = Path(docx_path)
-    if candidate.is_symlink() or any(p.is_symlink() for p in candidate.parents if p.exists()):
+    if candidate.is_symlink() or any(
+        p.is_symlink() for p in candidate.parents if p.exists()
+    ):
         logger.warning("docx_path_is_symlink", task_id=task_id, path=str(candidate))
         raise HTTPException(
             status_code=403,
@@ -4580,7 +4959,9 @@ async def list_investigation_files(
                     metadata = {}
             task_user_id = metadata.get("user_id", "")
         if task_user_id != current_user["user_id"]:
-            raise HTTPException(status_code=403, detail="You do not own this investigation")
+            raise HTTPException(
+                status_code=403, detail="You do not own this investigation"
+            )
 
     files_dir = Path(cfg.DATA_ROOT) / "files" / task_id
     if not files_dir.is_dir():
@@ -4594,12 +4975,16 @@ async def list_investigation_files(
             if f.is_file():
                 stat = f.stat()
                 suffix = f.suffix.lower()
-                result.append(FileAttachmentInfo(
-                    filename=f.name,
-                    size=stat.st_size,
-                    mime=_MIME_MAP.get(suffix, "application/octet-stream"),
-                    created_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
-                ))
+                result.append(
+                    FileAttachmentInfo(
+                        filename=f.name,
+                        size=stat.st_size,
+                        mime=_MIME_MAP.get(suffix, "application/octet-stream"),
+                        created_at=datetime.fromtimestamp(
+                            stat.st_mtime, tz=timezone.utc
+                        ).isoformat(),
+                    )
+                )
         except OSError:
             continue  # file disappeared between iterdir() and stat()
     return result
@@ -4642,7 +5027,9 @@ async def download_investigation_file(
                     metadata = {}
             task_user_id = metadata.get("user_id", "")
         if task_user_id != current_user["user_id"]:
-            raise HTTPException(status_code=403, detail="You do not own this investigation")
+            raise HTTPException(
+                status_code=403, detail="You do not own this investigation"
+            )
 
     files_dir = Path(cfg.DATA_ROOT) / "files" / task_id
     files_root = files_dir.resolve()
@@ -4651,14 +5038,19 @@ async def download_investigation_file(
     # Path traversal protection — the requested file must stay inside this task's
     # own artifact directory, not merely somewhere under DATA_ROOT.
     if not file_path.is_relative_to(files_root):
-        raise HTTPException(status_code=403, detail="Access denied: path outside investigation files directory")
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: path outside investigation files directory",
+        )
 
     if not file_path.is_file():
         logger.info("file_not_found", task_id=task_id, filename=filename)
         raise HTTPException(status_code=404, detail="not found")
     # BUG-0008 fix: reject symlinks in file download
     if file_path.is_symlink():
-        raise HTTPException(status_code=403, detail="Access denied: symlinks are not allowed")
+        raise HTTPException(
+            status_code=403, detail="Access denied: symlinks are not allowed"
+        )
 
     suffix = file_path.suffix.lower()
     mime = _MIME_MAP.get(suffix, "application/octet-stream")
@@ -4684,6 +5076,7 @@ _UPLOAD_MAX_FILES_PER_INVESTIGATION: int = 5
 # allowed concurrent callers to receive disjoint Lock instances and bypass
 # mutual exclusion entirely. F-02 and the file-count cap depend on this lock.
 import collections
+
 _UPLOAD_LOCK_CACHE_MAX: int = 4096
 _upload_locks_lock: asyncio.Lock = asyncio.Lock()
 _upload_locks: "collections.OrderedDict[str, asyncio.Lock]" = collections.OrderedDict()
@@ -4711,7 +5104,9 @@ def _get_upload_lock(target_id: str) -> asyncio.Lock:
     # entry up to ``_UPLOAD_LOCK_CACHE_MAX`` is held, allow temporary growth
     # rather than break correctness.
     if len(_upload_locks) > _UPLOAD_LOCK_CACHE_MAX:
-        for evict_key in list(_upload_locks.keys())[: max(1, len(_upload_locks) - _UPLOAD_LOCK_CACHE_MAX)]:
+        for evict_key in list(_upload_locks.keys())[
+            : max(1, len(_upload_locks) - _UPLOAD_LOCK_CACHE_MAX)
+        ]:
             evict_lock = _upload_locks.get(evict_key)
             if evict_lock is None:
                 continue
@@ -4719,10 +5114,23 @@ def _get_upload_lock(target_id: str) -> asyncio.Lock:
                 continue
             _upload_locks.pop(evict_key, None)
     return lock
-_UPLOAD_ALLOWED_EXTENSIONS: frozenset[str] = frozenset({
-    ".pdf", ".txt", ".md", ".csv", ".json", ".html",
-    ".png", ".jpg", ".jpeg", ".xlsx", ".docx",
-})
+
+
+_UPLOAD_ALLOWED_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".pdf",
+        ".txt",
+        ".md",
+        ".csv",
+        ".json",
+        ".html",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".xlsx",
+        ".docx",
+    }
+)
 
 _UPLOAD_MIME_MAP: dict[str, str] = {
     ".pdf": "application/pdf",
@@ -4777,7 +5185,9 @@ def _validate_upload_session_uuid(session_uuid: str) -> str:
     try:
         return str(uuid.UUID(session_uuid))
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Invalid upload session UUID") from exc
+        raise HTTPException(
+            status_code=400, detail="Invalid upload session UUID"
+        ) from exc
 
 
 @app.post(
@@ -4823,7 +5233,9 @@ async def upload_investigation_files(
                     metadata = {}
             task_user_id = metadata.get("user_id", "")
         if task_user_id != current_user["user_id"]:
-            raise HTTPException(status_code=403, detail="You do not own this investigation")
+            raise HTTPException(
+                status_code=403, detail="You do not own this investigation"
+            )
 
     if len(files) > _UPLOAD_MAX_FILES_PER_INVESTIGATION:
         raise HTTPException(
@@ -4868,7 +5280,7 @@ async def upload_investigation_files(
                 if size > _UPLOAD_MAX_FILE_SIZE:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024*1024)}MB limit",
+                        detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024 * 1024)}MB limit",
                     )
                 chunks.append(chunk)
             content = b"".join(chunks)
@@ -4877,11 +5289,15 @@ async def upload_investigation_files(
             # then reject dotfiles and traversal names.
             safe_name = os.path.basename(re.sub(r"[^\w\-.]", "_", filename))
             if not safe_name or safe_name.startswith(".") or safe_name in (".", ".."):
-                raise HTTPException(status_code=400, detail=f"Invalid filename: {filename!r}")
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid filename: {filename!r}"
+                )
             dest = upload_dir / safe_name
             # Ensure resolved path is within the upload directory
             if not str(dest.resolve()).startswith(str(upload_dir.resolve())):
-                raise HTTPException(status_code=400, detail=f"Invalid filename: {filename!r}")
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid filename: {filename!r}"
+                )
             # BUG-0034 fix: append counter suffix on duplicate filenames
             if dest.exists():
                 stem = Path(safe_name).stem
@@ -4895,13 +5311,19 @@ async def upload_investigation_files(
             # BUG-0008 fix: reject symlinks after write (race-safe check)
             if dest.is_symlink():
                 dest.unlink()
-                raise HTTPException(status_code=400, detail=f"Symlinks are not allowed: {safe_name!r}")
+                raise HTTPException(
+                    status_code=400, detail=f"Symlinks are not allowed: {safe_name!r}"
+                )
 
-            uploaded.append(UploadedFileInfo(
-                filename=safe_name,
-                size=len(content),
-                content_type=_UPLOAD_MIME_MAP.get(suffix, "application/octet-stream"),
-            ))
+            uploaded.append(
+                UploadedFileInfo(
+                    filename=safe_name,
+                    size=len(content),
+                    content_type=_UPLOAD_MIME_MAP.get(
+                        suffix, "application/octet-stream"
+                    ),
+                )
+            )
 
     logger.info(
         "files_uploaded",
@@ -4940,7 +5362,8 @@ async def upload_pending_files(
 
     normalized_session_uuid = (
         _validate_upload_session_uuid(session_uuid)
-        if session_uuid else str(uuid.uuid4())
+        if session_uuid
+        else str(uuid.uuid4())
     )
     pending_dir = Path(cfg.DATA_ROOT) / "uploads" / "pending" / normalized_session_uuid
     pending_dir.mkdir(parents=True, exist_ok=True)
@@ -4981,7 +5404,9 @@ async def upload_pending_files(
                     detail="Upload session belongs to another user",
                 )
 
-        existing_count = sum(1 for f in pending_dir.iterdir() if f.is_file() and f.name != ".owner")
+        existing_count = sum(
+            1 for f in pending_dir.iterdir() if f.is_file() and f.name != ".owner"
+        )
         if existing_count + len(files) > _UPLOAD_MAX_FILES_PER_INVESTIGATION:
             raise HTTPException(
                 status_code=400,
@@ -5014,7 +5439,7 @@ async def upload_pending_files(
                 if size > _UPLOAD_MAX_FILE_SIZE:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024*1024)}MB limit",
+                        detail=f"File {filename!r} exceeds {_UPLOAD_MAX_FILE_SIZE // (1024 * 1024)}MB limit",
                     )
                 chunks.append(chunk)
             content = b"".join(chunks)
@@ -5022,10 +5447,14 @@ async def upload_pending_files(
             # P1-FIX-46b: Same path-traversal protection as upload_investigation_files
             safe_name = os.path.basename(re.sub(r"[^\w\-.]", "_", filename))
             if not safe_name or safe_name.startswith(".") or safe_name in (".", ".."):
-                raise HTTPException(status_code=400, detail=f"Invalid filename: {filename!r}")
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid filename: {filename!r}"
+                )
             dest = pending_dir / safe_name
             if not str(dest.resolve()).startswith(str(pending_dir.resolve())):
-                raise HTTPException(status_code=400, detail=f"Invalid filename: {filename!r}")
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid filename: {filename!r}"
+                )
             # BUG-0034 fix: append counter suffix on duplicate filenames
             if dest.exists():
                 stem = Path(safe_name).stem
@@ -5039,13 +5468,19 @@ async def upload_pending_files(
             # BUG-0008 fix: reject symlinks after write (race-safe check)
             if dest.is_symlink():
                 dest.unlink()
-                raise HTTPException(status_code=400, detail=f"Symlinks are not allowed: {safe_name!r}")
+                raise HTTPException(
+                    status_code=400, detail=f"Symlinks are not allowed: {safe_name!r}"
+                )
 
-            uploaded.append(UploadedFileInfo(
-                filename=safe_name,
-                size=len(content),
-                content_type=_UPLOAD_MIME_MAP.get(suffix, "application/octet-stream"),
-            ))
+            uploaded.append(
+                UploadedFileInfo(
+                    filename=safe_name,
+                    size=len(content),
+                    content_type=_UPLOAD_MIME_MAP.get(
+                        suffix, "application/octet-stream"
+                    ),
+                )
+            )
 
     logger.info(
         "pending_files_uploaded",
@@ -5171,24 +5606,36 @@ def _build_architecture_preview(topic: str, tier: str) -> ResearchArchitecturePl
     ]
 
     # Add domain-specific hypotheses
-    if any(kw in topic_lower for kw in ("market", "stock", "invest", "financial", "price", "trade", "crypto")):
-        hypotheses.append(ArchitectureHypothesis(
-            statement="Quantitative validation: backtesting claims against historical market data",
-            priority=9,
-            test_strategy="Pull real price data from financial APIs, compute risk-adjusted returns and key metrics",
-        ))
+    if any(
+        kw in topic_lower
+        for kw in ("market", "stock", "invest", "financial", "price", "trade", "crypto")
+    ):
+        hypotheses.append(
+            ArchitectureHypothesis(
+                statement="Quantitative validation: backtesting claims against historical market data",
+                priority=9,
+                test_strategy="Pull real price data from financial APIs, compute risk-adjusted returns and key metrics",
+            )
+        )
     if any(kw in topic_lower for kw in ("company", "competitor", "industry", "sector")):
-        hypotheses.append(ArchitectureHypothesis(
-            statement="Competitive landscape: mapping the competitive dynamics and market position",
-            priority=7,
-            test_strategy="Cross-reference company filings, industry reports, and analyst coverage",
-        ))
-    if any(kw in topic_lower for kw in ("technology", "ai", "software", "algorithm", "indicator")):
-        hypotheses.append(ArchitectureHypothesis(
-            statement="Technical viability: assessing the underlying methodology and its limitations",
-            priority=8,
-            test_strategy="Review technical documentation, academic literature, and independent evaluations",
-        ))
+        hypotheses.append(
+            ArchitectureHypothesis(
+                statement="Competitive landscape: mapping the competitive dynamics and market position",
+                priority=7,
+                test_strategy="Cross-reference company filings, industry reports, and analyst coverage",
+            )
+        )
+    if any(
+        kw in topic_lower
+        for kw in ("technology", "ai", "software", "algorithm", "indicator")
+    ):
+        hypotheses.append(
+            ArchitectureHypothesis(
+                statement="Technical viability: assessing the underlying methodology and its limitations",
+                priority=8,
+                test_strategy="Review technical documentation, academic literature, and independent evaluations",
+            )
+        )
 
     # Standard data sources
     data_sources = [
@@ -5224,24 +5671,28 @@ def _build_architecture_preview(topic: str, tier: str) -> ResearchArchitecturePl
     ]
 
     if tier == "deep":
-        phases.extend([
-            ArchitecturePhase(
-                name="Iterative Deepening",
-                description="Gap detection → replan → additional search iterations until convergence",
-                depends_on=["Analysis & Scoring"],
-            ),
-            ArchitecturePhase(
-                name="Adversarial Review",
-                description="Skeptic challenge + tribunal cross-examination of key findings",
-                depends_on=["Iterative Deepening"],
-            ),
-        ])
+        phases.extend(
+            [
+                ArchitecturePhase(
+                    name="Iterative Deepening",
+                    description="Gap detection → replan → additional search iterations until convergence",
+                    depends_on=["Analysis & Scoring"],
+                ),
+                ArchitecturePhase(
+                    name="Adversarial Review",
+                    description="Skeptic challenge + tribunal cross-examination of key findings",
+                    depends_on=["Iterative Deepening"],
+                ),
+            ]
+        )
 
-    phases.append(ArchitecturePhase(
-        name="Report Synthesis",
-        description="Perspective synthesis, executive summary, and final report generation",
-        depends_on=[phases[-1].name],
-    ))
+    phases.append(
+        ArchitecturePhase(
+            name="Report Synthesis",
+            description="Perspective synthesis, executive summary, and final report generation",
+            depends_on=[phases[-1].name],
+        )
+    )
 
     estimated_branches = len(hypotheses)
 
@@ -5249,7 +5700,9 @@ def _build_architecture_preview(topic: str, tier: str) -> ResearchArchitecturePl
     if any(kw in topic_lower for kw in ("predict", "forecast", "future")):
         risk_factors.append("Forward-looking claims are inherently uncertain")
     if any(kw in topic_lower for kw in ("backtest", "strategy", "profitable")):
-        risk_factors.append("Backtesting results may suffer from overfitting or lookahead bias")
+        risk_factors.append(
+            "Backtesting results may suffer from overfitting or lookahead bias"
+        )
 
     return ResearchArchitecturePlan(
         hypotheses=hypotheses,
@@ -5339,8 +5792,15 @@ def _classify_topic(topic: str) -> ClassifyResponse:
         )
 
     # ── 2. Deep-tier signal words ───────────────────────────────────────
-    deep_signals = {"flagship", "exhaustive", "multi-day", "full analysis",
-                    "deep dive", "deep research", "thorough investigation"}
+    deep_signals = {
+        "flagship",
+        "exhaustive",
+        "multi-day",
+        "full analysis",
+        "deep dive",
+        "deep research",
+        "thorough investigation",
+    }
     if any(signal in topic_lower for signal in deep_signals):
         return ClassifyResponse(
             tier="deep",
@@ -5356,15 +5816,45 @@ def _classify_topic(topic: str) -> ClassifyResponse:
 
     # ── 3. Instant-tier: greetings, tests, trivial messages ────────────
     greeting_patterns = {
-        "hello", "hi", "hey", "test", "ping", "yo", "sup",
-        "hi there", "hey there", "hello there", "hey yo",
-        "good morning", "good afternoon", "good evening", "good night",
-        "are you there", "are you alive", "are you live",
-        "are you working", "who are you", "what are you",
-        "thanks", "thank you", "thanks a lot", "thx",
-        "ok", "okay", "cool", "nice", "great", "awesome",
-        "bye", "goodbye", "see you", "see ya",
-        "how are you", "whats up", "what's up", "hows it going",
+        "hello",
+        "hi",
+        "hey",
+        "test",
+        "ping",
+        "yo",
+        "sup",
+        "hi there",
+        "hey there",
+        "hello there",
+        "hey yo",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "good night",
+        "are you there",
+        "are you alive",
+        "are you live",
+        "are you working",
+        "who are you",
+        "what are you",
+        "thanks",
+        "thank you",
+        "thanks a lot",
+        "thx",
+        "ok",
+        "okay",
+        "cool",
+        "nice",
+        "great",
+        "awesome",
+        "bye",
+        "goodbye",
+        "see you",
+        "see ya",
+        "how are you",
+        "whats up",
+        "what's up",
+        "hows it going",
     }
     # Check if the whole message is basically a greeting/test
     # BUG-S5-03 fix: word_count <= 3 was too aggressive — "What is CATL" (3 words)
@@ -5396,10 +5886,27 @@ def _classify_topic(topic: str) -> ClassifyResponse:
     # Also catch "hello, let me test if you are live" style messages.
     # Use word-boundary-aware matching to avoid false positives like
     # "backtest" matching "test" or "highway" matching "hi ".
-    _greeting_patterns_re = [r'\bhello\b', r'\bhi\b', r'\bhey\b', r'\btest\b']
+    _greeting_patterns_re = [r"\bhello\b", r"\bhi\b", r"\bhey\b", r"\btest\b"]
     _has_greeting_word = any(re.search(p, topic_lower) for p in _greeting_patterns_re)
     if _has_greeting_word and word_count < 15:
-        if not any(kw in topic_lower for kw in ("research", "analyze", "investigate", "report", "find", "backtest", "backtesting", "strategy", "performance", "competitive", "analysis", "compare", "evaluate")):
+        if not any(
+            kw in topic_lower
+            for kw in (
+                "research",
+                "analyze",
+                "investigate",
+                "report",
+                "find",
+                "backtest",
+                "backtesting",
+                "strategy",
+                "performance",
+                "competitive",
+                "analysis",
+                "compare",
+                "evaluate",
+            )
+        ):
             return ClassifyResponse(
                 tier="instant",
                 estimated_duration_hours=0.01,
@@ -5414,14 +5921,39 @@ def _classify_topic(topic: str) -> ClassifyResponse:
     has_question = "?" in topic
     # Research-demanding keywords that push toward standard tier
     research_keywords = {
-        "investigate", "research", "analyze", "analysis", "report",
-        "compare", "evaluate", "comprehensive", "in-depth", "detailed",
-        "thesis", "paper", "study", "survey", "assessment",
-        "market analysis", "due diligence", "competitive analysis",
-        "competitive", "performance", "backtest", "backtesting",
-        "strategy", "position", "deep dive", "landscape",
-        "trend", "forecast", "prediction", "valuation",
-        "portfolio", "sector", "industry",
+        "investigate",
+        "research",
+        "analyze",
+        "analysis",
+        "report",
+        "compare",
+        "evaluate",
+        "comprehensive",
+        "in-depth",
+        "detailed",
+        "thesis",
+        "paper",
+        "study",
+        "survey",
+        "assessment",
+        "market analysis",
+        "due diligence",
+        "competitive analysis",
+        "competitive",
+        "performance",
+        "backtest",
+        "backtesting",
+        "strategy",
+        "position",
+        "deep dive",
+        "landscape",
+        "trend",
+        "forecast",
+        "prediction",
+        "valuation",
+        "portfolio",
+        "sector",
+        "industry",
     }
     has_research_keyword = any(kw in topic_lower for kw in research_keywords)
 
@@ -5481,15 +6013,25 @@ async def billing_usage(
         try:
             balance = await _supabase_get_user_tokens(user_id, cfg)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("billing_usage_balance_lookup_failed", user_id=user_id, error=str(exc))
+            logger.warning(
+                "billing_usage_balance_lookup_failed", user_id=user_id, error=str(exc)
+            )
             balance = None
 
     # B-31 fix: the JWT auth context only carries user_id + role; subscription
     # fields live in profiles.  Fetch them directly so billing_usage reflects
     # the current plan rather than always falling back to "free".
     sub_fields = await _supabase_get_subscription_fields(user_id, cfg)
-    plan_slug = (sub_fields.get("subscription_plan") or current_user.get("subscription_plan") or "free").lower()
-    plan_status = sub_fields.get("subscription_status") or current_user.get("subscription_status") or "none"
+    plan_slug = (
+        sub_fields.get("subscription_plan")
+        or current_user.get("subscription_plan")
+        or "free"
+    ).lower()
+    plan_status = (
+        sub_fields.get("subscription_status")
+        or current_user.get("subscription_status")
+        or "none"
+    )
     matched = next((p for p in _PLANS if p["id"] == plan_slug), None)
     # If user has no active plan, synthesize a "free" tier so the UI has
     # something to render. Free tier has limited credits to encourage upgrade.
@@ -5550,6 +6092,7 @@ async def create_checkout(
     # ``app.mariana.computer`` was in the CORS list but missing from this
     # allowlist, breaking checkout for the production frontend.
     from urllib.parse import urlparse  # noqa: PLC0415
+
     _ALLOWED_REDIRECT_HOSTS: set[str] = set()
     for _origin in (*_DEFAULT_PROD_CORS_ORIGINS, *_DEFAULT_DEV_CORS_ORIGINS):
         try:
@@ -5562,7 +6105,10 @@ async def create_checkout(
     # do not appear in the dev CORS list (e.g. 127.0.0.1 ports the CORS
     # list does not enumerate) continue to work.
     _ALLOWED_REDIRECT_HOSTS.update({"localhost", "127.0.0.1"})
-    for url_field, url_value in [("success_url", body.success_url), ("cancel_url", body.cancel_url)]:
+    for url_field, url_value in [
+        ("success_url", body.success_url),
+        ("cancel_url", body.cancel_url),
+    ]:
         try:
             parsed = urlparse(url_value)
             if parsed.hostname not in _ALLOWED_REDIRECT_HOSTS:
@@ -5573,7 +6119,9 @@ async def create_checkout(
         except HTTPException:
             raise
         except Exception:
-            raise HTTPException(status_code=400, detail=f"Invalid {url_field}: malformed URL")
+            raise HTTPException(
+                status_code=400, detail=f"Invalid {url_field}: malformed URL"
+            )
 
     # Resolve plan or top-up. Subscriptions use mode=subscription; top-ups use
     # mode=payment so the Stripe Checkout session yields a one-shot
@@ -5625,7 +6173,9 @@ async def create_checkout(
     )
     # BUG-API-004: Stripe can return null session.url in edge cases
     if not session.url:
-        raise HTTPException(status_code=502, detail="Could not start checkout. Try again.")
+        raise HTTPException(
+            status_code=502, detail="Could not start checkout. Try again."
+        )
     return CreateCheckoutResponse(
         checkout_url=session.url,
         session_id=session.id,
@@ -5667,7 +6217,9 @@ async def stripe_webhook(request: Request) -> JSONResponse:
     _previous_secret = cfg.STRIPE_WEBHOOK_SECRET_PREVIOUS
     if not _primary_secret:
         logger.error("stripe_webhook_secret_not_configured")
-        raise HTTPException(status_code=503, detail="Webhook signature verification not configured")
+        raise HTTPException(
+            status_code=503, detail="Webhook signature verification not configured"
+        )
 
     event = None
     _used_previous_secret = False
@@ -5694,11 +6246,13 @@ async def stripe_webhook(request: Request) -> JSONResponse:
         logger.warning(
             "stripe_webhook_accepted_via_previous_secret",
             detail="Webhook verified with the previous (rotating-out) secret — "
-                   "update Stripe dashboard to use the new secret.",
+            "update Stripe dashboard to use the new secret.",
         )
 
     event_id: str | None = event.get("id")
-    event_type: str | None = event.get("type")  # BUG-API-029: use .get() to avoid KeyError on malformed webhooks
+    event_type: str | None = event.get(
+        "type"
+    )  # BUG-API-029: use .get() to avoid KeyError on malformed webhooks
     if not event_type:
         raise HTTPException(status_code=400, detail="Webhook event missing type")
     log = logger.bind(event_type=event_type, event_id=event_id)
@@ -5761,7 +6315,9 @@ async def stripe_webhook(request: Request) -> JSONResponse:
 
         elif event_type == "charge.dispute.funds_withdrawn":
             dispute_obj = event["data"]["object"]
-            await _handle_charge_dispute_funds_withdrawn(dispute_obj, cfg, event_id=event_id)
+            await _handle_charge_dispute_funds_withdrawn(
+                dispute_obj, cfg, event_id=event_id
+            )
 
         else:
             log.info("stripe_webhook_unhandled_event")
@@ -5771,7 +6327,9 @@ async def stripe_webhook(request: Request) -> JSONResponse:
         # 500 so Stripe retries when the credit RPC is down.  B-03: do NOT
         # finalize the event — leave it 'pending' so the retry re-runs.
         log.error("stripe_webhook_handler_failed_retriable")
-        await _record_webhook_event_failure(event_id, f"http_{exc.status_code}: {exc.detail}")
+        await _record_webhook_event_failure(
+            event_id, f"http_{exc.status_code}: {exc.detail}"
+        )
         return JSONResponse(
             status_code=500,
             content={"status": "handler_error_retriable"},
@@ -5849,7 +6407,9 @@ async def billing_portal(
     logger.info("portal_session_created", user_id=user_id)
     # BUG-API-004: Stripe can return null portal_session.url
     if not portal_session.url:
-        raise HTTPException(status_code=502, detail="Could not open the billing portal. Try again.")
+        raise HTTPException(
+            status_code=502, detail="Could not open the billing portal. Try again."
+        )
     return BillingPortalResponse(portal_url=portal_session.url)
 
 
@@ -5864,7 +6424,9 @@ _ACTIVE_SUBSCRIPTION_STATUSES: frozenset[str] = frozenset(
 )
 
 
-def _effective_plan(subscription_status: str | None, subscription_plan_id: str | None) -> str:
+def _effective_plan(
+    subscription_status: str | None, subscription_plan_id: str | None
+) -> str:
     """Derive the canonical profiles.plan value from Stripe subscription state.
 
     Rules (F-04):
@@ -5883,7 +6445,6 @@ def _effective_plan(subscription_status: str | None, subscription_plan_id: str |
     return "free"
 
 
-
 async def _handle_checkout_completed(
     session_obj: dict[str, Any],
     cfg: AppConfig,
@@ -5899,23 +6460,26 @@ async def _handle_checkout_completed(
     """
     # BUG-API-043: Stripe may return metadata: null; guard with `or {}`
     _meta = session_obj.get("metadata") or {}
-    user_id: str | None = (
-        _meta.get("user_id")
-        or session_obj.get("client_reference_id")
-    )
+    user_id: str | None = _meta.get("user_id") or session_obj.get("client_reference_id")
     plan_id: str | None = _meta.get("deft_plan_id") or _meta.get("plan_id")
-    kind: str = (_meta.get("deft_kind") or session_obj.get("mode") or "subscription").lower()
+    kind: str = (
+        _meta.get("deft_kind") or session_obj.get("mode") or "subscription"
+    ).lower()
     stripe_customer_id: str | None = session_obj.get("customer")
     subscription_id: str | None = session_obj.get("subscription")
 
     if not user_id:
-        logger.warning("checkout_completed_no_user_id", session_id=session_obj.get("id"))
+        logger.warning(
+            "checkout_completed_no_user_id", session_id=session_obj.get("id")
+        )
         return
 
     # Top-ups are handled by payment_intent.succeeded — exit early to avoid
     # double-granting.
     if kind == "topup" or session_obj.get("mode") == "payment":
-        logger.info("checkout_completed_topup_deferred", user_id=user_id, plan_id=plan_id)
+        logger.info(
+            "checkout_completed_topup_deferred", user_id=user_id, plan_id=plan_id
+        )
         return
 
     plan = _PLAN_BY_ID.get(plan_id) if plan_id else None
@@ -5956,7 +6520,7 @@ async def _handle_checkout_completed(
     _checkout_pi_id: str | None = session_obj.get("payment_intent") or None
     if not _checkout_pi_id and subscription_id:
         try:
-            _latest_inv = (sub if 'sub' in dir() else {}).get("latest_invoice") or {}
+            _latest_inv = (sub if "sub" in dir() else {}).get("latest_invoice") or {}
             if isinstance(_latest_inv, dict):
                 _checkout_pi_id = _latest_inv.get("payment_intent") or None
         except Exception:  # noqa: BLE001
@@ -6046,7 +6610,9 @@ async def _handle_invoice_paid(
     _invoice_pi_id: str | None = invoice_obj.get("payment_intent") or None
     # K-01: invoice.amount_paid (cents) is the canonical paid amount and
     # equals the eventual charge.amount for paid invoices.
-    _invoice_charge_amount: int | None = invoice_obj.get("amount_paid") or invoice_obj.get("total")
+    _invoice_charge_amount: int | None = invoice_obj.get(
+        "amount_paid"
+    ) or invoice_obj.get("total")
 
     await _grant_credits_for_event(
         user_id=user_id,
@@ -6110,7 +6676,9 @@ async def _handle_payment_intent_succeeded(
     # K-01: capture the charge amount (cents) so the reversal flow can
     # compute pro-rata for partial-amount disputes. payment_intent.amount
     # equals the eventual charge.amount for top-ups (single-charge PI).
-    _topup_charge_amount: int | None = pi_obj.get("amount") or pi_obj.get("amount_received")
+    _topup_charge_amount: int | None = pi_obj.get("amount") or pi_obj.get(
+        "amount_received"
+    )
     _topup_charge_id: str | None = pi_obj.get("latest_charge")
     if not _topup_charge_id:
         _charges = (pi_obj.get("charges") or {}).get("data") or []
@@ -6265,9 +6833,7 @@ async def _grant_credits_for_event(
                 status=pg_resp.status_code,
                 body=body_text[:500],
             )
-            raise HTTPException(
-                status_code=503, detail="Credit grant mapping failed"
-            )
+            raise HTTPException(status_code=503, detail="Credit grant mapping failed")
 
         # U-01: defensive double-coverage at grant time.
         # Stripe's Charge object exposes ``refunded`` / ``amount_refunded``
@@ -6278,9 +6844,10 @@ async def _grant_credits_for_event(
         # on a deterministic synthetic event_id derived from the grant
         # ref_id so retries collapse via the UNIQUE(event_id) index.
         if stripe_charge is not None and pi_id:
-            already_refunded = bool(stripe_charge.get("refunded")) or int(
-                stripe_charge.get("amount_refunded") or 0
-            ) > 0
+            already_refunded = (
+                bool(stripe_charge.get("refunded"))
+                or int(stripe_charge.get("amount_refunded") or 0) > 0
+            )
             already_disputed = bool(stripe_charge.get("disputed"))
             if already_refunded or already_disputed:
                 synthetic_event_id = f"defensive:{ref_id}:reversal"
@@ -6341,13 +6908,21 @@ async def _get_user_id_for_customer(
     if not cfg.SUPABASE_URL or not api_key:
         return None
     url = f"{cfg.SUPABASE_URL}/rest/v1/profiles"
-    params = {"stripe_customer_id": f"eq.{stripe_customer_id}", "select": "id", "limit": "1"}
+    params = {
+        "stripe_customer_id": f"eq.{stripe_customer_id}",
+        "select": "id",
+        "limit": "1",
+    }
     headers = {"apikey": api_key, "Authorization": f"Bearer {api_key}"}
     async with httpx.AsyncClient(timeout=5.0) as client:
         try:
             resp = await client.get(url, params=params, headers=headers)
         except httpx.HTTPError as exc:
-            logger.error("customer_lookup_network_error", customer_id=stripe_customer_id, error=str(exc))
+            logger.error(
+                "customer_lookup_network_error",
+                customer_id=stripe_customer_id,
+                error=str(exc),
+            )
             return None
     if resp.status_code != 200:
         logger.error(
@@ -6391,7 +6966,7 @@ async def _handle_subscription_updated(
     subscription_plan_id: str | None = None
     items = (sub_obj.get("items") or {}).get("data") or []
     if items:
-        price = (items[0].get("price") or {})
+        price = items[0].get("price") or {}
         subscription_plan_id = price.get("id") or price.get("product")
         # Prefer the plan slug from _PLAN_BY_PRICE_ID; fall back to the raw value.
         if subscription_plan_id and subscription_plan_id in _PLAN_BY_PRICE_ID:
@@ -6407,9 +6982,7 @@ async def _handle_subscription_updated(
             period_end_ts, tz=timezone.utc
         ).isoformat()
 
-    await _supabase_patch_profile_by_customer(
-        stripe_customer_id, update_payload, cfg
-    )
+    await _supabase_patch_profile_by_customer(stripe_customer_id, update_payload, cfg)
     logger.info(
         "subscription_updated",
         stripe_customer_id=stripe_customer_id,
@@ -6454,6 +7027,7 @@ async def _handle_subscription_deleted(
 # ---------------------------------------------------------------------------
 # B-04: Stripe refund / dispute reversal handlers
 # ---------------------------------------------------------------------------
+
 
 async def _lookup_grant_tx_for_payment_intent(
     payment_intent_id: str,
@@ -6511,6 +7085,7 @@ async def _lookup_grant_tx_for_payment_intent(
         )
         return None
     return rows[0]
+
 
 def _compute_reversal_key(
     charge_obj: dict[str, Any],
@@ -6576,7 +7151,9 @@ async def _record_dispute_reversal_or_skip(
     if not cfg.SUPABASE_URL or not api_key:
         return False
 
-    reversal_key = _compute_reversal_key(charge_obj, dispute_obj, refund_event_id=refund_event_id)
+    reversal_key = _compute_reversal_key(
+        charge_obj, dispute_obj, refund_event_id=refund_event_id
+    )
 
     headers = {
         "apikey": api_key,
@@ -6634,7 +7211,9 @@ async def _insert_dispute_reversal(
     if not cfg.SUPABASE_URL or not api_key:
         return
 
-    reversal_key = _compute_reversal_key(charge_obj, dispute_obj, refund_event_id=refund_event_id)
+    reversal_key = _compute_reversal_key(
+        charge_obj, dispute_obj, refund_event_id=refund_event_id
+    )
     dispute_id: str | None = dispute_obj.get("id") if dispute_obj else None
 
     headers = {
@@ -6748,7 +7327,9 @@ async def _record_pending_reversal(
 
     pi_id: str | None = charge_obj.get("payment_intent")
     charge_id: str | None = charge_obj.get("id")
-    amount_cents = int(charge_obj.get("amount_refunded") or charge_obj.get("amount") or 0)
+    amount_cents = int(
+        charge_obj.get("amount_refunded") or charge_obj.get("amount") or 0
+    )
     currency = charge_obj.get("currency") or "usd"
     raw_event: dict[str, Any] = {"charge": charge_obj}
     if dispute_obj is not None:
@@ -6865,10 +7446,7 @@ async def _mark_pending_reversal_applied(
         "Content-Type": "application/json",
         "Prefer": "return=minimal",
     }
-    url = (
-        f"{cfg.SUPABASE_URL}/rest/v1/stripe_pending_reversals"
-        f"?event_id=eq.{event_id}"
-    )
+    url = f"{cfg.SUPABASE_URL}/rest/v1/stripe_pending_reversals?event_id=eq.{event_id}"
     payload = {"applied_at": datetime.now(tz=timezone.utc).isoformat()}
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -7022,7 +7600,9 @@ async def _reverse_credits_for_charge(
     user_id: str = grant_tx["user_id"]
     original_credits: int = int(grant_tx["credits"])
     amount_total: int = int(charge_obj.get("amount") or 0)
-    amount_refunded: int = int(charge_obj.get("amount_refunded") or charge_obj.get("amount") or 0)
+    amount_refunded: int = int(
+        charge_obj.get("amount_refunded") or charge_obj.get("amount") or 0
+    )
 
     # K-01 fix: when handling a dispute, the pseudo-charge built by
     # _handle_charge_dispute_* sets amount = amount_refunded = dispute.amount.
@@ -7055,6 +7635,7 @@ async def _reverse_credits_for_charge(
     # K-01 has already overridden amount_total above for the dispute path.
     if amount_total > 0 and amount_refunded < amount_total:
         import math as _math
+
         target_credits = _math.floor(original_credits * amount_refunded / amount_total)
     else:
         target_credits = original_credits
@@ -7131,7 +7712,9 @@ async def _reverse_credits_for_charge(
         event_id=event_id,
         user_id=user_id,
         target_credits=int(target_credits),
-        credits_debited=int(rpc_credits) if isinstance(rpc_credits, (int, float)) else None,
+        credits_debited=int(rpc_credits)
+        if isinstance(rpc_credits, (int, float))
+        else None,
         rpc_status=rpc_status,
         pi_id=pi_id,
         charge_id=charge_id,
@@ -7323,7 +7906,9 @@ async def _supabase_add_credits(
     api_key = _supabase_api_key(cfg)
     if not api_key:
         logger.error("supabase_no_api_key_for_add_credits")
-        raise HTTPException(status_code=503, detail="Credit service unavailable (no API key)")
+        raise HTTPException(
+            status_code=503, detail="Credit service unavailable (no API key)"
+        )
     rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/add_credits"
     headers = {
         "apikey": api_key,
@@ -7413,7 +7998,10 @@ async def _supabase_get_subscription_fields(
     (values are strings or None).  Returns both as None on any error.
     """
     api_key = _supabase_api_key(cfg)
-    empty: dict[str, str | None] = {"subscription_plan": None, "subscription_status": None}
+    empty: dict[str, str | None] = {
+        "subscription_plan": None,
+        "subscription_status": None,
+    }
     if not cfg.SUPABASE_URL or not api_key:
         return empty
     url = f"{cfg.SUPABASE_URL}/rest/v1/profiles"
@@ -7427,7 +8015,11 @@ async def _supabase_get_subscription_fields(
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(url, params=params, headers=headers)
     except httpx.HTTPError as exc:  # noqa: BLE001
-        logger.warning("supabase_get_subscription_fields_network_error", user_id=user_id, error=str(exc))
+        logger.warning(
+            "supabase_get_subscription_fields_network_error",
+            user_id=user_id,
+            error=str(exc),
+        )
         return empty
     if resp.status_code != 200:
         logger.warning(
@@ -7534,8 +8126,8 @@ async def _supabase_deduct_credits(
 # the claim attempt.  Using a small enum keeps the call-sites readable without
 # pulling in a heavier type elsewhere.
 class _WebhookClaim:
-    NEW = "new"            # First time seen; caller must run the handler.
-    RETRY = "retry"        # Previously crashed mid-handler; caller must run again.
+    NEW = "new"  # First time seen; caller must run the handler.
+    RETRY = "retry"  # Previously crashed mid-handler; caller must run again.
     DUPLICATE = "duplicate"  # Already completed successfully; caller must skip.
 
 
@@ -7736,8 +8328,12 @@ async def admin_list_users(
         resp = await client.post(url, headers=headers, json={})
 
     if resp.status_code != 200:
-        logger.error("admin_list_users_failed", status=resp.status_code, body=resp.text[:200])
-        raise HTTPException(status_code=502, detail="Failed to fetch users from Supabase")
+        logger.error(
+            "admin_list_users_failed", status=resp.status_code, body=resp.text[:200]
+        )
+        raise HTTPException(
+            status_code=502, detail="Failed to fetch users from Supabase"
+        )
 
     rows: list[dict[str, Any]] = resp.json()
     return [
@@ -7898,7 +8494,8 @@ async def admin_stats(
             # BUG-API-030 / BUG-API-048: normalize auth header before forwarding.
             # Loop6 / B-01: api_key uses service_role; JWT still carries caller.
             auth_header = _normalize_bearer_auth_header(
-                request.headers.get("authorization") or request.headers.get("Authorization")
+                request.headers.get("authorization")
+                or request.headers.get("Authorization")
             )
             api_key = _supabase_api_key(cfg) or ""
             headers = {
@@ -7926,32 +8523,47 @@ async def admin_stats(
     else:
         total_users_available = False
 
-    total_investigations: int = await db.fetchval("SELECT COUNT(*) FROM research_tasks") or 0
-    running: int = await db.fetchval(
-        "SELECT COUNT(*) FROM research_tasks WHERE status = 'RUNNING'"
-    ) or 0
-    completed: int = await db.fetchval(
-        "SELECT COUNT(*) FROM research_tasks WHERE status = 'COMPLETED'"
-    ) or 0
-    failed: int = await db.fetchval(
-        "SELECT COUNT(*) FROM research_tasks WHERE status IN ('FAILED', 'HALTED')"
-    ) or 0
+    total_investigations: int = (
+        await db.fetchval("SELECT COUNT(*) FROM research_tasks") or 0
+    )
+    running: int = (
+        await db.fetchval(
+            "SELECT COUNT(*) FROM research_tasks WHERE status = 'RUNNING'"
+        )
+        or 0
+    )
+    completed: int = (
+        await db.fetchval(
+            "SELECT COUNT(*) FROM research_tasks WHERE status = 'COMPLETED'"
+        )
+        or 0
+    )
+    failed: int = (
+        await db.fetchval(
+            "SELECT COUNT(*) FROM research_tasks WHERE status IN ('FAILED', 'HALTED')"
+        )
+        or 0
+    )
     total_spent: float = float(
         await db.fetchval(
             "SELECT COALESCE(SUM(total_spent_usd), 0.0) FROM research_tasks"
-        ) or 0.0
+        )
+        or 0.0
     )
     # Credits consumed: apply 20% platform markup before converting to credits.
     # Formula: credits = raw_cost_usd * 1.20 / _CREDIT_USD_RATE = raw * 1.20 / 0.01 = raw * 120
     total_credits_consumed = int(total_spent * 120)
-    active_users_30d: int = await db.fetchval(
-        """
+    active_users_30d: int = (
+        await db.fetchval(
+            """
         SELECT COUNT(DISTINCT metadata->>'user_id')
         FROM research_tasks
         WHERE created_at >= NOW() - INTERVAL '30 days'
           AND metadata->>'user_id' IS NOT NULL
         """
-    ) or 0
+        )
+        or 0
+    )
 
     return AdminStatsResponse(
         total_users=total_users,
@@ -8086,11 +8698,18 @@ async def _admin_rpc_call(
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(url, headers=headers, json=payload)
     if resp.status_code != 200:
-        body = resp.text[:400] if resp.text else ""
-        logger.error("admin_rpc_failed", fn=fn, status=resp.status_code, body=body)
+        body = resp.text[:500] if resp.text else ""
+        # CC-29 fix: do NOT echo the upstream Supabase/PostgREST body to the
+        # admin client — it can leak table/column names, FK/RLS policy names,
+        # and value snippets.  Stash the diagnostics in the structured log
+        # (operator-only) and surface a stable generic detail.
+        logger.error(
+            "admin_rpc_failed",
+            extra={"fn": fn, "status": resp.status_code, "body": body},
+        )
         # Map Postgres permission / validation errors to 4xx where possible
         code = 403 if resp.status_code in (401, 403) else 502
-        raise HTTPException(status_code=code, detail=f"RPC {fn} failed: {body}")
+        raise HTTPException(status_code=code, detail="admin RPC failed")
     try:
         return resp.json()
     except ValueError:
@@ -8177,11 +8796,17 @@ async def admin_user_set_role(
     # role revocations (admin → user) take effect on the very next request
     # rather than after the old 30 s TTL.
     _clear_admin_cache(user_id)
-    logger.info("admin_role_set", actor=caller["user_id"], target=user_id, role=body.role)
+    logger.info(
+        "admin_role_set", actor=caller["user_id"], target=user_id, role=body.role
+    )
     return JSONResponse(content={"user_id": user_id, "role": body.role})
 
 
-@app.post("/api/admin/users/{user_id}/suspend", tags=["Admin"], summary="Suspend/unsuspend user")
+@app.post(
+    "/api/admin/users/{user_id}/suspend",
+    tags=["Admin"],
+    summary="Suspend/unsuspend user",
+)
 async def admin_user_suspend(
     user_id: str,
     body: AdminSuspendRequest,
@@ -8207,7 +8832,11 @@ async def admin_user_suspend(
     return JSONResponse(content={"user_id": user_id, "suspended": body.suspend})
 
 
-@app.post("/api/admin/users/{user_id}/credits-v2", tags=["Admin"], summary="Adjust credits (v2, audited)")
+@app.post(
+    "/api/admin/users/{user_id}/credits-v2",
+    tags=["Admin"],
+    summary="Adjust credits (v2, audited)",
+)
 async def admin_user_credits_v2(
     user_id: str,
     body: AdminCreditsV2Request,
@@ -8215,7 +8844,9 @@ async def admin_user_credits_v2(
     caller: dict[str, str] = Depends(_require_admin),
 ) -> JSONResponse:
     if body.mode == "set" and body.amount < 0:
-        raise HTTPException(status_code=422, detail="amount must be >= 0 when mode='set'")
+        raise HTTPException(
+            status_code=422, detail="amount must be >= 0 when mode='set'"
+        )
     new_balance = await _admin_rpc_call(
         request,
         "admin_adjust_credits",
@@ -8238,7 +8869,11 @@ async def admin_user_credits_v2(
     return JSONResponse(content={"user_id": user_id, "new_balance": new_balance})
 
 
-@app.post("/api/admin/system/freeze", tags=["Admin"], summary="Toggle global system freeze (kill-switch)")
+@app.post(
+    "/api/admin/system/freeze",
+    tags=["Admin"],
+    summary="Toggle global system freeze (kill-switch)",
+)
 async def admin_system_freeze(
     body: AdminSystemFreezeRequest,
     request: Request,
@@ -8263,7 +8898,9 @@ async def admin_system_freeze(
     return JSONResponse(content={"frozen": body.frozen, "message": body.message})
 
 
-@app.get("/api/admin/tasks", tags=["Admin"], summary="List all user tasks (investigations)")
+@app.get(
+    "/api/admin/tasks", tags=["Admin"], summary="List all user tasks (investigations)"
+)
 async def admin_list_all_tasks(
     request: Request,
     status: str | None = Query(None, max_length=32),
@@ -8289,7 +8926,9 @@ async def admin_list_all_tasks(
 # --- Admin todo-list (admin_tasks table) ----------------------------------
 
 
-@app.get("/api/admin/admin-tasks", tags=["Admin"], summary="List internal admin todo tasks")
+@app.get(
+    "/api/admin/admin-tasks", tags=["Admin"], summary="List internal admin todo tasks"
+)
 async def admin_admintasks_list(
     request: Request,
     status: str | None = Query(None, max_length=32),
@@ -8313,11 +8952,24 @@ async def admin_admintasks_list(
         params["priority"] = f"eq.{priority}"
     resp = await _admin_rest_request(request, "GET", "/admin_tasks", params=params)
     if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"List admin_tasks failed: {resp.text[:200]}")
+        # CC-29: stash diagnostics, surface stable detail.
+        logger.error(
+            "admin_rpc_failed",
+            extra={
+                "fn": "list_admin_tasks",
+                "status": resp.status_code,
+                "body": resp.text[:500] if resp.text else "",
+            },
+        )
+        raise HTTPException(status_code=502, detail="admin operation failed")
     return JSONResponse(content=resp.json())
 
 
-@app.post("/api/admin/admin-tasks", tags=["Admin"], summary="Create an internal admin todo task")
+@app.post(
+    "/api/admin/admin-tasks",
+    tags=["Admin"],
+    summary="Create an internal admin todo task",
+)
 async def admin_admintasks_create(
     body: AdminAdminTaskUpsert,
     request: Request,
@@ -8333,12 +8985,25 @@ async def admin_admintasks_create(
         prefer="return=representation",
     )
     if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=502, detail=f"Create admin_task failed: {resp.text[:200]}")
+        # CC-29: stash diagnostics, surface stable detail.
+        logger.error(
+            "admin_rpc_failed",
+            extra={
+                "fn": "create_admin_task",
+                "status": resp.status_code,
+                "body": resp.text[:500] if resp.text else "",
+            },
+        )
+        raise HTTPException(status_code=502, detail="admin operation failed")
     data = resp.json()
     return JSONResponse(content=data[0] if isinstance(data, list) and data else data)
 
 
-@app.patch("/api/admin/admin-tasks/{task_id}", tags=["Admin"], summary="Update an internal admin todo task")
+@app.patch(
+    "/api/admin/admin-tasks/{task_id}",
+    tags=["Admin"],
+    summary="Update an internal admin todo task",
+)
 async def admin_admintasks_patch(
     task_id: str,
     body: AdminAdminTaskPatch,
@@ -8348,7 +9013,9 @@ async def admin_admintasks_patch(
     try:
         uuid.UUID(task_id)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail="Invalid task_id (must be UUID)") from exc
+        raise HTTPException(
+            status_code=422, detail="Invalid task_id (must be UUID)"
+        ) from exc
     payload = body.model_dump(exclude_none=True)
     if not payload:
         raise HTTPException(status_code=422, detail="No fields provided")
@@ -8361,12 +9028,25 @@ async def admin_admintasks_patch(
         prefer="return=representation",
     )
     if resp.status_code not in (200, 204):
-        raise HTTPException(status_code=502, detail=f"Patch admin_task failed: {resp.text[:200]}")
+        # CC-29: stash diagnostics, surface stable detail.
+        logger.error(
+            "admin_rpc_failed",
+            extra={
+                "fn": "patch_admin_task",
+                "status": resp.status_code,
+                "body": resp.text[:500] if resp.text else "",
+            },
+        )
+        raise HTTPException(status_code=502, detail="admin operation failed")
     data = resp.json() if resp.status_code == 200 else []
     return JSONResponse(content=data[0] if isinstance(data, list) and data else {})
 
 
-@app.delete("/api/admin/admin-tasks/{task_id}", tags=["Admin"], summary="Delete an internal admin todo task")
+@app.delete(
+    "/api/admin/admin-tasks/{task_id}",
+    tags=["Admin"],
+    summary="Delete an internal admin todo task",
+)
 async def admin_admintasks_delete(
     task_id: str,
     request: Request,
@@ -8375,7 +9055,9 @@ async def admin_admintasks_delete(
     try:
         uuid.UUID(task_id)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail="Invalid task_id (must be UUID)") from exc
+        raise HTTPException(
+            status_code=422, detail="Invalid task_id (must be UUID)"
+        ) from exc
     resp = await _admin_rest_request(
         request,
         "DELETE",
@@ -8383,7 +9065,16 @@ async def admin_admintasks_delete(
         params={"id": f"eq.{task_id}"},
     )
     if resp.status_code not in (200, 204):
-        raise HTTPException(status_code=502, detail=f"Delete admin_task failed: {resp.text[:200]}")
+        # CC-29: stash diagnostics, surface stable detail.
+        logger.error(
+            "admin_rpc_failed",
+            extra={
+                "fn": "delete_admin_task",
+                "status": resp.status_code,
+                "body": resp.text[:500] if resp.text else "",
+            },
+        )
+        raise HTTPException(status_code=502, detail="admin operation failed")
     return JSONResponse(content={"id": task_id, "deleted": True})
 
 
@@ -8402,7 +9093,16 @@ async def admin_feature_flags_list(
         params={"select": "*", "order": "key.asc"},
     )
     if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"List feature_flags failed: {resp.text[:200]}")
+        # CC-29: stash diagnostics, surface stable detail.
+        logger.error(
+            "admin_rpc_failed",
+            extra={
+                "fn": "list_feature_flags",
+                "status": resp.status_code,
+                "body": resp.text[:500] if resp.text else "",
+            },
+        )
+        raise HTTPException(status_code=502, detail="admin operation failed")
     return JSONResponse(content=resp.json())
 
 
@@ -8422,7 +9122,16 @@ async def admin_feature_flags_upsert(
         prefer="resolution=merge-duplicates,return=representation",
     )
     if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=502, detail=f"Upsert feature_flag failed: {resp.text[:200]}")
+        # CC-29: stash diagnostics, surface stable detail.
+        logger.error(
+            "admin_rpc_failed",
+            extra={
+                "fn": "upsert_feature_flag",
+                "status": resp.status_code,
+                "body": resp.text[:500] if resp.text else "",
+            },
+        )
+        raise HTTPException(status_code=502, detail="admin operation failed")
     # B-18 fix: audit write is now mandatory — 503 on failure.
     await _audit_or_503(
         request,
@@ -8436,7 +9145,9 @@ async def admin_feature_flags_upsert(
     return JSONResponse(content=data[0] if isinstance(data, list) and data else data)
 
 
-@app.delete("/api/admin/feature-flags/{key}", tags=["Admin"], summary="Delete a feature flag")
+@app.delete(
+    "/api/admin/feature-flags/{key}", tags=["Admin"], summary="Delete a feature flag"
+)
 async def admin_feature_flags_delete(
     key: str,
     request: Request,
@@ -8449,7 +9160,16 @@ async def admin_feature_flags_delete(
         params={"key": f"eq.{key}"},
     )
     if resp.status_code not in (200, 204):
-        raise HTTPException(status_code=502, detail=f"Delete feature_flag failed: {resp.text[:200]}")
+        # CC-29: stash diagnostics, surface stable detail.
+        logger.error(
+            "admin_rpc_failed",
+            extra={
+                "fn": "delete_feature_flag",
+                "status": resp.status_code,
+                "body": resp.text[:500] if resp.text else "",
+            },
+        )
+        raise HTTPException(status_code=502, detail="admin operation failed")
     # B-18 fix: audit write is now mandatory — 503 on failure.
     await _audit_or_503(
         request,
@@ -8472,6 +9192,7 @@ async def admin_usage_rollup(
     _: dict[str, str] = Depends(_require_admin),
 ) -> JSONResponse:
     from datetime import timedelta
+
     since = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
     params = {
         "select": "*",
@@ -8479,7 +9200,9 @@ async def admin_usage_rollup(
         "order": "day.desc",
         "limit": str(limit),
     }
-    resp = await _admin_rest_request(request, "GET", "/usage_rollup_daily", params=params)
+    resp = await _admin_rest_request(
+        request, "GET", "/usage_rollup_daily", params=params
+    )
     if resp.status_code != 200:
         # Table may be empty or missing — return empty list rather than 502
         logger.warning("admin_usage_rollup_non_200", status=resp.status_code)
@@ -8490,7 +9213,11 @@ async def admin_usage_rollup(
 # --- System health probe ---------------------------------------------------
 
 
-@app.get("/api/admin/health-probe", tags=["Admin"], summary="Deep health probe of all dependencies")
+@app.get(
+    "/api/admin/health-probe",
+    tags=["Admin"],
+    summary="Deep health probe of all dependencies",
+)
 async def admin_health_probe(
     request: Request,
     _: dict[str, str] = Depends(_require_admin),
@@ -8566,9 +9293,12 @@ async def admin_health_probe(
         if not base:
             raise RuntimeError("LLM_GATEWAY_BASE_URL not configured")
         async with httpx.AsyncClient(timeout=3.0) as client:
-            r = await client.get(f"{base}/models", headers={
-                "Authorization": f"Bearer {os.environ.get('LLM_GATEWAY_API_KEY','')}"
-            })
+            r = await client.get(
+                f"{base}/models",
+                headers={
+                    "Authorization": f"Bearer {os.environ.get('LLM_GATEWAY_API_KEY', '')}"
+                },
+            )
         return f"status={r.status_code}"
 
     await asyncio.gather(
@@ -8598,7 +9328,11 @@ class AdminDangerConfirm(BaseModel):
     confirm: str = Field(..., description="Must equal 'I UNDERSTAND' to proceed")
 
 
-@app.post("/api/admin/danger/flush-redis", tags=["Admin"], summary="DANGER: flush Redis (cache + queues)")
+@app.post(
+    "/api/admin/danger/flush-redis",
+    tags=["Admin"],
+    summary="DANGER: flush Redis (cache + queues)",
+)
 async def admin_danger_flush_redis(
     body: AdminDangerConfirm,
     request: Request,
@@ -8611,7 +9345,12 @@ async def admin_danger_flush_redis(
     try:
         await _redis.flushdb()
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Flush failed: {exc}") from exc
+        # CC-29: stash diagnostics, surface stable detail.
+        logger.error(
+            "admin_rpc_failed",
+            extra={"fn": "redis_flush", "status": 500, "body": str(exc)[:500]},
+        )
+        raise HTTPException(status_code=500, detail="admin operation failed") from exc
     logger.warning("admin_danger_flush_redis", actor=caller["user_id"])
     # B-18 fix: audit write is now mandatory — 503 on failure.
     await _audit_or_503(
@@ -8624,7 +9363,11 @@ async def admin_danger_flush_redis(
     return JSONResponse(content={"flushed": True})
 
 
-@app.post("/api/admin/danger/halt-running", tags=["Admin"], summary="DANGER: halt all RUNNING tasks")
+@app.post(
+    "/api/admin/danger/halt-running",
+    tags=["Admin"],
+    summary="DANGER: halt all RUNNING tasks",
+)
 async def admin_danger_halt_running(
     body: AdminDangerConfirm,
     request: Request,
@@ -8695,10 +9438,15 @@ async def graceful_shutdown(
     cfg = _get_config()
     admin_key = getattr(cfg, "ADMIN_SECRET_KEY", "")
     if not admin_key:
-        raise HTTPException(status_code=403, detail="Shutdown endpoint disabled (ADMIN_SECRET_KEY not configured)")
+        raise HTTPException(
+            status_code=403,
+            detail="Shutdown endpoint disabled (ADMIN_SECRET_KEY not configured)",
+        )
     # M-11 fix: constant-time comparison to prevent timing-attack recovery of
     # the admin key byte-by-byte.
-    if not hmac.compare_digest((x_admin_key or "").encode("utf-8"), admin_key.encode("utf-8")):
+    if not hmac.compare_digest(
+        (x_admin_key or "").encode("utf-8"), admin_key.encode("utf-8")
+    ):
         raise HTTPException(status_code=401, detail="Unauthorized")
     logger.warning("graceful_shutdown_initiated", actor=caller["user_id"])
     db: asyncpg.Pool | None = _db_pool
@@ -8740,18 +9488,21 @@ def _exit_process() -> None:
 
 class MemoryFactRequest(BaseModel):
     """Request body for storing a user fact."""
+
     fact: str = Field(..., min_length=1, max_length=2000)
     category: str = Field(default="general", max_length=100)
 
 
 class MemoryPreferenceRequest(BaseModel):
     """Request body for storing a user preference."""
+
     key: str = Field(..., min_length=1, max_length=200)
     value: str = Field(..., min_length=1, max_length=2000)
 
 
 class MemoryResponse(BaseModel):
     """Response containing user memory data."""
+
     facts: list[str]
     preferences: dict[str, str]
     history: list[dict[str, str]]
@@ -8806,11 +9557,13 @@ async def store_preference(
 
 class DeleteFactRequest(BaseModel):
     """Request body for DELETE /api/memory/facts."""
+
     fact: str = Field(..., min_length=1)
 
 
 class DeletePreferenceRequest(BaseModel):
     """Request body for DELETE /api/memory/preferences."""
+
     key: str = Field(..., min_length=1)
 
 
@@ -8855,6 +9608,7 @@ async def delete_preference(
 
 class CreateSkillRequest(BaseModel):
     """Request body for creating a custom skill."""
+
     name: str = Field(..., min_length=1, max_length=200)
     description: str = Field(..., min_length=1, max_length=2000)
     system_prompt: str = Field(..., min_length=1, max_length=10000)
@@ -8863,6 +9617,7 @@ class CreateSkillRequest(BaseModel):
 
 class SkillResponse(BaseModel):
     """Public representation of a skill."""
+
     id: str
     name: str
     description: str
@@ -8946,7 +9701,9 @@ async def delete_skill(
     # orphaned skills (owner_id=None) by any user — only admin can clean those up.
     if not _is_admin_user(current_user["user_id"]):
         if not skill.owner_id or skill.owner_id != current_user["user_id"]:
-            raise HTTPException(status_code=403, detail="Not authorized to delete this skill")
+            raise HTTPException(
+                status_code=403, detail="Not authorized to delete this skill"
+            )
 
     mgr.delete_skill(skill_id, owner_id=current_user["user_id"])
     return {"status": "deleted"}
@@ -8965,33 +9722,39 @@ async def delete_skill(
 # ---------------------------------------------------------------------------
 
 #: Columns that may legally appear in UPDATE research_tasks SET ... queries.
-_RESEARCH_TASK_UPDATABLE_COLUMNS: frozenset[str] = frozenset({
-    "status",
-    "current_state",
-    "error_message",
-    "total_spent_usd",
-    "ai_call_counter",
-    "diminishing_flags",
-    "started_at",
-    "completed_at",
-    "output_pdf_path",
-    "output_docx_path",
-    "metadata",
-})
+_RESEARCH_TASK_UPDATABLE_COLUMNS: frozenset[str] = frozenset(
+    {
+        "status",
+        "current_state",
+        "error_message",
+        "total_spent_usd",
+        "ai_call_counter",
+        "diminishing_flags",
+        "started_at",
+        "completed_at",
+        "output_pdf_path",
+        "output_docx_path",
+        "metadata",
+    }
+)
 
 #: Columns that may legally appear in UPDATE branches SET ... queries.
-_BRANCH_UPDATABLE_COLUMNS: frozenset[str] = frozenset({
-    "status",
-    "budget_allocated",
-    "budget_spent",
-    "cycles_completed",
-    "score_history",
-    "kill_reason",
-    "updated_at",
-})
+_BRANCH_UPDATABLE_COLUMNS: frozenset[str] = frozenset(
+    {
+        "status",
+        "budget_allocated",
+        "budget_spent",
+        "cycles_completed",
+        "score_history",
+        "kill_reason",
+        "updated_at",
+    }
+)
 
 
-def _validate_update_columns(columns: set[str], allowlist: frozenset[str], table: str) -> None:
+def _validate_update_columns(
+    columns: set[str], allowlist: frozenset[str], table: str
+) -> None:
     """
     Raise ValueError if any column name is not in the allowlist.
 
@@ -9020,9 +9783,15 @@ def _ensure_task_exists(row: asyncpg.Record | None, task_id: str) -> None:
 
 class FeedbackRequest(BaseModel):
     """Request body for submitting investigation feedback."""
+
     task_id: str | None = Field(None, description="UUID of the related investigation")
-    event_type: str = Field(..., description="One of: rating, feedback, correction, preference")
-    category: str | None = Field(None, description="Category: report_quality, search_depth, branch_decision, general")
+    event_type: str = Field(
+        ..., description="One of: rating, feedback, correction, preference"
+    )
+    category: str | None = Field(
+        None,
+        description="Category: report_quality, search_depth, branch_decision, general",
+    )
     content: dict = Field(..., description="Structured feedback payload")
 
     @field_validator("content")
@@ -9093,13 +9862,19 @@ async def submit_feedback(
     from mariana.orchestrator.learning import record_feedback  # noqa: PLC0415
 
     if body.event_type not in ("rating", "feedback", "correction", "preference"):
-        raise HTTPException(status_code=400, detail="event_type must be one of: rating, feedback, correction, preference")
+        raise HTTPException(
+            status_code=400,
+            detail="event_type must be one of: rating, feedback, correction, preference",
+        )
 
     # P0-FIX-4: Verify the task belongs to the current user before accepting feedback.
     if body.task_id:
         validated_task_id = _validate_task_id(body.task_id)  # BUG-API-001
         # F-05: prefer relational user_id FK for ownership.
-        row = await db.fetchrow("SELECT user_id, metadata FROM research_tasks WHERE id = $1", validated_task_id)
+        row = await db.fetchrow(
+            "SELECT user_id, metadata FROM research_tasks WHERE id = $1",
+            validated_task_id,
+        )
         if row is None:
             raise HTTPException(status_code=404, detail="Investigation not found")
         if not _is_admin_user(current_user["user_id"]):
@@ -9115,7 +9890,10 @@ async def submit_feedback(
                         meta = {}
                 _fb_owner = meta.get("user_id", "")
             if _fb_owner != current_user["user_id"]:
-                raise HTTPException(status_code=403, detail="Not authorized to submit feedback for this investigation")
+                raise HTTPException(
+                    status_code=403,
+                    detail="Not authorized to submit feedback for this investigation",
+                )
 
     event_id = await record_feedback(
         user_id=current_user["user_id"],
@@ -9248,7 +10026,9 @@ async def get_outcome(
 # ---------------------------------------------------------------------------
 
 
-def _build_next_cursor(items: list[dict], ts_key: str = "created_at", id_key: str = "id") -> str | None:
+def _build_next_cursor(
+    items: list[dict], ts_key: str = "created_at", id_key: str = "id"
+) -> str | None:
     """Build a keyset pagination cursor from the last item in a page."""
     if not items:
         return None
@@ -9284,11 +10064,14 @@ async def get_claims(
     """
     db = _get_db()
     from mariana.orchestrator.intelligence.evidence_ledger import get_evidence_ledger  # noqa: PLC0415
+
     claims = await get_evidence_ledger(task_id, db, limit=limit, cursor=cursor)
     # Serialize any datetime objects.
     serialized = _jsonable(claims)
     next_cursor = _build_next_cursor(claims)
-    return JSONResponse(content={"items": serialized, "next_cursor": next_cursor, "limit": limit})
+    return JSONResponse(
+        content={"items": serialized, "next_cursor": next_cursor, "limit": limit}
+    )
 
 
 @app.get(
@@ -9303,6 +10086,7 @@ async def get_claims_summary(
     """Fetch summary statistics for the evidence ledger."""
     db = _get_db()
     from mariana.orchestrator.intelligence.evidence_ledger import get_ledger_summary  # noqa: PLC0415
+
     summary = await get_ledger_summary(task_id, db)
     return JSONResponse(content=summary)
 
@@ -9323,12 +10107,23 @@ async def get_source_scores(
     F-06: returns envelope ``{items, next_cursor, limit, average_credibility}``.
     """
     db = _get_db()
-    from mariana.orchestrator.intelligence.credibility import get_source_scores, get_average_credibility  # noqa: PLC0415
+    from mariana.orchestrator.intelligence.credibility import (
+        get_source_scores,
+        get_average_credibility,
+    )  # noqa: PLC0415
+
     scores = await get_source_scores(task_id, db, limit=limit, cursor=cursor)
     avg = await get_average_credibility(task_id, db)
     serialized = _jsonable(scores)
     next_cursor = _build_next_cursor(scores)
-    return JSONResponse(content={"items": serialized, "next_cursor": next_cursor, "limit": limit, "average_credibility": avg})
+    return JSONResponse(
+        content={
+            "items": serialized,
+            "next_cursor": next_cursor,
+            "limit": limit,
+            "average_credibility": avg,
+        }
+    )
 
 
 @app.get(
@@ -9348,7 +10143,10 @@ async def get_contradictions(
     ``next_cursor`` and ``limit`` for page navigation.
     """
     db = _get_db()
-    from mariana.orchestrator.intelligence.contradictions import get_contradiction_matrix  # noqa: PLC0415
+    from mariana.orchestrator.intelligence.contradictions import (
+        get_contradiction_matrix,
+    )  # noqa: PLC0415
+
     matrix = await get_contradiction_matrix(task_id, db, limit=limit, cursor=cursor)
     # Build next_cursor from last item in contradictions list.
     next_cursor = _build_next_cursor(matrix.get("contradictions", []))
@@ -9377,7 +10175,11 @@ async def get_hypothesis_rankings(
     F-06: returns envelope ``{items, next_cursor, limit, winner}``.
     """
     db = _get_db()
-    from mariana.orchestrator.intelligence.hypothesis_engine import get_hypothesis_rankings, get_winning_hypothesis  # noqa: PLC0415
+    from mariana.orchestrator.intelligence.hypothesis_engine import (
+        get_hypothesis_rankings,
+        get_winning_hypothesis,
+    )  # noqa: PLC0415
+
     rankings = await get_hypothesis_rankings(task_id, db, limit=limit, cursor=cursor)
     winner = await get_winning_hypothesis(task_id, db)
     # Build next_cursor from _cursor_ts / _cursor_id fields added by helper.
@@ -9389,8 +10191,19 @@ async def get_hypothesis_rankings(
         if cts and cid:
             next_cursor = f"{cts}|{cid}"
     # Strip internal cursor fields from output.
-    clean_rankings = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rankings]
-    return JSONResponse(content=_jsonable({"items": clean_rankings, "next_cursor": next_cursor, "limit": limit, "winner": winner}))
+    clean_rankings = [
+        {k: v for k, v in r.items() if not k.startswith("_")} for r in rankings
+    ]
+    return JSONResponse(
+        content=_jsonable(
+            {
+                "items": clean_rankings,
+                "next_cursor": next_cursor,
+                "limit": limit,
+                "winner": winner,
+            }
+        )
+    )
 
 
 @app.get(
@@ -9405,6 +10218,7 @@ async def get_gaps(
     """Fetch the latest gap analysis (missing evidence, completeness score)."""
     db = _get_db()
     from mariana.orchestrator.intelligence.gap_detector import get_latest_gap_analysis  # noqa: PLC0415
+
     gap = await get_latest_gap_analysis(task_id, db)
     if gap is None:
         return JSONResponse(content={"gap_analysis": None, "status": "not_yet_run"})
@@ -9423,6 +10237,7 @@ async def get_temporal(
     """Fetch temporal coverage and timeline of claims."""
     db = _get_db()
     from mariana.orchestrator.intelligence.temporal import get_temporal_coverage  # noqa: PLC0415
+
     coverage = await get_temporal_coverage(task_id, db)
     # Get a flat timeline of all temporally-tagged claims
     timeline_rows = await db.fetch(
@@ -9437,6 +10252,7 @@ async def get_temporal(
         task_id,
     )
     from mariana.data.db import _row_to_dict  # noqa: PLC0415
+
     timeline = []
     for r in timeline_rows:
         d = _row_to_dict(r)
@@ -9478,7 +10294,10 @@ async def get_perspectives(
                 ORDER BY created_at ASC, id ASC
                 LIMIT $4
                 """,
-                task_id, cursor_ts, cursor_id, clamped_limit,
+                task_id,
+                cursor_ts,
+                cursor_id,
+                clamped_limit,
             )
         except Exception:
             rows = await db.fetch(
@@ -9490,7 +10309,8 @@ async def get_perspectives(
                 ORDER BY created_at ASC, id ASC
                 LIMIT $2
                 """,
-                task_id, clamped_limit,
+                task_id,
+                clamped_limit,
             )
     else:
         rows = await db.fetch(
@@ -9502,16 +10322,22 @@ async def get_perspectives(
             ORDER BY created_at ASC, id ASC
             LIMIT $2
             """,
-            task_id, clamped_limit,
+            task_id,
+            clamped_limit,
         )
     from mariana.data.db import _row_to_dict  # noqa: PLC0415
+
     perspectives = [_row_to_dict(r) for r in rows]
     # Serialize datetimes (guard against already-string values).
     for p in perspectives:
         if p.get("created_at") and hasattr(p["created_at"], "isoformat"):
             p["created_at"] = p["created_at"].isoformat()
     next_cursor = _build_next_cursor(perspectives)
-    return JSONResponse(content=_jsonable({"items": perspectives, "next_cursor": next_cursor, "limit": clamped_limit}))
+    return JSONResponse(
+        content=_jsonable(
+            {"items": perspectives, "next_cursor": next_cursor, "limit": clamped_limit}
+        )
+    )
 
 
 @app.get(
@@ -9526,6 +10352,7 @@ async def get_audit(
     """Fetch the latest reasoning chain audit results."""
     db = _get_db()
     from mariana.orchestrator.intelligence.auditor import get_latest_audit  # noqa: PLC0415
+
     audit = await get_latest_audit(task_id, db)
     if audit is None:
         return JSONResponse(content={"audit": None, "status": "not_yet_run"})
@@ -9543,7 +10370,10 @@ async def get_executive_summary(
 ) -> JSONResponse:
     """Fetch executive summaries at all compression levels."""
     db = _get_db()
-    from mariana.orchestrator.intelligence.executive_summary import get_executive_summary as _get_exec_summary  # noqa: PLC0415
+    from mariana.orchestrator.intelligence.executive_summary import (
+        get_executive_summary as _get_exec_summary,
+    )  # noqa: PLC0415
+
     summary = await _get_exec_summary(task_id, db)
     if summary is None:
         return JSONResponse(content={"summary": None, "status": "not_yet_generated"})
@@ -9562,6 +10392,7 @@ async def get_diversity(
     """Fetch source diversity assessment for an investigation."""
     db = _get_db()
     from mariana.orchestrator.intelligence.diversity import assess_diversity  # noqa: PLC0415
+
     result = await assess_diversity(task_id, db)
     return JSONResponse(content=_jsonable(result))
 
@@ -9584,13 +10415,17 @@ async def get_intelligence_overview(
     # Claims summary
     try:
         from mariana.orchestrator.intelligence.evidence_ledger import get_ledger_summary  # noqa: PLC0415
+
         overview["claims"] = await get_ledger_summary(task_id, db)
     except Exception:
         overview["claims"] = None
 
     # Source credibility
     try:
-        from mariana.orchestrator.intelligence.credibility import get_average_credibility  # noqa: PLC0415
+        from mariana.orchestrator.intelligence.credibility import (
+            get_average_credibility,
+        )  # noqa: PLC0415
+
         overview["average_credibility"] = await get_average_credibility(task_id, db)
     except Exception:
         overview["average_credibility"] = None
@@ -9607,14 +10442,20 @@ async def get_intelligence_overview(
 
     # Bayesian winner
     try:
-        from mariana.orchestrator.intelligence.hypothesis_engine import get_winning_hypothesis  # noqa: PLC0415
+        from mariana.orchestrator.intelligence.hypothesis_engine import (
+            get_winning_hypothesis,
+        )  # noqa: PLC0415
+
         overview["bayesian_winner"] = await get_winning_hypothesis(task_id, db)
     except Exception:
         overview["bayesian_winner"] = None
 
     # Gap analysis
     try:
-        from mariana.orchestrator.intelligence.gap_detector import get_latest_gap_analysis  # noqa: PLC0415
+        from mariana.orchestrator.intelligence.gap_detector import (
+            get_latest_gap_analysis,
+        )  # noqa: PLC0415
+
         gap = await get_latest_gap_analysis(task_id, db)
         overview["completeness_score"] = gap.get("completeness_score") if gap else None
         overview["gaps_found"] = len(gap.get("gaps", [])) if gap else 0
@@ -9625,6 +10466,7 @@ async def get_intelligence_overview(
     # Audit
     try:
         from mariana.orchestrator.intelligence.auditor import get_latest_audit  # noqa: PLC0415
+
         audit = await get_latest_audit(task_id, db)
         overview["audit_passed"] = audit.get("passed") if audit else None
         overview["audit_score"] = audit.get("overall_score") if audit else None
@@ -9634,7 +10476,10 @@ async def get_intelligence_overview(
 
     # Executive summary one-liner
     try:
-        from mariana.orchestrator.intelligence.executive_summary import get_executive_summary as _get_es  # noqa: PLC0415
+        from mariana.orchestrator.intelligence.executive_summary import (
+            get_executive_summary as _get_es,
+        )  # noqa: PLC0415
+
         es = await _get_es(task_id, db)
         overview["one_liner"] = es.get("one_liner", "") if es else ""
     except Exception:
