@@ -62,10 +62,101 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+# -----------------------------------------------------------------------------
+# CC-36: structured JSON logging
+#
+# The sidecar emits one JSON object per log record so the host's log
+# aggregator can parse fields without regex.  Format is selectable via
+# ``LOG_FORMAT=json|text`` (default ``json``); the legacy text format is
+# kept for local debugging.  This formatter is deliberately self-contained
+# so the sidecar has no dependency on the orchestrator's structlog stack.
+# -----------------------------------------------------------------------------
+
+_JSON_RESERVED = {
+    "args",
+    "asctime",
+    "created",
+    "exc_info",
+    "exc_text",
+    "filename",
+    "funcName",
+    "levelname",
+    "levelno",
+    "lineno",
+    "message",
+    "module",
+    "msecs",
+    "msg",
+    "name",
+    "pathname",
+    "process",
+    "processName",
+    "relativeCreated",
+    "stack_info",
+    "thread",
+    "threadName",
+    "taskName",
+}
+
+
+class _JsonLogFormatter(logging.Formatter):
+    """Emit each LogRecord as a single-line JSON object.
+
+    Includes timestamp, level, logger name, message, plus any structured
+    ``extra=`` keyword fields the call site attached.  Exception traces are
+    serialised under ``exc_info``.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:  # noqa: D401
+        import json as _json
+
+        payload: dict[str, Any] = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        # Surface any structured fields the caller passed via ``extra=``.
+        for key, value in record.__dict__.items():
+            if key in _JSON_RESERVED or key.startswith("_"):
+                continue
+            try:
+                _json.dumps(value)
+            except (TypeError, ValueError):
+                value = repr(value)
+            payload[key] = value
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        if record.stack_info:
+            payload["stack_info"] = self.formatStack(record.stack_info)
+        return _json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _configure_logging() -> None:
+    """Wire root logging to the format selected by ``LOG_FORMAT``.
+
+    Default is ``json`` so production aggregators get parseable records;
+    set ``LOG_FORMAT=text`` for legacy human-readable output during local
+    debugging.
+    """
+    fmt = os.getenv("LOG_FORMAT", "json").strip().lower()
+    handler = logging.StreamHandler()
+    if fmt == "text":
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+        )
+    else:
+        handler.setFormatter(_JsonLogFormatter())
+    root = logging.getLogger()
+    # Replace any handlers a previous call (e.g. test reload) installed so we
+    # never double-emit records.
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
+_configure_logging()
 log = logging.getLogger("sandbox")
 
 # -----------------------------------------------------------------------------

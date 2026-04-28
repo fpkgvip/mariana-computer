@@ -49,7 +49,96 @@ from playwright.async_api import (
 )
 from pydantic import BaseModel, Field, field_validator
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# -----------------------------------------------------------------------------
+# CC-36: structured JSON logging
+#
+# The sidecar emits one JSON object per log record so the host's log
+# aggregator can parse fields without regex.  Format is selectable via
+# ``LOG_FORMAT=json|text`` (default ``json``); the legacy text format is
+# kept for local debugging.  This formatter is deliberately self-contained
+# so the sidecar has no dependency on the orchestrator's structlog stack.
+# -----------------------------------------------------------------------------
+
+_JSON_RESERVED = {
+    "args",
+    "asctime",
+    "created",
+    "exc_info",
+    "exc_text",
+    "filename",
+    "funcName",
+    "levelname",
+    "levelno",
+    "lineno",
+    "message",
+    "module",
+    "msecs",
+    "msg",
+    "name",
+    "pathname",
+    "process",
+    "processName",
+    "relativeCreated",
+    "stack_info",
+    "thread",
+    "threadName",
+    "taskName",
+}
+
+
+class _JsonLogFormatter(logging.Formatter):
+    """Emit each LogRecord as a single-line JSON object.
+
+    Includes timestamp, level, logger name, message, plus any structured
+    ``extra=`` keyword fields the call site attached.  Exception traces are
+    serialised under ``exc_info``.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:  # noqa: D401
+        import json as _json
+
+        payload: dict[str, Any] = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        for key, value in record.__dict__.items():
+            if key in _JSON_RESERVED or key.startswith("_"):
+                continue
+            try:
+                _json.dumps(value)
+            except (TypeError, ValueError):
+                value = repr(value)
+            payload[key] = value
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        if record.stack_info:
+            payload["stack_info"] = self.formatStack(record.stack_info)
+        return _json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _configure_logging() -> None:
+    """Wire root logging to the format selected by ``LOG_FORMAT``.
+
+    Default is ``json`` so production aggregators get parseable records;
+    set ``LOG_FORMAT=text`` for legacy human-readable output during local
+    debugging.
+    """
+    fmt = os.getenv("LOG_FORMAT", "json").strip().lower()
+    handler = logging.StreamHandler()
+    if fmt == "text":
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    else:
+        handler.setFormatter(_JsonLogFormatter())
+    root = logging.getLogger()
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
+_configure_logging()
 log = logging.getLogger("browser")
 
 BROWSER_SHARED_SECRET = os.getenv("BROWSER_SHARED_SECRET", "")
@@ -183,9 +272,7 @@ def _resolve_and_validate(url: str) -> str:
 
     # 3. Hostname → DNS resolve; reject if *any* resolved address is blocked.
     try:
-        addr_info = socket.getaddrinfo(
-            bare_host, None, type=socket.SOCK_STREAM
-        )
+        addr_info = socket.getaddrinfo(bare_host, None, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
         log.warning(
             "browser_dns_failed",
@@ -366,7 +453,9 @@ async def _acquire_page(
 
 class FetchRequest(BaseModel):
     url: str = Field(..., max_length=MAX_URL_LEN)
-    wait_for: str = Field(default="networkidle", pattern=r"^(load|domcontentloaded|networkidle)$")
+    wait_for: str = Field(
+        default="networkidle", pattern=r"^(load|domcontentloaded|networkidle)$"
+    )
     wait_for_selector: str | None = None
     timeout_ms: int = Field(default=DEFAULT_TIMEOUT_MS, ge=1000, le=MAX_TIMEOUT_MS)
     # True → return text content (stripped HTML); False → full HTML.
@@ -385,7 +474,9 @@ class FetchRequest(BaseModel):
 
 class ScreenshotRequest(BaseModel):
     url: str = Field(..., max_length=MAX_URL_LEN)
-    wait_for: str = Field(default="networkidle", pattern=r"^(load|domcontentloaded|networkidle)$")
+    wait_for: str = Field(
+        default="networkidle", pattern=r"^(load|domcontentloaded|networkidle)$"
+    )
     wait_for_selector: str | None = None
     full_page: bool = True
     timeout_ms: int = Field(default=DEFAULT_TIMEOUT_MS, ge=1000, le=MAX_TIMEOUT_MS)
@@ -403,7 +494,9 @@ class ScreenshotRequest(BaseModel):
 
 class PdfRequest(BaseModel):
     url: str = Field(..., max_length=MAX_URL_LEN)
-    wait_for: str = Field(default="networkidle", pattern=r"^(load|domcontentloaded|networkidle)$")
+    wait_for: str = Field(
+        default="networkidle", pattern=r"^(load|domcontentloaded|networkidle)$"
+    )
     timeout_ms: int = Field(default=DEFAULT_TIMEOUT_MS, ge=1000, le=MAX_TIMEOUT_MS)
     format: Literal["A4", "Letter", "Legal"] = "A4"
     user_agent: str = DEFAULT_UA
@@ -419,7 +512,9 @@ class PdfRequest(BaseModel):
 class ClickFetchRequest(BaseModel):
     url: str = Field(..., max_length=MAX_URL_LEN)
     click_selector: str
-    wait_for: str = Field(default="networkidle", pattern=r"^(load|domcontentloaded|networkidle)$")
+    wait_for: str = Field(
+        default="networkidle", pattern=r"^(load|domcontentloaded|networkidle)$"
+    )
     wait_after_click_ms: int = Field(default=2000, ge=0, le=30_000)
     timeout_ms: int = Field(default=DEFAULT_TIMEOUT_MS, ge=1000, le=MAX_TIMEOUT_MS)
     extract_text: bool = True
@@ -432,7 +527,9 @@ class ClickFetchRequest(BaseModel):
 # -----------------------------------------------------------------------------
 
 
-async def _goto_and_settle(page: Page, url: str, wait_for: str, timeout_ms: int) -> dict[str, Any]:
+async def _goto_and_settle(
+    page: Page, url: str, wait_for: str, timeout_ms: int
+) -> dict[str, Any]:
     """Navigate and return the response status / final URL.  Raises HTTPException on failure."""
     try:
         resp = await page.goto(url, wait_until=wait_for, timeout=timeout_ms)
@@ -460,7 +557,7 @@ async def _extract(page: Page, *, as_text: bool, max_chars: int) -> str:
     else:
         text = await page.content()
     if len(text) > max_chars:
-        return text[: max_chars] + f"\n\n…[truncated at {max_chars} chars]"
+        return text[:max_chars] + f"\n\n…[truncated at {max_chars} chars]"
     return text
 
 
@@ -473,11 +570,15 @@ async def _extract(page: Page, *, as_text: bool, max_chars: int) -> str:
 async def fetch(req: FetchRequest) -> dict[str, Any]:
     start = time.monotonic()
     safe_url = _resolve_and_validate(req.url)
-    async with _acquire_page(user_agent=req.user_agent, timeout_ms=req.timeout_ms) as page:
+    async with _acquire_page(
+        user_agent=req.user_agent, timeout_ms=req.timeout_ms
+    ) as page:
         nav = await _goto_and_settle(page, safe_url, req.wait_for, req.timeout_ms)
         if req.wait_for_selector:
             try:
-                await page.wait_for_selector(req.wait_for_selector, timeout=req.timeout_ms)
+                await page.wait_for_selector(
+                    req.wait_for_selector, timeout=req.timeout_ms
+                )
             except PlaywrightTimeout:
                 # not fatal — still return what we have
                 pass
@@ -513,7 +614,9 @@ async def screenshot(req: ScreenshotRequest) -> dict[str, Any]:
         await _goto_and_settle(page, safe_url, req.wait_for, req.timeout_ms)
         if req.wait_for_selector:
             try:
-                await page.wait_for_selector(req.wait_for_selector, timeout=req.timeout_ms)
+                await page.wait_for_selector(
+                    req.wait_for_selector, timeout=req.timeout_ms
+                )
             except PlaywrightTimeout:
                 pass
         png = await page.screenshot(full_page=req.full_page, type="png")
@@ -531,7 +634,9 @@ async def screenshot(req: ScreenshotRequest) -> dict[str, Any]:
 async def pdf(req: PdfRequest) -> dict[str, Any]:
     start = time.monotonic()
     safe_url = _resolve_and_validate(req.url)
-    async with _acquire_page(user_agent=req.user_agent, timeout_ms=req.timeout_ms) as page:
+    async with _acquire_page(
+        user_agent=req.user_agent, timeout_ms=req.timeout_ms
+    ) as page:
         await _goto_and_settle(page, safe_url, req.wait_for, req.timeout_ms)
         data = await page.pdf(format=req.format, print_background=True)
         return {
@@ -548,7 +653,9 @@ async def pdf(req: PdfRequest) -> dict[str, Any]:
 async def click_and_fetch(req: ClickFetchRequest) -> dict[str, Any]:
     start = time.monotonic()
     safe_url = _resolve_and_validate(req.url)
-    async with _acquire_page(user_agent=req.user_agent, timeout_ms=req.timeout_ms) as page:
+    async with _acquire_page(
+        user_agent=req.user_agent, timeout_ms=req.timeout_ms
+    ) as page:
         await _goto_and_settle(page, safe_url, req.wait_for, req.timeout_ms)
         try:
             await page.click(req.click_selector, timeout=req.timeout_ms)
