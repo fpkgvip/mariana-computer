@@ -92,10 +92,55 @@ export default function Admin() {
   }, [user, navigate]);
 
   if (!user) {
+    // Pre-auth skeleton: header + sidebar + table placeholders so the page
+    // reserves layout space instead of jolting from a centered spinner to the
+    // full admin shell when the user object lands.
     return (
-      <div className="flex min-h-screen items-center justify-center text-muted-foreground">
-        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-        Loading…
+      <div
+        role="status"
+        aria-live="polite"
+        aria-busy="true"
+        aria-label="Loading admin console"
+        className="min-h-screen bg-background"
+      >
+        <div className="border-b border-border bg-card">
+          <div className="mx-auto flex max-w-[1400px] items-center justify-between px-6 py-4">
+            <div className="flex items-center gap-3">
+              <div className="h-6 w-6 animate-pulse rounded-md bg-muted" />
+              <div className="h-4 w-32 animate-pulse rounded bg-muted" />
+            </div>
+            <div className="h-7 w-24 animate-pulse rounded-md bg-muted" />
+          </div>
+        </div>
+        <div className="mx-auto max-w-[1400px] px-6 py-6">
+          <div className="flex gap-6">
+            <nav className="hidden w-44 shrink-0 space-y-1 sm:block">
+              {[0, 1, 2, 3, 4, 5].map((i) => (
+                <div
+                  key={i}
+                  className="h-7 w-full animate-pulse rounded-md bg-muted/70"
+                />
+              ))}
+            </nav>
+            <div className="flex-1 space-y-3">
+              <div className="h-9 w-48 animate-pulse rounded bg-muted" />
+              <div className="rounded-lg border border-border bg-card/40">
+                <div className="h-10 border-b border-border" />
+                {[0, 1, 2, 3, 4].map((i) => (
+                  <div
+                    key={i}
+                    className="flex items-center gap-3 border-b border-border/60 px-4 py-3 last:border-b-0"
+                  >
+                    <div className="h-3 w-1/4 animate-pulse rounded bg-muted" />
+                    <div className="h-3 w-1/3 animate-pulse rounded bg-muted/70" />
+                    <div className="ml-auto h-3 w-16 animate-pulse rounded bg-muted/70" />
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+        <span className="sr-only">Loading admin console</span>
       </div>
     );
   }

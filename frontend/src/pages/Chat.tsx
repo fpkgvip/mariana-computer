@@ -3076,7 +3076,7 @@ export default function Chat() {
               disabled={loadingMoreConversations}
               className="mt-2 w-full rounded-md px-3 py-1.5 text-[11px] text-muted-foreground hover:bg-secondary/50 transition-colors disabled:opacity-40"
             >
-              {loadingMoreConversations ? "Loading..." : "Load more"}
+              {loadingMoreConversations ? "Loading…" : "Load more"}
             </button>
           )}
         </div>
@@ -3249,9 +3249,30 @@ export default function Chat() {
             )}
 
             {/* Loading state when switching conversations */}
+            {/* Skeleton message rows that mirror the alternating user/agent
+               bubbles, so the layout reserves space and does not jolt when
+               messages arrive. */}
             {conversationLoading && messages.length === 0 && (
-              <div className="flex items-center justify-center py-24">
-                <div className="h-5 w-5 animate-spin rounded-full border-2 border-primary/20 border-t-primary" />
+              <div
+                role="status"
+                aria-live="polite"
+                aria-busy="true"
+                aria-label="Loading conversation"
+                className="space-y-4 py-2"
+              >
+                <div className="flex justify-end">
+                  <div className="h-10 w-2/3 animate-pulse rounded-lg bg-primary/5 ring-1 ring-primary/10 sm:max-w-md" />
+                </div>
+                <div className="flex justify-start">
+                  <div className="h-24 w-5/6 animate-pulse rounded-lg bg-card/40 ring-1 ring-border" />
+                </div>
+                <div className="flex justify-end">
+                  <div className="h-8 w-1/2 animate-pulse rounded-lg bg-primary/5 ring-1 ring-primary/10 sm:max-w-md" />
+                </div>
+                <div className="flex justify-start">
+                  <div className="h-16 w-3/4 animate-pulse rounded-lg bg-card/40 ring-1 ring-border" />
+                </div>
+                <span className="sr-only">Loading conversation</span>
               </div>
             )}
 

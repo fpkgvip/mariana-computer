@@ -27,7 +27,7 @@ import { VaultUnlockDialog } from "@/components/deft/VaultUnlockDialog";
 import { SecretsTable } from "@/components/deft/SecretsTable";
 import { VaultHeader } from "@/components/deft/vault/VaultHeader";
 import { UnlockedBar } from "@/components/deft/vault/UnlockedBar";
-import { Loader2 } from "lucide-react";
+import { VaultSkeleton } from "@/components/deft/vault/VaultSkeleton";
 import { toast } from "sonner";
 
 const LOCK_MS_FALLBACK = 30 * 60 * 1000;
@@ -73,16 +73,7 @@ export default function VaultPage() {
 
   let body: JSX.Element;
   if (!vault.loaded || authLoading) {
-    body = (
-      <div
-        role="status"
-        aria-live="polite"
-        className="flex items-center justify-center py-20 text-muted-foreground"
-      >
-        <Loader2 size={20} className="mr-2 animate-spin" aria-hidden />
-        Loading vault…
-      </div>
-    );
+    body = <VaultSkeleton />;
   } else if (!vault.exists || setupInProgress) {
     body = <VaultSetupWizard onDone={() => setSetupInProgress(false)} />;
   } else if (!vault.unlocked) {
