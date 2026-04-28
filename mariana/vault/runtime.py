@@ -113,7 +113,10 @@ def validate_vault_env(env: Mapping[str, Any]) -> dict[str, str]:
 
 import re
 
-_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+# CC-09: anchor with \Z, not $.  Python's $ matches before a trailing \n, so
+# a poisoned key like "FOO\n" would slip through shape validation and reach
+# the env / log layer.  \Z anchors strictly to end-of-string.
+_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}\Z")
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +251,27 @@ async def fetch_vault_env(
             extra={"task_id": task_id, "reason": "non_object_payload"},
         )
         return {}
+    # CC-06 fix: an empty-object payload (``{}``) under ``requires_vault=True``
+    # is the same fail-closed bypass shape U-03 + CC-04 were meant to close —
+    # the for-loop below would run zero iterations and silently return ``{}``.
+    # ``store_vault_env`` short-circuits ``if not env: return``, so a stored
+    # ``{}`` blob can only come from corruption / external poisoning; treat it
+    # as fail-closed too.  Under ``requires_vault=False`` an empty dict is the
+    # legitimate "no vaulted secrets" state and is preserved.
+    if not data:
+        if requires_vault:
+            raise VaultUnavailableError(
+                f"vault_env empty_payload for task {task_id} that required vault"
+            )
+        return {}
     # Final sanity: enforce caps and key/value shape on the way out.
+    # CC-09 fix: align fetch contract with validate_vault_env, which drops
+    # empty-string values on the WRITE path (validate_vault_env line ~105).
+    # Without this, a corrupted/poisoned blob with a present-but-empty value
+    # (``{"FOO": ""}``) would slip through here as ``{"FOO": ""}`` even though
+    # that shape is unreachable through the normal ingest API.  Treat it as
+    # fail-closed under requires_vault=True; under requires_vault=False, log
+    # and skip the key.
     out: dict[str, str] = {}
     for k, v in list(data.items())[:_MAX_VAULT_ENV_ENTRIES]:
         if not isinstance(k, str) or not isinstance(v, str) or not _NAME_RE.match(k):
@@ -262,6 +285,16 @@ async def fetch_vault_env(
             logger.warning(
                 "vault_env_corrupt_payload_degraded",
                 extra={"task_id": task_id, "reason": "invalid_kv_shape"},
+            )
+            continue
+        if len(v) == 0:
+            if requires_vault:
+                raise VaultUnavailableError(
+                    f"vault_env empty_value for task {task_id}: key {k!r}"
+                )
+            logger.warning(
+                "vault_env_corrupt_payload_degraded",
+                extra={"task_id": task_id, "reason": "empty_value", "key": k},
             )
             continue
         out[k] = v[:_MAX_VAULT_VALUE_LEN]
