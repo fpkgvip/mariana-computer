@@ -12,10 +12,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
 
+      # CC-12 supply-chain hardening: third-party Marketplace action
+      # pinned to a 40-char commit SHA so that a future tag-rewrite of
+      # appleboy/ssh-action cannot transparently inject code into the
+      # production deploy path.  Bump the SHA + comment together when
+      # upgrading.
       - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
         with:
           host: ${{ secrets.HETZNER_HOST }}
           username: ${{ secrets.HETZNER_USER }}
