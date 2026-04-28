@@ -1548,7 +1548,8 @@ async def _authenticate_stream_token_or_header(
         db = _get_db()
         row = await db.fetchrow("SELECT metadata FROM research_tasks WHERE id = $1", task_id)
         if row is None:
-            raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+            logger.info("task_not_found", task_id=task_id)
+            raise HTTPException(status_code=404, detail="task not found")
         if not _is_admin_user(user["user_id"]):
             metadata = row.get("metadata") or {}
             # BUG-API-016: wrap json.loads in try/except so that a malformed
@@ -3363,7 +3364,8 @@ async def get_investigation(
         task_id,
     )
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        logger.info("task_not_found", task_id=task_id)
+        raise HTTPException(status_code=404, detail="task not found")
     # F-05 fix: prefer FK column for ownership; fall back to metadata.
     if not _is_admin_user(current_user["user_id"]):
         fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
@@ -3409,7 +3411,8 @@ async def kill_investigation(
         task_id,
     )
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        logger.info("task_not_found", task_id=task_id)
+        raise HTTPException(status_code=404, detail="task not found")
     if not _is_admin_user(current_user["user_id"]):
         fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
         if fk_uid is not None:
@@ -3435,7 +3438,8 @@ async def kill_investigation(
     if rows_affected == 0:
         exists = await db.fetchval("SELECT 1 FROM research_tasks WHERE id = $1", task_id)
         if not exists:
-            raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+            logger.info("task_not_found", task_id=task_id)
+            raise HTTPException(status_code=404, detail="task not found")
         raise HTTPException(status_code=409, detail="Task is already in terminal state")
 
     if _redis is not None:
@@ -3477,7 +3481,8 @@ async def stop_investigation(
         task_id,
     )
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        logger.info("task_not_found", task_id=task_id)
+        raise HTTPException(status_code=404, detail="task not found")
     if not _is_admin_user(current_user["user_id"]):
         fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
         if fk_uid is not None:
@@ -4382,7 +4387,8 @@ async def download_report_pdf(
         task_id,
     )
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        logger.info("task_not_found", task_id=task_id)
+        raise HTTPException(status_code=404, detail="task not found")
 
     pdf_path: str | None = row["output_pdf_path"]
     if not pdf_path:
@@ -4463,7 +4469,8 @@ async def download_report_docx(
         task_id,
     )
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        logger.info("task_not_found", task_id=task_id)
+        raise HTTPException(status_code=404, detail="task not found")
 
     docx_path: str | None = row["output_docx_path"]
     if not docx_path:
@@ -4557,7 +4564,8 @@ async def list_investigation_files(
         task_id,
     )
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        logger.info("task_not_found", task_id=task_id)
+        raise HTTPException(status_code=404, detail="task not found")
 
     if not _is_admin_user(current_user["user_id"]):
         fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
@@ -4618,7 +4626,8 @@ async def download_investigation_file(
         task_id,
     )
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        logger.info("task_not_found", task_id=task_id)
+        raise HTTPException(status_code=404, detail="task not found")
 
     if not _is_admin_user(current_user["user_id"]):
         fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
@@ -4645,7 +4654,8 @@ async def download_investigation_file(
         raise HTTPException(status_code=403, detail="Access denied: path outside investigation files directory")
 
     if not file_path.is_file():
-        raise HTTPException(status_code=404, detail=f"File {filename!r} not found")
+        logger.info("file_not_found", task_id=task_id, filename=filename)
+        raise HTTPException(status_code=404, detail="not found")
     # BUG-0008 fix: reject symlinks in file download
     if file_path.is_symlink():
         raise HTTPException(status_code=403, detail="Access denied: symlinks are not allowed")
@@ -4797,7 +4807,8 @@ async def upload_investigation_files(
         task_id,
     )
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        logger.info("task_not_found", task_id=task_id)
+        raise HTTPException(status_code=404, detail="task not found")
 
     if not _is_admin_user(current_user["user_id"]):
         fk_uid = str(row["user_id"]) if row["user_id"] is not None else None
@@ -5570,7 +5581,8 @@ async def create_checkout(
     plan = _PLAN_BY_ID.get(body.plan_id)
     topup = _TOPUP_BY_ID.get(body.plan_id) if plan is None else None
     if plan is None and topup is None:
-        raise HTTPException(status_code=404, detail=f"Plan {body.plan_id!r} not found")
+        logger.info("plan_not_found", plan_id=body.plan_id)
+        raise HTTPException(status_code=404, detail="not found")
 
     line_items = [{"price": (plan or topup)["stripe_price_id"], "quantity": 1}]
     metadata: dict[str, str] = {
@@ -8926,7 +8938,8 @@ async def delete_skill(
     # Verify ownership: only custom skills owned by the user can be deleted
     skill = mgr.get_skill(skill_id)
     if skill is None:
-        raise HTTPException(status_code=404, detail=f"Skill {skill_id!r} not found")
+        logger.info("skill_not_found", skill_id=skill_id)
+        raise HTTPException(status_code=404, detail="not found")
     if skill.category == "built-in":
         raise HTTPException(status_code=403, detail="Cannot delete built-in skills")
     # P0-FIX-6: Require explicit ownership match; don't allow deletion of
@@ -9208,7 +9221,8 @@ async def get_outcome(
         task_id,
     )
     if row is None:
-        raise HTTPException(status_code=404, detail=f"No outcome found for task {task_id}")
+        logger.info("outcome_not_found", task_id=task_id)
+        raise HTTPException(status_code=404, detail="not found")
 
     return OutcomeResponse(
         task_id=row["task_id"],
