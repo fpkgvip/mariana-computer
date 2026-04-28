@@ -55,6 +55,7 @@ def _validate_redis_url_for_vault(url: str | None) -> None:
     """Enforce ``rediss://`` (TLS) for any non-loopback Redis URL."""
     assert_local_or_tls(url, surface="vault env transport")
 
+
 # Hard caps mirror the frontend grammar so server is the second line of defence.
 _MAX_VAULT_ENV_ENTRIES = 50
 _MAX_VAULT_VALUE_LEN = 16_384
@@ -63,6 +64,7 @@ _MAX_VAULT_VALUE_LEN = 16_384
 # floor we'll allow if a caller passes a bogus value.
 REDIS_KEY_FMT = "vault:env:{task_id}"
 _MIN_TTL_SECONDS = 600  # 10 min minimum even for a tiny budget
+
 
 # Default identity redactor used when no secrets are bound.
 def _identity(s: str) -> str:
@@ -93,9 +95,7 @@ def validate_vault_env(env: Mapping[str, Any]) -> dict[str, str]:
     if not isinstance(env, Mapping):
         raise ValueError("vault_env must be an object")
     if len(env) > _MAX_VAULT_ENV_ENTRIES:
-        raise ValueError(
-            f"vault_env too large: {len(env)} > {_MAX_VAULT_ENV_ENTRIES}"
-        )
+        raise ValueError(f"vault_env too large: {len(env)} > {_MAX_VAULT_ENV_ENTRIES}")
     out: dict[str, str] = {}
     for name, value in env.items():
         if not isinstance(name, str) or not _NAME_RE.match(name):
@@ -272,8 +272,35 @@ async def fetch_vault_env(
     # that shape is unreachable through the normal ingest API.  Treat it as
     # fail-closed under requires_vault=True; under requires_vault=False, log
     # and skip the key.
+    # CC-27 fix: ``validate_vault_env`` (WRITE path, line ~95) rejects any
+    # payload with more than ``_MAX_VAULT_ENV_ENTRIES`` keys with
+    # ``ValueError``.  The fetch path used to silently slice
+    # ``list(data.items())[:_MAX_VAULT_ENV_ENTRIES]``, which honoured the
+    # first 50 keys and silently dropped the rest — letting the worker run
+    # as if a half-honoured env had been delivered.  This is the same
+    # contract-drift class CC-11 closed for ``_MAX_VAULT_VALUE_LEN``.
+    # Match the WRITE-path contract: under ``requires_vault=True`` raise
+    # ``VaultUnavailableError`` with reason ``oversize_entries``; under
+    # ``requires_vault=False`` warn + return ``{}`` (legacy soft-fail) so
+    # the task runs with no vaulted secrets rather than a partial set.
+    if len(data) > _MAX_VAULT_ENV_ENTRIES:
+        if requires_vault:
+            raise VaultUnavailableError(
+                f"vault_env oversize_entries for task {task_id}: "
+                f"count={len(data)} > max={_MAX_VAULT_ENV_ENTRIES}"
+            )
+        logger.warning(
+            "vault_env_corrupt_payload_degraded",
+            extra={
+                "task_id": task_id,
+                "reason": "oversize_entries",
+                "count": len(data),
+                "max": _MAX_VAULT_ENV_ENTRIES,
+            },
+        )
+        return {}
     out: dict[str, str] = {}
-    for k, v in list(data.items())[:_MAX_VAULT_ENV_ENTRIES]:
+    for k, v in data.items():
         if not isinstance(k, str) or not isinstance(v, str) or not _NAME_RE.match(k):
             if requires_vault:
                 # We refuse to silently drop entries when the task said
@@ -350,7 +377,9 @@ class TaskContextHandle:
 
     __slots__ = ("_env_token", "_redactor_token")
 
-    def __init__(self, env_token: contextvars.Token[Any], redactor_token: contextvars.Token[Any]) -> None:
+    def __init__(
+        self, env_token: contextvars.Token[Any], redactor_token: contextvars.Token[Any]
+    ) -> None:
         self._env_token = env_token
         self._redactor_token = redactor_token
 
