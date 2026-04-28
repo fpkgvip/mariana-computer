@@ -333,7 +333,9 @@ def make_routes(
         db = get_db()
         task = await _load_agent_task(db, task_id)
         if task is None:
-            raise HTTPException(404, f"agent task {task_id} not found")
+            # CC-20: do not echo task_id in 404 detail.
+            logger.info("agent_task_not_found", task_id=task_id)
+            raise HTTPException(404, "task not found")
         if task.user_id != current_user["user_id"]:
             raise HTTPException(403, "not your task")
         async with db.acquire() as conn:
@@ -396,7 +398,9 @@ def make_routes(
         db = get_db()
         task = await _load_agent_task(db, task_id)
         if task is None:
-            raise HTTPException(404, f"agent task {task_id} not found")
+            # CC-20: do not echo task_id in 404 detail.
+            logger.info("agent_task_not_found", task_id=task_id)
+            raise HTTPException(404, "task not found")
         if task.user_id != current_user["user_id"]:
             raise HTTPException(403, "not your task")
         payload = {
@@ -440,7 +444,17 @@ def make_routes(
         try:
             vault_env_validated = validate_vault_env(body.vault_env or {})
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=f"vault_env: {exc}")
+            # CC-20: do not leak raw validator exception text to clients.
+            # Keep the cause in server logs, surface a stable detail only.
+            logger.info(
+                "agent_vault_env_invalid",
+                user_id=current_user["user_id"],
+                error=str(exc),
+            )
+            raise HTTPException(
+                status_code=422,
+                detail="vault_env invalid",
+            )
 
         # M-01 fix: Reserve credits before enqueueing using the canonical
         # platform conversion of **100 credits per $1** (i.e. 1 credit ==
@@ -610,21 +624,26 @@ def make_routes(
                             error=str(refund_exc),
                         )
                 # Mark the task so any later GET shows why it never ran.
+                # CC-20: persist a stable error_code only — raw exception
+                # text stays in the server-side log emitted above.
+                _vault_error_code = (
+                    "vault_transport_violation" if is_policy else "vault_unavailable"
+                )
                 try:
                     async with db.acquire() as conn:
                         await conn.execute(
                             "UPDATE agent_tasks SET state='failed', error=$2, updated_at=NOW() WHERE id=$1",
                             task_id,
-                            ("vault transport policy violation: " if is_policy else "vault unavailable: ") + str(exc),
+                            _vault_error_code,
                         )
                 except Exception:
                     pass
                 raise HTTPException(
                     status_code=503,
                     detail=(
-                        "Vault transport policy violation; refusing to store secrets"
+                        "vault transport policy violation"
                         if is_policy else
-                        "Vault storage unavailable; cannot honour requested secrets"
+                        "vault unavailable"
                     ),
                 ) from exc
 
@@ -645,7 +664,9 @@ def make_routes(
         db = get_db()
         task = await _load_agent_task(db, task_id)
         if task is None:
-            raise HTTPException(404, f"agent task {task_id} not found")
+            # CC-20: do not echo task_id in 404 detail.
+            logger.info("agent_task_not_found", task_id=task_id)
+            raise HTTPException(404, "task not found")
         if task.user_id != current_user["user_id"]:
             raise HTTPException(403, "not your task")
         return task.model_dump(mode="json")
@@ -661,7 +682,9 @@ def make_routes(
         db = get_db()
         task = await _load_agent_task(db, task_id)
         if task is None:
-            raise HTTPException(404, f"agent task {task_id} not found")
+            # CC-20: do not echo task_id in 404 detail.
+            logger.info("agent_task_not_found", task_id=task_id)
+            raise HTTPException(404, "task not found")
         if task.user_id != current_user["user_id"]:
             raise HTTPException(403, "not your task")
         async with db.acquire() as conn:
@@ -713,7 +736,9 @@ def make_routes(
         db = get_db()
         task = await _load_agent_task(db, task_id)
         if task is None:
-            raise HTTPException(404, f"agent task {task_id} not found")
+            # CC-20: do not echo task_id in 404 detail.
+            logger.info("agent_task_not_found", task_id=task_id)
+            raise HTTPException(404, "task not found")
         if task.user_id != current_user["user_id"]:
             raise HTTPException(403, "not your task")
         token = mint_stream_token(current_user["user_id"], task_id)
@@ -749,7 +774,9 @@ def make_routes(
         db = get_db()
         task = await _load_agent_task(db, task_id)
         if task is None:
-            raise HTTPException(404, f"agent task {task_id} not found")
+            # CC-20: do not echo task_id in 404 detail.
+            logger.info("agent_task_not_found", task_id=task_id)
+            raise HTTPException(404, "task not found")
         if task.user_id != current_user["user_id"]:
             raise HTTPException(403, "not your task")
 
@@ -800,8 +827,11 @@ def make_routes(
                 try:
                     msgs = await redis.xread({stream_key: last_id}, block=5_000, count=50)
                 except Exception as exc:
+                    # CC-20: do not leak raw exception text into the SSE
+                    # stream.  Emit a stable error_code; the raw cause is
+                    # kept server-side via the warning log below.
                     logger.warning("agent_sse_xread_error", task_id=task_id, error=str(exc))
-                    yield _sse_msg("error", {"error": str(exc)})
+                    yield _sse_msg("error", {"error_code": "stream_unavailable"})
                     break
                 if not msgs:
                     idle_ticks += 1
@@ -869,7 +899,9 @@ def make_routes(
         db = get_db()
         task = await _load_agent_task(db, task_id)
         if task is None:
-            raise HTTPException(404, f"agent task {task_id} not found")
+            # CC-20: do not echo task_id in 404 detail.
+            logger.info("agent_task_not_found", task_id=task_id)
+            raise HTTPException(404, "task not found")
         if task.user_id != current_user["user_id"]:
             raise HTTPException(403, "not your task")
 
@@ -887,7 +919,9 @@ def make_routes(
                     task_id,
                 )
                 if row is None:
-                    raise HTTPException(404, f"agent task {task_id} not found")
+                    # CC-20: do not echo task_id in 404 detail.
+                    logger.info("agent_task_not_found", task_id=task_id)
+                    raise HTTPException(404, "task not found")
                 cur_state_raw = row["state"]
                 cur_spent = float(row["spent_usd"] or 0.0)
                 already_settled = bool(row["credits_settled"])
@@ -981,7 +1015,9 @@ def make_routes(
         db = get_db()
         task = await _load_agent_task(db, task_id)
         if task is None:
-            raise HTTPException(404, f"agent task {task_id} not found")
+            # CC-20: do not echo task_id in 404 detail.
+            logger.info("agent_task_not_found", task_id=task_id)
+            raise HTTPException(404, "task not found")
         if task.user_id != current_user["user_id"]:
             raise HTTPException(403, "not your task")
         return {
