@@ -145,3 +145,109 @@ npm run build
 * Performance / load tests — out of scope for Loop 6 zero-bug
   convergence.
 * Mutation testing — out of scope.
+
+
+---
+
+## Coverage Fill (Phase D follow-up)
+
+After the CI gates landed, the loop6 audit grew the backend baseline by
+**+37 net tests** (38 added, 1 latent production bug fixed) across three
+high-blast-radius surfaces: the agent loop, the settlement reconciler,
+and the vault encryption / RLS layer.  Each surface ships in its own
+commit so a regression bisect can pin the *area* before drilling into
+individual cases.
+
+### Commit chain
+
+| Commit | What | Net |
+| --- | --- | --- |
+| `159ee57` | Phase D coverage: agent loop behavioural tests (+8) | +8 |
+| `c85bd0f` | **CC-02**: settlement reconciler `batch_size` LIMIT silently ignored | (bug fix, prod) |
+| `35e8dd8` | Phase D coverage: settlement reconciler edge case tests (+6) | +6 |
+| `45a28c5` | Phase D coverage: vault encryption + RLS tests (+23) | +23 |
+
+`tests/test_cc01_agent_loop_behavioural.py` (8 cases) pins:
+
+* planner failure → FAILED + `planner_failed:` error prefix;
+* pre-plan stop short-circuit → HALTED with zero planner spend;
+* unexpected exception in `_run_one_step` is caught and the step is
+  marked FAILED rather than crashing the loop;
+* Redis `get` failure during `_check_stop_requested` is treated as
+  "no stop" (resilience invariant);
+* `_budget_exceeded` returns `budget_exhausted:` and `duration_exhausted:`
+  on the spend and wallclock branches respectively;
+* `_attempt_replan` returns False once `replan_count == max_replans`;
+* hard-cap clamping (`_HARD_MAX_REPLANS`, `_HARD_MAX_FIX_PER_STEP`) at
+  `run_agent_task` entry — a malicious caller cannot weaken defences;
+* `requires_vault=True` with `redis=None` fails CLOSED before the
+  planner runs.
+
+`tests/test_cc02_settlement_reconciler_edge_cases.py` (6 cases) pins:
+
+* T-01 marker-fixup short-circuit: `ledger_applied_at IS NOT NULL` →
+  no RPC re-issued, only `completed_at` stamped;
+* claim younger than `max_age_seconds` is invisible to the reconciler;
+* empty candidate set → returns 0 with no settle attempts;
+* `batch_size` LIMIT is honoured (this is the test that revealed the
+  CC-02 production bug — see below);
+* loader returning `None` for one row is logged and skipped without
+  aborting the batch;
+* a per-row exception in `_mark_settlement_completed` is logged and
+  swallowed; subsequent rows still process.
+
+The second item — `batch_size` LIMIT — surfaced a real production bug.
+The reconciler's candidate query used `WHERE task_id IN (SELECT ... LIMIT
+$2 ... FOR UPDATE SKIP LOCKED)`.  PostgreSQL is free to inline that
+subquery as a semi-join, in which case the `LIMIT` applies to the join
+output rather than to the candidate set; the outer UPDATE then matches
+every uncompleted row.  Wrapping the candidate query in a CTE forces
+materialisation and makes `LIMIT` operate on the candidate set as
+intended.  See `loop6_audit/CC02_RECONCILER_LIMIT_FIX.md` for the full
+diagnosis.  The fix was committed BEFORE the test that revealed it, in
+keeping with Loop 6's "fix the bug first, then pin it" rule.  Both
+agent-side and research-side reconcilers were patched identically.
+
+`tests/test_cc03_vault_encryption_rls.py` (23 cases, 12 of which are
+parametrised name-grammar checks) pins the pure-Python crypto-byte
+invariants in `mariana/vault/store.py` and the RLS defence-in-depth
+contract:
+
+* `_validate_lengths` rejects short blob (< 16 B / GCM tag size),
+  oversize blob (> blob_max), wrong salt size (≠ 16), and wrong IV size
+  (≠ 12);
+* `create_secret` refuses oversize blobs *before* any HTTP request fires
+  (no DDoS of Supabase from a buggy client);
+* `_validate_name` rejects shell metacharacters (`;`, `$`, backtick,
+  `|`, `&`, `>`, `/`, whitespace) and lower-case starters; accepts the
+  canonical `^[A-Z][A-Z0-9_]{0,63}$` grammar;
+* `create_secret`, `update_secret`, `delete_secret`, and `get_vault`
+  all carry the appropriate `user_id=eq.<uid>` filter and (for
+  per-secret mutations) the redundant `id=eq.<sid>` filter so a
+  leaked secret_id cannot be cross-user weaponised;
+* `_from_bytea` rejects malformed hex / non-string inputs / garbage
+  base64 with `VaultError` rather than returning silent empty bytes.
+
+### Numbers
+
+| Metric | Before | After | Delta |
+| --- | --- | --- | --- |
+| pytest passing | 406 | 443 | **+37** |
+| pytest skipped | 13 | 13 | 0 |
+| pytest failing | 0 | 0 | 0 |
+| Production bugs found | — | 1 (CC-02) | — |
+
+Test discovery time on the local Postgres baseline: 7.54 s.  No new
+flaky time-based assertions were introduced (the only `time` use is to
+anchor `_budget_exceeded` to "now" with `time.time()` so the wallclock
+branch does not falsely trip).
+
+### Out of scope (deferred)
+
+* End-to-end RLS tests against a live Supabase project — `auth.users`
+  isn't in `testdb`, so the existing `tests/test_vault_integration.py`
+  and `tests/test_vault_live.py` retain the live coverage; the CC-03
+  suite covers the library-layer contract that complements them.
+* Property-based tests for byte-length boundaries (Hypothesis is not in
+  `requirements.txt`).
+* Mutation testing — still out of scope.
