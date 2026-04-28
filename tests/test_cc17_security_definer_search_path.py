@@ -27,6 +27,7 @@ scripts, because a rollback or a fresh-baseline rebuild that runs revert
 scripts can resurrect privileged functions with unpinned search_path — which
 is the exact CC-17 attack vector.
 """
+
 from __future__ import annotations
 
 import re
@@ -53,7 +54,9 @@ def _find_function_blocks(text: str):
     i = 0
     n = len(lines)
     while i < n:
-        if re.match(r"\s*CREATE\s+(OR\s+REPLACE\s+)?FUNCTION\b", lines[i], re.IGNORECASE):
+        if re.match(
+            r"\s*CREATE\s+(OR\s+REPLACE\s+)?FUNCTION\b", lines[i], re.IGNORECASE
+        ):
             start = i
             block = [lines[i]]
             i += 1
@@ -66,7 +69,7 @@ def _find_function_blocks(text: str):
                     m = re.search(r"\bAS\s+(\$[A-Za-z_]*\$)", cur)
                     if m:
                         tag = m.group(1)
-                        rest = cur[m.end():]
+                        rest = cur[m.end() :]
                         if tag in rest:
                             body_closed = True
                             if re.search(r";\s*$", cur):
@@ -123,9 +126,7 @@ def test_every_security_definer_function_pins_search_path():
     for fp, start, end, name, block in _iter_security_definer_blocks():
         total += 1
         if not SEARCH_PATH_RE.search(block):
-            gaps.append(
-                f"{fp.relative_to(REPO_ROOT)}:{start}-{end}  {name}"
-            )
+            gaps.append(f"{fp.relative_to(REPO_ROOT)}:{start}-{end}  {name}")
 
     # Sanity: we should be finding plenty of SECURITY DEFINER functions.
     # If this drops to 0 the parser is silently broken.
@@ -148,3 +149,85 @@ def test_parser_finds_known_function():
     assert "public.handle_new_user" in names, (
         f"Parser smoke-test failed; got names={sorted(names)[:10]}..."
     )
+
+
+# ---------------------------------------------------------------------------
+# CC-31: tighten the invariant to ALL CREATE FUNCTION blocks (DEFINER + INVOKER)
+# ---------------------------------------------------------------------------
+#
+# CC-31 (P4, post-CC-26 re-audit #44 Finding 5) found that
+# ``public.touch_updated_at()`` in ``003_deft_vault.sql`` — a SECURITY INVOKER
+# trigger function — did not pin ``search_path``.  As an INVOKER function it
+# runs with the caller's privileges, so a search-path hijack does not
+# escalate, but the same hardening hygiene that CC-17 applies to DEFINER
+# functions should apply universally.  We extend the CC-17 test to assert
+# EVERY ``CREATE FUNCTION`` block in repo-owned migrations pins
+# ``search_path``, regardless of DEFINER/INVOKER.  Future drift on either
+# privilege class is caught.
+#
+# Scope is repo-owned migrations only — we explicitly ignore Supabase's own
+# ``auth.role()`` / ``auth.uid()`` helpers that surface in the pg_dump CI
+# baseline; those are part of Supabase's managed ``auth`` schema and are
+# not migrations we control.
+
+
+AUTH_OWNED_FUNCTIONS = frozenset(
+    {
+        "auth.role",
+        "auth.uid",
+    }
+)
+
+
+def _iter_all_function_blocks():
+    for fp in _collect_sql_files():
+        text = fp.read_text()
+        for start, end, block in _find_function_blocks(text):
+            m = NAME_RE.search(block)
+            name = m.group(1) if m else "?"
+            yield fp, start, end, name, block
+
+
+def test_every_function_pins_search_path_definer_or_invoker():
+    """CC-31: every CREATE FUNCTION in repo-owned migrations pins search_path."""
+    gaps = []
+    total = 0
+    for fp, start, end, name, block in _iter_all_function_blocks():
+        if name in AUTH_OWNED_FUNCTIONS:
+            continue
+        total += 1
+        if not SEARCH_PATH_RE.search(block):
+            gaps.append(f"{fp.relative_to(REPO_ROOT)}:{start}-{end}  {name}")
+    assert total >= 20, (
+        f"Parser regression: only found {total} CREATE FUNCTION blocks "
+        f"(expected >= 20)."
+    )
+    if gaps:
+        msg = (
+            "CC-31 regression — CREATE FUNCTION blocks missing "
+            "`SET search_path = ...` (DEFINER and INVOKER both checked):\n  "
+            + "\n  ".join(gaps)
+        )
+        pytest.fail(msg)
+
+
+def test_touch_updated_at_pins_search_path_explicit():
+    """CC-31 pin: the specific INVOKER trigger function called out in A49 Finding 5."""
+    fp = MIGRATIONS_DIR / "003_deft_vault.sql"
+    assert fp.exists(), f"missing migration: {fp}"
+    text = fp.read_text()
+    found = False
+    for _start, _end, block in _find_function_blocks(text):
+        m = NAME_RE.search(block)
+        if m and m.group(1) == "public.touch_updated_at":
+            found = True
+            assert SEARCH_PATH_RE.search(block), (
+                "public.touch_updated_at() must pin search_path (CC-31)."
+            )
+            # Specifically the canonical hardening form.
+            assert re.search(
+                r"SET\s+search_path\s*=\s*public\s*,\s*pg_temp",
+                block,
+                re.IGNORECASE,
+            )
+    assert found, "public.touch_updated_at definition not located by parser."

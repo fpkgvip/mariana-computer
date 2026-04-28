@@ -164,7 +164,9 @@ CREATE POLICY "vault_secrets_owner_delete"
 -- 3. updated_at trigger (shared between both tables)
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.touch_updated_at() RETURNS trigger
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql
+SET search_path = public, pg_temp
+AS $$
 BEGIN
   NEW.updated_at = clock_timestamp();
   RETURN NEW;
