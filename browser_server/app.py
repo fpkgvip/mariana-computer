@@ -138,7 +138,11 @@ def _resolve_and_validate(url: str) -> str:
     try:
         parsed = urlparse(url)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(400, f"invalid url: {exc}") from exc
+        log.warning(
+            "browser_url_parse_failed",
+            extra={"reason": "url_parse", "detail": str(exc)},
+        )
+        raise HTTPException(400, "invalid url") from exc
 
     scheme = (parsed.scheme or "").lower()
     if scheme not in _ALLOWED_SCHEMES:
@@ -153,8 +157,11 @@ def _resolve_and_validate(url: str) -> str:
 
     # 1. Hostname denylist (covers the container-internal service names).
     if hostname in _BLOCKED_HOSTNAMES:
-        log.warning("ssrf_block_hostname host=%s", hostname)
-        raise HTTPException(403, f"blocked hostname: {hostname}")
+        log.warning(
+            "ssrf_block_hostname",
+            extra={"reason": "hostname_blocked", "host": hostname},
+        )
+        raise HTTPException(403, "target not allowed")
 
     # Strip optional ``[ ]`` brackets for IPv6 literals before ipaddress parse.
     bare_host = hostname.strip("[]")
@@ -167,8 +174,11 @@ def _resolve_and_validate(url: str) -> str:
 
     if ip_obj is not None:
         if _ip_is_blocked(ip_obj):
-            log.warning("ssrf_block_literal ip=%s", bare_host)
-            raise HTTPException(403, f"blocked ip: {bare_host}")
+            log.warning(
+                "ssrf_block_literal",
+                extra={"reason": "ip_literal_blocked", "ip": bare_host},
+            )
+            raise HTTPException(403, "target not allowed")
         return url
 
     # 3. Hostname → DNS resolve; reject if *any* resolved address is blocked.
@@ -177,7 +187,11 @@ def _resolve_and_validate(url: str) -> str:
             bare_host, None, type=socket.SOCK_STREAM
         )
     except socket.gaierror as exc:
-        raise HTTPException(400, f"dns resolution failed: {bare_host} ({exc})") from exc
+        log.warning(
+            "browser_dns_failed",
+            extra={"reason": "dns_failure", "host": bare_host, "detail": str(exc)},
+        )
+        raise HTTPException(400, "could not resolve target") from exc
 
     addrs: list[ipaddress._BaseAddress] = []
     for _family, _type, _proto, _canon, sockaddr in addr_info:
@@ -187,15 +201,23 @@ def _resolve_and_validate(url: str) -> str:
         except ValueError:
             continue
     if not addrs:
-        raise HTTPException(400, f"no usable ip for host: {bare_host}")
+        log.warning(
+            "browser_dns_no_usable_ip",
+            extra={"reason": "dns_no_usable_ip", "host": bare_host},
+        )
+        raise HTTPException(400, "could not resolve target")
 
     for addr in addrs:
         if _ip_is_blocked(addr):
-            log.warning("ssrf_block_resolved host=%s ip=%s", bare_host, addr)
-            raise HTTPException(
-                403,
-                f"blocked ip for host: {bare_host} → {addr}",
+            log.warning(
+                "ssrf_block_resolved",
+                extra={
+                    "reason": "resolved_ip_blocked",
+                    "host": bare_host,
+                    "ip": str(addr),
+                },
             )
+            raise HTTPException(403, "target not allowed")
 
     # DNS-rebind mitigation: pin to the first resolved global IP.  We keep
     # the ``Host`` header intact (Playwright re-sends the original hostname)
@@ -415,9 +437,17 @@ async def _goto_and_settle(page: Page, url: str, wait_for: str, timeout_ms: int)
     try:
         resp = await page.goto(url, wait_until=wait_for, timeout=timeout_ms)
     except PlaywrightTimeout as exc:
-        raise HTTPException(504, f"navigation timeout: {url}") from exc
+        log.warning(
+            "browser_navigation_timeout",
+            extra={"reason": "navigation_timeout", "detail": str(exc)},
+        )
+        raise HTTPException(504, "navigation timeout") from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(502, f"navigation failed: {exc}") from exc
+        log.exception(
+            "browser_navigation_failed",
+            extra={"reason": "navigation_failed", "detail": str(exc)},
+        )
+        raise HTTPException(502, "browser action failed") from exc
     if resp is None:
         # Same-document navigation or about:blank — fine but odd.
         return {"status": 0, "final_url": page.url}
@@ -523,9 +553,17 @@ async def click_and_fetch(req: ClickFetchRequest) -> dict[str, Any]:
         try:
             await page.click(req.click_selector, timeout=req.timeout_ms)
         except PlaywrightTimeout as exc:
-            raise HTTPException(400, f"click selector not found/clickable: {req.click_selector}") from exc
+            log.warning(
+                "browser_click_selector_timeout",
+                extra={"reason": "click_selector_timeout", "detail": str(exc)},
+            )
+            raise HTTPException(400, "selector did not match") from exc
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(400, f"click failed: {exc}") from exc
+            log.exception(
+                "browser_click_failed",
+                extra={"reason": "click_failed", "detail": str(exc)},
+            )
+            raise HTTPException(400, "browser action failed") from exc
         if req.wait_after_click_ms:
             try:
                 await page.wait_for_load_state("networkidle", timeout=req.timeout_ms)
