@@ -297,7 +297,36 @@ async def fetch_vault_env(
                 extra={"task_id": task_id, "reason": "empty_value", "key": k},
             )
             continue
-        out[k] = v[:_MAX_VAULT_VALUE_LEN]
+        # CC-11 fix: ``validate_vault_env`` (the WRITE path, line ~108) rejects
+        # any value longer than ``_MAX_VAULT_VALUE_LEN`` with ``ValueError``.
+        # The fetch path used to silently slice ``v[:_MAX_VAULT_VALUE_LEN]``,
+        # which mutated an oversize secret into a different (truncated) one
+        # and let the worker run as if the original had been honoured.  That
+        # is contract drift on the same vault surface CC-09 just closed for
+        # empty-string values.  Match the WRITE-path contract: under
+        # ``requires_vault=True`` raise ``VaultUnavailableError`` with reason
+        # ``oversize_value`` (do NOT log the value itself); under
+        # ``requires_vault=False`` warn + drop the key (do NOT store a
+        # truncated value).  The under-cap branch stores ``v`` verbatim — no
+        # slicing.
+        if len(v) > _MAX_VAULT_VALUE_LEN:
+            if requires_vault:
+                raise VaultUnavailableError(
+                    f"vault_env oversize_value for task {task_id}: key {k!r} "
+                    f"(len={len(v)} > max={_MAX_VAULT_VALUE_LEN})"
+                )
+            logger.warning(
+                "vault_env_corrupt_payload_degraded",
+                extra={
+                    "task_id": task_id,
+                    "reason": "oversize_value",
+                    "key": k,
+                    "length": len(v),
+                    "max": _MAX_VAULT_VALUE_LEN,
+                },
+            )
+            continue
+        out[k] = v
     return out
 
 
