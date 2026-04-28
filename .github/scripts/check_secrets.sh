@@ -23,11 +23,11 @@ PATTERNS=(
 )
 
 # Ignore paths that legitimately mention these prefixes (audit reports,
-# fixture comments, and the .github/scripts directory which contains
-# this scanner itself).
+# fixture comments, and the scanner file itself which references the
+# pattern strings literally). The rest of .github/scripts/ is scanned.
 EXCLUDES=(
   ':!loop6_audit/'
-  ':!.github/scripts/'
+  ':!.github/scripts/check_secrets.sh'
   ':!tests/'
   ':!frontend/package-lock.json'
   ':!frontend/node_modules/'
