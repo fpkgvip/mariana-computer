@@ -27,6 +27,7 @@ import contextvars
 import json
 from typing import Any, Callable, Mapping
 
+from mariana.util.redis_url import assert_local_or_tls
 from mariana.vault.redaction import build_redactor
 
 
@@ -47,41 +48,9 @@ class VaultUnavailableError(RuntimeError):
     """
 
 
-# Hosts that may safely use plaintext ``redis://`` — local dev, CI, and
-# the docker-compose service name baked into our default Compose stack
-# (see ``mariana/config.py:124``).  Mirrors the policy in
-# ``mariana/data/cache.py:421-433`` (M-05 fix) so vault and cache cannot
-# diverge.
-_LOCAL_REDIS_HOST_TOKENS: tuple[str, ...] = (
-    "://localhost",
-    "://127.",
-    "://[::1]",
-    "://redis:",  # docker-compose service name
-    "://redis/",  # docker-compose service name, no port
-)
-
-
 def _validate_redis_url_for_vault(url: str | None) -> None:
-    """Enforce ``rediss://`` (TLS) for any non-loopback Redis URL.
-
-    Mirrors ``mariana.data.cache._connect_redis`` (M-05 fix).  Vault
-    secrets are at least as sensitive as cached investigation data, so
-    the same transport policy applies: local hosts may use plaintext
-    ``redis://`` for developer convenience; everything else MUST use
-    ``rediss://``.
-
-    A ``None`` / empty URL is treated as "local" (no remote transport
-    will happen) and does not raise.
-    """
-    if not url:
-        return
-    u = url.lower().strip()
-    is_local = any(tok in u for tok in _LOCAL_REDIS_HOST_TOKENS)
-    if not is_local and u.startswith("redis://"):
-        raise ValueError(
-            "Remote Redis URLs must use rediss:// (TLS) for vault env transport; "
-            f"got {url!r}"
-        )
+    """Enforce ``rediss://`` (TLS) for any non-loopback Redis URL."""
+    assert_local_or_tls(url, surface="vault env transport")
 
 # Hard caps mirror the frontend grammar so server is the second line of defence.
 _MAX_VAULT_ENV_ENTRIES = 50

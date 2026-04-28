@@ -1172,39 +1172,20 @@ async def run_agent_task(
     except Exception:
         _vault_redis_url = None
     requires_vault = bool(getattr(task, "requires_vault", False))
+    ctx_handle = set_task_context(vault_env)
+
     try:
-        vault_env = await fetch_vault_env(
-            redis,
-            task.id,
-            requires_vault=requires_vault,
-            redis_url=_vault_redis_url,
-        )
-    except VaultUnavailableError as exc:
-        # Fail-closed BEFORE any tool execution.  Mark the task FAILED
-        # with a clear error and return without running anything.
-        log.error("vault_env_unavailable_fail_closed", task_id=task.id, error=str(exc))
-        task.error = f"Vault unavailable: {exc}"
-        task.state = AgentState.FAILED
         try:
-            await _persist_task(db, task)
-        except Exception:
-            pass
-        return task
-    except ValueError as exc:
-        # Transport policy violation (e.g. plaintext redis:// to a
-        # remote host).  Same fail-closed surface.
-        log.error("vault_env_redis_url_policy_violation", task_id=task.id, error=str(exc))
-        task.error = f"Vault transport policy violation: {exc}"
-        task.state = AgentState.FAILED
-        try:
-            await _persist_task(db, task)
-        except Exception:
-            pass
-        return task
-    except Exception as exc:  # pragma: no cover
-        # Non-vault tasks: legacy soft-fail behaviour preserved.
-        if requires_vault:
-            log.error("vault_env_unexpected_error_fail_closed", task_id=task.id, error=str(exc))
+            vault_env = await fetch_vault_env(
+                redis,
+                task.id,
+                requires_vault=requires_vault,
+                redis_url=_vault_redis_url,
+            )
+        except VaultUnavailableError as exc:
+            # Fail-closed BEFORE any tool execution.  Mark the task FAILED
+            # with a clear error and return without running anything.
+            log.error("vault_env_unavailable_fail_closed", task_id=task.id, error=str(exc))
             task.error = f"Vault unavailable: {exc}"
             task.state = AgentState.FAILED
             try:
@@ -1212,12 +1193,34 @@ async def run_agent_task(
             except Exception:
                 pass
             return task
-        logger.warning("vault_env_fetch_failed", task_id=task.id, error=str(exc))
-    ctx_handle = set_task_context(vault_env)
-    if vault_env:
-        log.info("vault_env_installed", count=len(vault_env), names=sorted(vault_env.keys()))
+        except ValueError as exc:
+            # Transport policy violation (e.g. plaintext redis:// to a
+            # remote host).  Same fail-closed surface.
+            log.error("vault_env_redis_url_policy_violation", task_id=task.id, error=str(exc))
+            task.error = f"Vault transport policy violation: {exc}"
+            task.state = AgentState.FAILED
+            try:
+                await _persist_task(db, task)
+            except Exception:
+                pass
+            return task
+        except Exception as exc:  # pragma: no cover
+            # Non-vault tasks: legacy soft-fail behaviour preserved.
+            if requires_vault:
+                log.error("vault_env_unexpected_error_fail_closed", task_id=task.id, error=str(exc))
+                task.error = f"Vault unavailable: {exc}"
+                task.state = AgentState.FAILED
+                try:
+                    await _persist_task(db, task)
+                except Exception:
+                    pass
+                return task
+            logger.warning("vault_env_fetch_failed", task_id=task.id, error=str(exc))
+        ctx_handle.reset()
+        ctx_handle = set_task_context(vault_env)
+        if vault_env:
+            log.info("vault_env_installed", count=len(vault_env), names=sorted(vault_env.keys()))
 
-    try:
         # ---- P-01 pre-flight: re-validate the DB row before any work -----
         # The queue worker loaded ``task`` via a plain SELECT in
         # ``_load_agent_task`` (no FOR UPDATE / no version check).  If the
