@@ -47,7 +47,7 @@ export function VaultSetupWizard({ onDone }: Props) {
       setRecoveryCode(rc);
       setStep(2);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Vault setup failed.");
+      toast.error(e instanceof Error ? e.message : "Could not set up your vault. Try again.");
     } finally {
       setBusy(false);
     }
@@ -61,7 +61,7 @@ export function VaultSetupWizard({ onDone }: Props) {
       toast.success("Recovery code copied. Store it somewhere safe.");
       window.setTimeout(() => setCopied(false), 2000);
     } catch {
-      toast.error("Could not copy. Select and copy the text manually.");
+      toast.error("Could not copy to clipboard. Select and copy the text manually.");
     }
   };
 

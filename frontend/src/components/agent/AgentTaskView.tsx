@@ -230,7 +230,7 @@ export function AgentTaskView({
       } catch (_err) {
         if (!cancelled) {
           // B-09: do NOT fall back to JWT — surface a visible error instead.
-          setConnectionError("Connection failed — please refresh");
+          setConnectionError("Lost connection. Reload to reconnect.");
         }
         return;
       }

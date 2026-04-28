@@ -1306,7 +1306,7 @@ export default function Chat() {
       if (warnMsg.trim()) {
         appendMessage({
           role: "system",
-          content: `⚠️ ${warnMsg}`,
+          content: warnMsg,
           type: "status",
           // BUG-F4-01: Use content-based id so identical warnings are deduplicated
           // on SSE reconnect. Date.now() produces a unique id on every call, making
@@ -1688,7 +1688,7 @@ export default function Chat() {
         if (!mountedRef.current || switchGenerationRef.current !== myGeneration) {
           return;
         }
-        toast.error("Connection failed — please refresh");
+        toast.error("Lost connection. Reload to reconnect.");
         return;
       }
 

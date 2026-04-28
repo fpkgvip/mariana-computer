@@ -166,14 +166,14 @@ describe("AgentTaskView — mint failure surfaces error state, no JWT fallback",
     expect(capturedEsUrls).toHaveLength(0);
   });
 
-  it("error message tells the user to refresh (no technical details)", async () => {
+  it("error message tells the user to reload (no technical details)", async () => {
     mockMintAgentStreamToken.mockRejectedValueOnce(new Error("503 backend down"));
 
     await renderAgentTaskView(async () => FAKE_JWT);
 
     await waitFor(() => {
       const el = screen.getByTestId("connection-error");
-      expect(el).toHaveTextContent(/refresh/i);
+      expect(el).toHaveTextContent(/reload/i);
     });
   });
 

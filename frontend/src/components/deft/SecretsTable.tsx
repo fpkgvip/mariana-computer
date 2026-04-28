@@ -50,7 +50,7 @@ export function SecretsTable() {
       await navigator.clipboard.writeText(plaintext);
       toast.success(`${s.name} copied to clipboard.`);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Could not copy.");
+      toast.error(e instanceof Error ? e.message : "Could not copy to clipboard.");
     }
   };
 
@@ -59,7 +59,7 @@ export function SecretsTable() {
       await navigator.clipboard.writeText(`$${s.name}`);
       toast.success(`$${s.name} copied. Paste into a prompt.`);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Could not copy.");
+      toast.error(e instanceof Error ? e.message : "Could not copy to clipboard.");
     }
   };
 
