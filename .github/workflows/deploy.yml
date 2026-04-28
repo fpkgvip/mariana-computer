@@ -5,6 +5,13 @@ on:
     branches: [master]
   workflow_dispatch:
 
+# CC-13 supply-chain hardening: minimum top-level permissions.  This
+# deploy job only needs to read the repo at the pinned ref and then
+# hand off to the remote host over SSH; no GitHub-side write scopes
+# are required.
+permissions:
+  contents: read
+
 jobs:
   deploy:
     runs-on: ubuntu-latest

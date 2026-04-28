@@ -16,6 +16,13 @@ on:
       - master
       - loop6/zero-bug
 
+# CC-13 supply-chain hardening: minimum top-level permissions.  Every
+# job inherits read-only `contents` access by default; any job that
+# needs more must declare it explicitly at the job level (see
+# loop6_audit/CC12_CC13_FIX_REPORT.md).
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
