@@ -246,24 +246,24 @@ def _normalize_bearer_auth_header(raw: str | None) -> str:
     if not raw:
         raise HTTPException(
             status_code=500,
-            detail="Internal error: admin endpoint called without authorization header",
+            detail="Sign-in failed. Try again, or contact support if this keeps happening.",
         )
     value = raw.strip()
     if not value:
         raise HTTPException(
             status_code=500,
-            detail="Internal error: authorization header is empty",
+            detail="Sign-in failed. Try again, or contact support if this keeps happening.",
         )
     if not value.lower().startswith("bearer "):
         raise HTTPException(
             status_code=500,
-            detail="Internal error: expected Bearer authorization header",
+            detail="Sign-in failed. Try again, or contact support if this keeps happening.",
         )
     token = value.split(" ", 1)[1].strip()
     if not token:
         raise HTTPException(
             status_code=500,
-            detail="Internal error: empty Bearer token",
+            detail="Sign-in failed. Try again, or contact support if this keeps happening.",
         )
     return f"Bearer {token}"
 
@@ -619,14 +619,14 @@ app.add_middleware(RateLimitMiddleware)
 def _get_db() -> asyncpg.Pool:
     """Return the live DB pool or raise 503 if unavailable."""
     if _db_pool is None:
-        raise HTTPException(status_code=503, detail="Database unavailable")
+        raise HTTPException(status_code=503, detail="Our database is offline. Try again in a moment.")
     return _db_pool
 
 
 def _get_config() -> AppConfig:
     """Return the loaded config or raise 503 if startup failed."""
     if _config is None:
-        raise HTTPException(status_code=503, detail="Configuration not loaded")
+        raise HTTPException(status_code=503, detail="The service is starting up. Try again in a few seconds.")
     return _config
 
 
@@ -1247,7 +1247,7 @@ async def _authenticate_supabase_token(token: str) -> dict[str, str]:
     """
     cfg = _get_config()
     if not cfg.SUPABASE_URL:
-        raise HTTPException(status_code=503, detail="Authentication service not configured")
+        raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again shortly.")
 
     headers = {"Authorization": f"Bearer {token}"}
     if cfg.SUPABASE_ANON_KEY:
@@ -1258,21 +1258,21 @@ async def _authenticate_supabase_token(token: str) -> dict[str, str]:
             resp = await client.get(f"{cfg.SUPABASE_URL}/auth/v1/user", headers=headers)
     except httpx.HTTPError as exc:
         logger.warning("supabase_auth_unreachable", error=str(exc))
-        raise HTTPException(status_code=503, detail="Authentication service unavailable") from exc
+        raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again shortly.") from exc
 
     if resp.status_code != 200:
         logger.warning("supabase_auth_rejected_token", status=resp.status_code)
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=401, detail="Your session is invalid. Sign in again.")
 
     try:
         payload = resp.json()
     except ValueError as exc:
         logger.error("supabase_auth_invalid_json", error=str(exc))
-        raise HTTPException(status_code=503, detail="Authentication service unavailable") from exc
+        raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again shortly.") from exc
 
     user_id: str | None = payload.get("id") or payload.get("sub")
     if not user_id:
-        raise HTTPException(status_code=401, detail="Token missing user identifier")
+        raise HTTPException(status_code=401, detail="Your session is malformed. Sign in again.")
 
     app_metadata = payload.get("app_metadata") or {}
     role: str = payload.get("role") or app_metadata.get("role") or "authenticated"
@@ -1284,10 +1284,10 @@ async def _get_current_user(
 ) -> dict[str, str]:
     """Validate a bearer token and return basic user info."""
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
+        raise HTTPException(status_code=401, detail="Sign in to continue.")
     token = authorization.split(" ", 1)[1].strip()
     if not token:
-        raise HTTPException(status_code=401, detail="Missing bearer token")
+        raise HTTPException(status_code=401, detail="Sign in to continue.")
     return await _authenticate_supabase_token(token)
 
 
@@ -1303,7 +1303,7 @@ async def _get_current_user_from_header_or_query(
         raw_token = token.strip()
 
     if not raw_token:
-        raise HTTPException(status_code=401, detail="Missing or invalid authorization credentials")
+        raise HTTPException(status_code=401, detail="Sign in to continue.")
 
     user = await _authenticate_supabase_token(raw_token)
     return {**user, "access_token": raw_token}
@@ -1566,7 +1566,7 @@ async def _authenticate_stream_token_or_header(
             if metadata.get("user_id") != user["user_id"]:
                 raise HTTPException(status_code=403, detail="You do not own this investigation")
         return user
-    raise HTTPException(status_code=401, detail="Missing or invalid authorization credentials")
+    raise HTTPException(status_code=401, detail="Sign in to continue.")
 
 
 
@@ -2448,7 +2448,7 @@ async def create_conversation(
     resp = await _supabase_rest(cfg, "POST", "/conversations", json=row, user_token=user_token)
     if resp.status_code not in (200, 201):
         logger.error("create_conversation_failed", status=resp.status_code, body=resp.text)
-        raise HTTPException(status_code=500, detail="Failed to create conversation")
+        raise HTTPException(status_code=500, detail="Could not start a new conversation. Try again.")
     data = resp.json()
     created = data[0] if isinstance(data, list) else data
     return CreateConversationResponse(id=created["id"], title=created["title"])
@@ -2479,7 +2479,7 @@ async def list_conversations(
     )
     if resp.status_code != 200:
         logger.error("list_conversations_failed", status=resp.status_code, body=resp.text)
-        raise HTTPException(status_code=500, detail="Failed to list conversations")
+        raise HTTPException(status_code=500, detail="Could not load your conversations. Try again.")
     rows = resp.json()
     items = [
         ConversationSummary(
@@ -2526,7 +2526,7 @@ async def get_conversation(
         user_token=user_token,
     )
     if conv_resp.status_code != 200:
-        raise HTTPException(status_code=500, detail="Failed to fetch conversation")
+        raise HTTPException(status_code=500, detail="Could not load this conversation. Try again.")
     convs = conv_resp.json()
     if not convs:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -2630,7 +2630,7 @@ async def update_conversation(
         user_token=user_token,
     )
     if resp.status_code not in (200, 204):
-        raise HTTPException(status_code=500, detail="Failed to update conversation")
+        raise HTTPException(status_code=500, detail="Could not save changes to this conversation. Try again.")
     # BUG-0053b fix: check if any rows were actually affected
     try:
         affected = resp.json()
@@ -2665,7 +2665,7 @@ async def delete_conversation(
         user_token=user_token,
     )
     if resp.status_code not in (200, 204):
-        raise HTTPException(status_code=500, detail="Failed to delete conversation")
+        raise HTTPException(status_code=500, detail="Could not delete this conversation. Try again.")
     # BUG-0053b fix: check if any rows were actually affected
     try:
         affected = resp.json()
@@ -2721,7 +2721,7 @@ async def save_message(
     resp = await _supabase_rest(cfg, "POST", "/conversation_messages", json=row, user_token=user_token)
     if resp.status_code not in (200, 201):
         logger.error("save_message_failed", status=resp.status_code, body=resp.text)
-        raise HTTPException(status_code=500, detail="Failed to save message")
+        raise HTTPException(status_code=500, detail="Could not save your message. Try again.")
 
     data = resp.json()
     created = data[0] if isinstance(data, list) else data
@@ -3226,7 +3226,7 @@ async def start_investigation(
         logger.error("task_write_failed", error=str(exc))
         raise HTTPException(
             status_code=500,
-            detail="Failed to submit investigation. Please try again.",
+            detail="Could not submit your report. Try again, or contact support if this keeps happening.",
         ) from exc
     except Exception:
         if reserved_credits > 0:
@@ -5602,7 +5602,7 @@ async def create_checkout(
         )
         raise HTTPException(
             status_code=502,
-            detail="Payment service error. Please try again.",
+            detail="Payments are temporarily unreachable. Try again in a moment.",
         ) from exc
 
     logger.info(
@@ -5613,7 +5613,7 @@ async def create_checkout(
     )
     # BUG-API-004: Stripe can return null session.url in edge cases
     if not session.url:
-        raise HTTPException(status_code=502, detail="Stripe did not return a checkout URL")
+        raise HTTPException(status_code=502, detail="Could not start checkout. Try again.")
     return CreateCheckoutResponse(
         checkout_url=session.url,
         session_id=session.id,
@@ -5831,13 +5831,13 @@ async def billing_portal(
         logger.error("stripe_portal_failed", user_id=user_id, error=str(exc))
         raise HTTPException(
             status_code=502,
-            detail="Payment service error. Please try again.",
+            detail="Payments are temporarily unreachable. Try again in a moment.",
         ) from exc
 
     logger.info("portal_session_created", user_id=user_id)
     # BUG-API-004: Stripe can return null portal_session.url
     if not portal_session.url:
-        raise HTTPException(status_code=502, detail="Stripe did not return a portal URL")
+        raise HTTPException(status_code=502, detail="Could not open the billing portal. Try again.")
     return BillingPortalResponse(portal_url=portal_session.url)
 
 
