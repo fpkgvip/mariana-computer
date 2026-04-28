@@ -72,6 +72,12 @@ jobs:
       PGUSER: postgres
       PGPASSWORD: postgres
       PGDATABASE: testdb
+      # tests/tools/conftest.py defaults to a local UNIX-socket DSN
+      # (/tmp:55432, db reconcile_test).  In CI we point it at the
+      # ubuntu-latest Postgres service container instead.  The
+      # `reconcile_test` database is created in the
+      # `Create reconcile_test database` step below before pytest runs.
+      RECONCILE_TEST_DSN: postgresql://postgres:postgres@localhost:5432/reconcile_test
       REDIS_URL: redis://localhost:6379/0
       PYTHONUNBUFFERED: "1"
 
@@ -101,6 +107,21 @@ jobs:
 
       - name: Apply Supabase migrations
         run: bash .github/scripts/apply_migrations.sh
+
+      - name: Create reconcile_test database
+        run: |
+          # tests/tools/* run reconciliation against a separate, schema-only
+          # database.  Locally that lives on /tmp:55432; in CI we use the
+          # service container.  Create the database fresh; the conftest
+          # owns the per-test schema reset.
+          PGPASSWORD=postgres psql -h localhost -U postgres -d postgres \
+            -c "DROP DATABASE IF EXISTS reconcile_test;"
+          PGPASSWORD=postgres psql -h localhost -U postgres -d postgres \
+            -c "CREATE DATABASE reconcile_test;"
+          # gen_random_uuid() lives in pgcrypto on Postgres 16; conftest's
+          # SCHEMA_SQL relies on it via credit_buckets.id default.
+          PGPASSWORD=postgres psql -h localhost -U postgres -d reconcile_test \
+            -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
 
       - name: Run pytest
         run: |
