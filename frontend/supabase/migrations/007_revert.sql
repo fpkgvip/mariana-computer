@@ -15,7 +15,7 @@ BEGIN;
 -- Restore live shapes (proconfig=NULL) -----------------------------------
 
 CREATE OR REPLACE FUNCTION public.add_credits(p_user_id uuid, p_credits integer)
-  RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+  RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 BEGIN
   IF p_credits < 0 THEN RAISE EXCEPTION 'Credits amount must be non-negative, got %', p_credits; END IF;
   UPDATE profiles SET tokens = tokens + p_credits, updated_at = now() WHERE id = p_user_id;
@@ -24,7 +24,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.admin_count_profiles()
-  RETURNS integer LANGUAGE sql SECURITY DEFINER AS $$
+  RETURNS integer LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $$
   SELECT COUNT(*)::integer FROM profiles
    WHERE (SELECT role FROM profiles WHERE id = auth.uid()) = 'admin';
 $$;
@@ -33,7 +33,7 @@ CREATE OR REPLACE FUNCTION public.admin_list_profiles()
   RETURNS TABLE(id uuid, email text, full_name text, tokens integer, role text,
                 stripe_customer_id text, subscription_plan text,
                 subscription_status text, created_at timestamptz)
-  LANGUAGE sql SECURITY DEFINER AS $$
+  LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $$
   SELECT p.id, p.email, p.full_name, p.tokens, p.role,
          p.stripe_customer_id, p.subscription_plan, p.subscription_status, p.created_at
     FROM profiles p
@@ -42,12 +42,12 @@ CREATE OR REPLACE FUNCTION public.admin_list_profiles()
 $$;
 
 CREATE OR REPLACE FUNCTION public.check_balance(target_user_id uuid)
-  RETURNS integer LANGUAGE sql SECURITY DEFINER AS $$
+  RETURNS integer LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_temp AS $$
   SELECT tokens FROM profiles WHERE id = target_user_id;
 $$;
 
 CREATE OR REPLACE FUNCTION public.deduct_credits(target_user_id uuid, amount integer)
-  RETURNS integer LANGUAGE plpgsql SECURITY DEFINER AS $$
+  RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE current_tokens integer; new_balance integer;
 BEGIN
   SELECT tokens INTO current_tokens FROM profiles WHERE id = target_user_id FOR UPDATE;
@@ -63,7 +63,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.get_stripe_customer_id(target_user_id uuid)
-  RETURNS text LANGUAGE plpgsql SECURITY DEFINER AS $$
+  RETURNS text LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE result TEXT;
 BEGIN
   SELECT stripe_customer_id INTO result FROM profiles WHERE id = target_user_id;
@@ -72,7 +72,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.get_user_tokens(target_user_id uuid)
-  RETURNS integer LANGUAGE plpgsql SECURITY DEFINER AS $$
+  RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 DECLARE result INTEGER;
 BEGIN
   SELECT tokens INTO result FROM profiles WHERE id = target_user_id;
@@ -81,7 +81,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.handle_new_user()
-  RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+  RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 BEGIN
   INSERT INTO public.profiles (id, email, full_name)
   VALUES (NEW.id, NEW.email, NEW.raw_user_meta_data->>'full_name');
@@ -90,7 +90,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.update_profile_by_id(target_user_id uuid, payload jsonb)
-  RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+  RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 BEGIN
   UPDATE profiles
      SET stripe_customer_id     = COALESCE(payload->>'stripe_customer_id',     stripe_customer_id),
@@ -109,7 +109,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.update_profile_by_stripe_customer(target_customer_id text, payload jsonb)
-  RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+  RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
 BEGIN
   UPDATE profiles
      SET subscription_status = COALESCE(payload->>'subscription_status', subscription_status),

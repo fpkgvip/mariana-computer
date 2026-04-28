@@ -60,6 +60,7 @@ CREATE OR REPLACE FUNCTION public.admin_set_credits(
 RETURNS integer
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public, pg_temp
 AS $function$
 DECLARE
   caller_role text;
