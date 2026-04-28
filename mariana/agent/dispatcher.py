@@ -26,7 +26,15 @@ logger = structlog.get_logger(__name__)
 
 
 class ToolError(RuntimeError):
-    """Raised when a tool call fails.  Includes a structured diagnostic."""
+    """Raised when a tool call fails.  Includes a structured diagnostic.
+
+    The ``message`` and ``detail`` attributes are **server-log-only** as of
+    CC-25.  The agent loop catches this exception and persists / emits a
+    stable ``tool_error`` code on the user-visible step record; only the
+    structured server log keeps the raw message + detail.  Construct messages
+    with as much diagnostic context as you need (workspace paths, file lists,
+    upstream response bodies) — they will not leak to the API surface.
+    """
 
     def __init__(self, tool: str, message: str, *, detail: Any = None) -> None:
         super().__init__(message)
@@ -98,7 +106,9 @@ async def dispatch(
         exc.tool = tool
         raise
     except (tools.SandboxError, tools.BrowserError) as exc:
-        # Surface a structured error from the remote service.
+        # CC-25: ToolError message + detail are server-log-only.  The agent
+        # loop persists/emits only a stable ``tool_error`` code; never assume
+        # this message string is rendered to the end user.
         raise ToolError(
             tool,
             f"{tool} failed: {exc}",

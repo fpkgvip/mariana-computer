@@ -17,6 +17,18 @@ Design notes
   and USD spend.  Any breach transitions to HALTED.
 * Self-correction: a step may fail up to ``max_fix_attempts_per_step`` times.
   On the final failure we bubble up and REPLAN, capped by ``max_replans``.
+
+Canonical error codes (CC-20/CC-21/CC-25)
+-----------------------------------------
+User-visible step/task error fields and SSE payloads only ever carry one of
+these stable codes.  Raw exception text/details stay in the structured logs.
+
+* ``tool_error`` — a tool dispatch raised :class:`ToolError`.
+* ``unexpected`` — a tool dispatch raised an unexpected non-ToolError exception.
+* ``planner_failed`` — fix-step or replan planner call failed.
+* ``vault_unavailable`` — per-task secret bootstrap failed.
+* ``vault_transport_violation`` — vault access violated transport policy.
+* ``stream_unavailable`` — SSE stream couldn't be established.
 """
 
 from __future__ import annotations
@@ -937,17 +949,28 @@ async def _run_one_step(
             step.tool, step.params, user_id=task.user_id, task_id=task.id,
         )
     except ToolError as exc:
+        # CC-25: persist a stable error_code on the user-visible step record;
+        # raw exception message + structured detail stay in the server log so
+        # operators can still diagnose without exposing internals such as
+        # workspace paths, file listings, or remote response bodies.
+        logger.warning(
+            "tool_error",
+            task_id=task.id,
+            step_id=step.id,
+            tool=step.tool,
+            raw_message=str(exc),
+            raw_detail=exc.detail,
+        )
         step.status = StepStatus.FAILED
         step.finished_at = time.time()
-        step.error = str(exc)
-        if exc.detail:
-            step.result = {"error_detail": exc.detail}
+        step.error = "tool_error"
+        step.result = {"error_code": "tool_error", "tool": step.tool}
         task.total_failures += 1
         await _persist_task(db, task)
         await _emit(
             db, redis, task, "step_failed",
             step_id=step.id,
-            payload={"error": step.error, "detail": exc.detail},
+            payload={"error": step.error, "tool": step.tool},
         )
         return False, step.error
     except Exception as exc:  # defensive: any unexpected error
