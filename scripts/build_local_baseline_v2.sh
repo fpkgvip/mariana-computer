@@ -1,40 +1,64 @@
 #!/usr/bin/env bash
-# Rebuild local testdb from a faithful copy of current NestD live state.
+# Rebuild local testdb from the canonical schema baseline that CI uses.
+#
+# Phase D unified the local-dev and CI baselines: both now apply
+# ``.github/scripts/ci_pg_bootstrap.sql`` (roles + pgcrypto extension)
+# followed by ``.github/scripts/ci_full_baseline.sql`` (full pg_dump
+# of the schema after every committed migration through 024).  This
+# script drops and recreates the local ``testdb`` and applies the
+# same two artefacts so ``pytest`` runs against the exact schema CI
+# enforces.
+#
+# Refresh procedure when a new migration lands: see
+# ``loop6_audit/PHASE_D_CI_REPORT.md`` "How to refresh the baseline".
+#
+# Required: a Postgres instance reachable via the env defaults below
+# (the standard local-dev convention).  Override via env to point at
+# a different cluster.
+
 set -euo pipefail
-PGHOST=/tmp PGPORT=55432 PGUSER=postgres PGDATABASE=testdb
+
+PGHOST="${PGHOST:-/tmp}"
+PGPORT="${PGPORT:-55432}"
+PGUSER="${PGUSER:-postgres}"
+PGDATABASE="${PGDATABASE:-testdb}"
 export PGHOST PGPORT PGUSER PGDATABASE
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SQL="$ROOT/scripts/local_baseline_v2.sql"
+BOOTSTRAP="$ROOT/.github/scripts/ci_pg_bootstrap.sql"
+BASELINE="$ROOT/.github/scripts/ci_full_baseline.sql"
 
-echo "Resetting testdb..."
-psql -d postgres -v ON_ERROR_STOP=1 <<'EOSQL'
+if [[ ! -f "$BOOTSTRAP" ]]; then
+  echo "Bootstrap SQL missing: $BOOTSTRAP" >&2
+  exit 1
+fi
+if [[ ! -f "$BASELINE" ]]; then
+  echo "Baseline SQL missing: $BASELINE" >&2
+  exit 1
+fi
+
+echo "Resetting $PGDATABASE..."
+psql -d postgres -v ON_ERROR_STOP=1 <<EOSQL
 SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-  WHERE datname='testdb' AND pid <> pg_backend_pid();
-DROP DATABASE IF EXISTS testdb;
-CREATE DATABASE testdb;
+  WHERE datname='$PGDATABASE' AND pid <> pg_backend_pid();
+DROP DATABASE IF EXISTS $PGDATABASE;
+CREATE DATABASE $PGDATABASE;
 EOSQL
 
-echo "Applying baseline v2 schema..."
-psql -v ON_ERROR_STOP=1 -f "$SQL"
+echo "Bootstrapping roles + extensions..."
+psql -v ON_ERROR_STOP=1 -f "$BOOTSTRAP"
 
-# B-36 (A1-16): Drop the stale weak update policy that 001_initial_schema.sql
-# creates and 004_loop5_idempotency_and_rls.sql supersedes. The local_baseline_v2.sql
-# doesn't include 001, but if it ever did (or if this script is extended to apply
-# 001), the DROP here ensures the weak policy is never left in place.
-# See loop6_audit/A1_db.md A1-16 for full drift description.
-psql -v ON_ERROR_STOP=1 -c \
-  'DROP POLICY IF EXISTS "Users can update own profile" ON public.profiles;'
+echo "Applying full schema baseline..."
+psql -v ON_ERROR_STOP=1 -f "$BASELINE"
 
-# Apply already-landed migrations (004 .. 007) which are already live.
-for m in 004_loop5_idempotency_and_rls.sql 004b_credit_tx_idem_concurrent.sql 005_loop6_b01_revoke_anon_rpcs.sql 006_refund_credits_repair.sql 007_loop6_b02_b05_b06_ledger_sync.sql 008_f04_plan_entitlement_sync.sql 009_f03_refund_debt.sql 010_f05_research_tasks_owner_fk.sql 011_p2_db_cluster_b11_b15.sql 012_p2_b16_admin_set_credits_ledger.sql 013_p3_b32_fk_indexes.sql 014_p3_b33_rls_select_wrap.sql 015_p3_b34_profile_check_simplify.sql 016_p3_b35_storage_rls.sql 017_h01_h02_stripe_grant_linkage.sql 018_i01_add_credits_lock.sql 019_i03_marker_tables_rls.sql; do
-  f="$ROOT/frontend/supabase/migrations/$m"
-  if [[ -f "$f" ]]; then
-    echo "Applying $m..."
-    psql -v ON_ERROR_STOP=1 -f "$f" || {
-      echo "NOTE: $m may be partially already-applied, continuing"
-    }
+echo "Verifying critical RPCs are present..."
+EXPECTED=(grant_credits refund_credits spend_credits expire_credits add_credits process_charge_reversal admin_set_credits)
+for fn in "${EXPECTED[@]}"; do
+  count=$(psql -tAc "SELECT COUNT(*) FROM pg_proc WHERE proname = '$fn' AND pronamespace = 'public'::regnamespace")
+  if [[ "$count" != "1" ]]; then
+    echo "FAIL: expected exactly 1 public.$fn() function, found $count" >&2
+    exit 1
   fi
 done
 
-echo "Local baseline v2 ready (mirrors current live)."
+echo "Local baseline v2 ready (mirrors CI baseline)."
