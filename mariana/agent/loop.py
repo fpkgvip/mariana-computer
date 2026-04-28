@@ -100,6 +100,17 @@ async def _persist_task(db: Any, task: AgentTask) -> bool:
     finalization stays intact and the stale worker's later finally-block
     settlement check will see ``credits_settled=TRUE`` and short-circuit.
 
+    Q-01: the original CAS predicate only checked the un-finalize direction
+    (``EXCLUDED.credits_settled = FALSE``).  That left a symmetric hole — the
+    worker's finally block deliberately sets ``task.credits_settled = True``
+    before re-persisting, which slipped past the guard and allowed the
+    worker's stale terminal state (e.g. HALTED) plus accumulated
+    ``spent_usd`` to clobber the stop-endpoint-settled row (CANCELLED,
+    spent_usd=0).  The tightened predicate now blocks ANY write to a row
+    that is already ``credits_settled=TRUE`` unless the incoming snapshot
+    preserves BOTH ``state`` AND ``credits_settled=TRUE`` (a true idempotent
+    self-write).
+
     Returns ``True`` if the row was inserted or updated, ``False`` if the
     UPDATE branch was rejected by the CAS guard.  Callers that care about
     finalization may use the return value to abort gracefully; legacy callers
@@ -154,10 +165,19 @@ async def _persist_task(db: Any, task: AgentTask) -> bool:
                 stop_requested = EXCLUDED.stop_requested,
                 error = EXCLUDED.error,
                 updated_at = EXCLUDED.updated_at
-            WHERE NOT (
-                agent_tasks.credits_settled = TRUE
-                AND agent_tasks.state IN ('done','failed','halted','cancelled')
-                AND EXCLUDED.credits_settled = FALSE
+            WHERE (
+                -- Existing row is not yet finalized: any progression is fine.
+                agent_tasks.credits_settled = FALSE
+                -- OR: existing row is already settled, but the incoming
+                -- write preserves BOTH state and credits_settled=TRUE (an
+                -- idempotent self-write by the legitimate finalizer).  Any
+                -- other write to a settled row — un-finalize attempts
+                -- (P-01) and post-settle state/spent_usd clobber
+                -- attempts (Q-01) — is rejected.
+                OR (
+                    agent_tasks.state = EXCLUDED.state
+                    AND EXCLUDED.credits_settled = TRUE
+                )
             )
             """,
             task.id,
@@ -1032,10 +1052,12 @@ async def run_agent_task(
             # would issue a SECOND ``add_credits`` RPC — the exact
             # double-refund the P-01 fix prevents.
             already_settled_in_db = False
+            db_terminal_state: str | None = None
             try:
                 async with db.acquire() as conn:
                     final_row = await conn.fetchrow(
-                        "SELECT credits_settled FROM agent_tasks WHERE id = $1",
+                        "SELECT credits_settled, state FROM agent_tasks "
+                        "WHERE id = $1",
                         task.id,
                     )
                 if final_row is not None:
@@ -1045,19 +1067,25 @@ async def run_agent_task(
                     already_settled_in_db = (
                         final_row["credits_settled"] is True
                     )
+                    db_terminal_state = final_row["state"]
             except Exception:  # noqa: BLE001 — defensive
                 logger.exception(
                     "agent_finally_settle_check_failed", task_id=task.id
                 )
             if already_settled_in_db:
-                # Reflect the canonical DB truth on the in-memory object so
-                # ``_settle_agent_credits`` short-circuits even if called
-                # again, and so the subsequent ``_persist_task`` does not
-                # re-flip the flag to False via the stale snapshot.
-                task.credits_settled = True
+                # Q-01 + P-01: another writer (typically the stop endpoint)
+                # has already finalized this row.  Skip BOTH the
+                # ``_settle_agent_credits`` call (P-01: avoid double-refund)
+                # AND the trailing ``_persist_task`` (Q-01: avoid even an
+                # idempotent self-write that could race with another
+                # writer landing between our re-read and our write, and to
+                # avoid leaking the worker's stale ``state`` /
+                # ``spent_usd`` into the canonical DB row).
                 logger.info(
                     "agent_finally_settle_skipped_already_settled",
                     task_id=task.id,
+                    db_state=db_terminal_state,
+                    in_memory_state=task.state.value,
                 )
             else:
                 try:
@@ -1068,14 +1096,14 @@ async def run_agent_task(
                         task_id=task.id,
                         error=str(_settle_exc),
                     )
-            try:
-                # The CAS guard inside _persist_task will quietly reject
-                # this if another writer's finalization is more recent.
-                await _persist_task(db, task)
-            except Exception:
-                logger.exception(
-                    "agent_finally_persist_failed", task_id=task.id
-                )
+                try:
+                    # CAS guard inside _persist_task will quietly reject
+                    # this if another writer's finalization is more recent.
+                    await _persist_task(db, task)
+                except Exception:
+                    logger.exception(
+                        "agent_finally_persist_failed", task_id=task.id
+                    )
         # Drop the per-task vault context AND the Redis blob.  This is the
         # only place plaintext can persist server-side, so we delete it as
         # soon as the loop exits regardless of state.
