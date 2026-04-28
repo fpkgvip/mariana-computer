@@ -92,16 +92,23 @@ class _JsonLogFormatter(logging.Formatter):
     Includes timestamp, level, logger name, message, plus any structured
     ``extra=`` keyword fields the call site attached.  Exception traces are
     serialised under ``exc_info``.
+
+    CC-38: field schema is aligned with the orchestrator's structlog
+    output (``mariana/main.py`` configures structlog with
+    ``TimeStamper(fmt="iso")`` + ``JSONRenderer()`` which emits
+    ``event`` and ``timestamp``).  Sidecars emit the same canonical keys
+    so cross-service log aggregation does not need format-translation
+    rules per emitter.
     """
 
     def format(self, record: logging.LogRecord) -> str:  # noqa: D401
         import json as _json
 
         payload: dict[str, Any] = {
-            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
             "level": record.levelname,
             "logger": record.name,
-            "msg": record.getMessage(),
+            "event": record.getMessage(),
         }
         for key, value in record.__dict__.items():
             if key in _JSON_RESERVED or key.startswith("_"):

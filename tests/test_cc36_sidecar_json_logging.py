@@ -11,8 +11,9 @@ Contract enforced here:
 * Both sidecars expose a ``_JsonLogFormatter`` ``logging.Formatter`` and a
   ``_configure_logging()`` initialiser.
 * When ``LOG_FORMAT`` is unset (or ``json``), records emit as one JSON
-  object per line containing at minimum ``ts``, ``level``, ``logger`` and
-  ``msg``.
+  object per line containing at minimum ``timestamp``, ``level``,
+  ``logger`` and ``event`` (CC-38: aligned with the orchestrator's
+  structlog schema in ``mariana/main.py``).
 * Structured ``extra=`` fields are surfaced as top-level keys in the
   emitted JSON (so ``log.info(\"x\", extra={\"req_id\": \"abc\"})`` round-trips).
 * Exception ``exc_info`` is serialised as a string under ``exc_info``.
@@ -147,8 +148,16 @@ def test_cc36_info_record_emits_valid_json(module_name: str) -> None:
     payload = json.loads(line)  # must be parseable JSON
     assert payload["level"] == "INFO"
     assert payload["logger"] == module_name
-    assert payload["msg"] == "ready"
-    assert "ts" in payload and isinstance(payload["ts"], str) and payload["ts"]
+    # CC-38: fields aligned with structlog (event/timestamp), not msg/ts.
+    assert payload["event"] == "ready"
+    assert (
+        "timestamp" in payload
+        and isinstance(payload["timestamp"], str)
+        and payload["timestamp"]
+    )
+    # Legacy field names must not leak back in.
+    assert "msg" not in payload
+    assert "ts" not in payload
 
 
 # ---------------------------------------------------------------------------
