@@ -64,38 +64,16 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sse_starlette.sse import EventSourceResponse
 
-# BUG-API-039: Rate limiting via slowapi. Import is guarded so that the
-# module still loads on environments where slowapi is not installed; in
-# that case the limiter decorators become no-ops.
-try:
-    from slowapi import Limiter, _rate_limit_exceeded_handler
-    from slowapi.util import get_remote_address
-    from slowapi.errors import RateLimitExceeded
-    _SLOWAPI_AVAILABLE = True
-except ImportError:  # pragma: no cover - slowapi is an optional hardening dep
-    _SLOWAPI_AVAILABLE = False
-
-    class RateLimitExceeded(Exception):  # type: ignore[no-redef]
-        """Fallback exception type when slowapi is not installed."""
-
-    def get_remote_address(request: Any) -> str:  # type: ignore[no-redef]
-        return getattr(getattr(request, "client", None), "host", "") or ""
-
-    def _rate_limit_exceeded_handler(request: Any, exc: Exception):  # type: ignore[no-redef]
-        return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
-
-    class _NoopLimiter:
-        """No-op limiter used when slowapi is not installed."""
-
-        def __init__(self, *_a: Any, **_kw: Any) -> None:
-            pass
-
-        def limit(self, *_a: Any, **_kw: Any):
-            def _decorator(func):
-                return func
-            return _decorator
-
-    Limiter = _NoopLimiter  # type: ignore[misc,assignment]
+# CC-16: Rate limiting via slowapi is a HARD dependency. Previous code
+# guarded the import with a `_NoopLimiter` fallback, which meant a production
+# install without slowapi would silently ship with no rate limiting at all.
+# slowapi is now pinned in requirements.txt and the import must succeed; if
+# it fails the module fails to load (fail-closed).
+import slowapi as _slowapi  # noqa: F401  # ensures non-None module reference for startup assertion
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from mariana.config import AppConfig, load_config
 from mariana.data.db import create_pool, init_schema, insert_research_task as _db_insert_research_task
@@ -424,34 +402,42 @@ def _load_rate_limit_storage_uri() -> str | None:
     return url
 
 
+# CC-16: ``_load_rate_limit_storage_uri()`` runs the transport-policy
+# validator (``assert_local_or_tls``) on REDIS_URL. A non-compliant value
+# would have raised already; reaching this line means the URI was either
+# absent (None) or successfully validated.
 _redis_rate_limit_url: str | None = _load_rate_limit_storage_uri()
+_RATE_LIMIT_STORAGE_VALIDATED: bool = True  # set by reaching this point
 
-if _SLOWAPI_AVAILABLE:
-    if _redis_rate_limit_url:
-        # Redis-backed: shared across all workers/instances.
-        limiter = Limiter(
-            key_func=get_remote_address,
-            default_limits=["60/minute"],
-            storage_uri=_redis_rate_limit_url,
-        )
-    else:
-        # Per-process fallback — warn at import time so it surfaces in logs.
-        import warnings as _warnings
-        _warnings.warn(
-            "B-21: REDIS_URL not configured — rate limiter is per-process only. "
-            "With multiple workers each worker gets an independent counter; "
-            "effective limit = N × 60 req/min. Set REDIS_URL for shared limiting.",
-            RuntimeWarning,
-            stacklevel=1,
-        )
-        limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
+if _redis_rate_limit_url:
+    # Redis-backed: shared across all workers/instances.
+    limiter = Limiter(
+        key_func=get_remote_address,
+        default_limits=["60/minute"],
+        storage_uri=_redis_rate_limit_url,
+    )
 else:
-    limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])  # type: ignore[assignment]
+    # Per-process fallback — warn at import time so it surfaces in logs.
+    import warnings as _warnings
+    _warnings.warn(
+        "B-21: REDIS_URL not configured — rate limiter is per-process only. "
+        "With multiple workers each worker gets an independent counter; "
+        "effective limit = N × 60 req/min. Set REDIS_URL for shared limiting.",
+        RuntimeWarning,
+        stacklevel=1,
+    )
+    limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
+
+# CC-16: Startup assertions — fail-closed if slowapi or its storage URI
+# validation somehow ended up in an inconsistent state. These guard against
+# a future refactor accidentally re-introducing a noop fallback.
+assert _slowapi is not None, "CC-16: slowapi module reference is None — refusing to start without a real rate limiter"
+assert isinstance(limiter, Limiter), "CC-16: limiter is not a real slowapi.Limiter — refusing to start"
+assert _RATE_LIMIT_STORAGE_VALIDATED, "CC-16: rate-limit storage URI was not validated by _load_rate_limit_storage_uri()"
+
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-if _SLOWAPI_AVAILABLE:
-    from slowapi.middleware import SlowAPIMiddleware  # noqa: PLC0415
-    app.add_middleware(SlowAPIMiddleware)
+app.add_middleware(SlowAPIMiddleware)
 
 # BUG-027: CORS origins read from config so the hardcoded Vercel URL can be
 # updated via environment variable without a code change.
