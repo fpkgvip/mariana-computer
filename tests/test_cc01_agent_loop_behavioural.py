@@ -54,9 +54,7 @@ try:
     import asyncpg  # type: ignore  # noqa: F401
     import psycopg2  # type: ignore
 
-    _conn = psycopg2.connect(
-        host=PGHOST, port=PGPORT, user=PGUSER, dbname=PGDATABASE
-    )
+    _conn = psycopg2.connect(host=PGHOST, port=PGPORT, user=PGUSER, dbname=PGDATABASE)
     _conn.close()
     _PG_AVAILABLE = True
 except Exception:
@@ -66,10 +64,7 @@ _pg_only = pytest.mark.skipif(not _PG_AVAILABLE, reason="Local PG not available"
 
 
 _AGENT_SCHEMA_PATH = (
-    pathlib.Path(__file__).resolve().parent.parent
-    / "mariana"
-    / "agent"
-    / "schema.sql"
+    pathlib.Path(__file__).resolve().parent.parent / "mariana" / "agent" / "schema.sql"
 )
 
 
@@ -92,8 +87,14 @@ async def _ensure_schema(pool: Any) -> None:
         await conn.execute(sql)
 
 
-def _new_task(*, reserved: int = 0, settled: bool = False, spent_usd: float = 0.0,
-              budget_usd: float = 5.0, state=None):
+def _new_task(
+    *,
+    reserved: int = 0,
+    settled: bool = False,
+    spent_usd: float = 0.0,
+    budget_usd: float = 5.0,
+    state=None,
+):
     from mariana.agent.models import AgentState, AgentTask  # noqa: PLC0415
 
     task = AgentTask(
@@ -134,9 +135,11 @@ async def test_cc01_planner_failure_marks_task_failed():
         record_mock = AsyncMock()
         settle_mock = AsyncMock()
 
-        with patch.object(planner_mod, "build_initial_plan", plan_mock), \
-             patch.object(loop_mod, "_record_event", record_mock), \
-             patch.object(loop_mod, "_settle_agent_credits", settle_mock):
+        with (
+            patch.object(planner_mod, "build_initial_plan", plan_mock),
+            patch.object(loop_mod, "_record_event", record_mock),
+            patch.object(loop_mod, "_settle_agent_credits", settle_mock),
+        ):
             result = await loop_mod.run_agent_task(task, db=pool, redis=None)
     finally:
         await pool.close()
@@ -205,9 +208,11 @@ async def test_cc01_stop_pre_plan_short_circuits_to_halted():
         record_mock = AsyncMock()
         settle_mock = AsyncMock()
 
-        with patch.object(planner_mod, "build_initial_plan", plan_mock), \
-             patch.object(loop_mod, "_record_event", record_mock), \
-             patch.object(loop_mod, "_settle_agent_credits", settle_mock):
+        with (
+            patch.object(planner_mod, "build_initial_plan", plan_mock),
+            patch.object(loop_mod, "_record_event", record_mock),
+            patch.object(loop_mod, "_settle_agent_credits", settle_mock),
+        ):
             result = await loop_mod.run_agent_task(task, db=pool, redis=redis)
     finally:
         await pool.close()
@@ -237,7 +242,6 @@ async def test_cc01_step_unexpected_exception_marks_step_failed():
     """A bare ``RuntimeError`` from dispatch is caught by the defensive
     ``except Exception`` in ``_run_one_step`` and surfaces as a soft
     step failure, NOT a loop_crash."""
-    from mariana.agent import dispatcher as dispatcher_mod  # noqa: PLC0415
     from mariana.agent import loop as loop_mod  # noqa: PLC0415
     from mariana.agent.models import (  # noqa: PLC0415
         AgentStep,
@@ -272,6 +276,7 @@ async def test_cc01_step_unexpected_exception_marks_step_failed():
 
                         async def fetchrow(self_c, *a, **kw):
                             return None
+
                     return _C()
 
                 async def __aexit__(self_inner, *a):
@@ -279,8 +284,17 @@ async def test_cc01_step_unexpected_exception_marks_step_failed():
 
             return _Acq()
 
-    with patch.object(dispatcher_mod, "dispatch", bad_dispatch), \
-         patch.object(loop_mod, "_record_event", record_mock):
+    # NB: ``loop.py`` does ``from mariana.agent.dispatcher import dispatch``,
+    # binding ``loop_mod.dispatch`` as a separate reference.  Patching the
+    # source module is not enough; we must patch the bound name on the loop
+    # module so the running step sees ``bad_dispatch``.  Without this, an
+    # unrelated import-order perturbation (e.g. another test reloading the
+    # sandbox app) can leave the original dispatch in place and the step
+    # surfaces ``tool_error`` instead of ``unexpected``.
+    with (
+        patch.object(loop_mod, "dispatch", bad_dispatch),
+        patch.object(loop_mod, "_record_event", record_mock),
+    ):
         ok, err = await loop_mod._run_one_step(_NoopDB(), None, task, step)
 
     assert ok is False, "step must report failure"
@@ -336,8 +350,8 @@ async def test_cc01_redis_get_failure_during_stop_check_does_not_abort():
 
 def test_cc01_budget_exhausted_halts_task():
     """``_budget_exceeded`` must trip when ``spent_usd >= budget_usd`` and
-    return a parseable ``budget_exhausted: ...`` reason string.  Also pin
-    the secondary wallclock guard via ``duration_exhausted``."""
+    return the canonical ``budget_exhausted`` code.  Also pin the secondary
+    wallclock guard via the canonical ``duration_exhausted`` code (CC-35)."""
     import time as _time  # noqa: PLC0415
 
     from mariana.agent import loop as loop_mod  # noqa: PLC0415
@@ -347,21 +361,22 @@ def test_cc01_budget_exhausted_halts_task():
     fresh = _time.time()
 
     task = _new_task(reserved=0, budget_usd=1.0, spent_usd=1.5)
-    over, why = loop_mod._budget_exceeded(task, started_at=fresh)
+    over, code, detail = loop_mod._budget_exceeded(task, started_at=fresh)
     assert over is True
-    assert why.startswith("budget_exhausted:"), (
-        f"budget exhaustion must be tagged for the SSE consumer; got {why!r}"
+    assert code == "budget_exhausted", (
+        f"budget exhaustion must use the canonical code; got {code!r}"
     )
+    assert detail["spent_usd"] >= detail["budget_usd"]
 
     # Right at the boundary: spent_usd == budget_usd is also "over".
     task.spent_usd = task.budget_usd
-    over, why = loop_mod._budget_exceeded(task, started_at=fresh)
+    over, code, _ = loop_mod._budget_exceeded(task, started_at=fresh)
     assert over is True
-    assert why.startswith("budget_exhausted:")
+    assert code == "budget_exhausted"
 
     # Strictly under spend cap and within wallclock: not over.
     task.spent_usd = 0.0
-    over, _ = loop_mod._budget_exceeded(task, started_at=fresh)
+    over, _, _ = loop_mod._budget_exceeded(task, started_at=fresh)
     assert over is False, (
         "a fresh task under both spend and wallclock caps must NOT be"
         " reported as exhausted"
@@ -369,11 +384,12 @@ def test_cc01_budget_exhausted_halts_task():
 
     # Wallclock guard: started_at far in the past trips duration_exhausted
     # even with zero spend.  Pin the second branch.
-    over, why = loop_mod._budget_exceeded(task, started_at=fresh - 10 * 3600.0)
+    over, code, detail = loop_mod._budget_exceeded(task, started_at=fresh - 10 * 3600.0)
     assert over is True
-    assert why.startswith("duration_exhausted:"), (
-        f"wallclock exhaustion must be tagged separately from spend; got {why!r}"
+    assert code == "duration_exhausted", (
+        f"wallclock exhaustion must use the canonical code; got {code!r}"
     )
+    assert detail["elapsed_hours"] >= detail["max_duration_hours"]
 
 
 # ---------------------------------------------------------------------------
@@ -406,15 +422,20 @@ async def test_cc01_replan_cap_enforced():
 
                         async def fetchrow(self_c, *a, **kw):
                             return None
+
                     return _C()
 
                 async def __aexit__(self_inner, *a):
                     return False
+
             return _Acq()
 
     with patch.object(loop_mod, "_record_event", record_mock):
         replanned = await loop_mod._attempt_replan(
-            _NoopDB(), None, task, reason="fix budget exhausted",
+            _NoopDB(),
+            None,
+            task,
+            reason="fix budget exhausted",
         )
 
     assert replanned is False, (
@@ -457,8 +478,10 @@ async def test_cc01_caller_cannot_raise_replan_cap_above_hard_max():
         plan_mock = AsyncMock(side_effect=RuntimeError("stop here"))
         record_mock = AsyncMock()
 
-        with patch.object(planner_mod, "build_initial_plan", plan_mock), \
-             patch.object(loop_mod, "_record_event", record_mock):
+        with (
+            patch.object(planner_mod, "build_initial_plan", plan_mock),
+            patch.object(loop_mod, "_record_event", record_mock),
+        ):
             result = await loop_mod.run_agent_task(task, db=pool, redis=None)
     finally:
         await pool.close()
@@ -507,9 +530,11 @@ async def test_cc01_requires_vault_with_no_redis_fails_closed_before_plan():
         record_mock = AsyncMock()
         settle_mock = AsyncMock()
 
-        with patch.object(planner_mod, "build_initial_plan", plan_mock), \
-             patch.object(loop_mod, "_record_event", record_mock), \
-             patch.object(loop_mod, "_settle_agent_credits", settle_mock):
+        with (
+            patch.object(planner_mod, "build_initial_plan", plan_mock),
+            patch.object(loop_mod, "_record_event", record_mock),
+            patch.object(loop_mod, "_settle_agent_credits", settle_mock),
+        ):
             result = await loop_mod.run_agent_task(task, db=pool, redis=None)
     finally:
         await pool.close()

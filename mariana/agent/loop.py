@@ -18,17 +18,41 @@ Design notes
 * Self-correction: a step may fail up to ``max_fix_attempts_per_step`` times.
   On the final failure we bubble up and REPLAN, capped by ``max_replans``.
 
-Canonical error codes (CC-20/CC-21/CC-25)
------------------------------------------
-User-visible step/task error fields and SSE payloads only ever carry one of
-these stable codes.  Raw exception text/details stay in the structured logs.
+Canonical error codes (CC-20/CC-21/CC-25/CC-35)
+-----------------------------------------------
+User-visible ``task.error`` / ``step.error`` fields and SSE error payloads
+only ever carry one of these stable codes.  Raw exception text and detail
+dicts stay in the structured server logs.  The two allow-list constants
+``CANONICAL_TASK_ERROR_CODES`` and ``CANONICAL_STEP_ERROR_CODES`` (defined
+below) are enforced by ``tests/test_cc35_canonical_error_codes.py``: any new
+literal assignment to ``task.error`` / ``step.error`` outside the allow-list
+breaks CI.
+
+Task-level codes (``task.error``):
+
+* ``stop_requested`` — a stop was requested before or during execution.
+* ``budget_exhausted`` — USD spend reached the task budget cap.
+* ``duration_exhausted`` — wall-clock runtime reached ``max_duration_hours``.
+* ``planner_failed`` — the LLM planner call failed (initial / fix / replan).
+* ``deliver_failed`` — the deliver step itself failed terminally.
+* ``unrecoverable`` — a step failed past fix + replan budgets.
+* ``vault_unavailable`` — per-task secret bootstrap failed (fail-closed).
+* ``vault_transport_violation`` — vault access violated transport policy.
+* ``loop_crash`` — a programming error escaped the inner loop.
+
+Step-level codes (``step.error``):
 
 * ``tool_error`` — a tool dispatch raised :class:`ToolError`.
 * ``unexpected`` — a tool dispatch raised an unexpected non-ToolError exception.
-* ``planner_failed`` — fix-step or replan planner call failed.
-* ``vault_unavailable`` — per-task secret bootstrap failed.
-* ``vault_transport_violation`` — vault access violated transport policy.
-* ``stream_unavailable`` — SSE stream couldn't be established.
+* ``timed_out`` — ``code_exec`` / ``bash_exec`` etc. wall-clock timeout.
+* ``process_killed`` — child process killed (memory / signal).
+* ``non_zero_exit`` — child process exited non-zero.
+* ``http_error`` — ``browser_fetch`` / ``browser_click_fetch`` returned >= 400.
+
+SSE-only codes (carried in ``error`` event payloads, not persisted):
+
+* ``stream_unavailable`` — SSE Redis stream couldn't be established.
+* ``planner_failed`` — reused for fix/replan SSE error frames.
 """
 
 from __future__ import annotations
@@ -85,6 +109,38 @@ _STEP_STDOUT_TAIL = 4000
 _STEP_STDERR_TAIL = 4000
 
 
+# CC-35: canonical allow-list of stable error codes that may be persisted
+# into ``task.error`` and ``step.error`` and emitted on SSE error payloads.
+# Any non-test source-grep test in ``tests/test_cc35_canonical_error_codes.py``
+# walks the AST of this module + ``mariana/agent/api_routes.py`` and forbids
+# any literal assignment to ``task.error`` / ``step.error`` outside these
+# sets.  Adding a new code is a deliberate, audited contract change.
+CANONICAL_TASK_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "stop_requested",
+        "budget_exhausted",
+        "duration_exhausted",
+        "planner_failed",
+        "deliver_failed",
+        "unrecoverable",
+        "vault_unavailable",
+        "vault_transport_violation",
+        "loop_crash",
+    }
+)
+
+CANONICAL_STEP_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "tool_error",
+        "unexpected",
+        "timed_out",
+        "process_killed",
+        "non_zero_exit",
+        "http_error",
+    }
+)
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint + event helpers
 # ---------------------------------------------------------------------------
@@ -97,7 +153,10 @@ _STEP_STDERR_TAIL = 4000
 # clobber it back to a non-terminal / non-settled state via _persist_task's
 # UPSERT.  See tests/test_p01_stale_worker_race.py.
 _TERMINAL_STATE_VALUES: tuple[str, ...] = (
-    "done", "failed", "halted", "cancelled",
+    "done",
+    "failed",
+    "halted",
+    "cancelled",
 )
 
 
@@ -287,7 +346,9 @@ async def _record_event(db: Any, redis: Any, task_id: str, event: AgentEvent) ->
                 approximate=True,
             )
         except Exception as exc:
-            logger.warning("agent_event_redis_xadd_failed", task_id=task_id, error=str(exc))
+            logger.warning(
+                "agent_event_redis_xadd_failed", task_id=task_id, error=str(exc)
+            )
 
 
 def _mk_event(
@@ -317,8 +378,12 @@ async def _emit(
     payload: dict[str, Any] | None = None,
 ) -> None:
     await _record_event(
-        db, redis, task.id,
-        _mk_event(task.id, event_type, state=task.state, step_id=step_id, payload=payload),
+        db,
+        redis,
+        task.id,
+        _mk_event(
+            task.id, event_type, state=task.state, step_id=step_id, payload=payload
+        ),
     )
 
 
@@ -327,7 +392,9 @@ async def _emit(
 # ---------------------------------------------------------------------------
 
 
-async def _transition(db: Any, redis: Any, task: AgentTask, new_state: AgentState) -> None:
+async def _transition(
+    db: Any, redis: Any, task: AgentTask, new_state: AgentState
+) -> None:
     if task.state == new_state:
         return
     assert_transition(task.state, new_state)
@@ -335,7 +402,10 @@ async def _transition(db: Any, redis: Any, task: AgentTask, new_state: AgentStat
     task.state = new_state
     await _persist_task(db, task)
     await _emit(
-        db, redis, task, "state_change",
+        db,
+        redis,
+        task,
+        "state_change",
         payload={"from": old.value, "to": new_state.value},
     )
 
@@ -360,13 +430,36 @@ async def _check_stop_requested(redis: Any, task: AgentTask) -> bool:
     return False
 
 
-def _budget_exceeded(task: AgentTask, started_at: float) -> tuple[bool, str]:
+def _budget_exceeded(
+    task: AgentTask, started_at: float
+) -> tuple[bool, str, dict[str, Any]]:
+    """Return ``(over, code, detail)``.
+
+    CC-35: ``code`` is a canonical ``CANONICAL_TASK_ERROR_CODES`` value
+    (``budget_exhausted`` or ``duration_exhausted``).  ``detail`` carries
+    the structured numeric context for the SSE payload + structured
+    server log; callers persist ``task.error = code`` only.
+    """
     if task.spent_usd >= task.budget_usd:
-        return True, f"budget_exhausted: spent ${task.spent_usd:.4f} >= ${task.budget_usd:.2f}"
+        return (
+            True,
+            "budget_exhausted",
+            {
+                "spent_usd": float(task.spent_usd),
+                "budget_usd": float(task.budget_usd),
+            },
+        )
     elapsed_h = (time.time() - started_at) / 3600.0
     if elapsed_h >= task.max_duration_hours:
-        return True, f"duration_exhausted: {elapsed_h:.3f}h >= {task.max_duration_hours:.3f}h"
-    return False, ""
+        return (
+            True,
+            "duration_exhausted",
+            {
+                "elapsed_hours": float(elapsed_h),
+                "max_duration_hours": float(task.max_duration_hours),
+            },
+        )
+    return False, "", {}
 
 
 # ---------------------------------------------------------------------------
@@ -586,7 +679,10 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
         # exit — do NOT re-issue the ledger RPC.  Even if the ledger is
         # idempotent on (ref_type, ref_id) we save a wasted round-trip
         # and avoid emitting a duplicate-status structured log line.
-        if existing_claim is not None and existing_claim["ledger_applied_at"] is not None:
+        if (
+            existing_claim is not None
+            and existing_claim["ledger_applied_at"] is not None
+        ):
             try:
                 await _mark_settlement_completed(db, task.id)
                 task.credits_settled = True
@@ -644,7 +740,10 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
                         error=str(exc),
                     )
                     return
-                if existing_claim is not None and existing_claim["completed_at"] is not None:
+                if (
+                    existing_claim is not None
+                    and existing_claim["completed_at"] is not None
+                ):
                     task.credits_settled = True
                     logger.info(
                         "agent_credits_settle_already_completed_after_race",
@@ -889,7 +988,11 @@ def _summarise_result(result: dict[str, Any]) -> dict[str, Any]:
             elif k in ("stderr",):
                 out[k] = redactor(_tail(v, _STEP_STDERR_TAIL))
             elif k in ("body", "content", "image_b64", "pdf_b64"):
-                out[k] = redactor(_tail(v, 4000)) if k == "body" else f"<{len(v)} bytes omitted>"
+                out[k] = (
+                    redactor(_tail(v, 4000))
+                    if k == "body"
+                    else f"<{len(v)} bytes omitted>"
+                )
             else:
                 out[k] = redactor(_tail(v, 4000))
         else:
@@ -902,21 +1005,46 @@ def _summarise_result(result: dict[str, Any]) -> dict[str, Any]:
 def _infer_failure(tool: str, result: dict[str, Any]) -> str | None:
     """Detect "soft" failures (non-exception tool results we still want to fix).
 
-    Returns a short error string if the step should be considered failed,
-    otherwise None.
+    CC-35: returns a canonical ``CANONICAL_STEP_ERROR_CODES`` value or
+    ``None``.  Raw numeric context (``duration_ms``, ``exit_code``,
+    ``status``) stays in ``step.result`` and the structured server log;
+    only the stable code lands in ``step.error``.
     """
     if tool in ("code_exec", "bash_exec", "typescript_exec", "rust_exec"):
         if bool(result.get("timed_out")):
-            return f"timed_out after {result.get('duration_ms', 0)}ms"
+            logger.info(
+                "agent_step_soft_failure",
+                tool=tool,
+                code="timed_out",
+                duration_ms=result.get("duration_ms", 0),
+            )
+            return "timed_out"
         if bool(result.get("killed")):
-            return "process killed (memory / signal)"
+            logger.info(
+                "agent_step_soft_failure",
+                tool=tool,
+                code="process_killed",
+            )
+            return "process_killed"
         exit_code = result.get("exit_code")
         if isinstance(exit_code, int) and exit_code != 0:
-            return f"non-zero exit code {exit_code}"
+            logger.info(
+                "agent_step_soft_failure",
+                tool=tool,
+                code="non_zero_exit",
+                exit_code=exit_code,
+            )
+            return "non_zero_exit"
     if tool in ("browser_fetch", "browser_click_fetch"):
         status = result.get("status")
         if isinstance(status, int) and status >= 400:
-            return f"HTTP {status}"
+            logger.info(
+                "agent_step_soft_failure",
+                tool=tool,
+                code="http_error",
+                http_status=status,
+            )
+            return "http_error"
     return None
 
 
@@ -934,7 +1062,10 @@ async def _run_one_step(
     step.result = None
     await _persist_task(db, task)
     await _emit(
-        db, redis, task, "step_started",
+        db,
+        redis,
+        task,
+        "step_started",
         step_id=step.id,
         payload={
             "title": step.title,
@@ -946,7 +1077,10 @@ async def _run_one_step(
 
     try:
         result = await dispatch(
-            step.tool, step.params, user_id=task.user_id, task_id=task.id,
+            step.tool,
+            step.params,
+            user_id=task.user_id,
+            task_id=task.id,
         )
     except ToolError as exc:
         # CC-25: persist a stable error_code on the user-visible step record;
@@ -968,7 +1102,10 @@ async def _run_one_step(
         task.total_failures += 1
         await _persist_task(db, task)
         await _emit(
-            db, redis, task, "step_failed",
+            db,
+            redis,
+            task,
+            "step_failed",
             step_id=step.id,
             payload={"error": step.error, "tool": step.tool},
         )
@@ -990,7 +1127,10 @@ async def _run_one_step(
         task.total_failures += 1
         await _persist_task(db, task)
         await _emit(
-            db, redis, task, "step_failed",
+            db,
+            redis,
+            task,
+            "step_failed",
             step_id=step.id,
             payload={"error": step.error},
         )
@@ -1004,7 +1144,10 @@ async def _run_one_step(
     # Stream terminal output for code_exec so the UI can render a live pane.
     if step.tool in ("code_exec", "bash_exec", "typescript_exec", "rust_exec"):
         await _emit(
-            db, redis, task, "terminal_output",
+            db,
+            redis,
+            task,
+            "terminal_output",
             step_id=step.id,
             payload={
                 "stdout": summary.get("stdout", ""),
@@ -1027,7 +1170,10 @@ async def _run_one_step(
             )
             task.artifacts.append(artifact)
             await _emit(
-                db, redis, task, "artifact_created",
+                db,
+                redis,
+                task,
+                "artifact_created",
                 step_id=step.id,
                 payload=artifact.model_dump(mode="json"),
             )
@@ -1041,7 +1187,10 @@ async def _run_one_step(
         task.total_failures += 1
         await _persist_task(db, task)
         await _emit(
-            db, redis, task, "step_failed",
+            db,
+            redis,
+            task,
+            "step_failed",
             step_id=step.id,
             payload={"error": soft_err, "result": summary},
         )
@@ -1051,9 +1200,17 @@ async def _run_one_step(
     step.finished_at = time.time()
     await _persist_task(db, task)
     await _emit(
-        db, redis, task, "step_completed",
+        db,
+        redis,
+        task,
+        "step_completed",
         step_id=step.id,
-        payload={"result": summary, "duration_ms": int((step.finished_at - (step.started_at or step.finished_at)) * 1000)},
+        payload={
+            "result": summary,
+            "duration_ms": int(
+                (step.finished_at - (step.started_at or step.finished_at)) * 1000
+            ),
+        },
     )
     return True, None
 
@@ -1064,7 +1221,10 @@ async def _run_one_step(
 
 
 async def _attempt_fix(
-    db: Any, redis: Any, task: AgentTask, failed_step: AgentStep,
+    db: Any,
+    redis: Any,
+    task: AgentTask,
+    failed_step: AgentStep,
 ) -> bool:
     """Ask the LLM for a replacement step; swap it in.  Returns True on success."""
     await _transition(db, redis, task, AgentState.FIX)
@@ -1080,7 +1240,10 @@ async def _attempt_fix(
             error=str(exc),
         )
         await _emit(
-            db, redis, task, "error",
+            db,
+            redis,
+            task,
+            "error",
             payload={"phase": "fix", "error": "planner_failed"},
         )
         return False
@@ -1089,7 +1252,10 @@ async def _attempt_fix(
     _replace_step(task, new_step)
     await _persist_task(db, task)
     await _emit(
-        db, redis, task, "plan_created",
+        db,
+        redis,
+        task,
+        "plan_created",
         step_id=new_step.id,
         payload={
             "kind": "fix",
@@ -1101,7 +1267,10 @@ async def _attempt_fix(
 
 
 async def _attempt_replan(
-    db: Any, redis: Any, task: AgentTask, reason: str,
+    db: Any,
+    redis: Any,
+    task: AgentTask,
+    reason: str,
 ) -> bool:
     if task.replan_count >= min(task.max_replans, _HARD_MAX_REPLANS):
         return False
@@ -1118,7 +1287,10 @@ async def _attempt_replan(
             error=str(exc),
         )
         await _emit(
-            db, redis, task, "error",
+            db,
+            redis,
+            task,
+            "error",
             payload={"phase": "replan", "error": "planner_failed"},
         )
         return False
@@ -1130,7 +1302,10 @@ async def _attempt_replan(
     task.steps = new_steps
     await _persist_task(db, task)
     await _emit(
-        db, redis, task, "plan_created",
+        db,
+        redis,
+        task,
+        "plan_created",
         payload={
             "kind": "replan",
             "reason": reason,
@@ -1152,7 +1327,10 @@ async def _deliver(db: Any, redis: Any, task: AgentTask, final_answer: str) -> N
     task.final_answer = final_answer or _default_summary(task)
     await _persist_task(db, task)
     await _emit(
-        db, redis, task, "delivered",
+        db,
+        redis,
+        task,
+        "delivered",
         payload={
             "final_answer": task.final_answer,
             "artifacts": [a.model_dump(mode="json") for a in task.artifacts],
@@ -1195,7 +1373,9 @@ async def run_agent_task(
 
     # Clamp caps so callers can't weaken defenses.
     task.max_replans = min(task.max_replans, _HARD_MAX_REPLANS)
-    task.max_fix_attempts_per_step = min(task.max_fix_attempts_per_step, _HARD_MAX_FIX_PER_STEP)
+    task.max_fix_attempts_per_step = min(
+        task.max_fix_attempts_per_step, _HARD_MAX_FIX_PER_STEP
+    )
 
     # F4 Vault: pull this task's ephemeral env from Redis (frontend POSTed it
     # alongside /api/agent) and install both the env and the matching
@@ -1217,6 +1397,7 @@ async def run_agent_task(
         # Late import: mariana.api owns the singleton config; avoids
         # circular import at module load.
         from mariana.api import _get_config as _get_cfg_loop  # noqa: PLC0415
+
         _vault_redis_url = getattr(_get_cfg_loop(), "REDIS_URL", None)
     except Exception:
         _vault_redis_url = None
@@ -1236,7 +1417,9 @@ async def run_agent_task(
             # with a clear error and return without running anything.
             # CC-21: persist only a stable error_code on the task record;
             # the raw cause stays in the server log above.
-            log.error("vault_env_unavailable_fail_closed", task_id=task.id, error=str(exc))
+            log.error(
+                "vault_env_unavailable_fail_closed", task_id=task.id, error=str(exc)
+            )
             task.error = "vault_unavailable"
             task.state = AgentState.FAILED
             try:
@@ -1249,7 +1432,9 @@ async def run_agent_task(
             # remote host).  Same fail-closed surface.
             # CC-21: persist only a stable error_code on the task record;
             # the raw cause stays in the server log above.
-            log.error("vault_env_redis_url_policy_violation", task_id=task.id, error=str(exc))
+            log.error(
+                "vault_env_redis_url_policy_violation", task_id=task.id, error=str(exc)
+            )
             task.error = "vault_transport_violation"
             task.state = AgentState.FAILED
             try:
@@ -1262,7 +1447,11 @@ async def run_agent_task(
             if requires_vault:
                 # CC-21: persist only a stable error_code on the task
                 # record; the raw cause stays in the server log above.
-                log.error("vault_env_unexpected_error_fail_closed", task_id=task.id, error=str(exc))
+                log.error(
+                    "vault_env_unexpected_error_fail_closed",
+                    task_id=task.id,
+                    error=str(exc),
+                )
                 task.error = "vault_unavailable"
                 task.state = AgentState.FAILED
                 try:
@@ -1274,7 +1463,11 @@ async def run_agent_task(
         ctx_handle.reset()
         ctx_handle = set_task_context(vault_env)
         if vault_env:
-            log.info("vault_env_installed", count=len(vault_env), names=sorted(vault_env.keys()))
+            log.info(
+                "vault_env_installed",
+                count=len(vault_env),
+                names=sorted(vault_env.keys()),
+            )
 
         # ---- P-01 pre-flight: re-validate the DB row before any work -----
         # The queue worker loaded ``task`` via a plain SELECT in
@@ -1322,8 +1515,13 @@ async def run_agent_task(
 
         # ---- PLAN --------------------------------------------------------
         await _persist_task(db, task)
-        await _emit(db, redis, task, "state_change",
-                    payload={"from": "init", "to": task.state.value})
+        await _emit(
+            db,
+            redis,
+            task,
+            "state_change",
+            payload={"from": "init", "to": task.state.value},
+        )
 
         # O-02: bail BEFORE invoking the planner if a stop has already been
         # requested.  The stop endpoint finalises pre-execution tasks itself,
@@ -1334,8 +1532,9 @@ async def run_agent_task(
         # legal from PLAN and signals "the worker honoured the stop".
         if await _check_stop_requested(redis, task):
             task.error = "stop_requested"
-            await _emit(db, redis, task, "halted",
-                        payload={"reason": "stop_requested_pre_plan"})
+            await _emit(
+                db, redis, task, "halted", payload={"reason": "stop_requested_pre_plan"}
+            )
             await _transition(db, redis, task, AgentState.HALTED)
             return task
 
@@ -1351,7 +1550,9 @@ async def run_agent_task(
                 error=str(exc),
             )
             task.error = "planner_failed"
-            await _emit(db, redis, task, "error", payload={"phase": "plan", "error": task.error})
+            await _emit(
+                db, redis, task, "error", payload={"phase": "plan", "error": task.error}
+            )
             task.state = AgentState.FAILED
             await _persist_task(db, task)
             return task
@@ -1360,7 +1561,10 @@ async def run_agent_task(
         task.steps = steps
         await _persist_task(db, task)
         await _emit(
-            db, redis, task, "plan_created",
+            db,
+            redis,
+            task,
+            "plan_created",
             payload={
                 "kind": "initial",
                 "steps": [s.model_dump(mode="json") for s in steps],
@@ -1372,25 +1576,46 @@ async def run_agent_task(
         while True:
             if await _check_stop_requested(redis, task):
                 task.error = "stop_requested"
-                await _emit(db, redis, task, "halted", payload={"reason": "stop_requested"})
+                await _emit(
+                    db, redis, task, "halted", payload={"reason": "stop_requested"}
+                )
                 await _transition(db, redis, task, AgentState.HALTED)
                 return task
 
-            over, why = _budget_exceeded(task, started_at)
+            over, code, detail = _budget_exceeded(task, started_at)
             if over:
-                task.error = why
-                await _emit(db, redis, task, "halted", payload={"reason": why})
+                # CC-35: ``task.error`` is a canonical code; structured
+                # numeric context lives in the SSE payload + server log.
+                log.warning(
+                    "agent_budget_exhausted",
+                    task_id=task.id,
+                    code=code,
+                    detail=detail,
+                )
+                task.error = code
+                await _emit(
+                    db,
+                    redis,
+                    task,
+                    "halted",
+                    payload={"reason": code, "detail": detail},
+                )
                 await _transition(db, redis, task, AgentState.HALTED)
                 return task
 
             # Pick next pending step.
-            next_step = next((s for s in task.steps if s.status == StepStatus.PENDING), None)
+            next_step = next(
+                (s for s in task.steps if s.status == StepStatus.PENDING), None
+            )
             if next_step is None:
                 # All steps processed.  If a deliver step was run, we're done.
                 # Otherwise synthesise a delivery.
                 deliver = next(
-                    (s for s in task.steps
-                     if s.tool == "deliver" and s.status == StepStatus.DONE),
+                    (
+                        s
+                        for s in task.steps
+                        if s.tool == "deliver" and s.status == StepStatus.DONE
+                    ),
                     None,
                 )
                 final = (deliver.result or {}).get("final_answer") if deliver else ""
@@ -1402,7 +1627,16 @@ async def run_agent_task(
                 await _transition(db, redis, task, AgentState.DELIVER)
                 ok, err = await _run_one_step(db, redis, task, next_step)
                 if not ok:
-                    task.error = f"deliver_failed: {err}"
+                    # CC-35: persist a canonical task error code; the raw
+                    # step error (already a canonical step code per
+                    # CC-21/CC-35) stays in the server log for ops.
+                    log.warning(
+                        "agent_deliver_failed",
+                        task_id=task.id,
+                        step_id=next_step.id,
+                        step_error=err,
+                    )
+                    task.error = "deliver_failed"
                     task.state = AgentState.FAILED
                     await _persist_task(db, task)
                     return task
@@ -1420,13 +1654,14 @@ async def run_agent_task(
 
             # FIX loop for this step.
             fixed = False
-            while (
-                not fixed
-                and next_step.attempts < min(task.max_fix_attempts_per_step, _HARD_MAX_FIX_PER_STEP)
+            while not fixed and next_step.attempts < min(
+                task.max_fix_attempts_per_step, _HARD_MAX_FIX_PER_STEP
             ):
                 if await _check_stop_requested(redis, task):
                     task.error = "stop_requested"
-                    await _emit(db, redis, task, "halted", payload={"reason": "stop_requested"})
+                    await _emit(
+                        db, redis, task, "halted", payload={"reason": "stop_requested"}
+                    )
                     await _transition(db, redis, task, AgentState.HALTED)
                     return task
 
@@ -1454,7 +1689,9 @@ async def run_agent_task(
             # FIX budget exhausted → REPLAN.
             log.warning("agent_step_fix_exhausted", step_id=next_step.id, error=err)
             replanned = await _attempt_replan(
-                db, redis, task,
+                db,
+                redis,
+                task,
                 reason=f"step {next_step.id} failed after {next_step.attempts} attempts: {err}",
             )
             if replanned:
@@ -1462,8 +1699,22 @@ async def run_agent_task(
                 continue
 
             # Out of replans → FAILED.
-            task.error = f"unrecoverable: step {next_step.id} — {err}"
-            await _emit(db, redis, task, "error", payload={"phase": "replan", "error": task.error})
+            # CC-35: persist a canonical task error code; the failing step
+            # id and final error stay in the server log for ops.
+            log.warning(
+                "agent_step_unrecoverable",
+                task_id=task.id,
+                step_id=next_step.id,
+                step_error=err,
+            )
+            task.error = "unrecoverable"
+            await _emit(
+                db,
+                redis,
+                task,
+                "error",
+                payload={"phase": "replan", "error": task.error},
+            )
             task.state = AgentState.FAILED
             await _persist_task(db, task)
             return task
@@ -1485,8 +1736,9 @@ async def run_agent_task(
         task.state = AgentState.FAILED
         try:
             await _persist_task(db, task)
-            await _emit(db, redis, task, "error",
-                        payload={"phase": "loop", "error": task.error})
+            await _emit(
+                db, redis, task, "error", payload={"phase": "loop", "error": task.error}
+            )
         except Exception:
             pass
         return task
@@ -1511,8 +1763,7 @@ async def run_agent_task(
             try:
                 async with db.acquire() as conn:
                     fast_row = await conn.fetchrow(
-                        "SELECT credits_settled FROM agent_tasks "
-                        "WHERE id = $1",
+                        "SELECT credits_settled FROM agent_tasks WHERE id = $1",
                         task.id,
                     )
                 if fast_row is not None and fast_row["credits_settled"] is True:
@@ -1524,9 +1775,7 @@ async def run_agent_task(
                 # ``_settle_agent_credits`` will claim via
                 # ``agent_settlements`` ON CONFLICT DO NOTHING and
                 # short-circuit if a winner already exists.
-                logger.exception(
-                    "agent_finally_fast_path_read_failed", task_id=task.id
-                )
+                logger.exception("agent_finally_fast_path_read_failed", task_id=task.id)
 
             if not already_settled_in_db:
                 try:
@@ -1548,9 +1797,7 @@ async def run_agent_task(
                 # if another writer's finalization is more recent (Q-01).
                 await _persist_task(db, task)
             except Exception:
-                logger.exception(
-                    "agent_finally_persist_failed", task_id=task.id
-                )
+                logger.exception("agent_finally_persist_failed", task_id=task.id)
         # Drop the per-task vault context AND the Redis blob.  This is the
         # only place plaintext can persist server-side, so we delete it as
         # soon as the loop exits regardless of state.
