@@ -128,19 +128,48 @@ def _workspace_size_bytes(workspace_root: pathlib.Path) -> int:
     return total
 
 
-def _enforce_workspace_quota(workspace_root: pathlib.Path) -> None:
-    """Raise HTTP 507 ``workspace_full`` if the workspace is over quota."""
+def _enforce_workspace_quota(
+    workspace_root: pathlib.Path,
+    additional_bytes: int = 0,
+) -> None:
+    """Raise HTTP 507 ``workspace_full`` if the projected size is over quota.
+
+    CC-34: callers MUST pass ``additional_bytes`` when they know the byte
+    count of the immediate write so the projected post-write size is
+    bounded (a workspace at ``cap - 1 KiB`` cannot be pushed over by a
+    single 10 MiB ``/fs/write`` payload).  ``additional_bytes`` defaults
+    to ``0`` for callers that only want to refuse already-over-quota
+    workspaces.  Runtime artifacts produced by ``/exec`` are bounded by
+    ``MAX_STDOUT_BYTES`` / ``MAX_STDERR_BYTES`` and the wall-clock
+    timeout — full post-run accounting is out of scope here.
+    """
+    if additional_bytes < 0:
+        additional_bytes = 0
     size = _workspace_size_bytes(workspace_root)
-    if size > _MAX_WORKSPACE_BYTES:
+    projected = size + additional_bytes
+    if projected > _MAX_WORKSPACE_BYTES:
         log.warning(
             "workspace_full",
             extra={
                 "workspace": str(workspace_root),
                 "size": size,
+                "additional": additional_bytes,
+                "projected": projected,
                 "max": _MAX_WORKSPACE_BYTES,
             },
         )
         raise HTTPException(status_code=507, detail="workspace_full")
+
+
+def _workspace_size_cache_set(workspace_root: pathlib.Path, size: int) -> None:
+    """Refresh the cached size for ``workspace_root`` after a successful write.
+
+    CC-34: avoids a stale cache window where two consecutive writes could
+    each see the pre-write size and both pass the quota check on a tight
+    boundary.  Callers update the cache immediately after the write
+    succeeds with the known new total bytes.
+    """
+    _WORKSPACE_SIZE_CACHE[str(workspace_root)] = (time.monotonic(), max(size, 0))
 
 
 SANDBOX_UID = 1000
@@ -640,9 +669,16 @@ async def exec_code(req: ExecRequest) -> dict[str, Any]:
     with suppress(PermissionError):
         os.chown(user_workspace, SANDBOX_UID, SANDBOX_GID)
 
-    # CC-28: enforce per-workspace disk quota before any write.  ``/exec``
-    # writes the source file plus whatever the user code produces.
-    _enforce_workspace_quota(user_workspace)
+    # CC-28 / CC-34: enforce per-workspace disk quota before any write.
+    # ``/exec`` writes the source file (the immediate, known write) plus
+    # whatever the user code produces; we project for the source bytes
+    # here.  Runtime artifacts are bounded by MAX_STDOUT_BYTES /
+    # MAX_STDERR_BYTES and the wall-clock timeout — a full post-run
+    # accounting check is out of scope.
+    _enforce_workspace_quota(
+        user_workspace,
+        additional_bytes=len(req.code.encode("utf-8")),
+    )
 
     # Resolve cwd (must stay in the workspace).  Empty → workspace root.
     if req.cwd:
@@ -823,15 +859,12 @@ async def fs_read(req: FsReadRequest) -> dict[str, Any]:
 @app.post("/fs/write")
 async def fs_write(req: FsWriteRequest) -> dict[str, Any]:
     p = _safe_workspace_path(req.user_id, req.path)
-    # CC-28: enforce per-workspace disk quota before any write.
-    _enforce_workspace_quota((WORKSPACE_ROOT / req.user_id).resolve())
-    if p.exists() and not req.overwrite:
-        log.info(
-            "sandbox_fs_write_exists",
-            extra={"reason": "file_exists", "user_id": req.user_id, "path": req.path},
-        )
-        raise HTTPException(409, "invalid request")
-    p.parent.mkdir(parents=True, exist_ok=True)
+    workspace_root = (WORKSPACE_ROOT / req.user_id).resolve()
+    # CC-34: decode/measure the incoming payload BEFORE the quota check so
+    # we can refuse a write whose post-write projection would push the
+    # workspace past ``_MAX_WORKSPACE_BYTES``.  An invalid base64 body
+    # gets the same generic 400 it always did — the decode happens here
+    # for sizing and again is not re-attempted in the binary branch below.
     if req.binary:
         try:
             data = base64.b64decode(req.content, validate=True)
@@ -845,11 +878,41 @@ async def fs_write(req: FsWriteRequest) -> dict[str, Any]:
                 },
             )
             raise HTTPException(400, "invalid request") from exc
+        additional_bytes = len(data)
+    else:
+        data = None
+        additional_bytes = len(req.content.encode("utf-8"))
+    # CC-28 / CC-34: enforce per-workspace disk quota with the projected
+    # post-write size, not just the current size.
+    pre_size = _workspace_size_bytes(workspace_root)
+    # If the file already exists and we're overwriting, the net delta is
+    # ``new_bytes - existing_bytes``; otherwise it's the full ``new_bytes``.
+    existing = 0
+    if p.exists() and p.is_file() and req.overwrite:
+        try:
+            existing = p.stat().st_size
+        except OSError:
+            existing = 0
+    delta = max(additional_bytes - existing, 0)
+    _enforce_workspace_quota(workspace_root, additional_bytes=delta)
+    if p.exists() and not req.overwrite:
+        log.info(
+            "sandbox_fs_write_exists",
+            extra={"reason": "file_exists", "user_id": req.user_id, "path": req.path},
+        )
+        raise HTTPException(409, "invalid request")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if req.binary:
+        assert data is not None
         p.write_bytes(data)
     else:
         p.write_text(req.content, encoding="utf-8")
     with suppress(PermissionError):
         os.chown(p, SANDBOX_UID, SANDBOX_GID)
+    # CC-34: refresh the cached workspace size so a subsequent write in
+    # the same TTL window sees the post-write total, not the stale
+    # pre-write total.
+    _workspace_size_cache_set(workspace_root, pre_size + delta)
     return {
         "path": req.path,
         "size": p.stat().st_size,
