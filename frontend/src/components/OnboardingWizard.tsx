@@ -238,7 +238,7 @@ export default function OnboardingWizard({
     switch (step) {
       case 1: return "Welcome to Deft";
       case 2: return "Set up your Vault";
-      case 3: return "Pick something to build";
+      case 3: return "Pick a first run";
       case 4: return "Your first quote";
       default: return "Welcome";
     }
@@ -246,7 +246,7 @@ export default function OnboardingWizard({
 
   const stepDescription = useMemo(() => {
     switch (step) {
-      case 1: return "We'll get you to your first build in under a minute.";
+      case 1: return "You'll have a first run inside a minute.";
       case 2: return "Encrypted secrets you can reference safely in any prompt.";
       case 3: return "Try one of these to see Deft work autonomously.";
       case 4: return "Pre-flight estimate so you know exactly what you'll spend.";
@@ -446,7 +446,7 @@ export default function OnboardingWizard({
                 onClick={handleFinish}
                 className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
               >
-                Start building <Check size={14} aria-hidden="true" />
+                Start the run <Check size={14} aria-hidden="true" />
               </button>
             )}
           </div>

@@ -3262,7 +3262,7 @@ export default function Chat() {
                   What should Deft do for you?
                 </h2>
                 <p className="text-sm text-muted-foreground max-w-md">
-                  Ask a question, build a tool, run an analysis, draft a document, or automate a workflow.
+                  Ask a question, write a tool, run an analysis, draft a document, or automate a workflow.
                   Deft picks the right approach and works until it's done.
                 </p>
               </div>

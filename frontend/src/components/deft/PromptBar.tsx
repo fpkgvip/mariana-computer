@@ -127,7 +127,7 @@ export const PromptBar = forwardRef<PromptBarHandle, PromptBarProps>(function Pr
     disabled = false,
     disabledHint,
     busy = false,
-    placeholder = "What should Deft build?",
+    placeholder = "What should Deft do?",
     initialValue = "",
     className,
     onChange,

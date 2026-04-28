@@ -199,7 +199,7 @@ export default function Index() {
                   onKeyDown={onKeyDown}
                   rows={1}
                   spellCheck={false}
-                  aria-label="Describe what you want to build"
+                  aria-label="Describe what you want to do"
                   placeholder=" "
                   className={[
                     "block w-full resize-none bg-transparent",

@@ -84,7 +84,7 @@ const BUILTIN_SKILLS: Skill[] = [
     id: "excel-model",
     name: "Spreadsheet & Modeling",
     description:
-      "Build spreadsheets and models — forecasts, budgets, pricing calculators, scenario analyses — in Excel format.",
+      "Spreadsheets and models — forecasts, budgets, pricing calculators, scenario analyses — in Excel format.",
     trigger_keywords: ["excel", "spreadsheet", "model", "forecast", "budget"],
     category: "built-in",
   },
@@ -92,7 +92,7 @@ const BUILTIN_SKILLS: Skill[] = [
     id: "app-builder",
     name: "App & Tool Builder",
     description:
-      "Build full web apps, internal tools, dashboards, and landing pages — React/TypeScript, deployed to a live URL.",
+      "Full web apps, internal tools, dashboards, and landing pages — React/TypeScript, deployed to a live URL.",
     trigger_keywords: ["app", "dashboard", "internal tool", "landing page", "build"],
     category: "built-in",
   },

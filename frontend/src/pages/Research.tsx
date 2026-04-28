@@ -51,7 +51,7 @@ const examples: Example[] = [
     prompt:
       "Build an internal admin dashboard (React + Tailwind, Supabase auth) with tabs for Users, Billing, Feature Flags, and Audit Log. Deploy to a private URL.",
     outcome:
-      "Operator tool shipped in a day. Replaced a Google Sheet and 5 Retool screens.",
+      "Operator tool delivered in a day. Replaced a Google Sheet and 5 Retool screens.",
     deliverables: [
       "Full React app",
       "Deployed URL",
@@ -160,7 +160,7 @@ const examples: Example[] = [
     category: "Operations",
   },
   {
-    title: "Scrape, normalize, and chart public data",
+    title: "Pull, normalize, and chart public data",
     prompt:
       "Pull FDA medical device recalls for the last 5 years, normalize the classification field, chart recall counts by manufacturer, flag outliers.",
     outcome:
@@ -182,7 +182,7 @@ export default function Research() {
       <div className="mx-auto max-w-7xl px-6 pb-24 pt-32 md:pt-40">
         <ScrollReveal>
           <h1 className="font-serif text-3xl font-semibold leading-[1.08] tracking-[-0.02em] text-foreground sm:text-4xl md:text-5xl">
-            Examples of things Deft has shipped
+            Examples of things Deft has delivered
           </h1>
           <p className="mt-5 max-w-2xl text-lg leading-[1.7] text-muted-foreground">
             Real prompts, real deliverables. Click any example to run it against

@@ -84,7 +84,7 @@ export default function Product() {
             <ScrollReveal delay={250} className="self-start lg:mt-14">
               <div className="rounded-lg bg-card p-6 shadow-sm ring-1 ring-border">
                 <p className="mb-5 text-[11px] font-medium uppercase tracking-[0.15em] text-muted-foreground">
-                  What Deft can build during a single task
+                  What Deft delivers in a single task
                 </p>
                 <div className="space-y-4 text-[15px] leading-relaxed text-muted-foreground">
                   <p>
@@ -282,7 +282,7 @@ export default function Product() {
               {
                 title: "Marketing & Growth",
                 items: [
-                  "Build landing pages, campaigns, and tracking plans",
+                  "Landing pages, campaigns, and tracking plans",
                   "Competitor sweeps, SEO audits, pricing teardowns",
                   "Generate launch assets in every format you need",
                 ],
