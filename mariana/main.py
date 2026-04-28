@@ -421,8 +421,16 @@ async def _deduct_user_credits(
         logger.warning("supabase_not_configured_skip_credit_deduction")
         return
 
+    # U-02 fix: quantize to cents with ROUND_HALF_UP via the central helper
+    # (`mariana.billing.precision.usd_to_credits`).  The prior code computed
+    # ``int(total_with_markup * 100)`` which truncated toward zero so a
+    # markup-inclusive $0.305 produced 30 credits instead of 31, and
+    # inherited IEEE-754 float drift from the ``cost_tracker.total_spent``
+    # accumulator.  See ``loop6_audit/U02_FIX_REPORT.md``.
+    from mariana.billing.precision import usd_to_credits  # noqa: PLC0415
+
     total_with_markup = getattr(cost_tracker, "total_with_markup", cost_tracker.total_spent * 1.20)
-    final_tokens = int(total_with_markup * 100)
+    final_tokens = usd_to_credits(total_with_markup)
     delta_tokens = final_tokens - reserved_credits
 
     if delta_tokens == 0:

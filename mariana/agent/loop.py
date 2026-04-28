@@ -457,7 +457,11 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
     by the frontend ``creditsFromUsd`` helper and the Pricing page.
 
     * No-op if ``credits_settled`` is already True or no credits were reserved.
-    * ``delta = final_tokens - reserved`` where ``final_tokens = int(spent_usd * 100)``.
+    * ``delta = final_tokens - reserved`` where ``final_tokens =
+      usd_to_credits(spent_usd)`` (Decimal, ROUND_HALF_UP at the cent
+      boundary; see ``mariana/billing/precision.py``).  U-02: prior
+      ``int(spent_usd * 100)`` truncated toward zero so $0.305 produced
+      30 credits instead of 31 and inherited float-accumulation drift.
     * ``delta == 0`` → noop, just flip the flag.
     * ``delta > 0``  → user spent more than reserved → debit the overrun via
       the idempotent ``refund_credits`` RPC (clawback semantics keyed on
@@ -520,7 +524,15 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
         )
         return
 
-    final_tokens = int(task.spent_usd * 100)
+    # U-02 fix: quantize to cents with ROUND_HALF_UP via the central helper
+    # (`mariana.billing.precision.usd_to_credits`).  The prior code computed
+    # ``int(task.spent_usd * 100)`` which (a) truncated toward zero so
+    # ``$0.305`` produced 30 credits instead of 31 and (b) inherited any
+    # IEEE-754 float drift accumulated in ``task.spent_usd``.  See
+    # ``loop6_audit/U02_FIX_REPORT.md``.
+    from mariana.billing.precision import usd_to_credits  # noqa: PLC0415
+
+    final_tokens = usd_to_credits(task.spent_usd)
     delta = final_tokens - task.reserved_credits
     ref_id = f"agent_settle:{task.id}"
 
