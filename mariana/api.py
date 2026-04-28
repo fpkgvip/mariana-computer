@@ -1321,7 +1321,8 @@ async def _require_investigation_owner(
         "SELECT user_id, metadata FROM research_tasks WHERE id = $1", task_id
     )
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        logger.info("task_not_found", task_id=task_id)
+        raise HTTPException(status_code=404, detail="task not found")
     if _is_admin_user(current_user["user_id"]):
         return current_user
 
@@ -1490,7 +1491,8 @@ async def _require_investigation_owner_header_or_query(
         "SELECT user_id, metadata FROM research_tasks WHERE id = $1", task_id
     )
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        logger.info("task_not_found", task_id=task_id)
+        raise HTTPException(status_code=404, detail="task not found")
     if _is_admin_user(current_user["user_id"]):
         return current_user
 
@@ -1757,7 +1759,8 @@ try:
         if target.is_dir():
             target = target / "index.html"
         if not target.is_file():
-            raise HTTPException(404, f"not found: {file_path}")
+            logger.info("preview_asset_not_found", file_path=file_path)
+            raise HTTPException(404, "not found")
         ctype, _ = _mt.guess_type(str(target))
         ctype = ctype or "application/octet-stream"
         headers = {
@@ -8993,7 +8996,8 @@ def _validate_update_columns(columns: set[str], allowlist: frozenset[str], table
 def _ensure_task_exists(row: asyncpg.Record | None, task_id: str) -> None:
     """Raise HTTP 404 if the task lookup returned None."""
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        logger.info("task_not_found", task_id=task_id)
+        raise HTTPException(status_code=404, detail="task not found")
 
 
 # ===========================================================================
