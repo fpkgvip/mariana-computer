@@ -25,10 +25,13 @@ from __future__ import annotations
 
 import contextvars
 import json
+import logging
 from typing import Any, Callable, Mapping
 
 from mariana.util.redis_url import assert_local_or_tls
 from mariana.vault.redaction import build_redactor
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -217,17 +220,51 @@ async def fetch_vault_env(
         return {}
     if isinstance(raw, (bytes, bytearray)):
         raw = raw.decode("utf-8", errors="replace")
+    # CC-04 fix: malformed / non-object / mis-shaped payloads must NOT
+    # silently degrade to {} when the task explicitly required vaulted
+    # secrets — that re-opens the U-03 fail-closed bypass.  Each branch
+    # below tags a distinct ``reason`` so ops can separate corruption
+    # from transport failure in logs / alerts.
     try:
         data = json.loads(raw)
-    except Exception:
+    except Exception as exc:
+        if requires_vault:
+            raise VaultUnavailableError(
+                f"vault_env malformed_payload for task {task_id}: {exc}"
+            ) from exc
+        logger.warning(
+            "vault_env_corrupt_payload_degraded",
+            extra={"task_id": task_id, "reason": "malformed_payload"},
+        )
         return {}
     if not isinstance(data, dict):
+        if requires_vault:
+            raise VaultUnavailableError(
+                f"vault_env non_object_payload for task {task_id}: "
+                f"got {type(data).__name__}"
+            )
+        logger.warning(
+            "vault_env_corrupt_payload_degraded",
+            extra={"task_id": task_id, "reason": "non_object_payload"},
+        )
         return {}
-    # Final sanity: enforce caps even on the way out.
+    # Final sanity: enforce caps and key/value shape on the way out.
     out: dict[str, str] = {}
     for k, v in list(data.items())[:_MAX_VAULT_ENV_ENTRIES]:
-        if isinstance(k, str) and isinstance(v, str) and _NAME_RE.match(k):
-            out[k] = v[:_MAX_VAULT_VALUE_LEN]
+        if not isinstance(k, str) or not isinstance(v, str) or not _NAME_RE.match(k):
+            if requires_vault:
+                # We refuse to silently drop entries when the task said
+                # "I need these secrets" — better to fail-closed than
+                # let a half-honoured env through.
+                raise VaultUnavailableError(
+                    f"vault_env invalid_kv_shape for task {task_id}"
+                )
+            logger.warning(
+                "vault_env_corrupt_payload_degraded",
+                extra={"task_id": task_id, "reason": "invalid_kv_shape"},
+            )
+            continue
+        out[k] = v[:_MAX_VAULT_VALUE_LEN]
     return out
 
 
