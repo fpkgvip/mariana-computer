@@ -164,17 +164,27 @@ class _ScriptedClient:
 
 
 # ---------------------------------------------------------------------------
-# 1. add_credits payload must contain exactly {p_user_id, p_credits}.
+# 1. Refund branch routes through the IDEMPOTENT grant_credits primitive
+#    with payload {p_user_id, p_credits, p_source, p_ref_type, p_ref_id}.
 # ---------------------------------------------------------------------------
+#
+# T-01 update: the agent settlement no longer calls the non-idempotent
+# ``add_credits(p_user_id, p_credits)`` low-level RPC.  It now routes
+# through ``grant_credits(p_user_id, p_credits, p_source, p_ref_type,
+# p_ref_id, p_expires_at)`` which dedupes on ``(ref_type, ref_id)`` so a
+# marker-loss replay is safe.  S-01's invariant — "payload matches the
+# live PostgREST signature" — still holds; only the chosen function and
+# its key-set have changed.  The negative-shape assertion now lives in
+# ``test_s01_no_legacy_unkeyed_rpc`` below.
 
 
 @_pg_only
 @pytest.mark.asyncio
-async def test_s01_add_credits_payload_no_ref_id():
-    """Refund branch: the JSON body sent to /rpc/add_credits must include
-    exactly ``p_user_id`` and ``p_credits`` — and NOTHING else.  The live
-    function signature is ``add_credits(p_user_id uuid, p_credits integer)``;
-    PostgREST rejects unknown JSON keys with PGRST202/HTTP 404."""
+async def test_s01_refund_payload_matches_grant_credits_signature():
+    """Refund branch: the JSON body sent to /rpc/grant_credits must contain
+    exactly the keys ``grant_credits(p_user_id, p_credits, p_source,
+    p_ref_type, p_ref_id)`` accepts — ``p_expires_at`` is omitted because
+    agent refunds never expire."""
     import httpx  # noqa: PLC0415
 
     from mariana import api as api_mod  # noqa: PLC0415
@@ -195,32 +205,45 @@ async def test_s01_add_credits_payload_no_ref_id():
              patch.object(httpx, "AsyncClient", return_value=client):
             await loop_mod._settle_agent_credits(task, db=pool)
 
-        refunds = [c for c in rpc_calls if "rpc/add_credits" in c["url"]]
+        refunds = [c for c in rpc_calls if "rpc/grant_credits" in c["url"]]
     finally:
         await pool.close()
 
-    assert len(refunds) == 1, f"expected 1 add_credits POST, got {len(refunds)}"
+    assert len(refunds) == 1, (
+        f"expected 1 grant_credits POST, got {len(refunds)}"
+    )
     payload = refunds[0]["json"]
-    assert set(payload.keys()) == {"p_user_id", "p_credits"}, (
-        f"add_credits POST body must contain ONLY 'p_user_id' and 'p_credits'; "
-        f"got keys: {sorted(payload.keys())} — PostgREST rejects unknown keys "
-        f"with PGRST202/HTTP 404"
+    assert set(payload.keys()) == {
+        "p_user_id", "p_credits", "p_source", "p_ref_type", "p_ref_id",
+    }, (
+        f"grant_credits POST body must contain exactly the live signature "
+        f"keys; got keys: {sorted(payload.keys())} — PostgREST rejects "
+        f"unknown keys with PGRST202/HTTP 404"
     )
     assert payload["p_user_id"] == task.user_id
     assert payload["p_credits"] == 470  # 500 reserved - 30 final = 470 refund
+    assert payload["p_source"] == "refund"
+    assert payload["p_ref_type"] == "agent_task"
+    assert payload["p_ref_id"] == task.id
 
 
 # ---------------------------------------------------------------------------
-# 2. deduct_credits payload must contain exactly {target_user_id, amount}.
+# 2. Overrun branch routes through the IDEMPOTENT refund_credits primitive
+#    with payload {p_user_id, p_credits, p_ref_type, p_ref_id}.
 # ---------------------------------------------------------------------------
+#
+# T-01 update: the agent overrun no longer calls the non-idempotent
+# ``deduct_credits(target_user_id, amount)`` low-level RPC.  It now
+# routes through ``refund_credits(p_user_id, p_credits, p_ref_type,
+# p_ref_id)`` (clawback semantics, idempotent on (ref_type, ref_id)).
 
 
 @_pg_only
 @pytest.mark.asyncio
-async def test_s01_deduct_credits_payload_no_ref_id():
+async def test_s01_overrun_payload_matches_refund_credits_signature():
     """Overrun branch: live signature is
-    ``deduct_credits(target_user_id uuid, amount integer)`` — the POST body
-    must have those two keys only, no ``ref_id``."""
+    ``refund_credits(p_user_id uuid, p_credits integer, p_ref_type text,
+    p_ref_id text)`` — the POST body must contain those exact four keys."""
     import httpx  # noqa: PLC0415
 
     from mariana import api as api_mod  # noqa: PLC0415
@@ -241,19 +264,73 @@ async def test_s01_deduct_credits_payload_no_ref_id():
              patch.object(httpx, "AsyncClient", return_value=client):
             await loop_mod._settle_agent_credits(task, db=pool)
 
-        deducts = [c for c in rpc_calls if "rpc/deduct_credits" in c["url"]]
+        deducts = [c for c in rpc_calls if "rpc/refund_credits" in c["url"]]
     finally:
         await pool.close()
 
-    assert len(deducts) == 1, f"expected 1 deduct_credits POST, got {len(deducts)}"
+    assert len(deducts) == 1, (
+        f"expected 1 refund_credits POST, got {len(deducts)}"
+    )
     payload = deducts[0]["json"]
-    assert set(payload.keys()) == {"target_user_id", "amount"}, (
-        f"deduct_credits POST body must contain ONLY 'target_user_id' and "
-        f"'amount'; got keys: {sorted(payload.keys())} — PostgREST rejects "
+    assert set(payload.keys()) == {
+        "p_user_id", "p_credits", "p_ref_type", "p_ref_id",
+    }, (
+        f"refund_credits POST body must contain exactly the live signature "
+        f"keys; got keys: {sorted(payload.keys())} — PostgREST rejects "
         f"unknown keys with PGRST202/HTTP 404"
     )
-    assert payload["target_user_id"] == task.user_id
-    assert payload["amount"] == 150  # spent 250 - reserved 100 = 150 overrun
+    assert payload["p_user_id"] == task.user_id
+    assert payload["p_credits"] == 150  # spent 250 - reserved 100 = 150 overrun
+    assert payload["p_ref_type"] == "agent_task_overrun"
+    assert payload["p_ref_id"] == task.id
+
+
+# ---------------------------------------------------------------------------
+# 2b. Negative shape: the legacy non-idempotent low-level RPCs MUST NOT be
+#     called from agent settlement.  This guards against accidental
+#     reversion to the pre-T-01 routing where a marker-loss became a
+#     double-settlement.
+# ---------------------------------------------------------------------------
+
+
+@_pg_only
+@pytest.mark.asyncio
+async def test_s01_no_legacy_unkeyed_rpc():
+    """Both refund and overrun branches must route through the idempotent
+    primitives — a POST to /rpc/add_credits or /rpc/deduct_credits is a
+    regression of T-01."""
+    import httpx  # noqa: PLC0415
+
+    from mariana import api as api_mod  # noqa: PLC0415
+    from mariana.agent import loop as loop_mod  # noqa: PLC0415
+    from mariana.agent.api_routes import _insert_agent_task  # noqa: PLC0415
+
+    pool = await _open_pool()
+    try:
+        await _ensure_schema(pool)
+        refund_task = _new_task(reserved=500, settled=False, spent_usd=0.30)
+        overrun_task = _new_task(reserved=100, settled=False, spent_usd=2.50)
+        await _insert_agent_task(pool, refund_task)
+        await _insert_agent_task(pool, overrun_task)
+
+        rpc_calls: list[dict[str, Any]] = []
+        client = _ScriptedClient(calls=rpc_calls, status=200)
+        with patch.object(api_mod, "_get_config", lambda: _cfg()), \
+             patch.object(api_mod, "_supabase_api_key", lambda c: "service_role_xxx"), \
+             patch.object(httpx, "AsyncClient", return_value=client):
+            await loop_mod._settle_agent_credits(refund_task, db=pool)
+            await loop_mod._settle_agent_credits(overrun_task, db=pool)
+    finally:
+        await pool.close()
+
+    legacy = [
+        c for c in rpc_calls
+        if "rpc/add_credits" in c["url"] or "rpc/deduct_credits" in c["url"]
+    ]
+    assert legacy == [], (
+        f"agent settlement must NOT call the non-idempotent low-level "
+        f"add_credits/deduct_credits RPCs; got {legacy}"
+    )
 
 
 # ---------------------------------------------------------------------------

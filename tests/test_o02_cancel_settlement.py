@@ -239,7 +239,7 @@ async def test_o02_stop_terminal_for_queued():
 
         # And the settlement helper triggered an add_credits refund for the
         # full reservation (500 reserved, 0 spent → 500 credit refund).
-        refund_calls = [c for c in client.calls if "rpc/add_credits" in c["url"]]
+        refund_calls = [c for c in client.calls if "rpc/grant_credits" in c["url"]]
         assert len(refund_calls) == 1
         body = refund_calls[0]["json"]
         refund = body.get("p_credits") or body.get("credits") or body.get("amount")

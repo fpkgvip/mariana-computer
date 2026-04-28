@@ -404,7 +404,7 @@ async def test_p01_full_race_simulation():
             f"setup: stop endpoint should have made 1 add_credits call; "
             f"got {len(rpc_calls)}"
         )
-        assert "rpc/add_credits" in rpc_calls[0]["url"]
+        assert "rpc/grant_credits" in rpc_calls[0]["url"]
 
         # Step 4: stale worker now resumes and calls run_agent_task with its
         # pre-stop in-memory snapshot.  Without P-01 fix this would clobber
@@ -433,7 +433,7 @@ async def test_p01_full_race_simulation():
     assert final_db.credits_settled is True
 
     # The critical invariant: only the stop endpoint's refund RPC happened.
-    refund_calls = [c for c in rpc_calls if "rpc/add_credits" in c["url"]]
+    refund_calls = [c for c in rpc_calls if "rpc/grant_credits" in c["url"]]
     assert len(refund_calls) == 1, (
         f"P-01: expected exactly ONE add_credits RPC (from stop endpoint); "
         f"got {len(refund_calls)} — stale worker double-refunded"

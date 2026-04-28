@@ -202,7 +202,7 @@ async def test_r01_concurrent_settle_only_one_wins():
                 loop_mod._settle_agent_credits(b, db=pool),
             )
 
-        refund_calls = [c for c in rpc_calls if "rpc/add_credits" in c["url"]]
+        refund_calls = [c for c in rpc_calls if "rpc/grant_credits" in c["url"]]
     finally:
         await pool.close()
 
@@ -260,7 +260,7 @@ async def test_r01_finally_fetch_failure_does_not_double_refund():
         await loop_mod._persist_task(pool, terminal_task)
 
         # Setup sanity: stop endpoint has done its single refund.
-        first_round = [c for c in rpc_calls if "rpc/add_credits" in c["url"]]
+        first_round = [c for c in rpc_calls if "rpc/grant_credits" in c["url"]]
         assert len(first_round) == 1
 
         # Step 3: stale worker snapshot — pretends finally guard fetch
@@ -281,7 +281,7 @@ async def test_r01_finally_fetch_failure_does_not_double_refund():
              patch.object(httpx, "AsyncClient", return_value=client):
             await loop_mod._settle_agent_credits(stale, db=pool)
 
-        all_refunds = [c for c in rpc_calls if "rpc/add_credits" in c["url"]]
+        all_refunds = [c for c in rpc_calls if "rpc/grant_credits" in c["url"]]
     finally:
         await pool.close()
 
@@ -411,7 +411,7 @@ async def test_r01_settle_idempotent_after_completion():
             # function cannot short-circuit on it alone.
             task.credits_settled = False
             await loop_mod._settle_agent_credits(task, db=pool)
-        refunds = [c for c in rpc_calls if "rpc/add_credits" in c["url"]]
+        refunds = [c for c in rpc_calls if "rpc/grant_credits" in c["url"]]
     finally:
         await pool.close()
 
@@ -469,7 +469,7 @@ async def test_r01_full_race_repro():
              patch.object(httpx, "AsyncClient", return_value=client):
             await loop_mod._settle_agent_credits(terminal_task, db=pool)
         await loop_mod._persist_task(pool, terminal_task)
-        assert len([c for c in rpc_calls if "rpc/add_credits" in c["url"]]) == 1
+        assert len([c for c in rpc_calls if "rpc/grant_credits" in c["url"]]) == 1
 
         # Now the worker resumes.  We patch its run_agent_task path so the
         # finally-block fetchrow raises (simulating a transient pool
@@ -489,7 +489,7 @@ async def test_r01_full_race_repro():
              patch.object(httpx, "AsyncClient", return_value=client):
             await loop_mod._settle_agent_credits(stale_worker_view, db=pool)
 
-        all_refunds = [c for c in rpc_calls if "rpc/add_credits" in c["url"]]
+        all_refunds = [c for c in rpc_calls if "rpc/grant_credits" in c["url"]]
         final_row = await _load_agent_task(pool, original.id)
     finally:
         await pool.close()
@@ -549,7 +549,7 @@ async def test_r01_in_memory_credits_settled_no_longer_authoritative():
 
             await loop_mod._settle_agent_credits(fresh, db=pool)
 
-        refunds = [c for c in rpc_calls if "rpc/add_credits" in c["url"]]
+        refunds = [c for c in rpc_calls if "rpc/grant_credits" in c["url"]]
     finally:
         await pool.close()
 

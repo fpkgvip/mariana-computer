@@ -88,6 +88,11 @@ async def reconcile_pending_settlements(
     #
     # ctid is included so the UPDATE only touches rows we explicitly select
     # via the LIMIT subquery (avoids scanning the whole index).
+    #
+    # T-01: also return ``ledger_applied_at`` so the per-row loop can
+    # short-circuit "ledger already applied, only marker is stale" without
+    # re-entering ``_settle_agent_credits`` (which would issue an idempotent
+    # but still wasted RPC round-trip).
     async with db.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -100,19 +105,25 @@ async def reconcile_pending_settlements(
                 LIMIT $2
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING task_id
+            RETURNING task_id, ledger_applied_at
             """,
             str(max_age_seconds),
             batch_size,
         )
-    task_ids = [str(r["task_id"]) for r in rows]
+    candidates = [
+        {
+            "task_id": str(r["task_id"]),
+            "ledger_applied_at": r["ledger_applied_at"],
+        }
+        for r in rows
+    ]
 
-    if not task_ids:
+    if not candidates:
         return 0
 
     logger.info(
         "settlement_reconciler_batch",
-        count=len(task_ids),
+        count=len(candidates),
         max_age_seconds=max_age_seconds,
     )
 
@@ -121,7 +132,31 @@ async def reconcile_pending_settlements(
     from mariana.agent import loop as loop_mod  # noqa: PLC0415
 
     attempted = 0
-    for task_id in task_ids:
+    for cand in candidates:
+        task_id = cand["task_id"]
+
+        # T-01: marker-fixup short-circuit.  ``ledger_applied_at`` is the
+        # durable proof that the ledger RPC has already succeeded for this
+        # claim; the only outstanding work is stamping ``completed_at``.
+        # Re-issuing the ledger RPC here would be wasteful (idempotent
+        # ledger primitives return ``duplicate`` but still consume a
+        # round-trip and emit a confusing log line).
+        if cand["ledger_applied_at"] is not None:
+            try:
+                await loop_mod._mark_settlement_completed(db, task_id)
+                attempted += 1
+                logger.info(
+                    "settlement_reconciler_marker_fixup",
+                    task_id=task_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "settlement_reconciler_marker_fixup_failed",
+                    task_id=task_id,
+                    error=str(exc),
+                )
+            continue
+
         try:
             task = await _load_agent_task_from_row(db, task_id)
         except Exception as exc:  # noqa: BLE001
@@ -142,6 +177,11 @@ async def reconcile_pending_settlements(
         # _settle_agent_credits will set it correctly once the RPC
         # succeeds.  Without this reset the early-exit guard
         # (``if task.credits_settled: return``) would prevent the retry.
+        #
+        # T-01 guard: this branch only runs when ``ledger_applied_at IS
+        # NULL``, i.e. the ledger genuinely has not been mutated yet.
+        # The ``existing_claim`` lookup inside ``_settle_agent_credits``
+        # will re-confirm this from the row before issuing any RPC.
         task.credits_settled = False
         try:
             await loop_mod._settle_agent_credits(task, db=db)

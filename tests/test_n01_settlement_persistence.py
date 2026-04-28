@@ -361,7 +361,7 @@ async def test_n01_round_trip_through_settlement():
              patch.object(httpx, "AsyncClient", return_value=client):
             await _settle_agent_credits(reloaded)
 
-        refund_calls = [c for c in client.calls if "rpc/add_credits" in c["url"]]
+        refund_calls = [c for c in client.calls if "rpc/grant_credits" in c["url"]]
         assert len(refund_calls) == 1, "expected exactly one add_credits refund"
         body = refund_calls[0]["json"]
         refund = body.get("p_credits") or body.get("credits") or body.get("amount")

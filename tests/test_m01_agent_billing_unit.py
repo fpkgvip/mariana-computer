@@ -246,8 +246,8 @@ async def test_settlement_refunds_unused_on_done():
     from mariana.agent.loop import _settle_agent_credits
 
     task = _make_task(reserved=500, spent_usd=0.30, state=AgentState.DONE)
-    add_url = "rpc/add_credits"
-    deduct_url = "rpc/deduct_credits"
+    add_url = "rpc/grant_credits"
+    deduct_url = "rpc/refund_credits"
     client = _ScriptedClient(
         by_path={
             add_url: [_FakeResp(200, True)],
@@ -279,8 +279,8 @@ async def test_settlement_refunds_full_on_failed():
     task = _make_task(reserved=500, spent_usd=0.0, state=AgentState.FAILED)
     client = _ScriptedClient(
         by_path={
-            "rpc/add_credits": [_FakeResp(200, True)],
-            "rpc/deduct_credits": [_FakeResp(200, True)],
+            "rpc/grant_credits": [_FakeResp(200, True)],
+            "rpc/refund_credits": [_FakeResp(200, True)],
         },
     )
 
@@ -289,7 +289,7 @@ async def test_settlement_refunds_full_on_failed():
          patch.object(httpx, "AsyncClient", return_value=client):
         await _settle_agent_credits(task)
 
-    refund_calls = [c for c in client.calls if "rpc/add_credits" in c["url"]]
+    refund_calls = [c for c in client.calls if "rpc/grant_credits" in c["url"]]
     assert len(refund_calls) == 1
     body = refund_calls[0]["json"]
     refund_amount = body.get("p_credits") or body.get("credits") or body.get("amount")
@@ -306,8 +306,8 @@ async def test_settlement_extra_deduct_on_overrun():
     task_eq = _make_task(reserved=500, spent_usd=5.0, state=AgentState.DONE)
     client_eq = _ScriptedClient(
         by_path={
-            "rpc/add_credits": [_FakeResp(200, True)],
-            "rpc/deduct_credits": [_FakeResp(200, True)],
+            "rpc/grant_credits": [_FakeResp(200, True)],
+            "rpc/refund_credits": [_FakeResp(200, True)],
         },
     )
     with patch.object(api_mod, "_get_config", lambda: _cfg()), \
@@ -323,8 +323,8 @@ async def test_settlement_extra_deduct_on_overrun():
     task_over = _make_task(reserved=500, spent_usd=5.4, state=AgentState.DONE)
     client_over = _ScriptedClient(
         by_path={
-            "rpc/add_credits": [_FakeResp(200, True)],
-            "rpc/deduct_credits": [_FakeResp(200, True)],
+            "rpc/grant_credits": [_FakeResp(200, True)],
+            "rpc/refund_credits": [_FakeResp(200, True)],
         },
     )
     with patch.object(api_mod, "_get_config", lambda: _cfg()), \
@@ -332,8 +332,8 @@ async def test_settlement_extra_deduct_on_overrun():
          patch.object(httpx, "AsyncClient", return_value=client_over):
         await _settle_agent_credits(task_over)
 
-    deduct_calls = [c for c in client_over.calls if "rpc/deduct_credits" in c["url"]]
-    refund_calls = [c for c in client_over.calls if "rpc/add_credits" in c["url"]]
+    deduct_calls = [c for c in client_over.calls if "rpc/refund_credits" in c["url"]]
+    refund_calls = [c for c in client_over.calls if "rpc/grant_credits" in c["url"]]
     assert len(deduct_calls) == 1, "expected one deduct_credits call for overrun"
     assert len(refund_calls) == 0, "must not refund when overrun"
     body = deduct_calls[0]["json"]
@@ -350,8 +350,8 @@ async def test_settlement_idempotent():
     task = _make_task(reserved=500, spent_usd=0.30, state=AgentState.DONE)
     client = _ScriptedClient(
         by_path={
-            "rpc/add_credits": [_FakeResp(200, True)],
-            "rpc/deduct_credits": [_FakeResp(200, True)],
+            "rpc/grant_credits": [_FakeResp(200, True)],
+            "rpc/refund_credits": [_FakeResp(200, True)],
         },
     )
     with patch.object(api_mod, "_get_config", lambda: _cfg()), \
@@ -361,7 +361,7 @@ async def test_settlement_idempotent():
         # Second call should be a no-op.
         await _settle_agent_credits(task)
 
-    refund_calls = [c for c in client.calls if "rpc/add_credits" in c["url"]]
+    refund_calls = [c for c in client.calls if "rpc/grant_credits" in c["url"]]
     assert len(refund_calls) == 1, (
         "second settlement must be a noop — credits_settled flag enforces idempotency"
     )

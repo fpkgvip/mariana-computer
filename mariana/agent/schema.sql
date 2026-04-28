@@ -114,5 +114,31 @@ ALTER TABLE agent_settlements
     ADD CONSTRAINT agent_settlements_task_id_fkey
         FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE RESTRICT;
 
+-- T-01: separate "ledger RPC has been applied" from "settlement workflow
+-- complete".  ``completed_at`` previously conflated the two: a successful
+-- ledger RPC followed by a transient failure to stamp ``completed_at``
+-- left the row eligible for reconciler retry, which then re-issued the
+-- ledger RPC against non-idempotent ``add_credits`` / ``deduct_credits``
+-- and caused double-settlement (refund-twice or charge-twice).
+--
+-- The fix routes settlement through the idempotent ledger primitives
+-- ``grant_credits(p_source='refund', p_ref_type='agent_task', p_ref_id=task.id)``
+-- and ``refund_credits(p_ref_type='agent_task_overrun', p_ref_id=task.id)``
+-- (live in NestD; both dedupe on ``(ref_type, ref_id)`` against
+-- ``credit_transactions``), AND it stamps ``ledger_applied_at`` BEFORE
+-- ``completed_at`` so the reconciler can distinguish "ledger mutation
+-- already on disk, just finish the bookkeeping" from "ledger genuinely
+-- failed, retry the RPC".  Defense-in-depth: even if both markers fail
+-- to land, the next RPC would be deduplicated by the ledger.
+ALTER TABLE agent_settlements
+    ADD COLUMN IF NOT EXISTS ledger_applied_at TIMESTAMPTZ;
+
 CREATE INDEX IF NOT EXISTS idx_agent_settlements_completed
     ON agent_settlements(completed_at) WHERE completed_at IS NULL;
+
+-- T-01: index on rows that need bookkeeping cleanup — ledger applied
+-- but completed_at not yet stamped.  The reconciler short-cuts these
+-- without re-issuing the ledger RPC.
+CREATE INDEX IF NOT EXISTS idx_agent_settlements_ledger_applied_pending_complete
+    ON agent_settlements(ledger_applied_at)
+    WHERE completed_at IS NULL AND ledger_applied_at IS NOT NULL;

@@ -631,7 +631,7 @@ async def test_q01_full_race_state_preserved():
     )
     assert final_db.credits_settled is True
 
-    refund_calls = [c for c in rpc_calls if "rpc/add_credits" in c["url"]]
+    refund_calls = [c for c in rpc_calls if "rpc/grant_credits" in c["url"]]
     assert len(refund_calls) == 1, (
         f"Q-01: expected exactly ONE add_credits RPC (from stop endpoint); "
         f"got {len(refund_calls)}"

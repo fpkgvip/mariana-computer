@@ -405,14 +405,45 @@ async def _claim_settlement(
 
 
 async def _mark_settlement_completed(db: Any, task_id: str) -> None:
-    """Stamp ``completed_at`` on the claim row after a successful RPC.
+    """Stamp BOTH ``ledger_applied_at`` (if NULL) and ``completed_at`` on
+    the claim row after a successful ledger RPC.
 
-    Idempotent — a second call is a no-op via the ``IS NULL`` filter.
+    Idempotent — a second call is a no-op via the ``IS NULL`` filter on
+    ``completed_at``.
+
+    T-01: combining both stamps into a single statement closes the window
+    where ``completed_at`` was already set but ``ledger_applied_at`` was
+    not (e.g. on a process that pre-dates the column or rolled back to
+    pre-T-01 code mid-deploy).  ``COALESCE(ledger_applied_at, now())``
+    preserves the original ledger-apply timestamp when it was already
+    stamped by ``_mark_ledger_applied``.
     """
     async with db.acquire() as conn:
         await conn.execute(
-            "UPDATE agent_settlements SET completed_at = now() "
+            "UPDATE agent_settlements "
+            "SET ledger_applied_at = COALESCE(ledger_applied_at, now()), "
+            "    completed_at = now() "
             "WHERE task_id = $1 AND completed_at IS NULL",
+            task_id,
+        )
+
+
+async def _mark_ledger_applied(db: Any, task_id: str) -> None:
+    """Stamp ``ledger_applied_at`` on the claim row immediately after a
+    successful ledger RPC, BEFORE attempting to stamp ``completed_at``.
+
+    T-01: this is the durable proof that the ledger mutation has already
+    happened.  The reconciler treats any row with ``ledger_applied_at IS
+    NOT NULL`` and ``completed_at IS NULL`` as a marker-fixup case — it
+    does NOT re-issue the ledger RPC, it just stamps ``completed_at`` to
+    clear the bookkeeping debt.
+
+    Idempotent under the ``IS NULL`` filter; safe to call repeatedly.
+    """
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_settlements SET ledger_applied_at = now() "
+            "WHERE task_id = $1 AND ledger_applied_at IS NULL",
             task_id,
         )
 
@@ -427,27 +458,40 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
     * No-op if ``credits_settled`` is already True or no credits were reserved.
     * ``delta = final_tokens - reserved`` where ``final_tokens = int(spent_usd * 100)``.
     * ``delta == 0`` → noop, just flip the flag.
-    * ``delta > 0``  → user spent more than reserved → deduct the overrun via
-      the ``deduct_credits`` RPC.
+    * ``delta > 0``  → user spent more than reserved → debit the overrun via
+      the idempotent ``refund_credits`` RPC (clawback semantics keyed on
+      ``ref_type='agent_task_overrun'`` + ``ref_id=task.id``).
     * ``delta < 0``  → reservation exceeded actual cost → refund the unused
-      portion via the ``add_credits`` RPC.
+      portion via the idempotent ``grant_credits`` RPC with
+      ``source='refund'`` keyed on ``ref_type='agent_task'`` + ``ref_id=task.id``.
 
-    S-01: the RPC payloads must match the live PostgREST function signatures
-    exactly — ``add_credits(p_user_id uuid, p_credits integer)`` and
-    ``deduct_credits(target_user_id uuid, amount integer)``.  An earlier
-    revision sent an extra ``ref_id`` JSON key and PostgREST rejected every
-    call with PGRST202 / HTTP 404, silently leaking refunds.  The ``ref_id``
-    string is still computed and used as the ``agent_settlements`` claim-row
-    idempotency key — it just must not be sent to PostgREST.
+    T-01: settlement now routes through the IDEMPOTENT ledger primitives
+    ``grant_credits`` / ``refund_credits`` (live in NestD; both dedupe on
+    ``(ref_type, ref_id)`` against ``credit_transactions``).  This replaces
+    the prior non-idempotent ``add_credits`` / ``deduct_credits`` calls
+    whose only fence was ``agent_settlements.completed_at`` — a single
+    transient marker-write failure after the RPC could leave the row
+    eligible for reconciler retry, double-settling the user.  With
+    idempotent ledger primitives, even a worst-case replay returns
+    ``status='duplicate'`` instead of mutating ``profiles.tokens`` twice.
 
-    S-01 retry contract: an existing claim row is the canonical idempotency
-    anchor.  We look it up FIRST.  If it exists with ``completed_at IS NOT
-    NULL`` we are already settled — flip the in-memory flag and return.
-    If it exists with ``completed_at IS NULL`` we retry the RPC.  If absent,
-    we insert it (race-safe via ON CONFLICT DO NOTHING) and then issue the
-    RPC.  ``task.credits_settled`` only flips to True on RPC 2xx OR
-    pre-completed claim — RPC failure leaves the row in flight for the
-    background reconciler (S-03).
+    T-01: defense in depth — ``agent_settlements.ledger_applied_at`` is
+    stamped immediately after the RPC returns 2xx, in a separate UPDATE
+    from ``completed_at``.  The reconciler treats any row with
+    ``ledger_applied_at IS NOT NULL`` and ``completed_at IS NULL`` as a
+    marker-fixup case: it stamps ``completed_at`` without re-issuing
+    the ledger RPC.  ``task.credits_settled`` only flips to True after
+    ``completed_at`` is durably stamped — the prior code set the in-memory
+    flag on RPC success alone, which let later same-process callers
+    short-circuit before the marker write was confirmed.
+
+    S-01 retry contract (preserved): an existing claim row is the canonical
+    idempotency anchor.  We look it up FIRST.  If it exists with
+    ``completed_at IS NOT NULL`` we are already settled.  If it exists with
+    ``ledger_applied_at IS NOT NULL`` (T-01) we just stamp ``completed_at``
+    and return — the ledger has already been mutated.  If it exists with
+    both timestamps NULL we retry the RPC.  If absent, we insert it
+    (race-safe via ON CONFLICT DO NOTHING) and then issue the RPC.
 
     Late imports avoid the api.py ↔ agent.loop circular import.
     """
@@ -488,7 +532,7 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
         try:
             async with db.acquire() as conn:
                 existing_claim = await conn.fetchrow(
-                    "SELECT delta_credits, completed_at "
+                    "SELECT delta_credits, completed_at, ledger_applied_at "
                     "FROM agent_settlements WHERE task_id = $1",
                     task.id,
                 )
@@ -510,6 +554,29 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
                 task_id=task.id,
                 user_id=task.user_id,
             )
+            return
+
+        # T-01: ledger mutation is already on disk for this claim, only
+        # the bookkeeping marker is stale.  Stamp ``completed_at`` and
+        # exit — do NOT re-issue the ledger RPC.  Even if the ledger is
+        # idempotent on (ref_type, ref_id) we save a wasted round-trip
+        # and avoid emitting a duplicate-status structured log line.
+        if existing_claim is not None and existing_claim["ledger_applied_at"] is not None:
+            try:
+                await _mark_settlement_completed(db, task.id)
+                task.credits_settled = True
+                logger.info(
+                    "agent_credits_settle_marker_fixup",
+                    task_id=task.id,
+                    user_id=task.user_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent_settlement_mark_completed_failed",
+                    task_id=task.id,
+                    error=str(exc),
+                    phase="marker_fixup",
+                )
             return
 
         if existing_claim is None:
@@ -572,8 +639,11 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
     if delta == 0:
         # No RPC needed.  Stamp completed_at inline so the reconciler doesn't
         # pick this up.  When db is None (legacy unit tests), just flip the
-        # in-memory flag.
-        task.credits_settled = True
+        # in-memory flag.  T-01: only flip ``credits_settled`` after the
+        # marker is durably stamped — a swallowed failure here used to
+        # leave the in-memory flag True while the row was reconciler-bait,
+        # and although the noop branch issues no ledger RPC the same
+        # pattern is structurally unsound.
         if db is not None:
             try:
                 await _mark_settlement_completed(db, task.id)
@@ -582,7 +652,13 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
                     "agent_settlement_mark_completed_failed",
                     task_id=task.id,
                     error=str(exc),
+                    phase="noop",
                 )
+                # Leave credits_settled False so the reconciler retries
+                # the marker write.  No ledger RPC was issued so there
+                # is nothing to replay.
+                return
+        task.credits_settled = True
         logger.info(
             "agent_credits_settle_noop",
             task_id=task.id,
@@ -604,14 +680,20 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
         async with httpx.AsyncClient(timeout=10.0) as client:
             if delta > 0:
                 # User spent more than reserved → take the overrun.
-                # S-01: payload keys MUST match the live function signature
-                # ``deduct_credits(target_user_id uuid, amount integer)``.
-                rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/deduct_credits"
+                # T-01: route through idempotent ``refund_credits`` keyed on
+                # ``(ref_type='agent_task_overrun', ref_id=task.id)``.  The
+                # NestD function (a) per-user advisory-lock-serialized,
+                # (b) returns ``status='duplicate'`` if the same
+                # (ref_type, ref_id) was already debited, and (c) handles
+                # FIFO bucket draining + clawback creation atomically.
+                rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/refund_credits"
                 resp = await client.post(
                     rpc_url,
                     json={
-                        "target_user_id": task.user_id,
-                        "amount": delta,
+                        "p_user_id": task.user_id,
+                        "p_credits": delta,
+                        "p_ref_type": "agent_task_overrun",
+                        "p_ref_id": task.id,
                     },
                     headers=headers,
                 )
@@ -638,15 +720,22 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
                     )
             else:
                 # delta < 0 → refund unused reservation.
-                # S-01: payload keys MUST match
-                # ``add_credits(p_user_id uuid, p_credits integer)``.
+                # T-01: route through idempotent ``grant_credits`` with
+                # ``source='refund'`` keyed on
+                # ``(ref_type='agent_task', ref_id=task.id)``.  The NestD
+                # function returns ``status='duplicate'`` for any matching
+                # ``credit_transactions`` row of type 'grant', so a worst-
+                # case replay does NOT mint additional credits.
                 refund = abs(delta)
-                rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/add_credits"
+                rpc_url = f"{cfg.SUPABASE_URL}/rest/v1/rpc/grant_credits"
                 resp = await client.post(
                     rpc_url,
                     json={
                         "p_user_id": task.user_id,
                         "p_credits": refund,
+                        "p_source": "refund",
+                        "p_ref_type": "agent_task",
+                        "p_ref_id": task.id,
                     },
                     headers=headers,
                 )
@@ -684,11 +773,35 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
             error=str(exc),
         )
 
-    # S-01: the in-memory flag and the completed_at stamp move TOGETHER on
-    # RPC success.  On failure both stay unset and the reconciler retries.
+    # T-01: durable two-step finalization.
+    #   1. Stamp ``ledger_applied_at`` immediately so the reconciler can
+    #      tell that the ledger mutation has already happened, even if
+    #      step 2 fails.  ``_mark_ledger_applied`` is idempotent under an
+    #      ``IS NULL`` filter so a re-stamp is a no-op.
+    #   2. Stamp ``completed_at`` (and re-stamp ``ledger_applied_at``
+    #      via COALESCE).  ``task.credits_settled`` only flips to True
+    #      after this completes — prior to T-01 it flipped after step 1
+    #      alone, which let same-process re-entries skip while the row
+    #      was still reconciler-eligible.
+    # If either step raises, the underlying ledger RPCs are now idempotent
+    # on (ref_type, ref_id) so a downstream replay is safe; but in
+    # practice ``ledger_applied_at`` will normally be set after step 1
+    # and the reconciler will short-cut to the marker-fixup path.
     if rpc_succeeded:
-        task.credits_settled = True
         if db is not None:
+            try:
+                await _mark_ledger_applied(db, task.id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent_settlement_mark_ledger_applied_failed",
+                    task_id=task.id,
+                    error=str(exc),
+                )
+                # Do NOT set credits_settled — next caller (worker or
+                # reconciler) must consult the DB row.  The ledger RPCs
+                # are idempotent so a worst-case replay returns
+                # ``status='duplicate'`` rather than mutating tokens.
+                return
             try:
                 await _mark_settlement_completed(db, task.id)
             except Exception as exc:  # noqa: BLE001
@@ -697,6 +810,11 @@ async def _settle_agent_credits(task: AgentTask, db: Any = None) -> None:
                     task_id=task.id,
                     error=str(exc),
                 )
+                # ``ledger_applied_at`` is set; reconciler will pick up
+                # the row via the ledger-applied-pending-complete index
+                # and stamp ``completed_at`` without re-issuing the RPC.
+                return
+        task.credits_settled = True
 
 
 # ---------------------------------------------------------------------------
