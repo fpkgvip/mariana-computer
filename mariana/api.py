@@ -42,6 +42,7 @@ import secrets
 import re
 import signal
 import sys
+import threading
 import time
 import uuid
 import weakref
@@ -2157,6 +2158,82 @@ _CREDIT_USD_RATE: float = 0.01
 async def health_check() -> HealthResponse:
     """Liveness probe — always returns 200 if the process is running."""
     return HealthResponse(status="ok", version=_VERSION)
+
+
+# ---------------------------------------------------------------------------
+# CC-33: minimal Prometheus-style /metrics endpoint, admin-gated
+# ---------------------------------------------------------------------------
+#
+# CC-33 (P4, post-CC-26 re-audit #44 Finding 7) called for an operator metrics
+# surface.  We keep it dependency-free — a tiny in-process counter set + an
+# admin-gated handler that emits Prometheus text format.  Auth-gating with
+# ``Depends(_require_admin)`` is the secure-by-default choice; operators that
+# want unauthenticated scraping should front the API with a network policy /
+# reverse proxy that exposes only their internal subnet.
+_metrics_lock = threading.Lock()
+_metrics_counters: dict[str, int] = {
+    "http_requests_total": 0,
+    "http_errors_total": 0,
+    "http_5xx_total": 0,
+}
+_metrics_started_at = time.time()
+
+
+@app.middleware("http")
+async def _metrics_middleware(request: Request, call_next):
+    """Count every HTTP request + error for the /metrics endpoint.
+
+    Skip self-instrumentation for ``/metrics`` so a Prometheus scrape does
+    not inflate its own counters.
+    """
+    is_metrics = request.url.path == "/metrics"
+    try:
+        response = await call_next(request)
+    except Exception:
+        if not is_metrics:
+            with _metrics_lock:
+                _metrics_counters["http_requests_total"] += 1
+                _metrics_counters["http_errors_total"] += 1
+                _metrics_counters["http_5xx_total"] += 1
+        raise
+    if not is_metrics:
+        with _metrics_lock:
+            _metrics_counters["http_requests_total"] += 1
+            if response.status_code >= 400:
+                _metrics_counters["http_errors_total"] += 1
+            if response.status_code >= 500:
+                _metrics_counters["http_5xx_total"] += 1
+    return response
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics_endpoint(
+    _: dict[str, str] = Depends(_require_admin),
+) -> Response:
+    """Prometheus-format metrics, admin-gated.
+
+    Returns counters for total requests, 4xx and 5xx errors, and process
+    uptime in seconds.  No PII, no per-route labels (cardinality safe).
+    """
+    uptime = max(0.0, time.time() - _metrics_started_at)
+    with _metrics_lock:
+        snapshot = dict(_metrics_counters)
+    lines = [
+        "# HELP http_requests_total Total HTTP requests handled",
+        "# TYPE http_requests_total counter",
+        f"http_requests_total {snapshot['http_requests_total']}",
+        "# HELP http_errors_total Total HTTP responses with status >= 400",
+        "# TYPE http_errors_total counter",
+        f"http_errors_total {snapshot['http_errors_total']}",
+        "# HELP http_5xx_total Total HTTP responses with status >= 500",
+        "# TYPE http_5xx_total counter",
+        f"http_5xx_total {snapshot['http_5xx_total']}",
+        "# HELP process_uptime_seconds Process uptime in seconds",
+        "# TYPE process_uptime_seconds gauge",
+        f"process_uptime_seconds {uptime:.3f}",
+        "",
+    ]
+    return Response(content="\n".join(lines), media_type="text/plain; version=0.0.4")
 
 
 @app.get("/api/config", response_model=ConfigResponse, tags=["Status"])
