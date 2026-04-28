@@ -92,7 +92,7 @@ jobs:
           pip install -r requirements.txt
           # Test-only deps not pinned in requirements.txt.  Match the
           # versions the local dev image already uses.
-          pip install pytest pytest-asyncio pytest-timeout psycopg2-binary
+          pip install pytest pytest-asyncio pytest-timeout psycopg2-binary "psycopg[binary]"
 
       - name: Install psql client
         run: |
