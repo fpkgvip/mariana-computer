@@ -6092,6 +6092,7 @@ async def _grant_credits_for_event(
     pi_id: str | None = None,
     charge_id: str | None = None,
     charge_amount: int | None = None,
+    stripe_charge: dict[str, Any] | None = None,
 ) -> None:
     """Idempotent grant via the ledger RPC. ``ref_id`` should be the Stripe event id.
 
@@ -6105,6 +6106,14 @@ async def _grant_credits_for_event(
     K-01: charge_amount (Stripe charge.amount in cents) is persisted on the
     grant row so partial-amount disputes can compute pro-rata reversal. The
     column is nullable on legacy rows where the value was not captured.
+
+    U-01: After the grant mapping insert, this function reconciles any
+    out-of-order ``stripe_pending_reversals`` rows targeting the same
+    payment_intent / charge. ``stripe_charge`` is an optional Stripe Charge
+    payload — when provided and its ``refunded`` / ``amount_refunded`` /
+    ``disputed`` flags indicate the charge was already reversed before the
+    grant was committed, a synthetic refund event is replayed against the
+    same codepath as a defensive double-check.
     """
     from mariana.billing.ledger import grant_credits as _grant_rpc, LedgerError
 
@@ -6201,6 +6210,69 @@ async def _grant_credits_for_event(
             )
             raise HTTPException(
                 status_code=503, detail="Credit grant mapping failed"
+            )
+
+        # U-01: defensive double-coverage at grant time.
+        # Stripe's Charge object exposes ``refunded`` / ``amount_refunded``
+        # and ``disputed`` flags. If the charge was already refunded or
+        # disputed before the grant landed (the OOO race window), ensure
+        # a synthetic refund event is recorded as pending so the
+        # reconciliation pass below picks it up. The pending row is keyed
+        # on a deterministic synthetic event_id derived from the grant
+        # ref_id so retries collapse via the UNIQUE(event_id) index.
+        if stripe_charge is not None and pi_id:
+            already_refunded = bool(stripe_charge.get("refunded")) or int(
+                stripe_charge.get("amount_refunded") or 0
+            ) > 0
+            already_disputed = bool(stripe_charge.get("disputed"))
+            if already_refunded or already_disputed:
+                synthetic_event_id = f"defensive:{ref_id}:reversal"
+                synthetic_charge: dict[str, Any] = {
+                    "id": stripe_charge.get("id") or charge_id,
+                    "payment_intent": pi_id,
+                    "amount": int(stripe_charge.get("amount") or charge_amount or 0),
+                    "amount_refunded": int(
+                        stripe_charge.get("amount_refunded")
+                        or (stripe_charge.get("amount") if already_refunded else 0)
+                        or 0
+                    ),
+                    "currency": stripe_charge.get("currency") or "usd",
+                }
+                kind_for_record = "refund" if already_refunded else "dispute_created"
+                synthetic_event_type = (
+                    "charge.refunded" if already_refunded else "charge.dispute.created"
+                )
+                logger.warning(
+                    "grant_time_charge_already_reversed_defensive",
+                    pi_id=pi_id,
+                    charge_id=charge_id,
+                    ref_id=ref_id,
+                    refunded=already_refunded,
+                    disputed=already_disputed,
+                )
+                await _record_pending_reversal(
+                    charge_obj=synthetic_charge,
+                    dispute_obj=None,
+                    event_id=synthetic_event_id,
+                    event_type=synthetic_event_type,
+                    cfg=cfg,
+                )
+                # Override the kind so the replay path picks the right
+                # event_type. _record_pending_reversal already handles
+                # this via _classify_reversal_kind, but the dispute
+                # branch here cannot synthesize a dispute object, so it
+                # falls through to the refund path which is the
+                # conservative reversal anyway.
+                _ = kind_for_record  # silence linters
+
+        # U-01: reconcile any pending reversals that arrived BEFORE this
+        # grant. The replay routes through process_charge_reversal which
+        # is idempotent on stripe_dispute_reversals.reversal_key, so
+        # Stripe-replay of either the original reversal event or this
+        # grant event cannot double-debit.
+        if pi_id or charge_id:
+            await _reconcile_pending_reversals_for_grant(
+                pi_id=pi_id, charge_id=charge_id, cfg=cfg
             )
 
 
@@ -6567,6 +6639,269 @@ async def _sum_reversed_credits_for_charge(charge_id: str, cfg: AppConfig) -> in
     return sum(int(r.get("credits") or 0) for r in rows)
 
 
+# ---------------------------------------------------------------------------
+# U-01: pending-reversal parking lot for out-of-order Stripe events.
+# ---------------------------------------------------------------------------
+
+
+def _classify_reversal_kind(
+    event_type: str,
+    dispute_obj: dict[str, Any] | None,
+) -> str:
+    if dispute_obj is not None:
+        if event_type == "charge.dispute.funds_withdrawn":
+            return "dispute_funds_withdrawn"
+        return "dispute_created"
+    return "refund"
+
+
+async def _record_pending_reversal(
+    *,
+    charge_obj: dict[str, Any],
+    dispute_obj: dict[str, Any] | None,
+    event_id: str,
+    event_type: str,
+    cfg: AppConfig,
+) -> None:
+    """Persist an out-of-order reversal request for later reconciliation.
+
+    U-01: Stripe explicitly does not guarantee event ordering. When a
+    charge.refunded or charge.dispute.* event lands before the
+    stripe_payment_grants mapping row exists, the original code logged
+    ``charge_reversal_no_grant_found`` and returned success — the outer
+    dispatcher then marked the event 'completed' so Stripe stopped
+    retrying. The later-arriving grant was credited but never reversed.
+
+    The pending row is keyed on event_id (UNIQUE) so Stripe-replay of the
+    same OOO reversal collapses at insert time. When the grant eventually
+    arrives, ``_reconcile_pending_reversals_for_grant`` replays each
+    matching pending row through the standard ``process_charge_reversal``
+    RPC and stamps ``applied_at``.
+    """
+    api_key = _supabase_api_key(cfg)
+    if not cfg.SUPABASE_URL or not api_key:
+        # Without Supabase configured we cannot persist anything; surface
+        # the same 503 the rest of the webhook surface raises so Stripe
+        # retries the event instead of treating no-grant as success.
+        logger.error(
+            "pending_reversal_supabase_unconfigured",
+            event_id=event_id,
+        )
+        raise HTTPException(status_code=503, detail="Reversal parking unavailable")
+
+    pi_id: str | None = charge_obj.get("payment_intent")
+    charge_id: str | None = charge_obj.get("id")
+    amount_cents = int(charge_obj.get("amount_refunded") or charge_obj.get("amount") or 0)
+    currency = charge_obj.get("currency") or "usd"
+    raw_event: dict[str, Any] = {"charge": charge_obj}
+    if dispute_obj is not None:
+        raw_event["dispute"] = dispute_obj
+
+    payload: dict[str, Any] = {
+        "event_id": event_id,
+        "charge_id": charge_id,
+        "payment_intent_id": pi_id,
+        "kind": _classify_reversal_kind(event_type, dispute_obj),
+        "amount_cents": amount_cents,
+        "currency": currency,
+        "raw_event": raw_event,
+    }
+    headers = {
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        # event_id is UNIQUE — replays collapse to a 2xx with empty body.
+        "Prefer": "resolution=ignore-duplicates,return=minimal",
+    }
+    url = f"{cfg.SUPABASE_URL}/rest/v1/stripe_pending_reversals"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "pending_reversal_insert_transport_error",
+            event_id=event_id,
+            error=str(exc),
+        )
+        raise HTTPException(status_code=503, detail="Reversal parking failed") from exc
+    if resp.status_code not in {200, 201, 204}:
+        body_text = (getattr(resp, "text", "") or "")[:500]
+        logger.error(
+            "pending_reversal_insert_failed",
+            event_id=event_id,
+            status=resp.status_code,
+            body=body_text,
+        )
+        raise HTTPException(status_code=503, detail="Reversal parking failed")
+
+
+async def _fetch_pending_reversals_for_grant(
+    *,
+    pi_id: str | None,
+    charge_id: str | None,
+    cfg: AppConfig,
+) -> list[dict[str, Any]]:
+    """Return unapplied stripe_pending_reversals rows matching either the
+    payment_intent_id or charge_id of a freshly inserted grant.
+    """
+    api_key = _supabase_api_key(cfg)
+    if not cfg.SUPABASE_URL or not api_key:
+        return []
+    headers = {
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
+    }
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    base = f"{cfg.SUPABASE_URL}/rest/v1/stripe_pending_reversals"
+    queries: list[str] = []
+    if pi_id:
+        queries.append(f"?payment_intent_id=eq.{pi_id}&applied_at=is.null&select=*")
+    if charge_id:
+        queries.append(f"?charge_id=eq.{charge_id}&applied_at=is.null&select=*")
+    if not queries:
+        return []
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        for q in queries:
+            try:
+                resp = await client.get(base + q, headers=headers)
+            except httpx.HTTPError as exc:
+                logger.error(
+                    "pending_reversal_fetch_network_error",
+                    pi_id=pi_id,
+                    charge_id=charge_id,
+                    error=str(exc),
+                )
+                return rows
+            if resp.status_code != 200:
+                continue
+            try:
+                body = resp.json() or []
+            except (ValueError, TypeError):
+                body = []
+            if not isinstance(body, list):
+                # Defensive: REST endpoint should return an array, but
+                # mocks/test fixtures sometimes return a dict. Treat
+                # anything other than a list as no pending rows.
+                continue
+            for row in body:
+                if not isinstance(row, dict):
+                    continue
+                ev = row.get("event_id")
+                if ev and ev not in seen:
+                    seen.add(ev)
+                    rows.append(row)
+    return rows
+
+
+async def _mark_pending_reversal_applied(
+    *,
+    event_id: str,
+    cfg: AppConfig,
+) -> None:
+    api_key = _supabase_api_key(cfg)
+    if not cfg.SUPABASE_URL or not api_key:
+        return
+    headers = {
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    url = (
+        f"{cfg.SUPABASE_URL}/rest/v1/stripe_pending_reversals"
+        f"?event_id=eq.{event_id}"
+    )
+    payload = {"applied_at": datetime.now(tz=timezone.utc).isoformat()}
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.patch(url, json=payload, headers=headers)
+    except httpx.HTTPError as exc:
+        logger.error(
+            "pending_reversal_mark_applied_network_error",
+            event_id=event_id,
+            error=str(exc),
+        )
+        return
+    if resp.status_code not in {200, 204}:
+        logger.error(
+            "pending_reversal_mark_applied_failed",
+            event_id=event_id,
+            status=resp.status_code,
+        )
+
+
+async def _reconcile_pending_reversals_for_grant(
+    *,
+    pi_id: str | None,
+    charge_id: str | None,
+    cfg: AppConfig,
+) -> None:
+    """Replay any out-of-order reversal events parked while the grant
+    mapping was missing.
+
+    Called immediately after a successful insert into stripe_payment_grants
+    so the same logical transaction that creates the grant also retires
+    pending reversals targeting it. The replay routes through the standard
+    ``_reverse_credits_for_charge`` codepath, which terminates at the K-02
+    ``process_charge_reversal`` RPC — so dedup, advisory locks, and
+    pro-rata math are unchanged.
+    """
+    rows = await _fetch_pending_reversals_for_grant(
+        pi_id=pi_id, charge_id=charge_id, cfg=cfg
+    )
+    for row in rows:
+        raw = row.get("raw_event") or {}
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, ValueError):
+                raw = {}
+        charge_payload = raw.get("charge") or {}
+        dispute_payload = raw.get("dispute")
+        kind = row.get("kind") or "refund"
+        if kind == "refund":
+            replay_event_type = "charge.refunded"
+            refund_event_id_for_key: str | None = row.get("event_id")
+        elif kind == "dispute_funds_withdrawn":
+            replay_event_type = "charge.dispute.funds_withdrawn"
+            refund_event_id_for_key = None
+        else:
+            replay_event_type = "charge.dispute.created"
+            refund_event_id_for_key = None
+        try:
+            await _reverse_credits_for_charge(
+                charge_payload,
+                cfg,
+                event_id=row.get("event_id") or "",
+                dispute_obj=dispute_payload,
+                event_type=replay_event_type,
+                refund_event_id=refund_event_id_for_key,
+            )
+        except HTTPException:
+            # Re-raise: the outer webhook handler will return 500 and
+            # Stripe will retry the grant-creating event. The pending
+            # row stays unapplied for the next attempt.
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "pending_reversal_replay_failed",
+                event_id=row.get("event_id"),
+                error=str(exc),
+            )
+            raise
+        await _mark_pending_reversal_applied(
+            event_id=row.get("event_id") or "", cfg=cfg
+        )
+        logger.info(
+            "pending_reversal_applied",
+            event_id=row.get("event_id"),
+            charge_id=row.get("charge_id"),
+            payment_intent_id=row.get("payment_intent_id"),
+            kind=kind,
+        )
+
+
 async def _reverse_credits_for_charge(
     charge_obj: dict[str, Any],
     cfg: AppConfig,
@@ -6605,10 +6940,25 @@ async def _reverse_credits_for_charge(
 
     grant_tx = await _lookup_grant_tx_for_payment_intent(pi_id, cfg)
     if grant_tx is None:
+        # U-01: Stripe does not guarantee delivery ordering between
+        # charge.refunded / charge.dispute.* and the charge.succeeded /
+        # payment_intent.succeeded event that creates the
+        # stripe_payment_grants mapping row. Persist a pending reversal
+        # request keyed on event_id; the grant-insert path reconciles it
+        # via the same process_charge_reversal RPC when the grant
+        # eventually arrives.
+        await _record_pending_reversal(
+            charge_obj=charge_obj,
+            dispute_obj=dispute_obj,
+            event_id=event_id,
+            event_type=event_type,
+            cfg=cfg,
+        )
         logger.warning(
             "charge_reversal_no_grant_found",
             pi_id=pi_id,
             event_id=event_id,
+            recorded_pending=True,
         )
         return
 
