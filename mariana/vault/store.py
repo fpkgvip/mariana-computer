@@ -133,7 +133,9 @@ class SecretRecord:
 # Validation helpers
 # -----------------------------------------------------------------------------
 
-_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+# CC-09: anchor with \Z (not $) — Python's $ matches before a trailing \n,
+# allowing a poisoned name like "FOO\n" to bypass shape validation.
+_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}\Z")
 
 
 def _validate_name(name: str) -> None:
