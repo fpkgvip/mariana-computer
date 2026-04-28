@@ -26,7 +26,11 @@ logger = structlog.get_logger(__name__)
 # H-03: reject any user_id that isn't the plain UUID/alphanumeric shape we
 # actually hand out.  Path separators, NUL, leading dots, etc., are all
 # rejected so the joined directory can't escape DATA_ROOT/memory.
-_USER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,127}$")
+# CC-10: anchor with \Z, not $.  Python's $ matches before a trailing \n, so
+# a poisoned user_id like "abc\n" would slip through shape validation and
+# reach the joined memory path / log layer.  \Z anchors strictly to
+# end-of-string.
+_USER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,127}\Z")
 
 # H-02: keep injected context bounded and defanged before it reaches the LLM.
 _MEMORY_CONTEXT_MAX_CHARS = 5000

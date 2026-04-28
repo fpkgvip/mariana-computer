@@ -94,8 +94,12 @@ SANDBOX_UID = 1000
 SANDBOX_GID = 100  # `users` group
 
 # Identifier validation (user_id, path components)
-_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,127}$")
-_PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._\- ]{0,254}$")
+# CC-10: anchor with \Z, not $.  Python's $ matches before a trailing \n, so
+# a poisoned identifier like "abc\n" or "file.txt\n" would slip through shape
+# validation and could be embedded in the joined workspace path.  \Z anchors
+# strictly to end-of-string.
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,127}\Z")
+_PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._\- ]{0,254}\Z")
 
 
 def _valid_user_id(uid: str) -> bool:
@@ -203,7 +207,8 @@ class ExecRequest(BaseModel):
         if len(v) > 32:
             raise ValueError("too many env vars (max 32)")
         for k, val in v.items():
-            if not re.match(r"^[A-Z_][A-Z0-9_]{0,63}$", k):
+            # CC-10: \Z (not $) so a poisoned key like "FOO\n" cannot pass.
+            if not re.match(r"^[A-Z_][A-Z0-9_]{0,63}\Z", k):
                 raise ValueError(f"invalid env var name: {k!r}")
             if len(val) > 4096:
                 raise ValueError(f"env var {k!r} value too long")

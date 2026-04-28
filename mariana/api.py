@@ -1665,7 +1665,10 @@ try:
 
     _PREVIEW_ROOT_PATH = _PathPv(os.environ.get("DEFT_PREVIEW_ROOT", "/var/lib/deft/preview"))
     _PREVIEW_ROOT_PATH.mkdir(parents=True, exist_ok=True)
-    _SAFE_PREVIEW_TASK = _re_preview.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+    # CC-10: anchor with \Z, not $.  Python's $ matches before a trailing \n,
+    # so a poisoned task_id like "abc\n" would slip through this gate and be
+    # joined into the on-disk preview path / signed cookie scope.
+    _SAFE_PREVIEW_TASK = _re_preview.compile(r"^[A-Za-z0-9_\-]{1,64}\Z")
 
     def _read_preview_manifest(task_id: str) -> dict[str, Any] | None:
         """Return the parsed manifest for a deployed preview, or None."""
