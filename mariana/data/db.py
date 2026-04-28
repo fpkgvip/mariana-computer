@@ -130,6 +130,46 @@ CREATE TABLE IF NOT EXISTS research_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_research_tasks_user_id ON research_tasks(user_id);
 
+-- Y-01: idempotent backfill so existing deployments gain the
+-- ``credits_settled`` flag.  ``CREATE TABLE IF NOT EXISTS`` does not add
+-- columns to a pre-existing table, so we ALTER explicitly.  Default
+-- FALSE means tasks created before this column landed are treated as
+-- not-yet-settled — they have no claim row in ``research_settlements``
+-- so the new settlement path will create one on first call.
+ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS credits_settled BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Y-01: DB-atomic settlement claim row for the legacy investigation
+-- (research-task) settlement path.  Mirrors ``agent_settlements`` from
+-- ``mariana/agent/schema.sql`` (T-01) so the legacy investigation
+-- pipeline gains the same once-only fence agent-mode tasks already
+-- enjoy.  Each ``research_tasks`` row can be settled at most once; the
+-- (task_id) primary key plus INSERT...ON CONFLICT DO NOTHING enforces
+-- this regardless of process-local in-memory flags or any race between
+-- the daemon's success / interrupt / exception paths and a stale
+-- ``.running`` resume.  After the ledger RPC returns 2xx, the row gets
+-- ``ledger_applied_at`` stamped; only then is ``completed_at`` written.
+-- The reconciler short-cuts any row with ``ledger_applied_at IS NOT
+-- NULL`` and ``completed_at IS NULL`` to a marker fix-up — never
+-- re-issuing the ledger RPC.
+CREATE TABLE IF NOT EXISTS research_settlements (
+    task_id            TEXT PRIMARY KEY REFERENCES research_tasks(id) ON DELETE RESTRICT,
+    user_id            TEXT NOT NULL,
+    reserved_credits   BIGINT NOT NULL CHECK (reserved_credits >= 0),
+    final_credits      BIGINT NOT NULL CHECK (final_credits >= 0),
+    delta_credits      BIGINT NOT NULL,
+    ref_id             TEXT NOT NULL,
+    claimed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ledger_applied_at  TIMESTAMPTZ,
+    completed_at       TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_settlements_completed
+    ON research_settlements(completed_at) WHERE completed_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_research_settlements_ledger_applied_pending_complete
+    ON research_settlements(ledger_applied_at)
+    WHERE completed_at IS NULL AND ledger_applied_at IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS hypotheses (
     id              TEXT        PRIMARY KEY,
     task_id         TEXT        NOT NULL REFERENCES research_tasks(id) ON DELETE CASCADE,

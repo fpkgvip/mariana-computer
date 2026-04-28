@@ -237,10 +237,16 @@ async def test_legacy_investigation_quantize():
         total_with_markup = 0.305
         total_spent = 0.305 / 1.20
 
+    # Y-01: legacy investigation settlement now routes through the
+    # idempotent ``refund_credits`` (overrun) / ``grant_credits``
+    # (refund) RPCs instead of the unkeyed ``add_credits`` /
+    # ``deduct_credits``.  This test still asserts the U-02 quantization
+    # contract — the rounding mode and helper are unchanged — but on
+    # the new RPC surface.
     client = _ScriptedClient(
         by_path={
-            "rpc/deduct_credits": [_FakeResp(200, True)],
-            "rpc/add_credits": [_FakeResp(200, True)],
+            "rpc/refund_credits": [_FakeResp(200, True)],
+            "rpc/grant_credits": [_FakeResp(200, True)],
         }
     )
 
@@ -252,15 +258,16 @@ async def test_legacy_investigation_quantize():
             reserved_credits=0,
         )
 
-    deduct_calls = [c for c in client.calls if "rpc/deduct_credits" in c["url"]]
-    assert len(deduct_calls) == 1, (
-        f"expected one deduct_credits call; got {len(deduct_calls)}"
+    # delta_tokens = 31 - 0 = +31 → overrun path → refund_credits.
+    overrun_calls = [c for c in client.calls if "rpc/refund_credits" in c["url"]]
+    assert len(overrun_calls) == 1, (
+        f"expected one refund_credits call; got {len(overrun_calls)}"
     )
-    body = deduct_calls[0]["json"]
-    amount = body.get("amount")
+    body = overrun_calls[0]["json"]
+    amount = body.get("p_credits")
     assert amount == 31, (
         f"legacy settlement must quantize $0.305 to 31 credits via "
-        f"ROUND_HALF_UP; got amount={amount}.  The pre-fix int() "
+        f"ROUND_HALF_UP; got p_credits={amount}.  The pre-fix int() "
         f"truncation produces 30."
     )
 

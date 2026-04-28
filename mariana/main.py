@@ -409,16 +409,107 @@ async def _run_kill_task(db: Any, task_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+async def _claim_research_settlement(
+    db: Any,
+    *,
+    task_id: str,
+    user_id: str,
+    reserved_credits: int,
+    final_credits: int,
+    delta_credits: int,
+    ref_id: str,
+) -> bool:
+    """Atomically claim the right to settle this research task.
+
+    Y-01: mirrors the agent-side ``_claim_settlement`` (R-01).  Returns True
+    iff the INSERT landed (this caller owns settlement) and False if a
+    previous caller already owns it (short-circuit).
+    """
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO research_settlements (
+                task_id, user_id, reserved_credits, final_credits,
+                delta_credits, ref_id
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (task_id) DO NOTHING
+            RETURNING task_id
+            """,
+            task_id,
+            user_id,
+            reserved_credits,
+            final_credits,
+            delta_credits,
+            ref_id,
+        )
+    return row is not None
+
+
+async def _mark_research_ledger_applied(db: Any, task_id: str) -> None:
+    """Stamp ``ledger_applied_at`` on the claim row immediately after a 2xx
+    ledger RPC, BEFORE attempting to stamp ``completed_at``.
+
+    Y-01 / T-01: this is the durable proof that the ledger mutation has
+    already happened.  The reconciler treats any row with
+    ``ledger_applied_at IS NOT NULL`` and ``completed_at IS NULL`` as a
+    marker-fixup case and does NOT re-issue the ledger RPC.
+    """
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE research_settlements SET ledger_applied_at = now() "
+            "WHERE task_id = $1 AND ledger_applied_at IS NULL",
+            task_id,
+        )
+
+
+async def _mark_research_settlement_completed(db: Any, task_id: str) -> None:
+    """Stamp BOTH ``ledger_applied_at`` (if NULL) and ``completed_at`` on
+    the claim row.  Idempotent under the ``completed_at IS NULL`` filter.
+
+    Also flips ``research_tasks.credits_settled`` to TRUE so a stale
+    daemon resume short-circuits on the in-row flag before even touching
+    the claim row.
+    """
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE research_settlements "
+                "SET ledger_applied_at = COALESCE(ledger_applied_at, now()), "
+                "    completed_at = now() "
+                "WHERE task_id = $1 AND completed_at IS NULL",
+                task_id,
+            )
+            await conn.execute(
+                "UPDATE research_tasks SET credits_settled = TRUE "
+                "WHERE id = $1 AND credits_settled = FALSE",
+                task_id,
+            )
+
+
 async def _deduct_user_credits(
     user_id: str,
     cost_tracker: Any,
     config: Config,
     reserved_credits: int = 0,
+    *,
+    task_id: str | None = None,
+    db: Any = None,
 ) -> None:
     """Settle the user's final credit balance after investigation.
 
-    If credits were reserved at submission time, only the delta versus the final
-    actual cost is applied here: refund unused credits or deduct any overage.
+    If credits were reserved at submission time, only the delta versus the
+    final actual cost is applied here: refund unused credits or deduct any
+    overage.
+
+    Y-01 fix: when ``task_id`` and ``db`` are provided, this function
+    routes through the idempotent ``research_settlements`` claim row +
+    ``grant_credits`` / ``refund_credits`` keyed on
+    ``(ref_type, ref_id=task_id)``.  Same once-only fence agent-mode tasks
+    enjoy under T-01.  Calls without ``task_id`` / ``db`` (legacy
+    callers, including older single-mode CLI invocations) skip the claim
+    row but still use the keyed idempotent RPCs so worst-case replay
+    returns ``status='duplicate'`` from the ledger rather than a real
+    second mutation.
     """
     if not user_id:
         return
@@ -438,11 +529,101 @@ async def _deduct_user_credits(
     total_with_markup = getattr(cost_tracker, "total_with_markup", cost_tracker.total_spent * 1.20)
     final_tokens = usd_to_credits(total_with_markup)
     delta_tokens = final_tokens - reserved_credits
+    refund_tokens = abs(delta_tokens)
+
+    # Y-01: existing-claim lookup is the entry point when we have a
+    # ``task_id`` + ``db``.  Mirrors T-01's structure exactly.
+    if task_id and db is not None:
+        try:
+            async with db.acquire() as conn:
+                existing = await conn.fetchrow(
+                    "SELECT completed_at, ledger_applied_at "
+                    "FROM research_settlements WHERE task_id = $1",
+                    task_id,
+                )
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logger.error(
+                "credit_settlement_claim_lookup_failed",
+                user_id=user_id,
+                task_id=task_id,
+                error=str(exc),
+            )
+            return
+
+        if existing is not None and existing["completed_at"] is not None:
+            logger.info(
+                "credit_settlement_already_completed",
+                user_id=user_id,
+                task_id=task_id,
+            )
+            return
+
+        if existing is not None and existing["ledger_applied_at"] is not None:
+            try:
+                await _mark_research_settlement_completed(db, task_id)
+                logger.info(
+                    "credit_settlement_marker_fixup",
+                    user_id=user_id,
+                    task_id=task_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "credit_settlement_mark_completed_failed",
+                    user_id=user_id,
+                    task_id=task_id,
+                    error=str(exc),
+                    phase="marker_fixup",
+                )
+            return
+
+        if existing is None:
+            try:
+                won = await _claim_research_settlement(
+                    db,
+                    task_id=task_id,
+                    user_id=user_id,
+                    reserved_credits=max(0, reserved_credits),
+                    final_credits=max(0, final_tokens),
+                    delta_credits=delta_tokens,
+                    ref_id=f"research_settle:{task_id}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "credit_settlement_claim_error",
+                    user_id=user_id,
+                    task_id=task_id,
+                    error=str(exc),
+                )
+                return
+            if not won:
+                # Lost the race; another caller is settling.  Re-fetch
+                # and exit gracefully — they will succeed or the
+                # reconciler picks up the row.
+                logger.info(
+                    "credit_settlement_claim_lost",
+                    user_id=user_id,
+                    task_id=task_id,
+                )
+                return
 
     if delta_tokens == 0:
+        # No RPC needed.  Stamp completed_at inline so the reconciler
+        # does not pick this up.
+        if task_id and db is not None:
+            try:
+                await _mark_research_settlement_completed(db, task_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "credit_settlement_mark_completed_failed",
+                    user_id=user_id,
+                    task_id=task_id,
+                    error=str(exc),
+                    phase="noop",
+                )
         logger.info(
             "credit_settlement_noop",
             user_id=user_id,
+            task_id=task_id,
             reserved_credits=reserved_credits,
             final_tokens=final_tokens,
         )
@@ -455,64 +636,120 @@ async def _deduct_user_credits(
         "Authorization": f"Bearer {_api_key}",
         "Content-Type": "application/json",
     }
+    rpc_succeeded = False
+    # Y-01: when no task_id is available (legacy CLI / unit-test calls
+    # without DB wiring), fall back to a synthetic ref_id derived from
+    # user_id + final cost.  Worst-case replay would still be deduped by
+    # ``credit_transactions.(ref_type, ref_id)`` but the synthetic ref
+    # is unique per call so this path provides best-effort idempotency
+    # only.  The DB-wired path (task_id + db) is the canonical fix.
+    _ref_id = task_id or f"research_settle:{user_id}:{final_tokens}"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             if delta_tokens > 0:
-                rpc_url = f"{config.SUPABASE_URL}/rest/v1/rpc/deduct_credits"
+                # Overrun — claw back via idempotent ``refund_credits``
+                # keyed on (ref_type='research_task_overrun', ref_id=task_id).
+                rpc_url = f"{config.SUPABASE_URL}/rest/v1/rpc/refund_credits"
                 resp = await client.post(
                     rpc_url,
-                    json={"target_user_id": user_id, "amount": delta_tokens},
+                    json={
+                        "p_user_id": user_id,
+                        "p_credits": delta_tokens,
+                        "p_ref_type": "research_task_overrun",
+                        "p_ref_id": _ref_id,
+                    },
                     headers=headers,
                 )
                 if resp.status_code in (200, 204):
+                    rpc_succeeded = True
                     logger.info(
-                        "credits_settled_by_extra_deduction",
+                        "credit_settlement_overrun_ok",
                         user_id=user_id,
+                        task_id=task_id,
                         reserved_credits=reserved_credits,
                         final_tokens=final_tokens,
                         extra_deducted=delta_tokens,
                     )
-                    return
-                logger.error(
-                    "credit_settlement_extra_deduction_failed",
-                    user_id=user_id,
-                    status=resp.status_code,
-                    reserved_credits=reserved_credits,
-                    final_tokens=final_tokens,
+                else:
+                    logger.error(
+                        "credit_settlement_overrun_failed",
+                        user_id=user_id,
+                        task_id=task_id,
+                        status=resp.status_code,
+                        reserved_credits=reserved_credits,
+                        final_tokens=final_tokens,
+                    )
+            else:
+                # Refund unused reservation via idempotent ``grant_credits``
+                # with source='refund' keyed on
+                # (ref_type='research_task', ref_id=task_id).
+                rpc_url = f"{config.SUPABASE_URL}/rest/v1/rpc/grant_credits"
+                resp = await client.post(
+                    rpc_url,
+                    json={
+                        "p_user_id": user_id,
+                        "p_credits": refund_tokens,
+                        "p_source": "refund",
+                        "p_ref_type": "research_task",
+                        "p_ref_id": _ref_id,
+                    },
+                    headers=headers,
                 )
-                return
-
-            rpc_url = f"{config.SUPABASE_URL}/rest/v1/rpc/add_credits"
-            refund_tokens = abs(delta_tokens)
-            resp = await client.post(
-                rpc_url,
-                json={"p_user_id": user_id, "p_credits": refund_tokens},
-                headers=headers,
-            )
-            if resp.status_code in (200, 204):
-                logger.info(
-                    "credits_settled_by_refund",
-                    user_id=user_id,
-                    reserved_credits=reserved_credits,
-                    final_tokens=final_tokens,
-                    refunded=refund_tokens,
-                )
-                return
-            logger.error(
-                "credit_settlement_refund_failed",
-                user_id=user_id,
-                status=resp.status_code,
-                reserved_credits=reserved_credits,
-                final_tokens=final_tokens,
-            )
+                if resp.status_code in (200, 204):
+                    rpc_succeeded = True
+                    logger.info(
+                        "credit_settlement_refund_ok",
+                        user_id=user_id,
+                        task_id=task_id,
+                        reserved_credits=reserved_credits,
+                        final_tokens=final_tokens,
+                        refunded=refund_tokens,
+                    )
+                else:
+                    logger.error(
+                        "credit_settlement_refund_failed",
+                        user_id=user_id,
+                        task_id=task_id,
+                        status=resp.status_code,
+                        reserved_credits=reserved_credits,
+                        final_tokens=final_tokens,
+                    )
     except Exception as exc:
         logger.error(
             "credit_settlement_failed",
             user_id=user_id,
+            task_id=task_id,
             error=str(exc),
             reserved_credits=reserved_credits,
             final_tokens=final_tokens,
         )
+
+    # Y-01: durable two-step finalisation, mirroring T-01.
+    # 1. Stamp ``ledger_applied_at`` first so the reconciler can tell
+    #    that the ledger mutation already happened even if step 2 fails.
+    # 2. Stamp ``completed_at`` (and re-stamp ``ledger_applied_at`` via
+    #    COALESCE) and flip ``research_tasks.credits_settled``.
+    if rpc_succeeded and task_id and db is not None:
+        try:
+            await _mark_research_ledger_applied(db, task_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "credit_settlement_mark_ledger_applied_failed",
+                user_id=user_id,
+                task_id=task_id,
+                error=str(exc),
+            )
+            return
+        try:
+            await _mark_research_settlement_completed(db, task_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "credit_settlement_mark_completed_failed",
+                user_id=user_id,
+                task_id=task_id,
+                error=str(exc),
+            )
+            return
 
 
 async def _run_single(
@@ -591,13 +828,21 @@ async def _run_single(
             total_calls=cost_tracker.call_count,
         )
         # Settle credits against the amount reserved at submission time
-        await _deduct_user_credits(user_id, cost_tracker, config, reserved_credits=reserved_credits)
+        await _deduct_user_credits(
+            user_id, cost_tracker, config,
+            reserved_credits=reserved_credits,
+            task_id=task.id, db=db,
+        )
         return 0
 
     except KeyboardInterrupt:
         logger.info("investigation_interrupted", task_id=task.id)
         # Still settle for work done before interruption
-        await _deduct_user_credits(user_id, cost_tracker, config, reserved_credits=reserved_credits)
+        await _deduct_user_credits(
+            user_id, cost_tracker, config,
+            reserved_credits=reserved_credits,
+            task_id=task.id, db=db,
+        )
         return 1
 
     except Exception as exc:
@@ -610,7 +855,11 @@ async def _run_single(
         )
         await _mark_task_failed(db, task.id, f"{type(exc).__name__}: {exc}")
         # Settle credits even on failure — the cost was incurred
-        await _deduct_user_credits(user_id, cost_tracker, config, reserved_credits=reserved_credits)
+        await _deduct_user_credits(
+            user_id, cost_tracker, config,
+            reserved_credits=reserved_credits,
+            task_id=task.id, db=db,
+        )
         return 1
 
 
@@ -894,6 +1143,41 @@ async def _run_settlement_reconciler_loop(db: Any) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "settlement_reconciler_iteration_failed",
+                error=str(exc),
+            )
+        await asyncio.sleep(_SETTLEMENT_RECONCILE_INTERVAL_S)
+
+
+async def _run_research_settlement_reconciler_loop(db: Any) -> None:
+    """Y-01: periodically reconcile stuck ``research_settlements`` rows.
+
+    Mirrors :func:`_run_settlement_reconciler_loop` (agent settlements)
+    for the legacy investigation pipeline.  Cadence and parameters are
+    deliberately shared with the agent loop so operators only manage
+    one knob set.
+    """
+    from mariana.research_settlement_reconciler import (  # noqa: PLC0415
+        reconcile_pending_research_settlements,
+    )
+
+    logger.info(
+        "research_settlement_reconciler_start",
+        interval_s=_SETTLEMENT_RECONCILE_INTERVAL_S,
+        max_age_s=_SETTLEMENT_RECONCILE_MAX_AGE_S,
+        batch_size=_SETTLEMENT_RECONCILE_BATCH_SIZE,
+    )
+    while True:
+        try:
+            await reconcile_pending_research_settlements(
+                db,
+                max_age_seconds=_SETTLEMENT_RECONCILE_MAX_AGE_S,
+                batch_size=_SETTLEMENT_RECONCILE_BATCH_SIZE,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "research_settlement_reconciler_iteration_failed",
                 error=str(exc),
             )
         await asyncio.sleep(_SETTLEMENT_RECONCILE_INTERVAL_S)
@@ -1290,8 +1574,17 @@ async def _async_main() -> int:  # noqa: PLR0912  (many branches by design)
                 _run_settlement_reconciler_loop(db=db),
                 name="settlement-reconciler",
             )
+            research_settlement_reconciler_task = asyncio.create_task(
+                _run_research_settlement_reconciler_loop(db=db),
+                name="research-settlement-reconciler",
+            )
             done, pending = await asyncio.wait(
-                {research_task, agent_task, settlement_reconciler_task},
+                {
+                    research_task,
+                    agent_task,
+                    settlement_reconciler_task,
+                    research_settlement_reconciler_task,
+                },
                 return_when=asyncio.FIRST_EXCEPTION,
             )
             for p in pending:
