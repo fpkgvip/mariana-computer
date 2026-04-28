@@ -28,7 +28,7 @@ from typing import Any
 import redis.asyncio as aioredis
 
 from mariana.data.models import SourceType
-from mariana.util.redis_url import assert_local_or_tls
+from mariana.util.redis_url import assert_local_or_tls, make_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -422,10 +422,16 @@ async def create_redis_client(
     M-05 fix: require ``rediss://`` (TLS) for any non-loopback Redis URL
     so cached investigation data / user context is not transmitted in
     cleartext over the network.
+
+    W-01: build through the shared validated factory so the same policy is
+    enforced uniformly across the codebase. The local ``assert_local_or_tls``
+    call is kept as defense-in-depth for any caller that historically reached
+    in to validate before constructing.
     """
     assert_local_or_tls(redis_url, surface="cached data")
-    client: aioredis.Redis = aioredis.from_url(
+    client: aioredis.Redis = make_redis_client(
         redis_url,
+        surface="cached data",
         max_connections=max_connections,
         socket_timeout=socket_timeout,
         # BUG-024: Use decode_responses=True for consistency with the API's Redis client

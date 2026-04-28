@@ -47,3 +47,19 @@ def assert_local_or_tls(url: str | None, *, surface: str) -> None:
     raise ValueError(
         f"Remote Redis URLs must use rediss:// (TLS) for {surface}; got {url!r}"
     )
+
+
+def make_redis_client(url: str, *, surface: str, **kwargs):
+    """Validated factory for ``redis.asyncio`` clients used anywhere in the app.
+
+    Centralizes the W-01 transport-policy contract: every call site that
+    builds a Redis client from an operator-controlled URL goes through this
+    factory so the V-01 ``assert_local_or_tls`` rule is enforced uniformly.
+
+    The import of ``redis.asyncio`` is intentionally lazy so the rest of
+    this module remains pure-stdlib for the V-01 unit tests.
+    """
+    import redis.asyncio as aioredis  # noqa: PLC0415  (lazy on purpose)
+
+    assert_local_or_tls(url, surface=surface)
+    return aioredis.from_url(url, **kwargs)

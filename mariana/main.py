@@ -52,6 +52,7 @@ import structlog
 
 from mariana.config import Config, load_config
 from mariana.data.models import ResearchTask, State, TaskStatus
+from mariana.util.redis_url import make_redis_client
 
 logger = structlog.get_logger(__name__)
 
@@ -252,10 +253,15 @@ async def _create_db_pool(config: Config) -> Any:
 
 
 async def _create_redis(config: Config) -> Any:
-    """Create and return a redis.asyncio client."""
-    import redis.asyncio as aioredis  # type: ignore[import]
-    return aioredis.from_url(
+    """Create and return a redis.asyncio client.
+
+    W-01: routes through the validated factory so plaintext ``redis://``
+    URLs to remote hosts are rejected the same way the vault and cache
+    surfaces already do.
+    """
+    return make_redis_client(
         config.REDIS_URL,
+        surface="agent_daemon",
         max_connections=20,
         socket_timeout=5.0,
         decode_responses=True,

@@ -100,6 +100,7 @@ except ImportError:  # pragma: no cover - slowapi is an optional hardening dep
 from mariana.config import AppConfig, load_config
 from mariana.data.db import create_pool, init_schema, insert_research_task as _db_insert_research_task
 from mariana.data.models import ResearchTask as _ResearchTask, TaskStatus as _TaskStatus, State as _State
+from mariana.util.redis_url import make_redis_client
 
 logger = structlog.get_logger(__name__)
 
@@ -334,10 +335,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ── Redis ───────────────────────────────────────────────────────────────
     try:
-        import redis.asyncio as aioredis  # type: ignore[import-not-found]
-
-        _redis = aioredis.from_url(
+        # W-01: route through the validated factory so the V-01 transport-policy
+        # rule covers every operator-controlled REDIS_URL, not just vault/cache.
+        _redis = make_redis_client(
             _config.REDIS_URL,
+            surface="api_startup",
             encoding="utf-8",
             decode_responses=True,
         )
