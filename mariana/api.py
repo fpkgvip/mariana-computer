@@ -5533,14 +5533,26 @@ async def create_checkout(
         raise HTTPException(status_code=503, detail="Billing service not configured")
 
     # VULN-C2-03 fix: Validate redirect URLs to prevent open-redirect phishing.
-    _ALLOWED_REDIRECT_HOSTS = {
-        "frontend-tau-navy-80.vercel.app",
-        "localhost",
-        "127.0.0.1",
-    }
+    # Z-02 fix: derive the allowlist from the same _DEFAULT_PROD_CORS_ORIGINS /
+    # _DEFAULT_DEV_CORS_ORIGINS lists used by the CORS middleware so the two
+    # surfaces stay in lockstep.  Pre-Z-02 the production host
+    # ``app.mariana.computer`` was in the CORS list but missing from this
+    # allowlist, breaking checkout for the production frontend.
+    from urllib.parse import urlparse  # noqa: PLC0415
+    _ALLOWED_REDIRECT_HOSTS: set[str] = set()
+    for _origin in (*_DEFAULT_PROD_CORS_ORIGINS, *_DEFAULT_DEV_CORS_ORIGINS):
+        try:
+            _h = urlparse(_origin).hostname
+            if _h:
+                _ALLOWED_REDIRECT_HOSTS.add(_h)
+        except Exception:  # noqa: BLE001 — malformed env entry, skip
+            continue
+    # Preserve the pre-Z-02 explicit loopback hosts so dev workflows that
+    # do not appear in the dev CORS list (e.g. 127.0.0.1 ports the CORS
+    # list does not enumerate) continue to work.
+    _ALLOWED_REDIRECT_HOSTS.update({"localhost", "127.0.0.1"})
     for url_field, url_value in [("success_url", body.success_url), ("cancel_url", body.cancel_url)]:
         try:
-            from urllib.parse import urlparse
             parsed = urlparse(url_value)
             if parsed.hostname not in _ALLOWED_REDIRECT_HOSTS:
                 raise HTTPException(
