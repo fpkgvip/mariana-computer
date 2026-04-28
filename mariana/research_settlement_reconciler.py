@@ -47,11 +47,17 @@ async def reconcile_pending_research_settlements(
         propagates so the caller's loop log can tag the iteration as
         failed.
     """
+    # CC-02: candidate selection MUST be a materialised CTE rather than an
+    # inline ``WHERE task_id IN (SELECT ... LIMIT $2 ...)``.  PostgreSQL is
+    # free to inline the IN-subquery as a semi-join, in which case the
+    # ``LIMIT`` of the subquery applies to the *join* output rather than to
+    # the candidate set — the outer UPDATE then matches every uncompleted
+    # row, blowing past ``batch_size``.  See the agent-side reconciler for
+    # the full diagnosis (loop6_audit/CC02_RECONCILER_LIMIT_FIX.md).
     async with db.acquire() as conn:
         rows = await conn.fetch(
             """
-            UPDATE research_settlements SET claimed_at = now()
-            WHERE task_id IN (
+            WITH cands AS (
                 SELECT task_id FROM research_settlements
                 WHERE completed_at IS NULL
                   AND claimed_at < now() - ($1 || ' seconds')::interval
@@ -59,6 +65,8 @@ async def reconcile_pending_research_settlements(
                 LIMIT $2
                 FOR UPDATE SKIP LOCKED
             )
+            UPDATE research_settlements SET claimed_at = now()
+            WHERE task_id IN (SELECT task_id FROM cands)
             RETURNING task_id, ledger_applied_at, user_id, reserved_credits,
                       final_credits, delta_credits
             """,

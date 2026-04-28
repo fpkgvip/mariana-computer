@@ -86,8 +86,16 @@ async def reconcile_pending_settlements(
     # SKIP LOCKED equivalent without the deadlock risk of holding a
     # FOR UPDATE lock across the slow ledger RPC.
     #
-    # ctid is included so the UPDATE only touches rows we explicitly select
-    # via the LIMIT subquery (avoids scanning the whole index).
+    # CC-02: the candidate selection MUST use a materialised CTE rather than
+    # an inline ``WHERE task_id IN (SELECT ... LIMIT $2 ...)``.  PostgreSQL
+    # is free to inline the IN-subquery as a semi-join, in which case the
+    # ``LIMIT`` of the subquery applies to the *join* output rather than to
+    # the candidate set — the outer UPDATE then matches every uncompleted
+    # row, blowing past ``batch_size``.  Wrapping the candidate query in a
+    # CTE forces the planner to evaluate the subquery as a one-shot result
+    # set (PG ≥ 12 still inlines simple non-modifying CTEs by default but
+    # the LIMIT-bearing FOR UPDATE form here qualifies as side-effecting and
+    # is materialised).  See ``loop6_audit/CC02_RECONCILER_LIMIT_FIX.md``.
     #
     # T-01: also return ``ledger_applied_at`` so the per-row loop can
     # short-circuit "ledger already applied, only marker is stale" without
@@ -96,8 +104,7 @@ async def reconcile_pending_settlements(
     async with db.acquire() as conn:
         rows = await conn.fetch(
             """
-            UPDATE agent_settlements SET claimed_at = now()
-            WHERE task_id IN (
+            WITH cands AS (
                 SELECT task_id FROM agent_settlements
                 WHERE completed_at IS NULL
                   AND claimed_at < now() - ($1 || ' seconds')::interval
@@ -105,6 +112,8 @@ async def reconcile_pending_settlements(
                 LIMIT $2
                 FOR UPDATE SKIP LOCKED
             )
+            UPDATE agent_settlements SET claimed_at = now()
+            WHERE task_id IN (SELECT task_id FROM cands)
             RETURNING task_id, ledger_applied_at
             """,
             str(max_age_seconds),
