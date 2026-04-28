@@ -12,6 +12,14 @@ on:
 permissions:
   contents: read
 
+# CC-15 ops hardening: serialize deploys so two pushes (or push + manual
+# dispatch) cannot race two `git reset --hard` + `docker compose build`
+# runs against the same Hetzner host.  cancel-in-progress=false ensures
+# the in-flight deploy completes before the next one starts.
+concurrency:
+  group: deploy-hetzner-prod
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
