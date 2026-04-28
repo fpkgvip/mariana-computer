@@ -243,24 +243,32 @@ def _normalize_bearer_auth_header(raw: str | None) -> str:
     single ``Bearer <token>`` form, and raise 500 on empty/malformed values
     so we never relay nonsense credentials to Supabase.
     """
+    # CC-08: keep the user-facing detail string identical across all four
+    # branches (security: do not leak which check failed). Emit a structured
+    # logger.warning per branch so operators retain forensic differentiation
+    # that previously lived in the user-facing detail string.
     if not raw:
+        logger.warning("admin_auth_header_missing", reason="missing")
         raise HTTPException(
             status_code=500,
             detail="Sign-in failed. Try again, or contact support if this keeps happening.",
         )
     value = raw.strip()
     if not value:
+        logger.warning("admin_auth_header_empty", reason="empty")
         raise HTTPException(
             status_code=500,
             detail="Sign-in failed. Try again, or contact support if this keeps happening.",
         )
     if not value.lower().startswith("bearer "):
+        logger.warning("admin_auth_header_wrong_scheme", reason="wrong_scheme")
         raise HTTPException(
             status_code=500,
             detail="Sign-in failed. Try again, or contact support if this keeps happening.",
         )
     token = value.split(" ", 1)[1].strip()
     if not token:
+        logger.warning("admin_auth_header_empty_token", reason="empty_token")
         raise HTTPException(
             status_code=500,
             detail="Sign-in failed. Try again, or contact support if this keeps happening.",
