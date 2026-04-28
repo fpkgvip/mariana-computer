@@ -97,9 +97,14 @@ describe("B-44 jsdom version ≥24 contract", () => {
     ).toBeGreaterThanOrEqual(2);
   });
 
-  it("package.json jsdom constraint uses ^ (allows patch/minor upgrades, not a hard pin)", () => {
+  it("package.json jsdom constraint is exact-pinned (CC-23 supply-chain hardening)", () => {
+    // CC-23 (2026-04-28): every direct dep is exact-pinned to the lockfile-installed
+    // version to prevent fresh-resolve drift. The original B-44 assertion required
+    // a caret prefix; that policy was superseded.
     const spec = pkg.devDependencies?.jsdom ?? "";
-    expect(spec).toMatch(/^\^/);
+    expect(spec).toMatch(/^\d+\.\d+\.\d+/);
+    expect(spec).not.toMatch(/^\^/);
+    expect(spec).not.toMatch(/^~/);
   });
 
   it("resolved jsdom version from package-lock.json is ≥24 (if lock file present)", () => {
