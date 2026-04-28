@@ -6,6 +6,7 @@ import { ArrowUpRight, Sparkles, Eye, Globe } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import { BRAND, STORAGE } from "@/lib/brand";
 import { usePageHead } from "@/lib/pageHead";
+import { useReducedMotion } from "@/hooks/useReducedMotion";
 
 /**
  * Deft homepage — prompt-first.
@@ -48,14 +49,21 @@ export default function Index() {
 
   const navigate = useNavigate();
   const { user } = useAuth();
+  const reducedMotion = useReducedMotion();
   const [prompt, setPrompt] = useState("");
   const [phIndex, setPhIndex] = useState(0);
   const [phText, setPhText] = useState("");
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   // Type-on / type-off rotating placeholder. Pauses while the user is typing.
+  // For users who request reduced motion we render a single static prompt
+  // rather than cycling — same surface area, none of the chatter.
   useEffect(() => {
     if (prompt.length > 0) return;
+    if (reducedMotion) {
+      setPhText(CYCLING_PROMPTS[phIndex]);
+      return;
+    }
     const target = CYCLING_PROMPTS[phIndex];
     let cancelled = false;
     let i = 0;
@@ -77,7 +85,7 @@ export default function Index() {
     return () => {
       cancelled = true;
     };
-  }, [phIndex, prompt.length]);
+  }, [phIndex, prompt.length, reducedMotion]);
 
   // Auto-grow textarea
   useEffect(() => {
@@ -148,9 +156,11 @@ export default function Index() {
 
         <div className="container-deft w-full">
           <div className="mx-auto max-w-[940px] text-center">
-            {/* Eyebrow */}
+            {/* Eyebrow — single steady accent dot. The hero already moves
+                with a cycling placeholder; a pulsing dot on top reads as
+                noise. Audit §5.2 / PF-23. */}
             <div className="mx-auto mb-7 inline-flex items-center gap-2 rounded-full border border-border/70 bg-surface-1/60 px-3 py-1 text-[12px] font-medium tracking-[0.01em] text-muted-foreground backdrop-blur">
-              <span className="size-1.5 rounded-full bg-deploy animate-pulse" />
+              <span className="size-1.5 rounded-full bg-deploy" />
               The AI developer with a real computer
             </div>
 

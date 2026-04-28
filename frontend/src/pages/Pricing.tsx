@@ -408,7 +408,7 @@ export default function Pricing() {
               <details key={faq.q} className="group py-5">
                 <summary className="flex cursor-pointer list-none items-start justify-between gap-4 text-[15px] font-medium text-foreground">
                   <span>{faq.q}</span>
-                  <span className="mt-1 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-md border border-border/60 text-muted-foreground transition-transform group-open:rotate-45">+</span>
+                  <span className="mt-1 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-md border border-border/60 text-muted-foreground transition-transform duration-200 ease-out group-open:rotate-45">+</span>
                 </summary>
                 <p className="mt-3 max-w-prose text-[13.5px] leading-[1.7] text-muted-foreground">
                   {faq.a}
