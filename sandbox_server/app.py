@@ -189,8 +189,84 @@ _MAX_WORKSPACE_BYTES = int(
     os.environ.get("SANDBOX_MAX_WORKSPACE_BYTES", str(2 * 1024 * 1024 * 1024))
 )
 _WORKSPACE_SIZE_TTL_SEC = 5.0
-# (path_str -> (timestamp, size_bytes))
-_WORKSPACE_SIZE_CACHE: dict[str, tuple[float, int]] = {}
+# CC-37: bound the workspace-size cache so a long-running sandbox container
+# cannot grow the dict without bound when many distinct user_ids drive
+# ``/fs/write`` over its lifetime.  10_000 entries × ~few hundred bytes ≈
+# under 10 MB ceiling — plenty of headroom for realistic tenancy while
+# still capping the worst case.  TTL stays at ``_WORKSPACE_SIZE_TTL_SEC``
+# so a stale cached size is refreshed by recursive ``stat`` on next read.
+_WORKSPACE_SIZE_CACHE_MAX_ENTRIES = 10_000
+
+
+class _BoundedTTLCache:
+    """Hand-rolled bounded TTL cache for ``_WORKSPACE_SIZE_CACHE``.
+
+    Mirrors the dict subset previously used by
+    :func:`_workspace_size_bytes` and :func:`_workspace_size_cache_set`:
+    ``get(key)`` returns the cached ``(inserted_at, size_bytes)`` tuple or
+    ``None``; ``__setitem__`` inserts / refreshes; ``clear()`` empties the
+    cache (used by tests).  TTL is enforced inside ``get``: an entry older
+    than ``ttl`` (compared against ``time.monotonic()``) is evicted and
+    ``None`` returned, so a stale post-write size never feeds the quota
+    helper.  Eviction on overflow is FIFO (insertion order) via
+    ``OrderedDict`` — matches ``mariana/api.py`` ``_BoundedTTLCache`` for
+    ``_ADMIN_ROLE_CACHE`` (CC-30) so the two caches behave alike.
+    """
+
+    __slots__ = ("_max", "_ttl", "_data")
+
+    def __init__(self, maxsize: int, ttl: float) -> None:
+        from collections import OrderedDict
+
+        self._max = maxsize
+        self._ttl = ttl
+        self._data: "OrderedDict[str, tuple[float, int]]" = OrderedDict()
+
+    def get(self, key: str) -> tuple[float, int] | None:
+        entry = self._data.get(key)
+        if entry is None:
+            return None
+        inserted_at, _size = entry
+        if (time.monotonic() - inserted_at) >= self._ttl:
+            # Expired — evict and report miss so the caller refreshes.
+            self._data.pop(key, None)
+            return None
+        return entry
+
+    def __setitem__(self, key: str, value: tuple[float, int]) -> None:
+        # Refresh insertion order so a re-set bumps the entry.
+        if key in self._data:
+            self._data.move_to_end(key, last=True)
+        self._data[key] = value
+        # FIFO eviction when over capacity.
+        while len(self._data) > self._max:
+            self._data.popitem(last=False)
+
+    def __getitem__(self, key: str) -> tuple[float, int]:
+        # Subscript access returns the raw stored tuple WITHOUT TTL
+        # eviction — used by tests that want to inspect cache state
+        # (e.g. "the cache reflects the post-write total").  Production
+        # code paths must use ``get(key)`` to honour the TTL.
+        return self._data[key]
+
+    def pop(self, key: str, default=None):
+        return self._data.pop(key, default)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
+
+
+# (path_str -> (monotonic_inserted_at, size_bytes))
+_WORKSPACE_SIZE_CACHE: _BoundedTTLCache = _BoundedTTLCache(
+    maxsize=_WORKSPACE_SIZE_CACHE_MAX_ENTRIES,
+    ttl=_WORKSPACE_SIZE_TTL_SEC,
+)
 
 
 def _workspace_size_bytes(workspace_root: pathlib.Path) -> int:
@@ -199,11 +275,14 @@ def _workspace_size_bytes(workspace_root: pathlib.Path) -> int:
     Cached for ~5 seconds per workspace path to avoid hammering the FS with
     a recursive ``stat`` on every write request.  Missing-file races are
     swallowed (best-effort accounting).
+
+    CC-37: backing store is a bounded TTL cache (FIFO eviction at
+    ``_WORKSPACE_SIZE_CACHE_MAX_ENTRIES`` distinct keys, TTL of
+    ``_WORKSPACE_SIZE_TTL_SEC`` enforced inside ``get``).
     """
     key = str(workspace_root)
-    now = time.monotonic()
     cached = _WORKSPACE_SIZE_CACHE.get(key)
-    if cached is not None and (now - cached[0]) < _WORKSPACE_SIZE_TTL_SEC:
+    if cached is not None:
         return cached[1]
     total = 0
     try:
@@ -215,7 +294,7 @@ def _workspace_size_bytes(workspace_root: pathlib.Path) -> int:
                 continue
     except FileNotFoundError:
         total = 0
-    _WORKSPACE_SIZE_CACHE[key] = (now, total)
+    _WORKSPACE_SIZE_CACHE[key] = (time.monotonic(), total)
     return total
 
 
