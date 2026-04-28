@@ -145,8 +145,10 @@ async def test_cc01_planner_failure_marks_task_failed():
     assert result.state == AgentState.FAILED, (
         f"planner failure must bring the task to FAILED; got {result.state.value!r}"
     )
-    assert result.error is not None and result.error.startswith("planner_failed:"), (
-        f"task.error must carry the planner_failed: prefix; got {result.error!r}"
+    # CC-21: task.error must be the stable code only — raw exception
+    # text is kept in the server log, not the user-visible record.
+    assert result.error == "planner_failed", (
+        f"task.error must be the stable planner_failed code; got {result.error!r}"
     )
     # The finally-block ALWAYS attempts settlement; the function itself
     # short-circuits internally when ``reserved_credits <= 0``.  Pin the
@@ -282,8 +284,10 @@ async def test_cc01_step_unexpected_exception_marks_step_failed():
         ok, err = await loop_mod._run_one_step(_NoopDB(), None, task, step)
 
     assert ok is False, "step must report failure"
-    assert err is not None and "unexpected:" in err, (
-        f"unexpected exception must be tagged with 'unexpected:'; got {err!r}"
+    # CC-21: step.error must be the stable code only — raw exception
+    # class + text is kept in the server log, not the step record.
+    assert err == "unexpected", (
+        f"unexpected exception must surface stable 'unexpected' code; got {err!r}"
     )
     # The step was failed, not the entire task.
     assert step.status == StepStatus.FAILED
@@ -517,6 +521,8 @@ async def test_cc01_requires_vault_with_no_redis_fails_closed_before_plan():
     assert result.state == AgentState.FAILED, (
         f"requires_vault with no redis must FAIL the task; got {result.state.value!r}"
     )
-    assert result.error is not None and "Vault unavailable" in result.error, (
-        f"task.error must carry the Vault unavailable surface; got {result.error!r}"
+    # CC-21: task.error must be the stable code only — raw exception
+    # text is kept in the server log, not the user-visible record.
+    assert result.error == "vault_unavailable", (
+        f"task.error must be the stable vault_unavailable code; got {result.error!r}"
     )

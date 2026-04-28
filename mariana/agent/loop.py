@@ -951,9 +951,19 @@ async def _run_one_step(
         )
         return False, step.error
     except Exception as exc:  # defensive: any unexpected error
+        # CC-21: persist a stable error_code on the user-visible step
+        # record; raw exception class + message stays in the server log
+        # so operators can still diagnose without exposing internals.
+        logger.warning(
+            "agent_step_unexpected_exception",
+            task_id=task.id,
+            step_id=step.id,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
         step.status = StepStatus.FAILED
         step.finished_at = time.time()
-        step.error = f"unexpected: {type(exc).__name__}: {exc}"
+        step.error = "unexpected"
         task.total_failures += 1
         await _persist_task(db, task)
         await _emit(
@@ -1038,9 +1048,17 @@ async def _attempt_fix(
     try:
         new_step, cost = await planner.fix_step(task, failed_step)
     except Exception as exc:
+        # CC-21: emit a stable error_code instead of raw exception text;
+        # keep the cause in the server log for operator diagnosis.
+        logger.warning(
+            "agent_fix_step_failed",
+            task_id=task.id,
+            failed_step_id=failed_step.id,
+            error=str(exc),
+        )
         await _emit(
             db, redis, task, "error",
-            payload={"phase": "fix", "error": str(exc)},
+            payload={"phase": "fix", "error": "planner_failed"},
         )
         return False
 
@@ -1068,9 +1086,17 @@ async def _attempt_replan(
     try:
         new_steps, cost = await planner.replan(task, reason=reason)
     except Exception as exc:
+        # CC-21: emit a stable error_code instead of raw exception text;
+        # keep the cause in the server log for operator diagnosis.
+        logger.warning(
+            "agent_replan_failed",
+            task_id=task.id,
+            reason=reason,
+            error=str(exc),
+        )
         await _emit(
             db, redis, task, "error",
-            payload={"phase": "replan", "error": str(exc)},
+            payload={"phase": "replan", "error": "planner_failed"},
         )
         return False
     task.replan_count += 1
@@ -1185,8 +1211,10 @@ async def run_agent_task(
         except VaultUnavailableError as exc:
             # Fail-closed BEFORE any tool execution.  Mark the task FAILED
             # with a clear error and return without running anything.
+            # CC-21: persist only a stable error_code on the task record;
+            # the raw cause stays in the server log above.
             log.error("vault_env_unavailable_fail_closed", task_id=task.id, error=str(exc))
-            task.error = f"Vault unavailable: {exc}"
+            task.error = "vault_unavailable"
             task.state = AgentState.FAILED
             try:
                 await _persist_task(db, task)
@@ -1196,8 +1224,10 @@ async def run_agent_task(
         except ValueError as exc:
             # Transport policy violation (e.g. plaintext redis:// to a
             # remote host).  Same fail-closed surface.
+            # CC-21: persist only a stable error_code on the task record;
+            # the raw cause stays in the server log above.
             log.error("vault_env_redis_url_policy_violation", task_id=task.id, error=str(exc))
-            task.error = f"Vault transport policy violation: {exc}"
+            task.error = "vault_transport_violation"
             task.state = AgentState.FAILED
             try:
                 await _persist_task(db, task)
@@ -1207,8 +1237,10 @@ async def run_agent_task(
         except Exception as exc:  # pragma: no cover
             # Non-vault tasks: legacy soft-fail behaviour preserved.
             if requires_vault:
+                # CC-21: persist only a stable error_code on the task
+                # record; the raw cause stays in the server log above.
                 log.error("vault_env_unexpected_error_fail_closed", task_id=task.id, error=str(exc))
-                task.error = f"Vault unavailable: {exc}"
+                task.error = "vault_unavailable"
                 task.state = AgentState.FAILED
                 try:
                     await _persist_task(db, task)
@@ -1287,7 +1319,15 @@ async def run_agent_task(
         try:
             steps, cost = await planner.build_initial_plan(task)
         except Exception as exc:
-            task.error = f"planner_failed: {exc}"
+            # CC-21: persist only a stable error_code on the task record;
+            # the raw cause stays in the server log emitted here.
+            log.error(
+                "agent_planner_failed",
+                task_id=task.id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            task.error = "planner_failed"
             await _emit(db, redis, task, "error", payload={"phase": "plan", "error": task.error})
             task.state = AgentState.FAILED
             await _persist_task(db, task)
@@ -1408,8 +1448,17 @@ async def run_agent_task(
     except Exception as exc:
         # Final safety net.  Every expected error path above already records
         # state; this catches programming errors.
-        log.exception("agent_loop_crash")
-        task.error = f"loop_crash: {type(exc).__name__}: {exc}"
+        # CC-21: ``log.exception`` already captures the raw traceback +
+        # exception text in structured logs; the persisted task.error
+        # is a stable error_code so the user-visible control plane does
+        # not leak internal class names / messages.
+        log.exception(
+            "agent_loop_crash",
+            task_id=task.id,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        task.error = "loop_crash"
         task.state = AgentState.FAILED
         try:
             await _persist_task(db, task)
