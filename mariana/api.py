@@ -394,7 +394,29 @@ app = FastAPI(
 # The _redis_rate_limit_url is read directly from env at module-load time so
 # that slowapi's storage is wired before the app is constructed (lifespan runs
 # after the middleware stack is assembled).
-_redis_rate_limit_url: str | None = os.environ.get("REDIS_URL") or None
+#
+# X-01 fix: route the URL through ``assert_local_or_tls`` so the V-01 / W-01
+# transport-policy contract covers the slowapi storage backend too. slowapi
+# performs its own ``redis.from_url(storage_uri)`` internally, so without this
+# pre-validation a misconfigured ``redis://remote:6379`` would carry rate-limit
+# counters in cleartext while every other Redis surface correctly raises.
+from mariana.util.redis_url import assert_local_or_tls as _assert_local_or_tls
+
+
+def _load_rate_limit_storage_uri() -> str | None:
+    """Return the validated REDIS_URL for the slowapi storage backend, or None.
+
+    Reads ``REDIS_URL`` from the environment at call time, validates it via the
+    shared ``assert_local_or_tls`` policy (``surface="rate_limit_storage"``) and
+    returns it. ``None``/empty is returned untouched so slowapi falls back to
+    its in-memory storage.
+    """
+    url = os.environ.get("REDIS_URL") or None
+    _assert_local_or_tls(url, surface="rate_limit_storage")
+    return url
+
+
+_redis_rate_limit_url: str | None = _load_rate_limit_storage_uri()
 
 if _SLOWAPI_AVAILABLE:
     if _redis_rate_limit_url:
